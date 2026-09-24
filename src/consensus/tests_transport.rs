@@ -2794,3 +2794,97 @@ fn an_idle_closed_link_is_probed_once_and_redialled() {
     assert_eq!(a.idle_redials() - redials, 1, "the probe did not find the close and redial");
     assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
 }
+
+#[test]
+fn a_link_left_holding_a_refusal_is_redialled_after_an_idle_gap() {
+    // **D224 review, F4.** The accepting side does write after the handshake, on one path. A refused
+    // handshake still sends its own handshake, then an `Error` frame, then closes (`conn_loop`). The
+    // dialler reads only the six handshake bytes and keeps the connection, so the `Error` frame and
+    // the FIN sit unread on it for good. A probe that reads unread bytes as "alive" is then blind on
+    // that link: the next frame after an idle gap goes into the closed connection and is lost
+    // uncounted, exactly as before D224.
+    //
+    // A hand-rolled peer puts those bytes on the wire: its handshake, an `Error` frame, and a close.
+    // Nothing is queued while the first connection is up, so A writes nothing on it and the close is
+    // a FIN, not a reset. After a gap past the probe gate, ONE send must arrive on a second
+    // connection.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_millis(300); // so the probe gate is 150 ms
+    let a = Transport::from_listener(
+        NodeId(1),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        BTreeMap::from([(NodeId(2), peer_addr)]),
+        opts,
+    )
+    .unwrap();
+    let mut ours = Vec::new();
+    crate::replication::write_handshake(&mut ours).unwrap();
+
+    // --- the refused connection, left as `conn_loop` leaves it ---------------------------------
+    let (mut c1, _) = listener.accept().expect("the transport should dial on its own");
+    c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = [0u8; 6];
+    // All six bytes are read: closing with unread bytes sends a reset, which any probe would see.
+    c1.read_exact(&mut hs).expect("the dialer sends its handshake first");
+    c1.write_all(&ours).unwrap();
+    crate::replication::Message::Error { message: "the handshake was refused".into() }
+        .write_to(&mut c1)
+        .unwrap();
+    let _ = c1.shutdown(Shutdown::Both);
+    drop(c1);
+
+    // --- an idle gap past the gate, then one frame ---------------------------------------------
+    // 600 ms: four times the gate, and ample for the FIN to reach A's kernel before the probe.
+    std::thread::sleep(Duration::from_millis(600));
+    let (probes, redials) = (a.idle_probes(), a.idle_redials());
+    a.send(&Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 7,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    })
+    .unwrap();
+
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let c2 = loop {
+        match listener.accept() {
+            Ok((s, _)) => break Some(s),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break None,
+        }
+    };
+    let Some(mut c2) = c2 else {
+        panic!(
+            "A never redialled a link holding an unread refusal and a FIN, so the frame went into \
+             the closed connection (idle_probes +{}, idle_redials +{}, lost_in_flight {})",
+            a.idle_probes() - probes,
+            a.idle_redials() - redials,
+            a.lost_in_flight()
+        );
+    };
+    // On BSD and macOS an accepted socket inherits the listener's non-blocking mode.
+    c2.set_nonblocking(false).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c2.read_exact(&mut hs).expect("the redial sends its handshake first");
+    c2.write_all(&ours).unwrap();
+    c2.flush().unwrap();
+    let mut head = [0u8; 5];
+    c2.read_exact(&mut head).expect("the frame the probe carried should arrive on the new connection");
+    assert_eq!(head[0], CONSENSUS_TAG);
+    let n = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; n];
+    c2.read_exact(&mut body).unwrap();
+    assert_eq!(decode(&body).unwrap().term, 7, "the redialled link carried some other frame first");
+    assert_eq!(a.idle_redials() - redials, 1, "the frame arrived, but not through the probe's redial");
+    assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
+}
