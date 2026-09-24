@@ -1,0 +1,19 @@
+# 2026-09-24T22:08:01Z HEAD=c2dad3f dirty=0
+# cmd: cargo test --no-fail-fast --test sim_durability a_torn_table_page_is_served_as_a_row_that_was_never_written -- --nocapture
+2026-09-24T22:08:01Z d256 acquiring (5s poll), pid 10893
+2026-09-24T22:08:01Z d256 ACQUIRED: 10893 d256 2026-09-24T22:08:01Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.23s
+     Running tests/sim_durability.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/sim_durability-9e6ed92c7221a067)
+
+running 1 test
+ferrodb: the log refuses every write from now on (transaction 1's Commit record could not be made durable (wal error: simulated fault: TearWrite at operation 41)); reopen the database, and every index is rebuilt then
+ferrodb: the log refuses every write from now on (transaction 1's Commit record could not be made durable (wal error: simulated fault: FailSync at operation 42)); reopen the database, and every index is rebuilt then
+known gap: a table page torn at operation 44 put 1 row(s) that were never written into a successful scan
+test a_torn_table_page_is_served_as_a_row_that_was_never_written ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.40s
+
+2026-09-24T22:08:04Z d256 rc=0
+2026-09-24T22:08:04Z d256 released (owner matched)
+# rc=0 end=2026-09-24T22:08:04Z

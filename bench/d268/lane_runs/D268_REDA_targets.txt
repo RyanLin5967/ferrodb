@@ -1,0 +1,77 @@
+# 2026-09-24T22:08:04Z HEAD=96be697 dirty=0
+# cmd: cargo test --no-fail-fast --test d268_power_loss_redo --test integration_replica_applier
+2026-09-24T22:08:04Z d256 acquiring (5s poll), pid 15976
+2026-09-24T22:08:24Z d256 ACQUIRED: 15976 d256 2026-09-24T22:08:24Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.04s
+     Running tests/d268_power_loss_redo.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d268_power_loss_redo-4442d6828909e198)
+
+running 3 tests
+test d268_an_init_insert_keeps_a_page_that_already_holds_its_own_later_image ... ok
+test d267_after_a_power_loss_the_allocator_does_not_hand_out_a_page_the_log_rebuilt ... FAILED
+test d268_a_reused_page_whose_writes_were_lost_holds_only_its_new_owners_rows ... FAILED
+
+failures:
+
+---- d267_after_a_power_loss_the_allocator_does_not_hand_out_a_page_the_log_rebuilt stdout ----
+
+thread 'd267_after_a_power_loss_the_allocator_does_not_hand_out_a_page_the_log_rebuilt' (357837548) panicked at tests/d268_power_loss_redo.rs:137:5:
+assertion `left != right` failed: the allocator handed out page 2, which the log rebuilt and B's directory lists: its bitmap bit was lost with the power and nothing at open set it again
+  left: 2
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- d268_a_reused_page_whose_writes_were_lost_holds_only_its_new_owners_rows stdout ----
+
+thread 'd268_a_reused_page_whose_writes_were_lost_holds_only_its_new_owners_rows' (357837549) panicked at tests/d268_power_loss_redo.rs:100:5:
+assertion `left == right` failed: B holds a row it never wrote: redo applied B's first insert onto A's stale image of page 2
+  left: [[176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176], [161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161, 161]]
+ right: [[176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176, 176]]
+
+
+failures:
+    d267_after_a_power_loss_the_allocator_does_not_hand_out_a_page_the_log_rebuilt
+    d268_a_reused_page_whose_writes_were_lost_holds_only_its_new_owners_rows
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--test d268_power_loss_redo`
+     Running tests/integration_replica_applier.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_replica_applier-16840cebb27ec7d5)
+
+running 12 tests
+test a_batch_beginning_above_the_frontier_is_refused_as_a_gap ... ok
+test a_frame_whose_crc_fails_is_refused ... ok
+test a_replica_does_not_hand_out_a_page_it_applied ... FAILED
+test a_frame_at_the_wrong_lsn_is_refused ... ok
+test a_replica_applies_a_shipped_insert_and_advances ... ok
+test re_applying_the_same_batch_is_a_no_op ... ok
+test an_alter_wrapped_in_a_clr_still_halts_the_replica ... ok
+test a_batch_with_one_bad_frame_applies_none_of_it ... ok
+test a_replica_still_applies_a_stream_carrying_create_and_drop_table ... ok
+test every_column_alteration_halts_the_replica ... ok
+test a_replica_refuses_a_stream_carrying_an_alter_rather_than_advancing_past_it ... ok
+test streaming_in_batches_converges_on_the_primarys_frontier ... ok
+
+failures:
+
+---- a_replica_does_not_hand_out_a_page_it_applied stdout ----
+
+thread 'a_replica_does_not_hand_out_a_page_it_applied' (357838160) panicked at tests/integration_replica_applier.rs:597:5:
+assertion `left != right` failed: the replica's allocator handed out page 1, which holds a row it applied
+  left: 1
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_replica_does_not_hand_out_a_page_it_applied
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+error: test failed, to rerun pass `--test integration_replica_applier`
+error: 2 targets failed:
+    `--test d268_power_loss_redo`
+    `--test integration_replica_applier`
+2026-09-24T22:08:39Z d256 rc=101
+2026-09-24T22:08:39Z d256 released (owner matched)
+# rc=101 end=2026-09-24T22:08:39Z

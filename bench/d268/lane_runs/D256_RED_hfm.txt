@@ -1,0 +1,84 @@
+# 2026-09-24T22:04:34Z HEAD=1f1d422 dirty=0
+# cmd: cargo test --no-fail-fast --lib storage::heap_file_manager::tests::a_listed_page_that_is_all_zero
+2026-09-24T22:04:34Z d256 acquiring (5s poll), pid 83529
+2026-09-24T22:05:50Z d256 ACQUIRED: 83529 d256 2026-09-24T22:05:50Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.50s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 1 test
+test storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it ... FAILED
+
+failures:
+
+---- storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it stdout ----
+
+thread 'storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it' (357539209) panicked at src/storage/heap_page.rs:106:34:
+slice index starts at 23 but ends at 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it' (357539209) panicked at src/storage/heap_file_manager.rs:555:23:
+a scan PANICKED (slice index starts at 23 but ends at 0) on an all-zero page instead of refusing it
+
+
+failures:
+    storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1706 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
+error: 1 target failed:
+    `--lib`
+2026-09-24T22:06:19Z d256 rc=101
+2026-09-24T22:06:19Z d256 released (owner matched)
+# rc=101 end=2026-09-24T22:06:19Z

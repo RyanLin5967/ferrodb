@@ -1,0 +1,164 @@
+# 2026-09-24T22:07:37Z HEAD=c2dad3f dirty=0
+# cmd: cargo test --no-fail-fast --lib storage::
+2026-09-24T22:07:37Z d256 acquiring (5s poll), pid 77468
+2026-09-24T22:07:38Z d256 ACQUIRED: 77468 d256 2026-09-24T22:07:38Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.47s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 99 tests
+test storage::atomic_file::tests::a_bare_relative_target_syncs_the_current_directory_not_the_empty_path ... ok
+test storage::atomic_file::tests::a_path_that_names_no_file_is_refused_rather_than_staged_through_dot_tmp ... ok
+test storage::atomic_file::tests::the_temporary_appends_tmp_instead_of_replacing_the_extension ... ok
+test storage::atomic_file::tests::a_durable_replace_syncs_the_temporary_before_the_rename_and_the_directory_after_it ... ok
+test storage::atomic_file::tests::a_durable_append_is_one_fsync_where_a_replace_is_two ... ok
+test storage::db_lock::tests::a_second_claim_on_one_database_is_refused ... ok
+test storage::disk_manager::tests::a_page_between_two_regions_belongs_to_this_allocator_and_can_be_freed ... ok
+test storage::db_lock::tests::a_stale_lock_is_refused_and_names_the_file_to_remove ... ok
+test storage::disk_manager::tests::growth_advances_past_bounded_regions_and_stops_at_an_unbounded_one ... ok
+test storage::db_lock::tests::an_empty_lock_file_still_refuses ... ok
+test storage::disk_manager::tests::allocate_skips_a_bounded_region_and_keeps_handing_out_pages_above_it ... ok
+test storage::disk_manager::tests::an_unbounded_region_still_stops_the_allocator_and_names_the_knob ... ok
+test storage::atomic_file::tests::syncing_a_real_directory_succeeds_on_this_platform ... ok
+test storage::disk_manager::tests::exhausting_the_table_region_says_the_knob_will_not_help_this_database ... ok
+test storage::db_lock::tests::dropping_the_lock_lets_the_next_open_through ... ok
+test storage::db_lock::tests::two_different_databases_do_not_contend ... ok
+test storage::disk_manager::tests::a_second_reservation_at_a_higher_base_is_refused ... ok
+test storage::disk_manager::tests::growing_the_bitmap_does_not_reuse_owned_pages ... ok
+test storage::disk_manager::tests::high_water_does_not_regress_after_a_free ... ok
+test storage::disk_manager::tests::re_registering_an_identical_region_is_a_restart_not_an_error ... ok
+test storage::heap_page::tests::a_restore_into_a_free_slot_without_room_is_refused_and_changes_nothing ... ok
+test storage::disk_manager::tests::next_page_id_is_not_the_high_water_mark ... ok
+test storage::atomic_file::tests::the_real_filesystem_replace_lands_the_bytes_and_leaves_no_temporary ... ok
+test storage::disk_manager::tests::two_bounded_regions_coexist_which_a_single_floor_refused ... ok
+test storage::heap_page::tests::a_shrink_keeps_the_slots_capacity_so_growing_back_is_in_place ... ok
+test storage::heap_page::tests::d256::a_free_space_end_that_disagrees_with_the_slots_is_refused ... ok
+test storage::heap_page::tests::d256::a_page_of_another_type_is_refused ... ok
+test storage::disk_manager::tests::test_freelist ... ok
+test storage::disk_manager::tests::overlapping_regions_are_refused_and_the_message_names_both ... ok
+test storage::disk_manager::tests::reattaching_at_the_same_base_is_allowed ... ok
+test storage::heap_page::tests::a_retired_slot_reads_as_deleted_keeps_its_bytes_and_is_restored_in_place ... ok
+test storage::disk_manager::tests::test_rw ... ok
+test storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused ... ok
+test storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused ... ok
+test storage::heap_page::tests::d256::a_slot_running_past_the_end_of_the_page_is_refused ... ok
+test storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused ... ok
+test storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so ... ok
+test storage::heap_file_manager::tests::test_scan ... ok
+test storage::heap_file_manager::tests::a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it ... ok
+test storage::heap_page::tests::d256::free_space_that_ends_before_it_starts_is_refused ... ok
+test storage::heap_file_manager::tests::test_insert_and_read ... ok
+test storage::heap_file_manager::tests::test_insert_delete_scan ... ok
+test storage::heap_file_manager::tests::test_update_in_place ... ok
+test storage::heap_page::tests::only_a_live_slot_is_retired_and_only_a_retired_one_is_released ... ok
+test storage::heap_page::tests::releasing_a_retired_slot_frees_its_bytes ... ok
+test storage::heap_page::tests::test_basic ... ok
+test storage::heap_page::tests::test_exact_bytes ... ok
+test storage::atomic_file::tests::a_replace_after_appends_drops_the_tail_instead_of_stranding_it ... ok
+test storage::heap_page::tests::d256::every_page_the_writer_produces_is_one_the_reader_accepts ... ok
+test storage::heap_file_manager::tests::test_multiple_pages ... ok
+test storage::index::tests::test_range_scan_basic ... ok
+test storage::index_fulltext::tests::an_over_long_run_is_dropped_and_its_neighbours_are_not ... ok
+test storage::index_fulltext::tests::distinct_tokens_dedups_but_tokenize_does_not ... ok
+test storage::index::tests::test_search_empty_tree_returns_none ... ok
+test storage::index::tests::test_search_finds_key ... ok
+test storage::index::tests::test_simple_insert ... ok
+test storage::index_fulltext::tests::indexed_text_accepts_varchar_and_null_and_refuses_the_rest ... ok
+test storage::index_fulltext::tests::null_is_the_floor_of_the_second_component ... ok
+test storage::index_fulltext::tests::the_cap_counts_bytes_not_chars ... ok
+test storage::index_fulltext::tests::tokenize_emits_no_empty_tokens ... ok
+test storage::index_fulltext::tests::tokenize_limits_are_the_documented_ones ... ok
+test storage::atomic_file::tests::appending_to_a_missing_file_is_refused_rather_than_creating_a_headless_tail ... ok
+test storage::index_fulltext::tests::tokenize_lowercases_and_splits_on_non_alphanumerics ... ok
+test storage::index_page::tests::test_internal_find_child ... ok
+test storage::index_page::tests::test_internal_insert_key_child ... ok
+test storage::index_page::tests::test_internal_split ... ok
+test storage::index_page::tests::test_leaf_composite_keys ... ok
+test storage::index::tests::test_create_init_empty_leaf ... ok
+test storage::index_page::tests::test_leaf_remove ... ok
+test storage::index_page::tests::test_leaf_get ... ok
+test storage::index_page::tests::test_leaf_insert_sorted ... ok
+test storage::index_page::tests::test_leaf_split ... ok
+test storage::index_page::tests::test_roundtrip_i_p ... ok
+test storage::index_page::tests::test_roundtrip_l_s ... ok
+test storage::index::tests::test_delete_not_real_key ... ok
+test storage::index_page::tests::test_roundtrip_i_s ... ok
+test storage::index_page::tests::test_roundtrip_l_p ... ok
+test storage::page_latch::tests::different_pages_do_not_block_each_other ... ok
+test storage::page_latch::tests::latching_first_and_then_entering_the_pool_is_allowed ... ok
+test storage::page_latch::tests::nested_pool_sections_unwind_to_zero_and_not_below ... ok
+test storage::page_latch::tests::a_write_latch_taken_from_inside_the_pool_is_refused - should panic ... ok
+test storage::page_latch::tests::a_read_latch_taken_from_inside_the_pool_is_refused - should panic ... ok
+test storage::page_latch::tests::the_depth_is_per_thread ... ok
+test storage::page_latch::tests::the_table_empties_when_every_guard_is_dropped ... ok
+test storage::tuple::tests::test_null ... ok
+test storage::tuple::tests::serialising_a_row_that_does_not_match_its_schema_is_refused ... ok
+test storage::tuple::tests::test_se_and_deserialize ... ok
+test storage::index::tests::test_delete_basic ... ok
+test storage::tuple::tests::test_versioned_tuple_roundtrip ... ok
+test storage::page_latch::tests::readers_share_and_a_writer_excludes ... ok
+test storage::index::tests::test_internal_node_split_a_lot ... ok
+test storage::index::tests::an_entry_larger_than_a_page_is_refused_rather_than_split_into_an_empty_leaf ... ok
+test storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts ... ok
+test storage::index::tests::test_range_scan_many_pages ... ok
+test storage::page_latch::tests::the_write_latch_actually_serialises ... ok
+test storage::index::tests::test_many_level_insert_and_search ... ok
+test storage::index::tests::test_many_level_reverse ... ok
+test storage::atomic_file::tests::concurrent_replaces_of_one_target_never_publish_a_mixture ... ok
+test storage::index::tests::internal_nodes_split_before_overflowing_the_page ... ok
+
+test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 1608 filtered out; finished in 1.48s
+
+2026-09-24T22:07:47Z d256 rc=0
+2026-09-24T22:07:47Z d256 released (owner matched)
+# rc=0 end=2026-09-24T22:07:47Z

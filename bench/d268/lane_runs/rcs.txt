@@ -1,0 +1,13 @@
+D256_RED_heap_page.txt HEAD=1f1d422 rc=101
+D256_RED_hfm.txt HEAD=1f1d422 rc=101
+D256_RED_open.txt HEAD=1f1d422 rc=101
+D256_RED_torn.txt HEAD=1f1d422 rc=0
+D256_GREEN_lib_storage.txt HEAD=c2dad3f rc=0
+D256_GREEN_lib_wal.txt HEAD=c2dad3f rc=0
+D256_GREEN_open.txt HEAD=c2dad3f rc=0
+D256_GREEN_torn.txt HEAD=c2dad3f rc=0
+D268_REDA_targets.txt HEAD=96be697 rc=101
+D268_REDA_v2peer.txt HEAD=96be697 rc=101
+D268_REDB_targets.txt HEAD=ff34f22 rc=101
+D268_REDB_truncated.txt HEAD=ff34f22 rc=101
+D268_REDC_target.txt HEAD=d3c6a9b rc=101
