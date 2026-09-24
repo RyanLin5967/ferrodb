@@ -1641,4 +1641,64 @@ use super::*;
         assert!(o.catalog.get_table("t").is_some(), "the new `t`, on another root, was forgotten as if it were the dropped one");
         assert!(o.catalog.get_table("keep").is_some(), "the table whose index took the dropped root is gone");
     }
+
+    /// **D250, the F2 residual the lead accepted (lane §3.7 test 10): an EMPTY table re-created at the
+    /// dropped root by a CREATE whose sync failed is forgotten by the next open, and its pages leak.**
+    /// After the DROP's record the log holds no `CreateTable` (the CREATE failed before logging it) and
+    /// no heap record, so nothing tells the new table from the dropped one. The CREATE was reported
+    /// failed, and no committed row is lost (a committed row is test 7). What this pins is that the
+    /// forget frees nothing: a failed CREATE's catalog entry names pages that are not known to be its
+    /// own, because the catalog page and the bitmap page are separate writes, so a free could hit
+    /// another owner. A guard at `f3f75af`, killed by FREEm. Only the three roots are probed; another
+    /// page the CREATE allocated is not, which weakens the probe and cannot falsify it.
+    #[test]
+    fn an_empty_table_recreated_at_the_dropped_root_by_a_failed_create_is_forgotten_and_its_pages_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated_empty.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            let root = catalog.get_table("t").unwrap().first_directory_page_id;
+            run_sql("DROP TABLE t;", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the CREATE failed, but not at its sync: {e}"),
+                Ok(_) => panic!("premise failed: the CREATE's checkpoint did not fail"),
+            }
+            armed.store(false, Ordering::SeqCst);
+            let e = catalog.get_table("t").expect("premise failed: the failed CREATE left no table in the running catalog");
+            let owned = vec![e.first_directory_page_id, e.time_travel_root, e.primary_index_root];
+            assert_eq!(owned[0], root, "premise failed: the re-created table did not land on the dropped root");
+            assert_eq!(owned.iter().collect::<HashSet<_>>().len(), 3, "premise failed: the re-created table's roots are not three pages: {owned:?}");
+            // The crash: every handle goes, and nothing was written into the re-created table.
+            owned
+        };
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after the failed re-create failed");
+        assert!(
+            o.catalog.get_table("t").is_none(),
+            "premise failed: the empty re-created `t` survived the open, so the residual whose pages this probes is gone"
+        );
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP");
+        // `allocate` hands out the lowest clear bit, so every free page below the high-water mark comes
+        // out before the first page at or above it.
+        let high = o.bp.disk_manager.high_water().unwrap();
+        for _ in 0..=high {
+            let next = o.bp.disk_manager.allocate().unwrap();
+            assert!(
+                !owned.contains(&next),
+                "page {next}, a root of the table the open forgot ({owned:?}), was handed out: the forget freed it"
+            );
+            if next >= high {
+                return;
+            }
+        }
+        panic!("`allocate` handed out more pages below the high-water mark {high} than there are");
+    }
 }
