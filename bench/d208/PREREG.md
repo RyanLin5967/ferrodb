@@ -448,3 +448,42 @@ It is merged at `e389b1b`:
 - `catalog.rs` still holds exactly two `let new_root_id` reads, one per creator (RUN).
 
 **The D222 expectation, as a test count:** `#[test]` in `tests/d222_index_root_after_backfill.rs` = **5**, unchanged (RUN), so GREEN stays **5/5**. The per-target prediction is unchanged: **2634 run, passed=2633, failed=1**. Nothing else in the pre-registration changes.
+
+---
+
+## Amendment 9 (appended before any run; nothing above is edited): review 3's C2 and C3
+
+Review 3 (`frontier/d208_review3.md` @ artie-research `dbb4464`, of `3a1b57e..55a7404` and `fb7ee3e`): SOUND-WITH-CAVEATS, and nothing blocks. Its C1 is ledger D230 (lane `d222-index-root`), and its A1 is ledger D229 (`d229-design`); neither is done here. Nothing has been built or run. Every expectation is INFERRED.
+
+| sha | what |
+|---|---|
+| `2924c41` | C3, docs: a lagging record names the new root's LEFT CHILD (a leaf only when the tree was one level deep). Comments only, in `catalog.rs` (`live_root`, `drop_table`), `recovery.rs` (the rebuild) and `fulltext_search.rs` (D215), plus T12's doc |
+| `2521d76` | C2 and the C3 premise, in the tests |
+| this commit | this amendment |
+
+### C2: the persisted layer
+- T10 and T11a/T11b asserted the IN-MEMORY record. The claim is about what the ALTER's one persist wrote.
+- Each now also reopens the catalog from its pages (`Catalog::open(d.bp.clone(), 1)`; page 1 is the first catalog page) and requires the persisted root to equal `post_split`:
+  - T10 for the primary;
+  - T11a/b for the B-tree or full-text record.
+- Messages: "the ALTER's persist wrote the lagging … record; it was caught up only in memory, after it".
+- No existing assertion changed, and no test was added: `root_cell_is_per_index` still has **17** `#[test]` (RUN, count).
+
+### C3: the premise
+`build_split_table` now asserts, for each of its three trees, that the CELL is off the first root. That first root is the value the lag writes into the record, so in the lag arm this is "cell != lagged record". In both arms it catches a regression that stopped moving cells with its own message, instead of failing T12's control arm under a misdiagnosis.
+
+### New mutants (base: this commit; target `--test root_cell_is_per_index`)
+
+| mutant | edit | expected FAILED |
+|---|---|---|
+| **K31** | `finish` catches the index records up AFTER `self.persist()?` (the two lines swapped) | T11a, T11b, each at the persisted assertion; their in-memory assertions pass |
+| **K32** | `finish` sets the primary record AFTER `self.persist()?` (the line removed, then re-added after the persist) | T10, at the persisted assertion; its in-memory assertion passes |
+
+- T12, T13, U1 and U2 are expected to pass under both. U1/U2 read the in-memory record only, and T12/T13 run no ALTER.
+- Fire-checked without compute (RUN):
+  - `PATTERNS_ONLY=1` at `2521d76`: all **38** expressions (35 + K31's 1 + K32's 2) match exactly one site, rc=0.
+  - `bash -n` passes under both shells.
+  - Applied to a scratch copy of `alter.rs`, K31 leaves `persist()?` then `catch_up_index_records`, and K32 leaves the primary record written after `persist()?` (read back).
+
+### Counts
+Unchanged: GREEN `root_cell_is_per_index` 17/17, `catalog::alter::tests` 2/2, `d222_index_root_after_backfill` 5/5; per-target **2634 run, passed=2633, failed=1**.
