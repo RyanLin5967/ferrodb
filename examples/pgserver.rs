@@ -142,8 +142,4 @@ fn main() {
     let stats = lease.stop();
     let _ = writeln!(std::io::stderr(), "pgserver: lease scan stopped after {stats:?}");
     store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
-    // Every failure the WAL layer counted this session, so none of them goes unread (review 2).
-    if let Some(line) = ferrodb::wal::txn::failure_counters_line() {
-        let _ = writeln!(std::io::stderr(), "pgserver: {line}");
-    }
 }

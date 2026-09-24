@@ -152,8 +152,10 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // added since the last checkpoint is listed only once the repair has run, and each release
     // tells the directory its page's new free space. Before it, that update found no entry and was
     // counted and printed as a failed release. Ascending id, for the reason the losers are sorted.
-    // A release that fails here waits in the pending list, and the checkpoint `open_recovered` would
-    // run is skipped, so the log keeps the record of it (F2).
+    // A release that fails here waits in the pending list. `open_recovered`'s checkpoint then still
+    // flushes every page and syncs, and keeps only the log, which is the record of it (F2, review 2's
+    // N1). One that turns out to be a page/log mismatch is written to the quarantine file and dropped
+    // (review 2's Q3, review 3's decision 6).
     let mut owed: Vec<(u64, Vec<RetiredSlot>)> = owed
         .into_iter()
         .filter(|(id, slots)| committed.contains(id) && !slots.is_empty())
@@ -471,15 +473,12 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         // Review 2's N1 (the lead's decision): the checkpoint ALWAYS runs, and always flushes every
         // page. The rebuild above freed the old trees and reallocated their pages on disk, so a
         // skipped flush left the next open reading a zeroed root. Only the truncation is refused
-        // while a release is still owed (F2): the log is then the only record of it.
-        let owed = txn.checkpoint_keeping_owed()?;
-        if owed > 0 {
-            let _ = writeln!(
-                std::io::stderr(),
-                "ferrodb: {owed} release(s) owed by committed transactions could not be finished; \
-                 every page is flushed, the log is kept, and the next checkpoint or open retries them"
-            );
-        } else if stale {
+        // while a release is still owed (F2): the log is then the only record of it. Without a retry
+        // first: `recover` has just tried every owed release, and a retry would stand between the
+        // rebuild's on-disk frees and the sync (D229's window; lane §21.2). A kept log is counted,
+        // and printed when the log-keeping state begins (`TxnManager::checkpoint_or_keep_held`).
+        let owed = txn.checkpoint_after_frees()?;
+        if owed == 0 && stale {
             if let Err(e) = std::fs::remove_file(&marker) {
                 let _ = writeln!(
                     std::io::stderr(),
@@ -892,12 +891,15 @@ use super::*;
 
     /// **Review 2's N1, on the path its red test cannot reach: a release that fails RETRYABLY at open.**
     ///
-    /// `tests/owed_release_at_open_reopens.rs` stages a page/log mismatch, which since review 2's Q3
-    /// is dropped rather than kept pending, so it no longer reaches the open's owed branch. Here the
-    /// release fails as an I/O error would (the thread-local `wal::txn::FAIL_RELEASES`), twice: once in
-    /// recovery's `finish_releases`, once in the checkpoint's retry. So open #1 owes it, and must still
-    /// FLUSH every page while keeping the log. At `368d0e1` it skipped the flush, and open #2 then
-    /// walked a root the rebuild had already zeroed on disk. Its red is mutant-only: the seam is new.
+    /// `tests/owed_release_at_open_reopens.rs` reaches the open's owed branch through a mismatch whose
+    /// quarantine record cannot be written. Here the release fails as an I/O error would (the
+    /// thread-local `wal::txn::FAIL_RELEASES`), once, in recovery's `finish_releases`. The open's
+    /// checkpoint does not retry it (lane §21.2), so open #1 owes it and must still FLUSH every page
+    /// while keeping the log. At `368d0e1` it skipped the flush, and open #2 then walked a root the
+    /// rebuild had already zeroed on disk. Its red is mutant-only: the seam is new.
+    ///
+    /// Amended by lane §21.1: `FAIL_RELEASES` was 2 while the open's checkpoint retried, and open #1's
+    /// owed count and its counted deferral are now asserted.
     #[test]
     fn an_open_whose_release_fails_retryably_flushes_so_the_next_open_rebuilds_cleanly() {
         use crate::execution::executor::{run, Outcome};
@@ -936,13 +938,20 @@ use super::*;
             // The crash: the commit's HeapRelease is still in the log buffer, and is lost.
         }
 
-        // Open #1 owes the release and fails it twice (finish_releases, then the checkpoint's retry).
-        FAIL_RELEASES.with(|f| f.set(2));
+        // Open #1 owes the release and fails it once, in finish_releases. Its checkpoint does not retry.
+        FAIL_RELEASES.with(|f| f.set(1));
+        let deferred = crate::wal::txn::deferred_checkpoints();
         {
             let lock = DbLock::acquire(&db).unwrap();
             let o = open_recovered(&db, &lock).expect("open #1 failed");
             assert!(o.recovered, "premise: open #1 replayed nothing, so no rebuild ran");
-            assert_eq!(FAIL_RELEASES.with(|f| f.get()), 0, "premise: the injected failures were not both consumed");
+            assert_eq!(FAIL_RELEASES.with(|f| f.get()), 0, "premise: the injected failure was not consumed");
+            assert_eq!(o.txn.owed_releases(), 1, "open #1 does not owe the release that failed");
+            // At least: the lib tests run in parallel on this process-wide counter.
+            assert!(
+                crate::wal::txn::deferred_checkpoints() > deferred,
+                "open #1's checkpoint kept the log without counting a deferral"
+            );
             // The log was kept, not truncated: the checkpoint found the release still owed. A
             // truncating checkpoint in a process that ran no DDL leaves the header alone (24 bytes).
             assert!(
