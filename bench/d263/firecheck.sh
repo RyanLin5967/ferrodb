@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# D263 fire-check: the red, the three mutants and the tip, judged from the files this script names and nothing
-# else. The judge functions are bench/d232/firecheck.sh's @ 40f7570 (D232 review 4 Q5, in the shape of
+# D263 fire-check: the red, the seven review-1 mutants and the tip, judged from the files this script names and
+# nothing else. The judge functions are bench/d232/firecheck.sh's @ e56cfe1 (D232 review 4 Q5, in the shape of
 # bench/d237/firecheck.sh @ e8054dc), with one addition: a row may register that NOTHING fails. Each arm restores
 # src/ from its commit, runs its targets in the background and waits, and writes $OUT/<label>.<target>.out with
 # an `arm=<sha>` first line and an `rc=<n>` last line. $OUT is cleared first, the control runs first, src/ is
 # restored from git on any exit, and --self-test runs the judge on planted outputs.
-# Pre-registration: artie-research frontier/lane_d263_free_after_durable.md §0 and §2.
+# Pre-registration: artie-research frontier/lane_d263_free_after_durable.md §0, §2 and §3.
 # Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work: it runs only when the lead
 # releases the FAN-QUEUE row.
 #
@@ -15,23 +15,24 @@
 # Targets: d263 (`--lib d263_`), d232 (`--lib d232_`), branch (`--lib branch::`). Killers are full test paths.
 # Arms, in run order:
 # - control: SUBJECT_SHA, targets d263, d232 and branch. Every file OK, nothing FAILED, and per target
-#   passed + ignored == the harness's own `-- --list` count, both > 0; d263 lists exactly 4 and d232 exactly
+#   passed + ignored == the harness's own `-- --list` count, both > 0; d263 lists exactly 7 and d232 exactly
 #   31. Anything else VOIDS the run (exit 2).
 # - red: c38d920 (`d263_` only), with its registered FAILED set.
-# - mutants: the three `d263-r4-mut-*` branches, a literal list below, each on `d263_` (its killers) and on
-#   `d232_` (nothing may fail). The run refuses (exit 2) if the repo's `d263-r4-mut-*` branches differ from it
-#   by name or by sha.
+# - mutants: the seven `d263-rv1-mut-*` branches (D263 review 1), a literal list below, each on `d263_` (its
+#   killers) and on `d232_` (the D248 test for two of them, nothing for the rest). The run refuses (exit 2) if
+#   the repo's `d263-rv1-mut-*` branches differ from it by name or by sha.
 # A registered row is AS-REGISTERED when its file is OK, it selected exactly the registered count, every
 # registered killer FAILED, nothing else did, no FAILED test's panic text is a premise (`fixture:` or
 # `control:`), and each registered panic message appears in its test's block.
 #
 # Blind spots, stated: as bench/d232/firecheck.sh's. The per-target suite (FAN row step (c)) is judged by
-# tools/verify-suite.sh, not here.
+# tools/verify-suite.sh, not here. Three changes of this round have no mutant, because no single-threaded test
+# can see them (lane §3): load_state's persist hold (F1), H2b's epoch stamp (F4), the capture race (F5).
 set -u
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=28c0525114c0005d81b1f261076042d1975fb259
+SUBJECT_SHA=11f6c82df16f0fac9fe811caf3c79b795eb72aef
 OUT=bench/d263/firecheck
 
 A=branch::arena::tests
@@ -39,34 +40,61 @@ FREE_RETURNS=$A::d263_a_free_that_failed_to_persist_returns_its_range_at_the_nex
 CLAIM_RETURNS=$A::d263_a_claim_that_failed_to_persist_returns_its_range_at_the_next_rewrite
 GUARD=$A::d263_a_rewrite_that_fails_keeps_the_range_out
 COUNTER=$A::d263_the_quarantine_is_counted_and_empties_at_a_rewrite
+F2B=$A::d263_a_quarantined_range_of_a_superseded_authority_is_dropped_not_reused
+F2C=$A::d263_load_state_empties_the_quarantine_against_the_map_it_installs
+F2D=$A::d263_a_checkpoint_of_the_armed_file_returns_the_quarantined_ranges
+D248=$A::d232_after_a_failed_rewrite_the_next_persist_is_still_a_rewrite
 
 # label|sha|target|selected (a count, or "any" for > 0)|required FAILED (full paths; every one must FAIL, and
 # nothing else may; empty means nothing may fail). Rows of one label are adjacent and share a sha.
 ARMS=(
   "red_c38d920|c38d9201682cfa7dfc5c3a0143f6f521d0285b5f|d263|3|$FREE_RETURNS $CLAIM_RETURNS"
-  "d263-r4-mut-never-folds|921752646c2455ad56e5c4264cce2545b1a5f119|d263|4|$FREE_RETURNS $CLAIM_RETURNS"
-  "d263-r4-mut-never-folds|921752646c2455ad56e5c4264cce2545b1a5f119|d232|31|"
-  "d263-r4-mut-fold-survives-failure|f9478fd5b351144bcc01f8e725f04834257b1ec6|d263|4|$GUARD"
-  "d263-r4-mut-fold-survives-failure|f9478fd5b351144bcc01f8e725f04834257b1ec6|d232|31|"
-  "d263-r4-mut-no-quarantine|1f2f942f6ba146bbdfd077ceb4e71b292fbd90a2|d263|4|$FREE_RETURNS $COUNTER"
-  "d263-r4-mut-no-quarantine|1f2f942f6ba146bbdfd077ceb4e71b292fbd90a2|d232|31|"
+  "d263-rv1-mut-never-gives-back|d76e89dc864caf702df973cf913406121291d71a|d263|7|$FREE_RETURNS $CLAIM_RETURNS"
+  "d263-rv1-mut-never-gives-back|d76e89dc864caf702df973cf913406121291d71a|d232|31|$D248"
+  "d263-rv1-mut-image-omits-held|1c2d67d652bb326755bb70023589604b7a811f72|d263|7|$FREE_RETURNS $F2D"
+  "d263-rv1-mut-image-omits-held|1c2d67d652bb326755bb70023589604b7a811f72|d232|31|$D248"
+  "d263-rv1-mut-gives-back-on-failure|c57ac4bfcb7cadfe4b67d94d919c1b0b01484a91|d263|7|$GUARD"
+  "d263-rv1-mut-gives-back-on-failure|c57ac4bfcb7cadfe4b67d94d919c1b0b01484a91|d232|31|"
+  "d263-rv1-mut-no-quarantine|31329913f006ab2a431228ba31daa0788f3e4321|d263|7|$FREE_RETURNS $COUNTER $F2C $F2D"
+  "d263-rv1-mut-no-quarantine|31329913f006ab2a431228ba31daa0788f3e4321|d232|31|"
+  "d263-rv1-mut-no-epoch-retain|09d744fc05624a82fa5aa5df7a0a4a51258e1d1a|d263|7|$F2B"
+  "d263-rv1-mut-no-epoch-retain|09d744fc05624a82fa5aa5df7a0a4a51258e1d1a|d232|31|"
+  "d263-rv1-mut-no-load-clear|4eea293f6392f24a18a0ec7ed0f7ad821c594744|d263|7|$F2C"
+  "d263-rv1-mut-no-load-clear|4eea293f6392f24a18a0ec7ed0f7ad821c594744|d232|31|"
+  "d263-rv1-mut-armed-checkpoint-no-fold|40ba6db6a25f3e6b1a5b6dad84984d364ac569eb|d263|7|$F2D"
+  "d263-rv1-mut-armed-checkpoint-no-fold|40ba6db6a25f3e6b1a5b6dad84984d364ac569eb|d232|31|"
 )
 BASES=(
-  "d263-r4-mut-never-folds|$SUBJECT_SHA" "d263-r4-mut-fold-survives-failure|$SUBJECT_SHA"
-  "d263-r4-mut-no-quarantine|$SUBJECT_SHA"
+  "d263-rv1-mut-never-gives-back|$SUBJECT_SHA" "d263-rv1-mut-image-omits-held|$SUBJECT_SHA"
+  "d263-rv1-mut-gives-back-on-failure|$SUBJECT_SHA" "d263-rv1-mut-no-quarantine|$SUBJECT_SHA"
+  "d263-rv1-mut-no-epoch-retain|$SUBJECT_SHA" "d263-rv1-mut-no-load-clear|$SUBJECT_SHA"
+  "d263-rv1-mut-armed-checkpoint-no-fold|$SUBJECT_SHA"
 )
 # label|test (full path)|text its panic block must contain (each a one-line prefix of the assertion's message).
+IMAGE_MSG="D263: the rewrite after the failed free did not record its range as free"
+F7_MSG="D263 review 1 F7: the failed free was not counted as quarantined"
+F2D_MSG="D263 review 1 F2d: the armed checkpoint after a failed free did not record its range"
+D248_MSG="D248: after the failed rewrite the durable map is not the live one"
 MSGS=(
-  "red_c38d920|$FREE_RETURNS|D263: the rewrite after the failed free did not record its range as free"
+  "red_c38d920|$FREE_RETURNS|$IMAGE_MSG"
   "red_c38d920|$CLAIM_RETURNS|D263: once a rewrite recorded the failed claim's range as free"
-  "d263-r4-mut-never-folds|$FREE_RETURNS|D263: the rewrite after the failed free did not record its range as free"
-  "d263-r4-mut-never-folds|$CLAIM_RETURNS|D263: once a rewrite recorded the failed claim's range as free"
-  "d263-r4-mut-fold-survives-failure|$GUARD|D263: a range a failed rewrite had put on the free list"
-  "d263-r4-mut-no-quarantine|$FREE_RETURNS|D263: the rewrite after the failed free did not record its range as free"
-  "d263-r4-mut-no-quarantine|$COUNTER|D263: the free whose record failed was not counted as quarantined"
+  "d263-rv1-mut-never-gives-back|$FREE_RETURNS|D263: once a rewrite recorded the failed free's range as free"
+  "d263-rv1-mut-never-gives-back|$CLAIM_RETURNS|D263: once a rewrite recorded the failed claim's range as free"
+  "d263-rv1-mut-never-gives-back|$D248|$D248_MSG"
+  "d263-rv1-mut-image-omits-held|$FREE_RETURNS|$IMAGE_MSG"
+  "d263-rv1-mut-image-omits-held|$F2D|$F2D_MSG"
+  "d263-rv1-mut-image-omits-held|$D248|$D248_MSG"
+  "d263-rv1-mut-gives-back-on-failure|$GUARD|D263: a range a failed rewrite had put on the free list"
+  "d263-rv1-mut-no-quarantine|$FREE_RETURNS|$IMAGE_MSG"
+  "d263-rv1-mut-no-quarantine|$COUNTER|D263: the free whose record failed was not counted as quarantined"
+  "d263-rv1-mut-no-quarantine|$F2C|$F7_MSG"
+  "d263-rv1-mut-no-quarantine|$F2D|$F7_MSG"
+  "d263-rv1-mut-no-epoch-retain|$F2B|D263 review 1 F2b: a range quarantined under a superseded authority"
+  "d263-rv1-mut-no-load-clear|$F2C|D263 review 1 F2c: a range quarantined before load_state was folded free"
+  "d263-rv1-mut-armed-checkpoint-no-fold|$F2D|$F2D_MSG"
 )
 CONTROL_TARGETS="d263 d232 branch"
-CONTROL_LISTED="d263=4 d232=31"
+CONTROL_LISTED="d263=7 d232=31"
 
 target_args() {
   case "$1" in
@@ -197,6 +225,9 @@ verdict() { # $1 label, $2 target, $3 sha, $4 selected (count or any), $5 requir
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     mt=${line%%|*}; mx=${line#*|}
+    # A label's messages cover all its rows; one for a test this row does not register belongs to the
+    # label's row on another target, and is asked there, not here (found by D263's self-test).
+    case " $(echo $req) " in *" $mt "*) ;; *) continue ;; esac
     if ! block_of "$label" "$t" "$mt" | grep -qF "$mx"; then
       echo "MISMATCH ($t; $mt did not fail with the registered message: $mx)"; return
     fi
@@ -293,9 +324,10 @@ plant_registered() { # $1 index into ARMS: plant that row exactly as registered
 plant_strays() { # stray files that share a prefix or a label; each holds FAILED lines and a result line
   local name
   for name in fire_d263-mut-never-folds.txt fire_d263-mut-never-folds_d232.txt red_fa80aba.txt tip_d263.txt \
-    fire_d263-r4-mut-bogus.txt red_0000000.txt "d263-r4-mut-never-folds.d263.out.bak" \
-    "d263-r4-mut-never-folds.d263.out~" "d263-r4-mut-never-folds.d263.outx" "d263-r4-mut-never-folds.stale.out" \
-    "red_c38d920.d263.out.old" selftest.log summary.txt; do
+    fire_d263-rv1-mut-bogus.txt red_0000000.txt "d263-rv1-mut-never-gives-back.d263.out.bak" \
+    "d263-rv1-mut-never-gives-back.d263.out~" "d263-rv1-mut-never-gives-back.d263.outx" \
+    "d263-rv1-mut-never-gives-back.stale.out" "d263-r4-mut-never-folds.d263.out" "red_c38d920.d263.out.old" \
+    selftest.log summary.txt; do
     printf '%s\n' "arm=0000000000000000000000000000000000000000" "running 3 tests" \
       "test stray::not_a_registered_killer ... FAILED" \
       "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" \
@@ -314,29 +346,29 @@ all_registered() { # every ARMS row judged; prints the number not AS-REGISTERED
 }
 
 self_test() {
-  local keep=$OUT st_bad=0 tmp i m name sha rest lists k1 v
+  local keep=$OUT st_bad=0 tmp i m name sha rest lists k1 v req
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/d263-selftest.XXXXXX") || { echo "self-test: mktemp failed"; return 1; }
   OUT=$tmp
-  lists="d263=4 d232=31 branch=400"
+  lists="d263=7 d232=31 branch=400"
 
-  ok_file control d263 "$SUBJECT_SHA" 4; ok_file control d232 "$SUBJECT_SHA" 31
+  ok_file control d263 "$SUBJECT_SHA" 7; ok_file control d232 "$SUBJECT_SHA" 31
   ok_file control branch "$SUBJECT_SHA" 400
   expect "clean control" "clean" "$(control_verdict control "$lists")"
 
-  ok_file dirty d263 "$SUBJECT_SHA" 4; ok_file dirty d232 "$SUBJECT_SHA" 31
+  ok_file dirty d263 "$SUBJECT_SHA" 7; ok_file dirty d232 "$SUBJECT_SHA" 31
   fail_file dirty branch "$SUBJECT_SHA" 399 claim "$GUARD"
   # The branch list count is planted equal to the passed count, so the count gate alone would pass this
   # control: the case proves the FAILED check fires on its own.
-  expect "dirty control" "VOID (a test FAILED in branch)" "$(control_verdict dirty "d263=4 d232=31 branch=399")"
+  expect "dirty control" "VOID (a test FAILED in branch)" "$(control_verdict dirty "d263=7 d232=31 branch=399")"
 
-  ok_file empty d263 "$SUBJECT_SHA" 4; ok_file empty d232 "$SUBJECT_SHA" 31
+  ok_file empty d263 "$SUBJECT_SHA" 7; ok_file empty d232 "$SUBJECT_SHA" 31
   plant empty branch "$SUBJECT_SHA" 0 "running 0 tests" \
     "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2600 filtered out; finished in 0.00s"
-  expect "control that collected nothing" "VOID" "$(control_verdict empty "d263=4 d232=31 branch=0")"
+  expect "control that collected nothing" "VOID" "$(control_verdict empty "d263=7 d232=31 branch=0")"
 
-  ok_file short d263 "$SUBJECT_SHA" 3; ok_file short d232 "$SUBJECT_SHA" 31; ok_file short branch "$SUBJECT_SHA" 400
-  expect "control whose d263 list is not the registered 4" "VOID (d263: listed 3" \
-    "$(control_verdict short "d263=3 d232=31 branch=400")"
+  ok_file short d263 "$SUBJECT_SHA" 6; ok_file short d232 "$SUBJECT_SHA" 31; ok_file short branch "$SUBJECT_SHA" 400
+  expect "control whose d263 list is not the registered 7" "VOID (d263: listed 6" \
+    "$(control_verdict short "d263=6 d232=31 branch=400")"
 
   # Every registered row, planted exactly as registered, from the tables the run uses. A row that registers
   # nothing failing is planted as a clean file of its selected count.
@@ -356,24 +388,25 @@ self_test() {
   expect "the aggregate counts one row that survived" "1" "$(all_registered 2>/dev/null | tail -n 1)"
   plant_registered 0
 
-  name=d263-r4-mut-no-quarantine
-  sha=1f2f942f6ba146bbdfd077ceb4e71b292fbd90a2
+  # The cases below use no-quarantine: four killers.
+  name=d263-rv1-mut-no-quarantine
+  sha=31329913f006ab2a431228ba31daa0788f3e4321
+  req="$FREE_RETURNS $COUNTER $F2C $F2D"
 
-  fail_file "$name" d263 "$sha" 3 claim "$FREE_RETURNS"
-  expect "PARTIAL kill: the counter passed" "PARTIAL" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  fail_file "$name" d263 "$sha" 4 claim "$FREE_RETURNS" "$COUNTER" "$F2C"
+  expect "PARTIAL kill: one of four killers passed" "PARTIAL" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  fail_file "$name" d263 "$sha" 1 claim "$FREE_RETURNS" "$COUNTER" "$GUARD"
-  expect "unexpected extra failure" "MISMATCH" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  fail_file "$name" d263 "$sha" 2 claim "$FREE_RETURNS" "$COUNTER" "$F2C" "$F2D" "$GUARD"
+  expect "unexpected extra failure" "MISMATCH" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  fail_file "$name" d263 "$sha" 2 fixture "$FREE_RETURNS" "$COUNTER"
-  expect "killers failed on their premise" "FIXTURE-FAIL" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  fail_file "$name" d263 "$sha" 3 fixture "$FREE_RETURNS" "$COUNTER" "$F2C" "$F2D"
+  expect "killers failed on their premise" "FIXTURE-FAIL" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  fail_file "$name" d263 "$sha" 2 other "$FREE_RETURNS" "$COUNTER"
-  expect "killers failed with unregistered messages" "MISMATCH" \
-    "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  fail_file "$name" d263 "$sha" 3 other "$FREE_RETURNS" "$COUNTER" "$F2C" "$F2D"
+  expect "killers failed with unregistered messages" "MISMATCH" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  ok_file "$name" d263 "$sha" 4
-  expect "survivor" "SURVIVED" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  ok_file "$name" d263 "$sha" 7
+  expect "survivor" "SURVIVED" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
   fail_file "$name" d232 "$sha" 30 claim "$A::d232_a_free_whose_record_fails_to_persist_does_not_hand_its_range_out_again"
   expect "a d232_ row that registers nothing, with a failure" "MISMATCH" "$(verdict "$name" d232 "$sha" 31 "")"
@@ -385,53 +418,51 @@ self_test() {
   expect "a d232_ row that registers nothing, two tests short" "SELECTED-MISMATCH" \
     "$(verdict "$name" d232 "$sha" 31 "")"
 
-  fail_file "$name" d263 "$SUBJECT_SHA" 2 claim "$FREE_RETURNS" "$COUNTER"
-  expect "output from another commit (the mutant's base)" "STALE" \
-    "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  fail_file "$name" d263 "$SUBJECT_SHA" 3 claim "$FREE_RETURNS" "$COUNTER" "$F2C" "$F2D"
+  expect "output from another commit (the mutant's base)" "STALE" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
   rm -f "$(tfile "$name" d263)"
-  expect "no output file" "INCOMPLETE (d263: no output file)" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  expect "no output file" "INCOMPLETE (d263: no output file)" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  printf '%s\n' "arm=$sha" "running 4 tests" > "$(tfile "$name" d263)"
-  expect "no rc line (killed mid-run)" "INCOMPLETE (d263: no rc line)" \
-    "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  printf '%s\n' "arm=$sha" "running 7 tests" > "$(tfile "$name" d263)"
+  expect "no rc line (killed mid-run)" "INCOMPLETE (d263: no rc line)" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  printf '%s\n' "running 4 tests" "rc=101" > "$(tfile "$name" d263)"
-  expect "no arm line" "INCOMPLETE (d263: no arm line)" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  printf '%s\n' "running 7 tests" "rc=101" > "$(tfile "$name" d263)"
+  expect "no arm line" "INCOMPLETE (d263: no arm line)" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  plant "$name" d263 "$sha" 124 "running 4 tests" "test $FREE_RETURNS has been running for over 60 seconds"
-  expect "timeout" "TIMEOUT" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  plant "$name" d263 "$sha" 124 "running 7 tests" "test $FREE_RETURNS has been running for over 60 seconds"
+  expect "timeout" "TIMEOUT" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
   plant "$name" d263 "$sha" 101 "error[E0308]: mismatched types" \
     "error: could not compile \`ferrodb\` (lib test) due to 1 previous error"
-  expect "compile failure" "COMPILE-FAIL" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+  expect "compile failure" "COMPILE-FAIL" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
   plant "$name" d263 "$sha" 0 "test $FREE_RETURNS ... FAILED" \
-    "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
-  expect "rc=0 with a FAILED line" "RC-MISMATCH" "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+    "test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  expect "rc=0 with a FAILED line" "RC-MISMATCH" "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  plant "$name" d263 "$sha" 0 "running 4 tests" \
-    "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" \
-    "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  plant "$name" d263 "$sha" 0 "running 7 tests" \
+    "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" \
+    "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
   expect "two result lines for a one-binary target" "INCOMPLETE (d263: 2 result lines)" \
-    "$(verdict "$name" d263 "$sha" 4 "$FREE_RETURNS $COUNTER")"
+    "$(verdict "$name" d263 "$sha" 7 "$req")"
 
-  # Registration: every mutant has a killer row, a base and a d232_ row; every message names a killer.
+  # Registration: every mutant has a killer row, a d232_ row and a base; every message names a killer.
   for m in "${BASES[@]}"; do
     IFS='|' read -r name rest <<< "$m"
-    v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' -v n="$name" '$1 == n && $5 != "" { c++ } END { print c + 0 }')
-    [ "$v" -gt 0 ] || { echo "self-test FAIL  registration: $name has no ARMS row with a killer"; st_bad=$((st_bad + 1)); }
-    v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' -v n="$name" '$1 == n && $3 == "d232" && $5 == "" { c++ } END { print c + 0 }')
-    [ "$v" -eq 1 ] || { echo "self-test FAIL  registration: $name has no clean d232_ row"; st_bad=$((st_bad + 1)); }
+    v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' -v n="$name" '$1 == n && $3 == "d263" && $5 != "" { c++ } END { print c + 0 }')
+    [ "$v" -eq 1 ] || { echo "self-test FAIL  registration: $name has no d263_ row with a killer"; st_bad=$((st_bad + 1)); }
+    v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' -v n="$name" '$1 == n && $3 == "d232" { c++ } END { print c + 0 }')
+    [ "$v" -eq 1 ] || { echo "self-test FAIL  registration: $name has no d232_ row"; st_bad=$((st_bad + 1)); }
   done
-  v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' '$1 ~ /^d263-r4-mut-/ { print $1 }' | sort -u | wc -l | tr -d ' ')
+  v=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' '$1 ~ /^d263-rv1-mut-/ { print $1 }' | sort -u | wc -l | tr -d ' ')
   [ "$v" -eq "${#BASES[@]}" ] || { echo "self-test FAIL  registration: $v mutants in ARMS, ${#BASES[@]} in BASES"; st_bad=$((st_bad + 1)); }
   for m in "${MSGS[@]}"; do
     IFS='|' read -r name k1 rest <<< "$m"
     printf '%s\n' "${ARMS[@]}" | awk -F'|' -v n="$name" -v k="$k1" '$1 == n { split($5, a, " "); for (x in a) if (a[x] == k) f = 1 } END { exit !f }' ||
       { echo "self-test FAIL  registration: message for $name names $k1, not one of its killers"; st_bad=$((st_bad + 1)); }
   done
-  [ "$st_bad" -eq 0 ] && echo "self-test PASS  registration: every mutant has a killer row, a clean d232_ row and a base; every message names a killer"
+  [ "$st_bad" -eq 0 ] && echo "self-test PASS  registration: every mutant has a killer row, a d232_ row and a base; every message names a killer"
 
   # Arguments: anything but nothing or --self-test is refused with 2, before any work.
   bash "$SELF" --bogus > /dev/null 2>&1
@@ -456,10 +487,10 @@ if [ -n "$(git status --porcelain -- src/ tests/)" ]; then
   exit 2
 fi
 # The literal mutant list must be the repo's: a mutant added or moved without a registration is refused here.
-want=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' '$1 ~ /^d263-r4-mut-/ { print $1 " " $2 }' | sort -u)
-have=$(git for-each-ref --format='%(refname:short) %(objectname)' 'refs/heads/d263-r4-mut-*' | sort)
+want=$(printf '%s\n' "${ARMS[@]}" | awk -F'|' '$1 ~ /^d263-rv1-mut-/ { print $1 " " $2 }' | sort -u)
+have=$(git for-each-ref --format='%(refname:short) %(objectname)' 'refs/heads/d263-rv1-mut-*' | sort)
 if [ "$want" != "$have" ]; then
-  echo "REFUSED: the d263-r4-mut-* branches differ from the registered list" >&2
+  echo "REFUSED: the d263-rv1-mut-* branches differ from the registered list" >&2
   diff <(echo "$want") <(echo "$have") >&2
   exit 2
 fi
