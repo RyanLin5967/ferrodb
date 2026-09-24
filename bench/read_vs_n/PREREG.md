@@ -689,3 +689,24 @@ The lane report's FAN-QUEUE row carries this as its re-run instruction.
    * The `Fire` enum doc no longer says every mode injects at the call site.
    * `LeaseStats::finished`'s doc says the pass REACHED the end of `scan_once`, the orphan sweep ATTEMPTED: a sweep
      that failed is reported and still counts.
+
+**A10, 2026-09-24, before any build or run. Found while implementing A9.1's amortized column, by reading
+`TxnManager::commit`'s trigger (`wal/txn.rs`, the `due` test) and the harness's axis-(ii) sampling.**
+
+1. **A9.1's divisor 256 is replaced by the MEASURED period.**
+   * **Why 256 is wrong.** The auto-checkpoint fires only when the counter reaches `checkpoint_interval()`
+     AND the active-transaction table is empty, so it can be deferred. A merge cycle (`BEGIN AGENT SESSION`,
+     `INSERT`, `MERGE;`) can also commit more than once. "/256" assumed neither.
+   * **Why the observed share is also wrong.** Axis (ii) prints the LAST 64 merges before each M target, and the
+     targets are multiples of 256, so every block ends on the checkpointing merge. Pooled over the printed
+     blocks, the checkpoint share is 4/256, not 1/256.
+   * **The measurement.** Each applied merge that checkpointed carries `period`: the merge cycles since the
+     previous checkpoint, or since the open, that merge included. The harness counts the cycles itself and
+     zeroes the count at every open, whose fresh `TxnManager` counts commits from zero.
+   * The summary prints `period` and `amort ns` = median + (`ckpt ns` − median) / period.
+   * **Pre-registered:** on axis (ii), `period` = 256 at M = 1024, 4096 and 16384. Those three periods run between
+     two checkpoints. At M = 256 the period runs from the open and is also expected to be 256. INFERRED: one
+     commit per cycle, and no concurrent transaction at the publish's commit. A different value is a finding
+     about the trigger, not a failed guard: `amort ns` is computed from the measured value either way.
+   * On axis (i), a 64-merge batch after an open is expected to contain no checkpoint, so `ckpt ns`, `period`
+     and `amort ns` print "-".
