@@ -17,10 +17,11 @@
 //! branch catalog and `AgentRuntime` are built from the files alone — the sequence `cli.rs` runs. No
 //! `Arc` survives the restart, so nothing a process happens to carry can stand in for durability.
 //!
-//! Every test compiles against the base `9aa6968`, and none names an API the fix adds. All but the
-//! last are written to be RED there; the reason each fails at the base is stated on it and
-//! pre-registered in `frontier/lane_d212_revert.md`. The last is a regression test for a defect the
-//! first Step 0 commit introduced (`3fd20eb`), so it is green at the base and red at that commit.
+//! Every test compiles against the base `9aa6968`, and none names an API the fix adds. Every one
+//! except `a_live_dependent_the_cascade_could_not_undo_stays_revertible_once_it_publishes` is
+//! written to be RED there; the reason each fails at the base is stated on it and pre-registered in
+//! `frontier/lane_d212_revert.md`. That one is a regression test for a defect the first Step 0
+//! commit introduced (`3fd20eb`), so it is green at the base and red at that commit.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -142,6 +143,15 @@ impl Db {
         match self.ok("MERGE;", s) {
             Outcome::Agent(AgentOutput::Merge(m)) => m,
             _ => panic!("MERGE did not return a merge report"),
+        }
+    }
+
+    /// Whether row `id` exists, read by plain SQL outside any session.
+    fn has_row(&mut self, id: i32) -> bool {
+        let mut s = self.session();
+        match self.ok("SELECT id, qty FROM inventory;", &mut s) {
+            Outcome::Rows(r) => r.iter().any(|row| row[0] == Value::Integer(id)),
+            _ => panic!("SELECT did not return rows"),
         }
     }
 
@@ -431,4 +441,46 @@ fn a_live_dependent_the_cascade_could_not_undo_stays_revertible_once_it_publishe
     let later = plan(db.ok(&format!("REVERT MERGE {};", ml.merge_id), &mut main));
     assert!(!later.is_blocked(), "{later:?}");
     assert_eq!(db.qty_of(2), 5, "L's published write was not reverted");
+}
+
+/// **A failed cascade must leave the operator a revert that still works** — the schedule the lead's
+/// review of `3fd20eb` (`frontier/d212_step0_review.md` F2) built against that commit.
+///
+/// B deletes row 3, so B's inverse is an INSERT. With the one-transaction REVERT of `3fd20eb`, the
+/// cascade inserted row 3, then failed on A's deleted row and aborted — and an aborted INSERT leaves
+/// its primary-index entry behind (D202), so every later INSERT of key 3, including B's own revert,
+/// failed. RED at `3fd20eb` at `REVERT MERGE <B>`. RED at the base too, earlier: B's inverse
+/// committed on its own, so row 3 is back after a revert that reported failure.
+///
+/// Green from `509c305`, where `plan_undo` refuses A's missing row before anything is written.
+#[test]
+fn a_failed_cascade_does_not_poison_the_key_its_retry_reinserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    db.seed(&[(1, 20), (2, 5), (3, 30)]);
+
+    let (mut a, _) = db.agent("a");
+    db.ok("UPDATE inventory SET qty = qty + 5 WHERE id = 1;", &mut a);
+    let ma = db.merge(&mut a);
+    let (mut b, _) = db.agent("b");
+    db.ok("SELECT qty FROM inventory WHERE id = 1;", &mut b);
+    db.ok("DELETE FROM inventory WHERE id = 3;", &mut b);
+    let mb = db.merge(&mut b);
+    assert!(ma.applied_to_target && mb.applied_to_target, "{ma} / {mb}");
+    assert!(!db.has_row(3), "the fixture needs B's delete published");
+
+    let mut plain = db.session();
+    db.ok("DELETE FROM inventory WHERE id = 1;", &mut plain);
+
+    let mut main = db.session();
+    let msg = match db.exec(&format!("REVERT MERGE {} CASCADE;", ma.merge_id), &mut main) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the cascade reported success although A's row is gone"),
+    };
+    assert!(msg.contains("gone"), "the cascade failed for a reason the fixture did not set up: {msg}");
+    assert!(!db.has_row(3), "the failed cascade put row 3 back");
+
+    let later = plan(db.ok(&format!("REVERT MERGE {};", mb.merge_id), &mut main));
+    assert!(!later.is_blocked(), "{later:?}");
+    assert_eq!(db.qty_of(3), 30, "B's revert did not bring row 3 back");
 }

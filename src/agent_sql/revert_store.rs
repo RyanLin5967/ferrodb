@@ -128,9 +128,12 @@ pub(crate) fn tables() -> Vec<(&'static str, Schema)> {
 
 /// The durable counters as committed, or `None` when there are none yet.
 ///
-/// `None` covers two states on purpose: the table does not exist (a database no merge has touched),
-/// and the table exists without its row (a crash between creating it and the first reservation's
-/// commit). Both mean "nothing was ever reserved", and in both the next write inserts the row.
+/// `None` covers two states on purpose: the table does not exist (a database no merge of THIS build
+/// has touched), and the table exists without its row (a crash between creating it and the first
+/// reservation's commit). Both mean "nothing was ever reserved", and in both the next write inserts
+/// the row. ⚠ "Nothing reserved" is not "nothing issued" for a database written before D217: that
+/// build issued ids and kept no record of them, so there is nothing here to start above (the blind
+/// spots are listed on `AgentRuntime::attach_history`).
 pub(crate) fn read_meta(ctx: &ReadCtx) -> Result<Option<Meta>, FerroError> {
     if ctx.catalog.get_table(META_TABLE).is_none() {
         return Ok(None);

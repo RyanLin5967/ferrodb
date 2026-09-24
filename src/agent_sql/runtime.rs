@@ -926,6 +926,14 @@ struct RevertState {
     /// published nothing — a live session that read the target — and marking those would refuse
     /// the revert of whatever they publish LATER, while their writes stayed live.
     reverted: BTreeMap<u64, String>,
+    /// **D226 — who each published row belonged to BEFORE the merge that published it**, keyed by
+    /// `(txn, table, row)`. `ProvId::NONE` for a row nobody was on record for (seeded by plain SQL,
+    /// or created by that merge).
+    ///
+    /// Read from the provenance store before `record_applied` stamps the merge's run, because after
+    /// it the answer is gone. A `REVERT` hands each undone row back to this author; without it
+    /// `who_wrote_row` went on naming the reverted run as the author of a value it no longer wrote.
+    prior_author: BTreeMap<(u64, u32, u64), ProvId>,
 }
 
 /// **D217 — this runtime's position against the durable counters in `revert_store`.**
@@ -3514,6 +3522,17 @@ impl AgentRuntime {
     /// that has a ceiling: those ids were minted without knowing it and may repeat an earlier run's.
     /// No SQL path can reach that state, because every minting path attaches first; the refusal is
     /// the guard on a caller that drives the runtime directly.
+    ///
+    /// ⚠ **Blind spots, stated here rather than discovered:**
+    /// - It attaches ONCE per runtime, so a runtime is bound to the first database it is used
+    ///   against. Driving one runtime over two catalogs would keep the first one's ceiling and mint
+    ///   in the second without reserving there. Nothing in production does it — a `ServerContext`
+    ///   pairs one runtime with one catalog — and nothing here detects it.
+    /// - A database written before D217 has no ceiling, so its first run under this code mints
+    ///   from `m_1` again: no durable record of the older ids exists to start above.
+    /// - A restore from a base backup, or a promoted asynchronous standby, carries an OLDER
+    ///   ceiling, so ids the lost timeline issued above it can be issued again. The guarantee is
+    ///   "never repeats across a restart or crash of one store", not across a forked timeline.
     pub fn attach_history(&self, ctx: &ReadCtx) -> Result<(), FerroError> {
         if self.state.lock().unwrap().revert.cursor.is_some() {
             return Ok(());
@@ -5387,6 +5406,11 @@ impl AgentRuntime {
             base..state.apply_seq
         };
 
+        // **D226 — who these rows belonged to before this merge**, read while the provenance store
+        // still says so: `record_applied` stamps this merge's run over every one of them. Read before
+        // the publish transaction opens, so a failed read leaves nothing to abort.
+        let prior_authors = self.prior_authors(&rows)?;
+
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
@@ -5447,6 +5471,12 @@ impl AgentRuntime {
             &images,
             reserved,
         )?;
+        {
+            let mut state = self.state.lock().unwrap();
+            for ((tbl, row), author) in prior_authors {
+                state.revert.prior_author.insert((snapshot.txn.0, tbl, row), author);
+            }
+        }
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -5523,6 +5553,25 @@ impl AgentRuntime {
             h = fnv64_update(h, &v.to_be_bytes());
         }
         h
+    }
+
+    /// **D226 — the author on record for every row a merge is about to attribute**, one entry per
+    /// distinct row. Must be read before `record_applied`, which overwrites every one of them with
+    /// the merge's run.
+    fn prior_authors(
+        &self,
+        rows: &[RowMergeOutcome],
+    ) -> Result<Vec<((u32, u64), ProvId)>, FerroError> {
+        let mut out: BTreeMap<(u32, u64), ProvId> = BTreeMap::new();
+        for r in rows {
+            for op in &r.applied {
+                let key = (op.tbl.0, op.row.0);
+                if !out.contains_key(&key) {
+                    out.insert(key, self.prov_store.row_author(key.0, key.1)?);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// The composed effect the target absorbed on this cell since we forked, if any.
@@ -6026,9 +6075,13 @@ impl AgentRuntime {
     /// failed part-way — a row a later statement deleted, a `Max` that cannot be inverted — left
     /// some ops inverted, nothing recording which, and a retry inverting the committed ones again.
     /// Now every such refusal is decided before the first write ([`plan_undo`]), and what can still
-    /// fail after it aborts the transaction.
+    /// fail after it — only an environmental failure — aborts the transaction. An abort leaves no
+    /// ROW changed. It does leave the touched tables' change counters bumped (the executors bump
+    /// them as they write, not at commit), which only makes a held `MergeEvaluation` over those
+    /// tables refuse as stale; and a rolled-back re-insert leaves its primary-index entry behind
+    /// until D202 is fixed.
     ///
-    /// Once it commits, every txn it undid is recorded in [`State::reverted`], and a second
+    /// Once it commits, every txn it undid is recorded in [`RevertState::reverted`], and a second
     /// `REVERT MERGE` of the same merge — or of a dependent a cascade already undid — is refused.
     /// Before this the second one re-applied every inverse, so an `Add` merge moved its cell twice.
     pub fn revert_merge(
@@ -6066,9 +6119,12 @@ impl AgentRuntime {
         }
         let mut order: Vec<TxnId> = plan.cascade.clone();
         order.push(target);
-        let ops: Vec<AppliedOp> = {
+        let (ops, restore) = {
             let state = self.state.lock().unwrap();
-            order.iter().flat_map(|t| ops_of_txn(&state.applied, *t)).collect()
+            let ops: Vec<AppliedOp> =
+                order.iter().flat_map(|t| ops_of_txn(&state.applied, *t)).collect();
+            let restore = authors_to_restore(&state.revert.prior_author, &ops)?;
+            (ops, restore)
         };
         // Every refusal first, against an image of the tables — then the writes, in one transaction.
         let writes = plan_undo(&ctx.read(), &ops)?;
@@ -6100,8 +6156,37 @@ impl AgentRuntime {
             }
         }
         committed?;
+        // D226: each undone row goes back to the author it had before the undone merge, and a row
+        // the merge created goes back to nobody. After the commit, for the reason `record_applied`
+        // stamps after its own: an attribution of a write that did not commit is worse than none.
+        // Newest undone op first, so a row two undone merges touched ends with the OLDER one's prior.
+        for (tbl, row, author) in restore {
+            self.prov_store.stamp_row(tbl, row, author)?;
+        }
         Ok(plan)
     }
+}
+
+/// **D226 — the author each undone op's row is handed back to**, in undo order.
+///
+/// Refused, before anything is written, when an op's prior author is not on record: restoring a
+/// guess would be the confident wrong answer `stamp_row`'s contract exists to avoid, and leaving
+/// the row alone would keep naming the reverted run.
+fn authors_to_restore(
+    prior: &BTreeMap<(u64, u32, u64), ProvId>,
+    ops: &[AppliedOp],
+) -> Result<Vec<(u32, u64, ProvId)>, FerroError> {
+    ops.iter()
+        .map(|a| {
+            prior.get(&(a.txn.0, a.tbl.0, a.row.0)).map(|p| (a.tbl.0, a.row.0, *p)).ok_or_else(|| {
+                FerroError::Internal(format!(
+                    "no prior author is recorded for row {} of {} as {} published it, so a revert \
+                     could not say whose the row is afterwards; refusing before changing anything",
+                    a.row, a.table, a.txn
+                ))
+            })
+        })
+        .collect()
 }
 
 /// **Every write a revert will make, decided before the first one is made** — D218.
@@ -6650,10 +6735,10 @@ fn no_such_merge(state: &State, merge_id: &str) -> FerroError {
     let floor = state.revert.cursor.as_ref().map_or(0, |h| h.boot_merge_floor);
     match merge_number(merge_id) {
         Some(n) if n <= floor => FerroError::Merge(format!(
-            "{merge_id} was issued by an earlier server run: every merge id up to m_{floor} was \
-             issued or reserved before this server started, and this run's ids start above it. \
-             REVERT reaches only the merges this server run published, so {merge_id} cannot be \
-             reverted here"
+            "{merge_id} belongs to an earlier server run: every merge id up to m_{floor} was issued, \
+             or reserved and left unused, before this server started, and this run's ids start \
+             above it. REVERT reaches only the merges this server run published, so {merge_id} \
+             cannot be reverted here"
         )),
         Some(n) if n <= state.next_merge => FerroError::Merge(format!(
             "unknown merge {merge_id}: it was issued by this server run but published nothing to \
