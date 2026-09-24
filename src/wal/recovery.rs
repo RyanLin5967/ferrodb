@@ -489,9 +489,11 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
     if rebuild || holds_records {
         txn.checkpoint()?;
-        // On the flag that decided the rebuild, not on `stale` alone, so the marker goes only with
-        // the rebuild it asked for (the D216 re-adversary's F1: removed on `stale` inside this
-        // branch, it went whether or not that rebuild ran).
+        // On the flag that decided the rebuild. Today `rebuild && stale` is the same as `stale`;
+        // it is spelled this way so that an edit to the rebuild's condition cannot leave the
+        // marker removed without the rebuild it asked for. The tracer in
+        // `the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations` is what checks
+        // that the rebuild ran.
         if rebuild && stale {
             if let Err(e) = std::fs::remove_file(&marker) {
                 use std::io::Write;
