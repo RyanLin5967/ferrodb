@@ -536,17 +536,11 @@ fn attach_built_index(
     txn: &TxnManager,
     built: crate::catalog::catalog::BuiltIndex,
 ) -> Result<Outcome, FerroError> {
-    let mut attached = false;
-    let unit = txn.ddl_checkpointed(|| {
-        catalog.attach_index(&built)?;
-        attached = true;
-        Ok(())
-    });
-    match unit {
-        Ok(()) => Ok(Outcome::Ok),
-        Err(e) if !attached => Err(catalog.discard_after(e, built)),
-        Err(e) => Err(e),
-    }
+    // D271 MUTANT MB: attach first, then checkpoint, as the base did (`checkpoint_keeping_owed` has
+    // the deleted `ddl_checkpoint`'s refusal and keep behaviour)
+    catalog.attach_index(&built)?;
+    txn.checkpoint_keeping_owed()?;
+    Ok(Outcome::Ok)
 }
 
 fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
