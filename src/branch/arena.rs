@@ -1727,7 +1727,12 @@ impl ArenaPageStore {
             // good (the fresh-context review's F2: after any reap the next free is a full
             // rewrite). Nobody can take it in between: only `alloc_arena` pops the free list, and
             // it holds `persist`, which this holds. On failure it comes back off the list before
-            // `persist` is released, and stays out of circulation until the next open (a leak).
+            // `persist` is released, and the range is then a leak, never an alias (review 2 F2):
+            // lost for this process, and for good once any later rewrite succeeds, because the
+            // extent has already left memory and a rewrite lists the range in neither `extents`
+            // nor `free_extents`. After a failed append that rewrite is the very next persist. A
+            // crash before it leaves the durable map charging the range to the freed extent, which
+            // the open sweep collects only if that extent reads empty.
             //
             // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
             // as the claim this mirrors, and not per page.
@@ -1779,8 +1784,22 @@ impl ArenaPageStore {
         // holding `state` across the write: a pop landing in between sets it again, and the image
         // — read afterwards from live memory — contains that pop anyway. Clearing AFTER would do
         // the opposite, dropping the flag for a pop the image does not contain.
+        //
+        // **D248 (review 2 F5) — and a rewrite that FAILS puts the flag back.** It returns with
+        // `image_bytes` unchanged, so without the flag the next persist could append behind an
+        // image that still lists a reissued page as recycled: the one condition here whose absence
+        // is a live page freed. Set to true, not back to what it was. The rewrite that failed was
+        // owed for some reason, and making the next persist a rewrite pays it whatever the reason
+        // was; and a pop that landed while this one was writing has already set it, which
+        // restoring an earlier value would undo.
         self.recycled_reissued.store(false, Ordering::SeqCst);
-        let written = self.checkpoint_with(&OsFileOps, &p)?;
+        let written = match self.checkpoint_with(&OsFileOps, &p) {
+            Ok(written) => written,
+            Err(e) => {
+                self.recycled_reissued.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
         g.image_bytes = written as u64;
         g.tail_bytes = 0;
         g.image_epoch = crate::cluster::epoch();
@@ -2558,6 +2577,12 @@ impl PageStore for ArenaPageStore {
             st.live_order.insert(arena);
             st.recycled.insert(arena, Vec::new());
         }
+        // Counted with the extent and BEFORE the persist, for the reason the extent is in the map
+        // by then: a persist that turns out to be a full rewrite serialises this counter from live
+        // memory, and a count added afterwards is missing from an image that holds the extent
+        // (review 2 F1: the restore came back short by the claim's pages). An appended claim
+        // record carries no count; its replay adds `page_count`.
+        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
 
         // Persist the map now that the region has grown. This is the write that makes
         // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
@@ -2600,17 +2625,26 @@ impl PageStore for ArenaPageStore {
             // **D232 (H2b) — never publish an extent whose record failed to persist.** It used to
             // stay in the map as the branch's current arena (and in its catalog record), later
             // writes filled it, and a crash before any later persist succeeded re-issued its id
-            // over pages that were written. Taken back out here. Its page range is deliberately
-            // NOT given back: a persist that errs can still have reached the disk (an fsync that
-            // fails after the bytes landed), and a range the durable map may charge to this extent
-            // must not be handed to another claim in this process. It is lost until the next open.
+            // over pages that were written. Taken back out here, pages and count both. Its page
+            // range is deliberately NOT given back: a persist that errs can still have reached the
+            // disk (an fsync that fails after the bytes landed), and a range the durable map may
+            // charge to this extent must not be handed to another claim in this process.
+            //
+            // So the range is lost for this process, and lost for good once any later rewrite
+            // succeeds (review 2 F2): a rewrite serialises live memory, which lists it in neither
+            // `extents` nor `free_extents`, and the watermark is already past it. After a failed
+            // append that rewrite is the very next persist, because the append's failure forgets
+            // `image_bytes`. Only a crash before then gives it back, through the durable map: as
+            // an unissued or free range if the record never landed, or, if it did, as an extent no
+            // catalog key names, collected as an orphan once this branch is reaped. At most one
+            // extent per failed persist: a leak, never an alias.
             let mut st = self.state.lock().unwrap();
             st.extents.remove(&arena);
             st.live_order.remove(&arena);
             st.recycled.remove(&arena);
+            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
             return Err(e);
         }
-        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
 
         // Keep the durable record truthful: the reaper frees exactly `record.arenas`.
         //
@@ -2631,9 +2665,11 @@ impl PageStore for ArenaPageStore {
             return match self.free_arena_locked(&mut persist, arena) {
                 Ok(_) => Err(refused),
                 Err(undo) => Err(FerroError::Internal(format!(
-                    "{refused}. Undoing the durable claim of arena {arena} also failed ({undo}); \
-                     the map keeps its range reserved for {branch}, which no catalog record \
-                     names, so it leaks until that extent is collected as an orphan"
+                    "{refused}. Undoing the durable claim of arena {arena} also failed ({undo}): \
+                     the extent has already left this process's map, and its range is lost for \
+                     this process, and for good once a later rewrite of the map succeeds. A \
+                     restart before that finds the extent charged to {branch}, which no catalog \
+                     record names, and collects it as an orphan once {branch} is gone"
                 ))),
             };
         }

@@ -238,8 +238,9 @@ pub struct TwoTierReaper {
     /// **D232.** Sweep verdicts refused because the owner's record could not be read. See
     /// [`Self::unreadable_owners`].
     unreadable_owners: AtomicU64,
-    /// **D232.** Arenas a reap refused to free because the store charges them to another branch.
-    /// See [`Self::foreign_arenas_skipped`].
+    /// **D232.** Arenas a reap refused to free because the store charges them to another branch,
+    /// and (review 2 F3) parked pages a drain refused to release. See
+    /// [`Self::foreign_arenas_skipped`].
     foreign_arenas_skipped: AtomicU64,
 }
 
@@ -329,6 +330,15 @@ impl TwoTierReaper {
     /// write survived a crash that lost its map record, from before D232 made the map record go
     /// first, and a restart that then issued the same arena id to another branch. The other
     /// branch's data is intact because of this refusal. `scan_once` reports new ones.
+    ///
+    /// **Review 2 F3: a drain counts here too, one per parked page it drops.** The pending-free
+    /// log is older than the reap's owner filter, so a slow-path reap over an aliased key before
+    /// D232 left durable entries naming another branch's extent, and a drain now drops them
+    /// instead of releasing them. One more case counts, and it needs no alias: an entry whose
+    /// extent no longer exists, which a drain that a catalog read error refused leaves behind if
+    /// the extent is then freed whole. Its page went back with the extent. The units differ (an
+    /// arena, a page); both mean "not this entry's to free", and both are zero on a healthy
+    /// database.
     pub fn foreign_arenas_skipped(&self) -> u64 {
         self.foreign_arenas_skipped.load(Ordering::Relaxed)
     }
@@ -839,6 +849,28 @@ impl TwoTierReaper {
             let mut still_pinned = Vec::new();
             let mut moved = false;
             for (i, pf) in entries.iter().copied().enumerate() {
+                // **D232, review 2 F3 — the reap's owner filter, applied to this log.** A parked
+                // page is released only into an extent the store charges to the branch that
+                // parked it. `reap` filters `record.arenas` the same way, but this log is older
+                // than that filter: a slow-path reap that once ran over an aliased catalog key
+                // (before D232 put the map record first) parked Y's pages under X, those entries
+                // are durable, and the first drain after X's pinning children died put a page Y's
+                // tree still points at onto Y's recycled list. An extent that no longer exists is
+                // refused as well. Its page went back with it, and `release_page` changed no count
+                // for it, but it still evicted the id from the pool: once the range is reissued,
+                // that is another extent's page, and an unflushed write goes with the frame.
+                //
+                // Dropped, not kept, because no later answer could make the release right: a
+                // foreign or freed extent never becomes the parking branch's, and an id issued
+                // again (only a pre-D232 map can do that) names a new extent whose pages are not
+                // this entry's. Asked before the catalog, so the drop does not depend on the
+                // parking branch's record being readable. Nothing moves the answer before the
+                // release below: the extent holding a parked page is not empty, so no sweep
+                // collects it, and the drain touches it before releasing into it (D221).
+                if self.store.arena_owner(pf.arena_id) != Some(pf.owner) {
+                    self.foreign_arenas_skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let pinned = match self.catalog.get_raw(pf.owner.id) {
                     // **D18, second site.** This read `rec.live_children` too, and on the table
                     // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
