@@ -1971,9 +1971,9 @@ fn sender_loop(
     // the next connection, so finding the close does not itself lose the frame. The dial resets
     // `last_used`, though, so the carried frame goes out unprobed, and a redial that lands on a peer
     // shutting down mid-handshake still loses it (`idle_probe_gap`, "a redial onto a refusal").
-    // It sits outside the queue's
-    // drop-oldest bound while the peer is down, so on return the stalest frame goes first, against
-    // `push`'s policy. Consensus refuses a stale term, so one such frame is harmless.
+    // It sits outside the queue's drop-oldest bound while the peer is down, so on return the
+    // stalest frame goes first, against `push`'s policy. Consensus refuses a stale term, so one such
+    // frame is harmless.
     let mut carried: Option<Vec<u8>> = None;
     // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
     let probe_gap = idle_probe_gap(&opts);
