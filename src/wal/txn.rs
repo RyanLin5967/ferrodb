@@ -279,7 +279,11 @@ pub struct ReadView {
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
-        let start = wal.header_txn_id;
+        // **Id 0 is never issued (the D216 adversary's F3).** DDL and run declarations are logged
+        // under it, every log reader takes a record under 0 for a declaration, and recovery never
+        // undoes it. A fresh log's header starts at 1, but `WalManager::truncate` writes whatever
+        // it is given, and a snapshot install gives it 0.
+        let start = wal.header_txn_id.max(1);
         Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
     }
 
