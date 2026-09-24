@@ -4,6 +4,15 @@ use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE, MAX_TUPLE_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
+/// The page space of the largest tuple a page holds must fit the `u16` a directory entry records
+/// free space in, or [`HeapFileManager::space_needed`] could not answer in the unit
+/// `find_page_with_space` compares. Checked at compile time, so a `PAGE_SIZE` change that broke it
+/// fails the build rather than an insert (D257).
+const _: () = assert!(
+    MAX_TUPLE_SIZE + SLOT_ENTRY_SIZE <= u16::MAX as usize,
+    "a tuple's page space no longer fits a u16; PageDirectoryEntry::free_space must widen"
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct RecordId {
     pub page_id: u32,
@@ -49,11 +58,55 @@ impl HeapFileManager {
     /// table region below the copy-on-write arena floor is full — a real limit, fixed when the
     /// database is created (`cli::DEFAULT_ARENA_HEADROOM`), not a test contrivance. See the
     /// relocation branch of [`Self::update`] for what that cost before this split existed.
+    ///
+    /// **A tuple no page can hold is refused first**, before the directory is read and before
+    /// anything is allocated: see [`Self::space_needed`] (D257).
     pub fn find_or_make_page(&self, tuple_len: usize) -> Result<u32, FerroError> {
-        if let Some(id) = self.find_page_with_space(tuple_len as u16 + SLOT_ENTRY_SIZE as u16)? {
+        let needed = Self::space_needed(tuple_len)?;
+        if let Some(id) = self.find_page_with_space(needed)? {
             return Ok(id);
         }
         self.add_empty_page()
+    }
+
+    /// The page space a tuple of `tuple_len` bytes occupies (its bytes plus the slot entry that
+    /// addresses it), or the refusal if no page can ever hold it. **D257.**
+    ///
+    /// The one place the heap turns a tuple's length into page space, and the one place it
+    /// refuses a tuple for its size. [`Self::find_or_make_page`] asks it before anything else,
+    /// which covers [`Self::insert`] and the relocation branch of [`Self::update`];
+    /// `execution::update` asks it before it writes the old version to the time-travel heap.
+    ///
+    /// Before it, nothing on the insert path compared the length with [`MAX_TUPLE_SIZE`]. No
+    /// directory entry ever claims more than `PAGE_SIZE - HEADER_SIZE` free, so for a longer
+    /// tuple the search always failed and `add_empty_page` allocated and listed a page, unlogged,
+    /// before `insert_into` found that the tuple did not fit. Every refused attempt left one more
+    /// page in the file and the directory, for good. The length also went through
+    /// `tuple_len as u16 + SLOT_ENTRY_SIZE as u16`, which panicked (debug) or wrapped (release) at
+    /// 65532..=65535 and truncated from 65536 on, where the small figure it produced was answered
+    /// by any page. Pinned by `tests/d257_insert_bound.rs`.
+    ///
+    /// `Constraint` rather than `NotEnoughSpace`: a row too wide is the statement's fault. That
+    /// is how every other row-width refusal reports it (`catalog::alter`), and it is the SQLSTATE
+    /// class a client should see (`pgwire::sqlstate_of`: 23000, where `NotEnoughSpace` is XX000,
+    /// a server fault).
+    pub fn space_needed(tuple_len: usize) -> Result<u16, FerroError> {
+        if tuple_len > MAX_TUPLE_SIZE {
+            return Err(FerroError::Constraint(format!(
+                "a row stored as {tuple_len} bytes cannot be written: a row must fit in one \
+                 {PAGE_SIZE}-byte page, which holds at most {MAX_TUPLE_SIZE} bytes of row, and \
+                 a row does not span pages. Nothing was allocated or written for it; shorten \
+                 the row, usually its longest VARCHAR."
+            )));
+        }
+        // Cannot fail while the assertion at the top of this file holds. Checked anyway, so a
+        // wrong answer is an error and never a smaller number.
+        u16::try_from(tuple_len + SLOT_ENTRY_SIZE).map_err(|_| {
+            FerroError::Internal(format!(
+                "the page space of a {tuple_len}-byte tuple does not fit a u16, which the \
+                 compile-time bound on MAX_TUPLE_SIZE ({MAX_TUPLE_SIZE}) rules out"
+            ))
+        })
     }
 
     /// Allocate one empty data page and record it in the directory. **Always allocates.**
@@ -151,6 +204,10 @@ impl HeapFileManager {
     }
 
     /// Write `tuple` into `page_id`, which the caller has already established can hold it.
+    ///
+    /// The pin is a `PagePin`, so every `?` after it releases it (D237). The one a directory entry
+    /// that overstates a page's free space reaches, `page.insert`, is forced by
+    /// `tests/d257_insert_bound.rs::an_insert_refused_inside_its_page_releases_the_pin`.
     fn insert_into(&self, page_id: u32, tuple: Tuple) -> Result<RecordId, FerroError> {
         let pin = self.buffer_pool_manager.pin(page_id)?;
         let mut frame = pin.write();
@@ -189,50 +246,50 @@ impl HeapFileManager {
                 return Ok(record_id)
             },
             Err(FerroError::NotEnoughSpace) => {
-                // **Decided here, while the row is still on its page.**
+                // **Decided before the delete below, while the row is still on its page.**
                 //
-                // The relocation below deletes the slot and unpins the page DIRTY before the
-                // insert that is supposed to replace it, so past `page.delete` the row exists
-                // nowhere: if the insert then fails, the `?` unwinds with the row already gone and
-                // no caller can tell that from an update that simply did not happen. `insert`
-                // allocates a fresh page when no existing one has room, and a fresh page holds any
-                // tuple up to `MAX_TUPLE_SIZE`, so the one way it can fail on the data is a tuple
-                // no page can ever hold — and that is decidable before touching anything.
+                // The relocation deletes the slot and unpins the page DIRTY before the insert that
+                // is supposed to replace it, so past `page.delete` the row exists nowhere: if the
+                // insert then fails, the `?` unwinds with the row already gone and no caller can
+                // tell that from an update that simply did not happen. So every way that insert
+                // can fail is settled first, by `find_or_make_page`, which answers two different
+                // questions with different answers:
                 //
-                // This is not redundant with the caller's own checks. A logged update survives the
+                // - **Can any page hold this tuple?** `space_needed` refuses one past
+                //   `MAX_TUPLE_SIZE` before touching anything. This used to be a guard of its own
+                //   here, on the same predicate; D257 needed the refusal on INSERT too and gave it
+                //   one definition inside `find_or_make_page`, which this branch already called
+                //   before the delete. A second copy here would test nothing the first does not,
+                //   and would hide a broken first copy from every test.
+                // - **Is there a page at all?** `DiskManager::allocate` refuses once the table
+                //   region below the copy-on-write arena floor is full, and that floor is fixed
+                //   when the database is created, so it is an ordinary end-state rather than an
+                //   exotic one. Measured when the delete came first: a 41-row single-page heap with
+                //   the floor reached lost row 1 outright to an `ALTER TABLE ... ADD COLUMN` that
+                //   reported failure, and left the primary index pointing at the deleted slot —
+                //   durably, across checkpoint, flush and a reopen.
+                //
+                // With the destination in hand `insert_into` cannot fail for want of space: a
+                // fresh page holds any tuple up to `MAX_TUPLE_SIZE`.
+                //
+                // This is not redundant with the callers' own checks. A logged update survives the
                 // old behaviour by accident: the delete is a WAL record, so the statement's abort
                 // undoes it. Every caller that opens a heap through `HeapFileManager::open` gets
                 // `txn: None` — `catalog::alter::rewrite_heap` is one — and for those there is no
-                // undo record and no recovery: the row is simply gone. Measured before this guard
-                // existed: an unlogged `update` with a 4124-byte tuple took the heap from one live
-                // tuple to zero and left the slot reading `SlotDeleted`.
+                // undo record and no recovery: the row is simply gone. Measured before the size
+                // refusal existed: an unlogged `update` with a 4124-byte tuple took the heap from
+                // one live tuple to zero and left the slot reading `SlotDeleted`.
                 //
                 // Reordering the delete after the insert was the alternative and it is worse: the
                 // insert needs the frame lock this function is holding (deadlock unless the lock is
                 // dropped and the page re-fetched), and it changes the order of the WAL records a
                 // logged update writes, which is the order recovery's undo path reads them in.
-                if new_bytes.len() > MAX_TUPLE_SIZE {
-                    drop(frame);
-                    pin.unpin(false);
-                    return Err(FerroError::NotEnoughSpace);
-                }
-                // **Reserve the destination before freeing the source.** `Page::update` returned
-                // `NotEnoughSpace` without touching the page, so nothing has changed yet; the lock
-                // is released here because `find_or_make_page` fetches directory pages and may
-                // allocate, and holding this frame's write lock across that would deadlock the
-                // moment the allocator handed back a page whose frame is this one.
                 //
-                // A fresh page can hold any tuple up to `MAX_TUPLE_SIZE`, so with the destination
-                // in hand `insert_into` cannot fail for want of space. Obtaining it FIRST is what
-                // makes the size guard above sufficient: the guard answers "can any page hold
-                // this tuple", and this answers "is there a page at all", which is a different
-                // question with a different answer. `DiskManager::allocate` refuses once the table
-                // region below the copy-on-write arena floor is full, and that floor is fixed when
-                // the database is created, so it is an ordinary end-state rather than an exotic
-                // one. Measured under the old order: a 41-row single-page heap with the floor
-                // reached lost row 1 outright to a `ALTER TABLE ... ADD COLUMN` that reported
-                // failure, and left the primary index pointing at the deleted slot — durably,
-                // across checkpoint, flush and a reopen.
+                // `Page::update` returned `NotEnoughSpace` without touching the page, so nothing
+                // has changed yet. The lock is released here because `find_or_make_page` fetches
+                // directory pages and may allocate, and holding this frame's write lock across
+                // that would deadlock the moment the allocator handed back a page whose frame is
+                // this one.
                 drop(frame);
                 pin.unpin(false);
                 let dest = self.find_or_make_page(new_bytes.len())?;

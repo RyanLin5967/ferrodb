@@ -90,6 +90,15 @@ impl Modify for Update {
             let mut old_ver = self.heap.read(rid)?;
             old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
             let mut tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;
+            // **D257: a new version no page can hold is refused BEFORE the time-travel write.**
+            // The old version goes to `tt_heap` first because the new one records where it went
+            // (`tt_rid`, below), and `heap.update` refuses an oversized tuple only after that. The
+            // abort undoes that insert with `page.delete`, which keeps the slot entry (`Page::insert`
+            // never reuses one) and leaves the directory understating the page until the next
+            // insert there. So every refused attempt left the time-travel heap four bytes fuller
+            // for good, and the first allocated its first page. Called for its refusal;
+            // `find_or_make_page` asks the same question again inside `heap.update`.
+            HeapFileManager::space_needed(tuple.data.len())?;
             let tt_rid = self.tt_heap.insert(old_ver)?;
             tuple.data[16..20].copy_from_slice(&tt_rid.page_id.to_be_bytes());
             tuple.data[20..22].copy_from_slice(&tt_rid.slot_num.to_be_bytes());
