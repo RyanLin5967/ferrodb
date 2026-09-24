@@ -635,3 +635,45 @@ Per-target on macOS: **2598** = 2593 + T1 + T2 + T3 + T4 + T5.
 | M33 `unaddressable_uncounted` | no count on the two addressing refusals | T4 | transport |
 | M34 `entry_wire_len_short` | `entry_wire_len` reports one byte less (the re-review asked for a mutant here) | E (one byte over: 2 entries), T3 (its premise `entry_wire_len == 8,388,531`) | replicate + log |
 | M27 (re-cut) | no at-least-one rule | **T5** (was: survives) | replicate |
+
+---
+
+## Amendment 9 — D223's fix, tests and mutants, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `c590265` | the registered test edits: E pins `probe_body == 4_194_439`; Q's comment corrected |
+| `20d8d44` | the fix, as amendment 8 described |
+| `010d3c4` | post-fix tests T4 and T5 |
+
+Two small additions beyond amendment 8:
+
+- `send`'s no-address message now names `unaddressable` instead of "every meter reads healthy". The one test that
+  reads that message matches only its unchanged prefix, "no address is configured for n2".
+- The module header no longer says a send after shutdown is "refused rather than counted". It is both, and it
+  already was.
+
+**Counts at `010d3c4`**, READ from the attributes:
+
+| module | tests |
+|---|---|
+| `tests_replicate.rs` | 60 |
+| `tests_log.rs` | 49 |
+| `tests_transport.rs` | 58: 57 on non-macOS |
+
+These match Run G5's predictions.
+
+**All 29 mutants are re-generated from `010d3c4`**; every patch passes `git apply --check`. The edits to M1–M27 are
+unchanged; only their hunk line numbers moved. M28–M34 are new, cut as amendment 8 registered them.
+
+**Commands per D223 mutant:**
+
+| mutants | command |
+|---|---|
+| M27, M28, M29, M30 | the replicate module |
+| M31 | the log module, `timeout 900 cargo test --no-fail-fast --lib consensus::log::tests_log::` |
+| M32, M33 | the transport module |
+| M34 | both modules, `timeout 900 cargo test --no-fail-fast --lib -- consensus::replicate::tests_replicate:: consensus::log::tests_log::` (two libtest filters) |
+
+Predicted kills are amendment 8's table, with M27 now killed by T5. **Run G5 at the tip**: replicate 60 passed, log
+49 passed, transport 58 passed. Per-target **2598**.

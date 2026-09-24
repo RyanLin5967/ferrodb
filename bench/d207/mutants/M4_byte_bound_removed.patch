@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1203,7 +1203,7 @@
+@@ -1241,7 +1241,7 @@
          // made permanently unsendable by the bound that exists to keep sending possible.
          while !st.queue.is_empty()
              && (st.queue.len() >= self.depth

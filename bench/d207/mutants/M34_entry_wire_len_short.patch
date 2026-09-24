@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -242,7 +242,7 @@
+ pub(crate) fn entry_wire_len(e: &Entry) -> usize {
+     let mut b = Vec::new();
+     match encode_entry(&mut b, e) {
+-        Ok(()) => b.len(),
++        Ok(()) => b.len() - 1,
+         Err(_) => usize::MAX,
+     }
+ }

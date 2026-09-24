@@ -1,0 +1,18 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1599,7 +1599,6 @@
+             )));
+         }
+         if m.to == self.self_id {
+-            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
+             return Err(FerroError::Internal(format!(
+                 "{} tried to send a consensus message to itself; the state machine addresses peers \
+                  only, and a self-addressed message means a handler used the wrong id",
+@@ -1607,7 +1606,6 @@
+             )));
+         }
+         let ob = self.outboxes.get(&m.to).ok_or_else(|| {
+-            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
+             FerroError::Internal(format!(
+                 "no address is configured for {}, so a message to it cannot be sent. This node \
+                  holds addresses for {:?}. A configuration that names a node the transport cannot \

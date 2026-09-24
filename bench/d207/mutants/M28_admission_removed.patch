@@ -1,0 +1,13 @@
+--- a/src/consensus/replicate.rs
++++ b/src/consensus/replicate.rs
+@@ -1332,10 +1332,6 @@
+         // is the encoder's own (`transport::admit_entry`), and it runs before `append_own_entry`, so
+         // a refusal leaves neither the in-memory tail nor the disk holding the round.
+         let candidate = Entry { term: self.hard.term, round: self.last_round + 1, command: c };
+-        if let Err(why) = super::transport::admit_entry(&candidate) {
+-            out.push(Action::Refuse { why });
+-            return;
+-        }
+         self.append_own_entry(candidate.command, out);
+         self.bcast_append(out);
+         // No commit advance here. This leader holds the round but has not made it durable, and a

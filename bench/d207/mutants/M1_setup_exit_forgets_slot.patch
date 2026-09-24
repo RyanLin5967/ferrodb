@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -2006,6 +2006,7 @@
+@@ -2064,6 +2064,7 @@
                      // with no number attached is the silent loss this module does not allow.
                      counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                      let _ = stream.shutdown(Shutdown::Both);

@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1402,7 +1402,7 @@
+@@ -1440,7 +1440,7 @@
          // Two more knobs whose zero is a partition that reads as health, not a smaller setting
          // (D207, ported from F3-transport's `207d362`). Not folded into the loop above: its message
          // blames std's socket calls, and neither of these ever reaches one.

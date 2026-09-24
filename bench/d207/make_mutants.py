@@ -18,6 +18,7 @@ import sys
 PATH = "src/consensus/transport.rs"
 CONFIG = "src/consensus/config.rs"
 REPLICATE = "src/consensus/replicate.rs"
+LOG = "src/consensus/log.rs"
 
 SETUP_EXIT = """                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.shutdown(Shutdown::Both);
@@ -100,6 +101,30 @@ MUTANTS = [
         "        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))\n",
         "        .map_or(0, |_b| MAX_FRAME_BYTES.saturating_sub(signing::MAC_LEN))\n",
     )]),
+    # --- amendment 8: D223, admission at proposal and counted refusals ------------------------------
+    ("M29_admission_cut_one_early", [(
+        "    if b.len() > budget {\n",
+        "    if b.len() >= budget {\n",
+    )]),
+    ("M30_admission_swallows_encoder_error", [(
+        "    encode_entry(&mut b, e)?;\n    let budget = append_entries_budget();\n",
+        "    let _ = encode_entry(&mut b, e);\n    let budget = append_entries_budget();\n",
+    )]),
+    ("M32_unencodable_uncounted", [(
+        "        let frame = encode_signed(m, self.key.as_deref()).inspect_err(|_| {\n            self.counters.unencodable.fetch_add(1, Ordering::SeqCst);\n        })?;\n",
+        "        let frame = encode_signed(m, self.key.as_deref())?;\n",
+    )]),
+    ("M33_unaddressable_uncounted", [(
+        "            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);\n            return Err(FerroError::Internal(format!(\n",
+        "            return Err(FerroError::Internal(format!(\n",
+    ), (
+        "        let ob = self.outboxes.get(&m.to).ok_or_else(|| {\n            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);\n",
+        "        let ob = self.outboxes.get(&m.to).ok_or_else(|| {\n",
+    )]),
+    ("M34_entry_wire_len_short", [(
+        "        Ok(()) => b.len(),\n        Err(_) => usize::MAX,\n",
+        "        Ok(()) => b.len() - 1,\n        Err(_) => usize::MAX,\n",
+    )]),
 ]
 
 # Mutants of replicate.rs (D220), same shape.
@@ -115,6 +140,18 @@ REPLICATE_MUTANTS = [
     ("M27_empty_when_first_too_big", [(
         "            if !taken.is_empty() && bytes.saturating_add(len) > max_bytes {\n",
         "            if bytes.saturating_add(len) > max_bytes {\n",
+    )]),
+    ("M28_admission_removed", [(
+        "        if let Err(why) = super::transport::admit_entry(&candidate) {\n            out.push(Action::Refuse { why });\n            return;\n        }\n",
+        "",
+    )]),
+]
+
+# Mutants of log.rs (D223), same shape.
+LOG_MUTANTS = [
+    ("M31_disk_limit_below_wire", [(
+        "pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES;\n",
+        "pub const MAX_ENTRY_BYTES: usize = crate::replication::MAX_FRAME_BYTES - 4096;\n",
     )]),
 ]
 
@@ -142,7 +179,12 @@ def main() -> int:
     sha = sys.argv[1]
     out = pathlib.Path("bench/d207/mutants")
     out.mkdir(parents=True, exist_ok=True)
-    for path, mutants in ((PATH, MUTANTS), (CONFIG, CONFIG_MUTANTS), (REPLICATE, REPLICATE_MUTANTS)):
+    for path, mutants in (
+        (PATH, MUTANTS),
+        (CONFIG, CONFIG_MUTANTS),
+        (REPLICATE, REPLICATE_MUTANTS),
+        (LOG, LOG_MUTANTS),
+    ):
         rc = write(sha, path, mutants, out)
         if rc:
             return rc
