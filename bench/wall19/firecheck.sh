@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# Wall #19 fire-check: each mutant reverts ONE piece of the refusal (or of the reap pruning) and must
-# turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
-# section 8.4. Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
+# Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
+# lease-reap attestation, and must turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
+# section 9.4 (supersedes 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
-# Blind spots, stated: it runs two targets per mutant (the attest lib module and
-# integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
+# Blind spots, stated: it runs three selections per mutant (the attest lib module, the two D199
+# lease tests, and integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
 # a survivor here. It judges kills by cargo's own "test result" line and FAILED names, not by exit
 # code alone: a compile error is recorded as COMPILE-FAIL, which is not a kill.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=97e3111           # the tree these mutants were written against
-FILE=src/branch/attest.rs
+SUBJECT_SHA=a5e9423           # the tree these mutants were written against
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -25,25 +24,33 @@ if [ -n "$(git status --porcelain -- src/ tests/ examples/)" ]; then
   exit 2
 fi
 
-# name|old text (python literal)|new text (python literal)
+# name|file|old text (python literal)|new text (python literal)
+A=src/branch/attest.rs
+R=src/agent_sql/runtime.rs
 MUTANTS=(
-  'M1_append_genesis_fallback|"            None => return self.refuse(AppendRefused::NoLiveHead { branch }),\n"|"            None => Attestation::genesis(),\n"'
-  'M2_fork_genesis_fallback|"            None => return self.refuse(AppendRefused::NoLiveParent { parent }),\n"|"            None => Attestation::genesis(),\n"'
-  'M3_trunk_reap_allowed|"        if op == BranchOp::Reap && branch.is_trunk() {\n            return self.refuse(AppendRefused::TrunkReap);\n        }\n"|""'
-  'M4_refusal_not_counted|"        self.refused += 1;\n"|""'
-  'M5_trunk_exemption_removed|"            None if branch.is_trunk() => Attestation::genesis(),\n"|""'
-  'M6_reap_keeps_head|"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n        } else {\n            self.heads.insert(e.branch, att);\n        }\n"|"        self.heads.insert(e.branch, att);\n"'
+  "M1_append_genesis_fallback|$A|"'"            None => return self.refuse(AppendRefused::NoLiveHead { branch }),\n"|"            None => Attestation::genesis(),\n"'
+  "M2_fork_genesis_fallback|$A|"'"            None => return self.refuse(AppendRefused::NoLiveParent { parent }),\n"|"            None => Attestation::genesis(),\n"'
+  "M3_trunk_reap_allowed|$A|"'"        if op == BranchOp::Reap && branch.is_trunk() {\n            return self.refuse(AppendRefused::TrunkReap);\n        }\n"|""'
+  "M4_refusal_not_counted|$A|"'"        self.refused += 1;\n"|""'
+  "M5_trunk_exemption_removed|$A|"'"            None if branch.is_trunk() => Attestation::genesis(),\n"|""'
+  "M6_reap_keeps_head|$A|"'"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n        } else {\n            self.heads.insert(e.branch, att);\n        }\n"|"        self.heads.insert(e.branch, att);\n"'
+  "M7_scan_forget_does_not_attest|$R|"'"            // D199: attested once the state lock is released. See `attest_forgotten_reaps`.\n            self.attest_forgotten_reaps(\u0026sealed);\n"|""'
+  "M8_sweep_forget_does_not_attest|$R|"'"                // D199: attested once the state lock is released. See `attest_forgotten_reaps`.\n                self.attest_forgotten_reaps(\u0026sealed);\n"|""'
+  "M9_attest_every_gone_branch|$R|"'"                    if forget_one_branch(\u0026mut state, bid) {\n                        forgotten += 1;\n                        sealed.push(bid);\n                    }\n"|"                    sealed.push(bid);\n                    if forget_one_branch(\u0026mut state, bid) {\n                        forgotten += 1;\n                    }\n"'
+  "M10_lease_reap_published|$R|"'"            let _ = self.attest_reap(branch, epoch, false);\n"|"            let _ = self.attest_reap(branch, epoch, true);\n"'
 )
 
 run_targets() { # $1 = label
   timeout 1800 cargo test --lib branch::attest > "$OUT/$1.lib.txt" 2>&1
   echo "lib_rc=$?" >> "$OUT/$1.lib.txt"
+  timeout 1800 cargo test --lib attested_exactly_once > "$OUT/$1.d199.txt" 2>&1
+  echo "d199_rc=$?" >> "$OUT/$1.d199.txt"
   timeout 1800 cargo test --test integration_branch_attestation > "$OUT/$1.integ.txt" 2>&1
   echo "integ_rc=$?" >> "$OUT/$1.integ.txt"
 }
 
 summarise() { # $1 = label
-  for t in lib integ; do
+  for t in lib d199 integ; do
     f="$OUT/$1.$t.txt"
     res=$(grep -E "^test result:" "$f" | tail -1)
     [ -z "$res" ] && res="COMPILE-FAIL or no result line"
@@ -58,7 +65,7 @@ summarise control | tee "$OUT/summary.txt"
 
 survivors=0
 for m in "${MUTANTS[@]}"; do
-  IFS='|' read -r name old new <<< "$m"
+  IFS='|' read -r name FILE old new <<< "$m"
   echo "== $name"
   if ! timeout 60 python3 - "$FILE" "$old" "$new" <<'EOF'
 import ast, sys
@@ -82,7 +89,7 @@ EOF
     exit 3
   fi
   summarise "$name" | tee -a "$OUT/summary.txt"
-  if ! grep -qE "^test .* FAILED$" "$OUT/$name.lib.txt" "$OUT/$name.integ.txt"; then
+  if ! grep -qE "^test .* FAILED$" "$OUT/$name.lib.txt" "$OUT/$name.d199.txt" "$OUT/$name.integ.txt"; then
     echo "$name: SURVIVED (no test failed)" | tee -a "$OUT/summary.txt"
     survivors=$((survivors + 1))
   fi
