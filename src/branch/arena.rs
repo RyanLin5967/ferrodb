@@ -1829,7 +1829,7 @@ impl ArenaPageStore {
             // corruption: the "next open" every failure path here leans on would not happen.
             // Forgetting the image makes the next persist an atomic rewrite, which replaces the
             // torn tail along with everything else.
-            g.image_bytes = 0;
+            // MUTANT (fire-check only, never land): the next persist appends behind the failure.
             return Err(FerroError::Io(e.to_string()));
         }
         g.tail_bytes += rec.len() as u64;
