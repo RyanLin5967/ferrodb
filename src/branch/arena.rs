@@ -2604,10 +2604,7 @@ impl PageStore for ArenaPageStore {
             // NOT given back: a persist that errs can still have reached the disk (an fsync that
             // fails after the bytes landed), and a range the durable map may charge to this extent
             // must not be handed to another claim in this process. It is lost until the next open.
-            let mut st = self.state.lock().unwrap();
-            st.extents.remove(&arena);
-            st.live_order.remove(&arena);
-            st.recycled.remove(&arena);
+            // MUTANT (fire-check only, never land): the unpersisted extent stays in the map.
             return Err(e);
         }
         self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
