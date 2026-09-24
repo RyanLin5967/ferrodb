@@ -349,8 +349,12 @@ self_test() {
   expect "control, clean" "clean" "$(control_verdict ctl)"
   ok_file ctlfail alter 16; fail_file ctlfail d257 7 "$T2|planted"
   expect "control with a FAILED test and the counts still 7/16" "VOID (a test FAILED" "$(control_verdict ctlfail)"
+  # One short-count case per target: a gate that checks only one target's count must not pass
+  # (JL2, lane §3.6: at `f7135a6` only the d257 half had a case).
   ok_file ctlcount d257 6; ok_file ctlcount alter 16
-  expect "control with a short count and nothing FAILED" "VOID (passed d257=6" "$(control_verdict ctlcount)"
+  expect "control with a short d257 count and nothing FAILED" "VOID (passed d257=6" "$(control_verdict ctlcount)"
+  ok_file ctlcountalter d257 7; ok_file ctlcountalter alter 15
+  expect "control with a short alter count and nothing FAILED" "VOID (passed d257=7 alter=15" "$(control_verdict ctlcountalter)"
   ok_file ctlrc alter 16; plant ctlrc d257 101 "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
   expect "control with rc=101, nothing FAILED, counts 7/16" "VOID (RC-MISMATCH" "$(control_verdict ctlrc)"
   for t in $TARGETS; do plant ctlcf "$t" 101 "error: could not compile \`ferrodb\`"; done
