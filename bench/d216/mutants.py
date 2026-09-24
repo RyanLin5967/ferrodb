@@ -314,6 +314,10 @@ def main():
             skipped += [m[0] for m in mutants if (m[0] in named) != keep]
             mutants = [m for m in mutants if (m[0] in named) == keep]
     env = dict(os.environ)
+    # The D216 gate controls need the INSERT's pages dirty when they are written back; an automatic
+    # checkpoint after every commit cleans them first and makes both controls, and M7's kill,
+    # vacuous (lane PREREG (G)). Every mutant runs at the default checkpoint interval.
+    env.pop("FERRODB_CHECKPOINT_INTERVAL", None)
     if "--target-dir" in sys.argv:
         env["CARGO_TARGET_DIR"] = sys.argv[sys.argv.index("--target-dir") + 1]
     if os.path.exists(TREE):
