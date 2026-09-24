@@ -629,10 +629,21 @@ impl Catalog {
     ///   (D249). A plan can be held across a statement, and the plan's decisions, the encoder's
     ///   answer included, hold only for the entry they were made against.
     ///
-    /// Neither fires inside `AgentRuntime::merge`. A merge holds no transaction open, and it applies
-    /// each table's plan with no statement in between that touches that table's entry:
-    /// `apply_plan` for one table changes only that table's entry. That is what keeps a merge atomic
-    /// in its refusals.
+    /// Neither fires inside `AgentRuntime::merge`, and that is what keeps a merge atomic in its
+    /// refusals. The reasons (D249 review 3, H3):
+    ///
+    /// - **The quiesce re-check reads every session's transactions, not only the merge's.** What
+    ///   keeps another session from beginning one between the merge's plan loop and a later table's
+    ///   `apply_plan` is that every production `TxnManager::begin` runs with an exclusive borrow of
+    ///   the one `Catalog` (`executor::run_staged`, `apply_dml`'s `ExecCtx`), which the merge holds
+    ///   for its whole statement. The shared read path, `executor::try_run_read`, begins none. That
+    ///   borrow comes from the pgwire server's per-statement `Mutex<Catalog>`
+    ///   (`ServerContext::catalog`), from the CLI's per-statement catalog mutex, or, for an embedded
+    ///   caller, from its own `&mut Catalog`. The premise under all three is ONE `Catalog` per
+    ///   `TxnManager`. A second catalog over the same transactions could begin one mid-merge.
+    /// - **The staleness check:** a merge applies each table's plan with no statement in between
+    ///   that touches that table's entry, and `apply_plan` for one table changes only that table's
+    ///   entry.
     ///
     /// Past those two, the failures it can still meet are environmental — a buffer pool with no
     /// evictable frame, a disk write that fails, a B+tree page that cannot be read. See
@@ -668,10 +679,18 @@ impl Catalog {
         // nothing overwritten first. A staleness check, not a second encoder guard: it compares, and
         // asks the encoder nothing.
         //
-        // **Its blind spot, stated.** A committed INSERT, UPDATE or DELETE that moves no root changes
-        // the heap and not the entry, and this does not see it. The plan's `prepared` rows would then
-        // not describe the heap. That stays with the caller's discipline, as `AgentRuntime::merge`'s
-        // ordering comment already says: a plan's decision is only valid for the heap it read.
+        // **Its blind spot, stated by its condition: the heap changed while the entry compares
+        // equal.** Then the plan's `prepared` rows no longer describe the heap, and this cannot tell.
+        // Two known routes (D249 review 3, H2):
+        //
+        // - committed DML (an INSERT, UPDATE or DELETE) that moves no root;
+        // - `DROP TABLE` followed by a `CREATE TABLE` of the same declaration. `drop_table` frees every
+        //   page of the table, and the allocator walks its bitmap from bit 0, so the new table can
+        //   receive the same page ids and so an equal entry.
+        //
+        // Closing it would take a heap-side stamp taken at plan time. It stays with the caller's
+        // discipline, as `AgentRuntime::merge`'s ordering comment says: a plan's decision is only
+        // valid for the heap it read.
         if self.require_table(&table)? != &read {
             return Err(FerroError::Constraint(format!(
                 "the alteration of '{table}' was planned against its catalog entry as it was then, \
