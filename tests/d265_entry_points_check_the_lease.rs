@@ -42,3 +42,13 @@ fn every_entry_point_asks_whether_its_lease_thread_ended_alive() {
         );
     }
 }
+
+/// **D265 (e).** What the shared check returns: `Err` for a thread that panicked, `Ok` otherwise.
+#[test]
+fn ended_alive_refuses_a_dead_thread_and_passes_a_live_one() {
+    use ferrodb::branch::LeaseStats;
+    let dead = LeaseStats { panicked: true, ..Default::default() };
+    assert!(dead.ended_alive().is_err(), "a thread that panicked passed the shutdown check: {dead:?}");
+    let alive = LeaseStats::default();
+    assert!(alive.ended_alive().is_ok(), "a live thread failed the shutdown check: {alive:?}");
+}

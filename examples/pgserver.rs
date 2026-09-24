@@ -142,4 +142,10 @@ fn main() {
     let stats = lease.stop();
     let _ = writeln!(std::io::stderr(), "pgserver: lease scan stopped after {stats:?}");
     store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
+    // D265 (PREREG A22.1): a lease thread that died leaves a server that stopped reaping. After the
+    // checkpoint, so the files are left clean either way; a PANIC, not `process::exit`, for the
+    // reason given at the lease scan above: `<db>.lock` must be released. So the exit is non-zero.
+    if let Err(e) = stats.ended_alive() {
+        panic!("pgserver: {e}");
+    }
 }

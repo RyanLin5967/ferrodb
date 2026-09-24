@@ -130,16 +130,7 @@ impl OpenDatabase {
         // D265: a lease thread that died leaves a database that stopped reaping for the rest of the
         // session. The checkpoints above still ran; the close then fails, so `run_cli` exits
         // non-zero instead of printing "bye bye".
-        let closed = closed.and_then(|()| {
-            if stats.panicked {
-                Err(FerroError::Branch(
-                    "the lease scan thread panicked during this session: no lease was reaped after it died"
-                        .into(),
-                ))
-            } else {
-                Ok(())
-            }
-        });
+        let closed = closed.and_then(|()| stats.ended_alive());
         (stats, closed)
     }
 }

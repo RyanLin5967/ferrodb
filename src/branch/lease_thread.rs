@@ -322,6 +322,22 @@ pub struct LeaseStats {
     pub panicked: bool,
 }
 
+impl LeaseStats {
+    /// **D265: the one check every entry point makes at shutdown** (PREREG A22.1). `Err` when the
+    /// scan thread died by panicking, so the process exits non-zero: `run_cli` reaches it through
+    /// `OpenDatabase::close`, and `examples/pgserver.rs` calls it after its final checkpoint.
+    /// `tests/d265_entry_points_check_the_lease.rs` holds both entry points to it.
+    pub fn ended_alive(&self) -> Result<(), FerroError> {
+        if self.panicked {
+            Err(FerroError::Branch(
+                "the lease scan thread panicked during this session: no lease was reaped after it died".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     attempts: AtomicU64,
