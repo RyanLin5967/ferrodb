@@ -1585,3 +1585,44 @@ fn the_generation_rises_by_one_at_every_checkpoint_and_survives_a_restart() {
         fabric = fabric.restart();
     }
 }
+
+#[test]
+fn the_largest_entry_one_frame_can_carry_is_storable_and_reads_back() {
+    // **D223, re-review R2.** The disk's limit sat about 4 KiB below the wire's, so an entry in
+    // between was one the wire carries and the disk refuses. With admission at proposal set to the
+    // wire's own limit, that would be a round a leader holds and offers, and that no disk — its own
+    // or any follower's — will store. The disk must accept everything one frame can carry, and read
+    // it back.
+    //
+    // The largest entry a proposal can admit: a `WalBatch` exactly at the signed frame budget,
+    // 8,388,531 bytes on the wire, which is a payload of 8,388,531 − 29.
+    assert_eq!(
+        crate::consensus::transport::append_entries_budget(),
+        8_388_531,
+        "the frame budget moved; re-derive the payload"
+    );
+    let e = Entry {
+        term: 1,
+        round: 1,
+        command: Command::WalBatch { start_lsn: 0, bytes: vec![0u8; 8_388_531 - 29] },
+    };
+    assert_eq!(
+        crate::consensus::transport::entry_wire_len(&e),
+        8_388_531,
+        "the fixture is not exactly at the wire's limit"
+    );
+
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    if let Err(err) = log.append(&[e]) {
+        panic!("the log refused an entry one signed frame carries: {err:?}");
+    }
+    log.sync().unwrap();
+    assert_eq!(log.last_round(), 1);
+    drop(log);
+
+    // ...and the scan reads it back: a frame the log writes must be one its own read bound admits.
+    let restarted = fabric.restart();
+    let log = open_on(&restarted).unwrap();
+    assert_eq!(log.last_round(), 1, "the stored entry did not survive a reopen");
+}

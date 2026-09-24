@@ -1717,3 +1717,90 @@ fn an_append_is_cut_where_a_signed_frame_would_overflow_and_not_a_byte_before() 
         );
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// D223 — one admission check at proposal: nothing the wire cannot carry reaches the log. From the
+// re-review of dd9d1e1..5a86ad8 (artie-research frontier/d207_rereview.md, R1 and R2). Written
+// red against 5a86ad8.
+// -------------------------------------------------------------------------------------------
+
+/// Propose `c` to a fresh leader of `cfg3`. Returns the last round it held before and after the
+/// proposal, and the actions the proposal produced.
+fn propose_to_fresh_leader(c: Command) -> (Round, Round, Vec<Action>) {
+    let mut l = Consensus::new(N1, cfg3(), 71);
+    promote_bare(&mut l, 1);
+    let before = l.last_round;
+    let out = l.step(Event::Propose(c));
+    (before, l.last_round, out)
+}
+
+fn refusals(out: &[Action]) -> Vec<String> {
+    out.iter()
+        .filter_map(|a| match a {
+            Action::Refuse { why } => Some(format!("{why}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_membership_the_wire_cannot_carry_is_refused_at_proposal_and_never_reaches_the_log() {
+    // **D223, re-review R1.** The wire refuses a configuration over `MAX_CONFIG_NODES`, but nothing
+    // in front of it did: `write_config` checks only that a count fits a u32, and `on_propose`
+    // appended any command at all. So a leader could hold a round that no frame will ever carry,
+    // and offer it, alone, to a follower on every heartbeat. `node.rs` discards the encoder's refusal,
+    // so no meter moved.
+    let cfg = Config::new([N1, N2, N3], 2, 1).with_learners((4..=1028).map(NodeId));
+    assert_eq!(
+        cfg.learners().len(),
+        crate::consensus::transport::MAX_CONFIG_NODES + 1,
+        "the fixture is not one learner over the wire's limit"
+    );
+    let (before, after, out) = propose_to_fresh_leader(Command::Membership { config: cfg });
+    assert_eq!(
+        after, before,
+        "the proposal reached the log: the leader now holds round {after}, which no frame can carry"
+    );
+    assert!(persisted_entries(&out).is_empty(), "the proposal was sent to the disk");
+    let why = refusals(&out);
+    assert_eq!(why.len(), 1, "expected exactly one refusal, got {why:?}");
+    assert!(why[0].contains("1024"), "the refusal does not name the limit it enforces: {}", why[0]);
+}
+
+#[test]
+fn a_wal_batch_one_byte_over_a_frame_is_refused_at_proposal_and_one_at_the_limit_is_admitted() {
+    // **D223, re-review R2.** Nothing checked an entry's size before the in-memory tail:
+    // `append_own_entry` pushed it and emitted `Persist`, the disk refused it later, and the tail
+    // kept the round. The limit that matters is the wire's: one entry must fit one signed `Append`
+    // frame on its own.
+    //
+    // The boundary is pinned as literals, not taken from the functions under test. The budget is
+    // 8,388,608 − 45 (the Append envelope) − 32 (the MAC) = 8,388,531, and a `WalBatch` entry spends
+    // 29 bytes around its payload: term 8, round 8, tag 1, lsn 8, length 4.
+    const AT_LIMIT: usize = 8_388_531 - 29;
+    assert_eq!(
+        crate::consensus::transport::append_entries_budget(),
+        8_388_531,
+        "the frame budget moved; re-derive AT_LIMIT"
+    );
+    for (payload, admitted) in [(AT_LIMIT, true), (AT_LIMIT + 1, false)] {
+        let (before, after, out) =
+            propose_to_fresh_leader(Command::WalBatch { start_lsn: 1, bytes: vec![7; payload] });
+        if admitted {
+            assert_eq!(
+                after,
+                before + 1,
+                "a {payload}-byte batch fits one signed frame exactly and was not admitted: {:?}",
+                refusals(&out)
+            );
+            assert!(refusals(&out).is_empty(), "an admitted batch was also refused");
+        } else {
+            assert_eq!(
+                after, before,
+                "a {payload}-byte batch, one byte over a signed frame, reached the log at round {after}"
+            );
+            assert!(persisted_entries(&out).is_empty(), "the over-size batch was sent to the disk");
+            assert_eq!(refusals(&out).len(), 1, "the over-size batch was not refused exactly once");
+        }
+    }
+}
