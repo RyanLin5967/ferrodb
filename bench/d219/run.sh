@@ -50,6 +50,14 @@ step() {
   } > "$OUT/$name.txt"
   (cd "$FIRE" && "$@") >> "$OUT/$name.txt" 2>&1
   rc=$?
+  # A test step that collected nothing has not passed: a filter that matches no test prints
+  # "running 0 tests" and exits 0. The same check as bench/d246/run.sh's, fire-checked there with a
+  # stub cargo on PATH. Cargo's own rc is kept on its own line before it is overridden.
+  if [ "$3" = cargo ] && [ "$4" = test ] && grep -q '^running 0 tests' "$OUT/$name.txt"; then
+    echo "# cargo rc=$rc" >> "$OUT/$name.txt"
+    echo "# REFUSED: this step collected zero tests" >> "$OUT/$name.txt"
+    rc=97
+  fi
   echo "rc=$rc" >> "$OUT/$name.txt"
 }
 
