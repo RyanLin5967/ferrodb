@@ -22,7 +22,7 @@ use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
+use ferrodb::wal::recovery::{rebuild_indexes, recover};
 use ferrodb::wal::txn::TxnManager;
 
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
@@ -63,12 +63,23 @@ fn main() {
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
-    recover(&txn).unwrap();
-    let catalog = if existed {
+    let recovered = recover(&txn).unwrap();
+    let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
     } else {
         Catalog::create(bp.clone()).unwrap()
     };
+    // **D202 — the trees are rebuilt from the recovered heap, as `cli::run_cli` does.** Index pages
+    // are not logged, and `recover` redoes and undoes heap records only. So without this, a row
+    // committed after the last checkpoint came back in the heap but not in its primary index: a
+    // lookup by key missed it, and an INSERT of its key was admitted as a second live row. An entry
+    // for a row that recovery rolled back survived the same way. This had been missing since D9.
+    // Before the arena below, for the reason given there: the rebuild allocates pages.
+    // `tests/pgserver_crash_rebuilds_indexes.rs`.
+    if recovered {
+        rebuild_indexes(&mut catalog, &bp).unwrap();
+        txn.checkpoint().unwrap();
+    }
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
     // Readiness, not a guess: the test reads this line rather than sleeping.

@@ -1,6 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
 
-use crate::catalog::column::DataType;
+use crate::catalog::column::{DataType, Value};
+use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
@@ -105,6 +106,38 @@ pub struct TxnManager {
     /// Held here rather than written when it is bound, and that is the whole correctness property.
     /// See [`TxnManager::bind_run`].
     run_bindings: Mutex<HashMap<u64, RunEntity>>,
+    /// Open transaction -> every primary-index entry it moved, oldest first. D202.
+    ///
+    /// Index pages are not logged, so the heap undo in [`TxnManager::abort`] cannot reach them,
+    /// and a rolled-back write used to leave its key pointing at the slot `undo_insert` freed.
+    /// Every later read of the key then failed with `SlotDeleted`, and so did every INSERT of it.
+    /// See [`PrimaryWrite`] for what is recorded, and `abort` for how it is undone.
+    ///
+    /// In memory, beside `run_bindings` and for the same reason: it dies with the process, and so
+    /// does every tree it could repair. After a crash, the trees are rebuilt from the recovered heap
+    /// (`wal::recovery::rebuild_indexes`), which is correct whatever this held.
+    index_undo: Mutex<HashMap<u64, Vec<PrimaryWrite>>>,
+}
+
+/// One primary-index write, as a transaction's abort must undo it. D202.
+///
+/// `prev` is what the entry held before the write: `None` for a key that was absent, `Some(rid)`
+/// for an entry that was repointed (a relocated UPDATE, or a reused key whose new row relocated).
+/// So undo is "remove the key" or "point it back at `rid`".
+///
+/// Only writes that MOVE an entry are recorded. An in-place UPDATE, a DELETE and an in-place reuse
+/// write no index entry, so a rollback of them has nothing in a tree to take back
+/// (`tests/rollback_index_undo.rs::a_rollback_leaves_every_committed_key_where_it_was`).
+///
+/// The tree is held by its shared root cell, not by a page id, so a split during the transaction
+/// cannot leave this pointing at a stale root. The cell cannot be retired under an open
+/// transaction: DROP and ALTER refuse while any transaction is active (`ddl_checkpointed`,
+/// `Catalog::alter_table`), and `Catalog::sync_root_cells` keeps the existing cell for a live
+/// table (`or_insert_with`).
+pub struct PrimaryWrite {
+    pub root: Arc<AtomicU32>,
+    pub key: Value,
+    pub prev: Option<RecordId>,
 }
 
 /// A retained DDL record, replayed into the log after every checkpoint.
@@ -231,7 +264,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -618,6 +651,10 @@ impl TxnManager {
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
+        // D202: committed, so nothing may ever undo these writes. Dropped here and not left for
+        // a later abort to find: transaction ids restart from the log header after a restart, and
+        // a stale list under a reissued id would repoint or remove a committed key.
+        self.index_undo.lock().unwrap().remove(&txn_id);
         // **F4: the automatic checkpoint is a node-local decision, and on a cluster it is wrong.**
         //
         // `consensus::Command::Checkpoint` exists for this and says why in its own words:
@@ -654,6 +691,14 @@ impl TxnManager {
         {
             self.att_write().get_mut(&txn_id).unwrap().status = TxnStatus::Aborting;
         }
+        // D202: the index before the heap. For the common case, a rolled-back INSERT of a new
+        // key, this removes the key while its slot still holds the (uncommitted, invisible) row,
+        // so a lock-free reader sees "no such key" rather than a key pointing at a freed slot.
+        // A relocated write has a window either way round: the entry and the slot it names are
+        // two page writes. Its error is kept until the heap undo below has run, because a
+        // transaction whose heap undo was skipped is worse than one whose index undo failed.
+        let writes = self.index_undo.lock().unwrap().remove(&txn_id).unwrap_or_default();
+        let index_undone = self.undo_primary_writes(writes);
         let mut lsn = {
             self.att_read().get(&txn_id).unwrap().last_lsn.load(Ordering::Acquire)
         };
@@ -702,7 +747,53 @@ impl TxnManager {
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
         self.run_bindings.lock().unwrap().remove(&txn_id);
-        Ok(())
+        index_undone
+    }
+
+    /// Record that `txn_id` is about to move the primary-index entry for `key` away from `prev`.
+    /// D202; see [`PrimaryWrite`].
+    ///
+    /// Called BEFORE the write, so an abort that follows a half-finished write still restores
+    /// `prev`. Undoing a write that never happened is harmless: it puts back what is already
+    /// there, or removes a key that is not there.
+    pub fn record_primary_write(&self, txn_id: u64, root: Arc<AtomicU32>, key: Value, prev: Option<RecordId>) {
+        self.index_undo
+            .lock()
+            .unwrap()
+            .entry(txn_id)
+            .or_default()
+            .push(PrimaryWrite { root, key, prev });
+    }
+
+    /// Undo `writes` newest first, so a key moved twice in one transaction ends where it started.
+    ///
+    /// Unconditional: it does not check that the entry still holds what this transaction wrote.
+    /// Nobody else can have moved it. While the row is uncommitted, another INSERT of the key is
+    /// refused (the head is not deleted-for-them), and another UPDATE or DELETE of it is refused
+    /// by `check_write_conflict` (the head's `begin_ts` is not committed for them). A check here
+    /// could not be made to fire, and an unfireable guard is one no test can hold to account.
+    ///
+    /// Every write is attempted even if one fails, and the first error is returned.
+    fn undo_primary_writes(&self, writes: Vec<PrimaryWrite>) -> Result<(), FerroError> {
+        let mut first_err = None;
+        for w in writes.into_iter().rev() {
+            let tree = BPlusTreeManager::<Value, RecordId>::open_shared(w.root, self.bp.clone());
+            let undone = match w.prev {
+                // Replacing a present key never grows the leaf, so this cannot split and move the root.
+                Some(rid) => tree.upsert(w.key, rid),
+                // A net removal, which nothing did before D202. `delete` never rebalances
+                // (`handle_underflow` has no caller) and the descent already walks past an
+                // empty leaf, so it leaves a sparse leaf and nothing worse.
+                None => match tree.delete(&w.key) {
+                    Err(FerroError::KeyNotFound) => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(e) = undone {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Remember a schema change and write it to the log.
@@ -1826,5 +1917,50 @@ use super::*;
         assert!(view.visible(&h(5, 12)));
         assert!(view.visible(&h(5, 7)));
         assert!(!view.visible(&h(5, 10)));
+    }
+
+    /// **D202 — abort takes back the primary-index writes a transaction recorded, and commit
+    /// forgets them.**
+    ///
+    /// The SQL tests in `tests/rollback_index_undo.rs` see only the outcome. Three things here have
+    /// no SQL shape: undo runs newest first (a key moved twice must end where it STARTED, not at
+    /// its middle position), a new key is removed rather than left pointing anywhere, and a
+    /// committed list is dropped. That last one matters because transaction ids restart from the
+    /// log header after a restart, so a list kept under a reissued id would undo committed work.
+    #[test]
+    fn abort_undoes_recorded_primary_writes_newest_first_and_commit_forgets_them() {
+        use crate::catalog::column::Value;
+        use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
+
+        let (bp, _wal, txn, _dir) = setup();
+        let tree = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap();
+        let (a, b, c) = (RecordId::new(40, 1), RecordId::new(41, 2), RecordId::new(42, 3));
+        tree.insert(Value::Integer(7), a).unwrap();
+
+        let t = txn.begin().unwrap();
+        txn.record_primary_write(t, tree.root_cell(), Value::Integer(5), None);
+        tree.upsert(Value::Integer(5), c).unwrap();
+        txn.record_primary_write(t, tree.root_cell(), Value::Integer(7), Some(a));
+        tree.upsert(Value::Integer(7), b).unwrap();
+        txn.record_primary_write(t, tree.root_cell(), Value::Integer(7), Some(b));
+        tree.upsert(Value::Integer(7), c).unwrap();
+        txn.abort(t).unwrap();
+        assert_eq!(tree.search(&Value::Integer(5)).unwrap(), None, "a key the rollback added survived it");
+        assert_eq!(
+            tree.search(&Value::Integer(7)).unwrap(),
+            Some(a),
+            "a key moved twice did not end where it started (undo ran oldest first, or not at all)"
+        );
+        assert!(txn.index_undo.lock().unwrap().get(&t).is_none(), "an aborted transaction's list outlived it");
+
+        let u = txn.begin().unwrap();
+        txn.record_primary_write(u, tree.root_cell(), Value::Integer(6), None);
+        tree.upsert(Value::Integer(6), b).unwrap();
+        txn.commit(u).unwrap();
+        assert_eq!(tree.search(&Value::Integer(6)).unwrap(), Some(b), "a committed write was undone");
+        assert!(
+            txn.index_undo.lock().unwrap().get(&u).is_none(),
+            "a committed transaction's list was kept; an abort under a reissued id would undo committed work"
+        );
     }
 }
