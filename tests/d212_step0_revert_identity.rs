@@ -185,7 +185,7 @@ fn plan(out: Outcome) -> RevertPlan {
 /// **The ledger's red test: merge, reopen, merge, and `REVERT MERGE m_1` must not touch the second
 /// merge.**
 ///
-/// RED at the base, at `assert_ne!(second.merge_id, "m_1")`: the post-restart merge is named `m_1`
+/// RED at the base, at `assert_ne!(second.merge_id, first.merge_id)`: the post-restart merge is `m_1`
 /// again. The assertions after it are what that reuse would have cost — `REVERT MERGE m_1` reverting
 /// the post-restart merge, row 2 back to 20 — and they are not reached at the base.
 ///
@@ -203,7 +203,6 @@ fn a_merge_id_from_before_a_restart_never_names_a_merge_made_after_it() {
     db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut a);
     let first = db.merge(&mut a);
     assert!(first.applied_to_target, "the pre-restart merge did not land: {first}");
-    assert_eq!(first.merge_id, "m_1", "the fixture assumes a fresh database's first id");
 
     // A session holds the runtime; it goes first, or the old runtime outlives the "restart".
     drop(a);
@@ -215,12 +214,12 @@ fn a_merge_id_from_before_a_restart_never_names_a_merge_made_after_it() {
     assert!(second.applied_to_target, "the post-restart merge did not land: {second}");
     assert_eq!(db.qty_of(2), 22);
     assert_ne!(
-        second.merge_id, "m_1",
+        second.merge_id, first.merge_id,
         "the post-restart merge was issued the id an earlier run already handed out"
     );
 
     let mut main = db.session();
-    match db.exec("REVERT MERGE m_1;", &mut main) {
+    match db.exec(&format!("REVERT MERGE {};", first.merge_id), &mut main) {
         // Step 0: refused, and refused for the reason that is TRUE.
         Err(e) => {
             let msg = e.to_string();
@@ -229,10 +228,10 @@ fn a_merge_id_from_before_a_restart_never_names_a_merge_made_after_it() {
         // Option (a): the pre-restart merge is revertible, so this is ITS revert.
         Ok(out) => {
             let p = plan(out);
-            assert_ne!(p.target, b_txn, "REVERT MERGE m_1 planned the post-restart merge's txn");
+            assert_ne!(p.target, b_txn, "REVERT of the first id planned the post-restart merge's txn");
         }
     }
-    assert_eq!(db.qty_of(2), 22, "REVERT MERGE m_1 reverted the merge made after the restart");
+    assert_eq!(db.qty_of(2), 22, "REVERT of the first id reverted the merge made after the restart");
 }
 
 /// **An id an earlier run issued and never published is refused as an earlier run's**, which is a
@@ -252,7 +251,7 @@ fn an_unpublished_id_from_an_earlier_run_is_refused_as_that_runs() {
     db.seed(&[(1, 10)]);
 
     // Two agents assign the same cell. The first merge lands as m_1; the second conflicts under
-    // the default REJECT policy, publishes nothing, and is still handed an id: m_2.
+    // the default REJECT policy, publishes nothing, and is still handed an id.
     let (mut x, _) = db.agent("x");
     db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut x);
     let (mut y, _) = db.agent("y");
@@ -261,18 +260,17 @@ fn an_unpublished_id_from_an_earlier_run_is_refused_as_that_runs() {
     assert!(landed.applied_to_target, "{landed}");
     let refused = db.merge(&mut y);
     assert!(!refused.applied_to_target, "the fixture needs a merge that publishes nothing: {refused}");
-    assert_eq!(refused.merge_id, "m_2", "the fixture assumes the conflict took the second id");
     assert_eq!(db.qty_of(1), 11);
 
     drop((x, y));
     let mut db = db.restart();
     let mut main = db.session();
 
-    let msg = match db.exec("REVERT MERGE m_2;", &mut main) {
+    let msg = match db.exec(&format!("REVERT MERGE {};", refused.merge_id), &mut main) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("REVERT MERGE m_2 returned a plan for a merge that published nothing"),
+        Ok(_) => panic!("REVERT of the conflict's id returned a plan for a merge that published nothing"),
     };
-    assert!(msg.contains("m_2"), "the refusal does not name the id: {msg}");
+    assert!(msg.contains(&refused.merge_id), "the refusal does not name the id: {msg}");
     assert!(
         msg.contains("earlier server run"),
         "an id an earlier run issued was refused without saying so: {msg}"
