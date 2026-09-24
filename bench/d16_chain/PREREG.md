@@ -460,3 +460,28 @@ the extra check prints G7 again, and at baseline it reads 0.
   unchanged.
 - **Output and exit codes.** Build logs are saved next to the run's output. An interrupted run exits
   3, distinct from 1 (differed) and 2 (could not run).
+
+---
+
+## Amendment 4 — 2026-09-24, after a third fresh-context review of the script; before the change
+
+Still nothing compiled or run. The review (of `203e3f5..489bc0d`) found no path by which the script
+reports success without having run what is registered. Changes:
+
+- **A3.4's "the two baselines must be identical" was a check that cannot fire, and its claim was
+  false.** A baseline passes only if all 9 cells MATCH, and MATCH means every measured value equals
+  a prediction that depends only on (arm, D, P). Slots, sha and build flag are pinned exactly too.
+  Two passing baselines therefore print identical lines by construction, and "each matching the
+  registration on its own is not enough" is wrong for this harness. **The check is removed** rather
+  than kept as a guard that can never fire. The second baseline still has to pass on its own.
+- **Restore blocks SIGTERM and SIGHUP instead of ignoring them.** An ignored signal is lost, so a
+  `timeout` landing during a restore would let the run continue unseen. A blocked one is delivered
+  when the write finishes, and the run exits 3.
+- **Restore is atomic.** It writes a sibling file (not `*.rs`), then `os.replace`s it over the
+  original. If the file no longer holds the bytes the script wrote, another writer changed it during
+  the run: those bytes are saved to the run directory as evidence before the restore, and the run
+  stops with exit 2.
+- **Exit codes.** SIGINT also exits 3. A restore that does not match HEAD exits 2 even when a signal
+  caused it, because that is the condition the operator must act on. A failed `git grep` for the
+  D200 marker refuses (exit 2) instead of reading as "absent". Every `VALUES` key must name a mutant,
+  or the script refuses. HEAD and the tree are re-checked before the final baseline build too.
