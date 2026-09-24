@@ -3722,6 +3722,8 @@ impl AgentRuntime {
         Ok(Some(HistoryRecord {
             hseq: cursor.last_hseq + 1,
             ordinal: cursor.last_ordinal + 1,
+            // Stamped by `TxnManager::commit` once the `Commit` record has an LSN.
+            commit_lsn: 0,
             body: revert_store::encode_publish(&record)?,
         }))
     }
@@ -6346,6 +6348,7 @@ impl AgentRuntime {
                 Some(c) if c.store.is_some() => Some(HistoryRecord {
                     hseq: c.last_hseq + 1,
                     ordinal: 0,
+                    commit_lsn: 0,
                     body: revert_store::encode_reverted(merge_id, &undone)?,
                 }),
                 _ => None,

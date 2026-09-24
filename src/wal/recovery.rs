@@ -114,14 +114,17 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // not already hold its `hseq`, wherever that falls (AMENDED 2, F9). The next checkpoint (the CLI
     // takes one right after this) writes them. With no store attached they are counted instead, and
     // no checkpoint truncates the log while that count stands (F5).
-    let committed: HashSet<u64> =
-        records.iter().filter(|r| matches!(r.kind, RecKind::Commit)).map(|r| r.txn_id).collect();
-    let parts: Vec<(u64, u64, u64, u32, bool, Vec<u8>)> = records
+    // txn -> its `Commit` record's LSN, which each of its history records carries (AMENDED 3, item 2).
+    let committed: HashMap<u64, u64> = records
         .iter()
-        .filter(|r| committed.contains(&r.txn_id))
-        .filter_map(|r| match &r.kind {
-            RecKind::RevertHistory { hseq, ordinal, part, last, bytes } => {
-                Some((r.txn_id, *hseq, *ordinal, *part, *last, bytes.clone()))
+        .filter(|r| matches!(r.kind, RecKind::Commit))
+        .map(|r| (r.txn_id, r.lsn))
+        .collect();
+    let parts: Vec<(u64, u64, u64, u64, u32, bool, Vec<u8>)> = records
+        .iter()
+        .filter_map(|r| match (&r.kind, committed.get(&r.txn_id)) {
+            (RecKind::RevertHistory { hseq, ordinal, part, last, bytes }, Some(commit_lsn)) => {
+                Some((r.txn_id, *commit_lsn, *hseq, *ordinal, *part, *last, bytes.clone()))
             }
             _ => None,
         })
