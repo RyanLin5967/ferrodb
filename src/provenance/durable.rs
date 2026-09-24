@@ -783,7 +783,15 @@ impl ProvenanceStore for DurableProvenanceStore {
     /// pending records are physical stamps. Nothing pending is not a write — no sync, and no
     /// refusal even from a poisoned store.
     fn flush(&self) -> Result<(), FerroError> {
-        let mut file = self.file.lock().unwrap();
+        // Not `unwrap`, unlike every other write path: this one is called from two `Drop`s, and a
+        // panic inside a drop that runs during unwinding aborts the process. A lock poisoned by a
+        // panicking writer is refused like a poisoned store.
+        let mut file = self.file.lock().map_err(|_| {
+            FerroError::Provenance(format!(
+                "{}: the provenance lock was poisoned by a panicking writer; refusing to flush",
+                self.path.display()
+            ))
+        })?;
         if file.pending.is_empty() {
             return Ok(());
         }
@@ -890,11 +898,9 @@ impl Drop for DurableProvenanceStore {
     /// and dropping it silently would lose attribution the process had already reported. A failure
     /// here cannot be returned, and there is no later write for the poison flag to protect.
     fn drop(&mut self) {
-        // A lock poisoned by a panicking writer is not flushed through: `flush` would panic on it,
-        // and a panic inside a drop that runs during unwinding aborts the process.
-        if !self.file.is_poisoned() {
-            let _ = self.flush();
-        }
+        // `flush` refuses a poisoned lock rather than panicking on it, so this cannot abort an
+        // unwinding process.
+        let _ = self.flush();
     }
 }
 
@@ -1485,6 +1491,44 @@ mod tests {
         let s = DurableProvenanceStore::open(&path).unwrap();
         assert_eq!(s.recovery().stamps, 2, "dropping the store lost its pending stamps");
         assert_eq!(s.attribute(rid(4, 1)).unwrap(), id);
+    }
+
+    /// A poisoned store refuses a pending stamp, AT the stamp: queueing it would put a record in
+    /// the index that no later write can ever carry to the file.
+    #[test]
+    fn a_poisoned_store_refuses_a_pending_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DurableProvenanceStore::open(dir.path().join("prov.log")).unwrap();
+        let id = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp_pending(rid(6, 0), id).expect("a healthy store refused a pending stamp");
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(1, 1, id).is_err(), "the injected failure was swallowed");
+        let err = s.stamp_pending(rid(6, 1), id).expect_err("a poisoned store queued a stamp");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+        assert_eq!(
+            s.attribute(rid(6, 1)).unwrap(),
+            ProvId::NONE,
+            "the refused stamp reached the index"
+        );
+    }
+
+    /// A flush with nothing pending is not a write: it succeeds even on a poisoned store, as an
+    /// empty batch does. With something pending, a poisoned store refuses it.
+    #[test]
+    fn an_empty_flush_is_not_a_write_even_on_a_poisoned_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DurableProvenanceStore::open(dir.path().join("prov.log")).unwrap();
+        let id = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp_pending(rid(7, 0), id).unwrap();
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.flush().is_err(), "the injected failure was swallowed");
+        let err = s.flush().expect_err("a poisoned store flushed its pending stamps");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+        let empty = DurableProvenanceStore::open(dir.path().join("empty.log")).unwrap();
+        empty.intern(&run("restock", "run-1")).unwrap();
+        empty.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(empty.stamp_row(1, 1, id).is_err());
+        empty.flush().expect("a poisoned store refused a flush with nothing pending");
     }
 
     /// A batch naming a run this store never interned attributes none of its rows, writes nothing,

@@ -4,20 +4,26 @@
 //! the executors stamp every version the publish loop writes, and `record_applied` records which
 //! run published each row. Against the durable store every one of those calls used to sync, so a
 //! merge of δ rows paid on the order of 2δ fsyncs while every other statement waited on the catalog
-//! lock it holds.
+//! lock it holds. Now it pays ONE, whatever δ is — or TWO if it alters a table, because the schema
+//! phase is a durability point of its own (see [`ProvenanceFlush::flush_so_far`]).
 //!
 //! [`ProvenanceFlush`] is what the merge holds instead. The code that stamps through the trait —
 //! the executors and the rewrite, neither of which knows it is inside a merge — is handed
 //! [`ProvenanceFlush::stamper`], whose `stamp` is `stamp_pending`: applied to the index at once,
-//! with every guard, and written later. The merge's first durable write after that (its row
-//! authorship) carries every pending stamp ahead of its own records in one append and one sync, and
-//! [`ProvenanceFlush::flush`] covers a merge with no row to attribute.
+//! with every guard, and written later. The rewrite's stamps are written by
+//! [`ProvenanceFlush::flush_so_far`] just before the heap flush that makes the rewrite durable; the
+//! publish loop's ride the merge's final durable write (its row authorship), which carries every
+//! pending stamp ahead of its own records in one append and one sync; [`ProvenanceFlush::flush`]
+//! covers anything left.
 //!
 //! **The guard exists for the exits nobody writes a flush on.** A merge that fails half way has
 //! already applied its stamps to the index, exactly as it had already synced them before D219; the
-//! guard's `Drop` writes them on the early return, so the index and the file still agree and no
-//! record outlives the statement unwritten. This is `ForkDurability`'s shape
-//! (`agent_sql/session.rs`): the durability debt is an object, so every `?` discharges it.
+//! guard's `Drop` writes them on the early return, so the index and the file still agree. This is
+//! `ForkDurability`'s shape (`agent_sql/session.rs`): the durability debt is an object, so every `?`
+//! discharges it. **The one exit it cannot cover is a store already poisoned** by a failed append:
+//! a poisoned store refuses every write, flushes included, so that merge's stamps stay in the index
+//! and never reach the file — the state the poison flag exists to stop from growing, and the same
+//! one any failed append leaves.
 //!
 //! # Crash semantics, before and after
 //!
@@ -31,23 +37,28 @@
 //! * A crash between the commit and the authorship sync: the rows and every physical stamp are
 //!   durable; row authorship is a prefix of the merge's records.
 //!
-//! **After:** nothing reaches the file until the one append after the commit.
+//! **After:** the rewrite's stamps are written in one sync just BEFORE the heap flush that makes the
+//! rewrite durable, so they are still durable no later than the rewrite. The publish loop's stamps
+//! and the row authorship reach the file only in the one append after the commit.
 //!
-//! * A crash before the commit: the file holds nothing from this merge, so the stale-stamp case is
-//!   gone.
-//! * A crash between the commit and the one sync: the rows are durable, and the file holds a
-//!   PREFIX of `[rewrite stamps, publish stamps, row authorship]`, possibly empty, because the
-//!   reader stops at the first frame whose length or CRC fails. So a committed version CAN now
-//!   reopen physically unattributed, which it could not before, and a re-published row reopens
-//!   under its previous author, as before. A row the rewrite moved is in the same case: its heap
-//!   move is durable before its stamp is.
-//! * Once the sync returns, everything is durable, and the MERGE returns only after it (the
+//! * A crash before the commit: the file holds the rewrite's stamps (if the merge altered a table)
+//!   and nothing from the publish, so the stale-stamp case for a rolled-back publish is gone.
+//! * A crash between the commit and the final sync: the rows are durable, and the file holds a
+//!   PREFIX of `[publish stamps, row authorship]`, possibly empty, because the reader stops at the
+//!   first frame whose length or CRC fails. So a committed version CAN now reopen physically
+//!   unattributed, which it could not before; a re-published row reopens under its previous author,
+//!   as it already could after `871846a` batched the authorship (the window for that is unchanged
+//!   at one sync; for physical stamps it is new).
+//! * Once the final sync returns, everything is durable, and the MERGE returns only after it (the
 //!   explicit flush on success, `Drop` on every other exit). The durability point did not move past
 //!   the acknowledgement.
 //!
-//! Neither shape is atomic per merge. The window in which a committed merge's provenance can be
-//! missing went from "until the last of δ syncs" to one sync; closing it entirely needs the
-//! provenance carried by the WAL commit itself, which is a format decision and not this change.
+//! "Nothing reaches the file until" holds for the SQL shapes, where the catalog lock serialises
+//! every provenance writer. Through the embedded API another thread's durable write can carry this
+//! merge's pending stamps EARLIER — never later, and never out of index order.
+//!
+//! Neither shape is atomic per merge; closing the window entirely needs the provenance carried by
+//! the WAL commit itself, which is a format decision and not this change.
 
 use std::sync::Arc;
 
@@ -73,6 +84,16 @@ impl ProvenanceFlush {
     /// underlying store's `stamp_pending`; every other call passes straight through.
     pub fn stamper(&self) -> &Arc<dyn ProvenanceStore> {
         &self.stamper
+    }
+
+    /// Make everything pending SO FAR durable now, and keep the guard armed for what follows.
+    ///
+    /// For a durability point inside the statement. A MERGE that alters a table makes its heap
+    /// rewrite durable before the publish begins, so the stamps that rewrite wrote are made durable
+    /// here first; a crash in the publish then cannot leave the ALTER applied and its moved rows
+    /// unattributed. Nothing pending is not a write: no sync.
+    pub fn flush_so_far(&self) -> Result<(), FerroError> {
+        self.store.flush()
     }
 
     /// Make everything pending durable now, reporting a failure. Call it before acknowledging the

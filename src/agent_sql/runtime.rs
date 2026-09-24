@@ -5019,13 +5019,13 @@ impl AgentRuntime {
         // this row. What IS closed, below, is the change feed — it never carries half of a
         // multi-table merge.
         //
-        // **D219 — every provenance record this merge writes is made durable by ONE sync.** The
+        // **D219 — this merge's provenance is made durable by one sync per durability point.** The
         // rewrite below re-stamps the rows it moves and the publish loop stamps every version it
         // writes, both through `prov`, which is the guard's stamper: applied to the index at once
-        // with every guard, and written later. `record_applied`'s row authorship is the merge's one
-        // durable write and carries all of them ahead of its own records; `provenance.flush()`
-        // after it covers a merge with no row to attribute, and the guard's `Drop` covers every
-        // early return, so nothing this merge stamped outlives the statement unwritten.
+        // with every guard, and written later. The rewrite's stamps are written just before the
+        // schema phase's own flush (below); the publish loop's ride `record_applied`'s row
+        // authorship, the merge's final durable write. `provenance.flush()` after it covers
+        // anything left, and the guard's `Drop` covers every early return.
         let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
         let prov = Arc::clone(provenance.stamper());
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
@@ -5126,6 +5126,14 @@ impl AgentRuntime {
         // X's new column and no word about table Y, permanently and with no later record to
         // reconcile it against.
         if !records.is_empty() {
+            // **D219 — the rewrite's stamps are durable no later than the rewrite.** The flush
+            // below makes the schema phase durable on its own, before the publish begins and
+            // whether or not it ever commits, so the stamps the rewrite wrote for the rows it moved
+            // are written first (one sync, however many rows and tables). Left for the merge's
+            // final sync, a crash anywhere in the publish would reopen with the ALTER applied and
+            // every moved row unattributed, for good. So a merge that alters a table syncs the
+            // provenance file twice — once per durability point — and every other merge once.
+            provenance.flush_so_far()?;
             ctx.bp.flush_all()?;
             ctx.bp.disk_manager.sync()?;
             for record in records {
