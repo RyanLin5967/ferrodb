@@ -208,6 +208,19 @@ impl Catalog {
         self.get_table(name).ok_or_else(|| self.unknown_table(name))
     }
 
+    /// Free an index tree whose backfill failed, and return the failure. D225.
+    ///
+    /// The tree is not in the catalog yet, so nothing else can hold a handle on it. If freeing it
+    /// fails too, both are reported, with the backfill's failure first because it is the cause.
+    fn abandon_backfill(tree: &BPlusTreeManager<(Value, Value), ()>, failure: FerroError) -> FerroError {
+        match tree.free_all() {
+            Ok(()) => failure,
+            Err(e) => FerroError::Internal(format!(
+                "{failure}; and freeing the half-built index tree failed too, leaking its pages: {e}"
+            )),
+        }
+    }
+
     // create a secondary B+ tree, push an IndexInfo onto the table, persist
     pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
         let (schema, first_dir_page_id, col_index) = {
@@ -234,12 +247,21 @@ impl Catalog {
         let new_root_id = sec_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        for item in hfm.scan() {
-            let (_, tuple) = item?;
-            let values = tuple.deserialize(&schema)?;
-            let sec_value = values[col_index].clone();
-            let primary_key = values[0].clone();   // first column = primary key
-            sec_tree.insert((sec_value, primary_key), ())?;
+        let backfill = (|| -> Result<(), FerroError> {
+            for item in hfm.scan() {
+                let (_, tuple) = item?;
+                let values = tuple.deserialize(&schema)?;
+                let sec_value = values[col_index].clone();
+                let primary_key = values[0].clone();   // first column = primary key
+                sec_tree.insert((sec_value, primary_key), ())?;
+            }
+            Ok(())
+        })();
+        // D225: a backfill that fails leaves a half-built tree nothing will ever name, and a row
+        // too wide for an index entry (legal in an unindexed VARCHAR column) now fails it by name,
+        // every time it is retried. Free the tree rather than leak one per attempt.
+        if let Err(e) = backfill {
+            return Err(Self::abandon_backfill(&sec_tree, e));
         }
 
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
@@ -304,13 +326,20 @@ impl Catalog {
         let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        for item in hfm.scan() {
-            let (_, tuple) = item?;
-            let values = tuple.deserialize(&schema)?;
-            let primary_key = values[0].clone();   // first column = primary key
-            if let Some(text) = indexed_text(&values[col_index])? {
-                post_tokens(&ft_tree, text, &primary_key)?;
+        let backfill = (|| -> Result<(), FerroError> {
+            for item in hfm.scan() {
+                let (_, tuple) = item?;
+                let values = tuple.deserialize(&schema)?;
+                let primary_key = values[0].clone();   // first column = primary key
+                if let Some(text) = indexed_text(&values[col_index])? {
+                    post_tokens(&ft_tree, text, &primary_key)?;
+                }
             }
+            Ok(())
+        })();
+        // D225: as in `create_index`, a failed backfill frees its half-built tree.
+        if let Err(e) = backfill {
+            return Err(Self::abandon_backfill(&ft_tree, e));
         }
 
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;

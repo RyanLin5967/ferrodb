@@ -70,28 +70,23 @@ impl Modify for Update {
             };
             res.push((rid, values));
         }
-        let mut count = 0;
+        // **D225 — every row's new values, and the entry bound over every index entry they will
+        // add, BEFORE the first row is written.**
+        //
+        // Each tree refuses an entry over `MAX_ENTRY_BYTES` by name, but it would refuse after the
+        // heap update, and an abort undoes only the heap: a row the heap moved would keep a primary
+        // entry pointing at a deleted slot (`execution::insert` gives the same argument). Asking
+        // per row inside the write loop is not enough either, because a later row's refusal lands
+        // after the earlier rows are written. So all of them are asked first, here, for exactly
+        // the entries the loop below will add: a changed secondary value, and the tokens of
+        // changed text. The assignments are evaluated here too, still once per row.
+        let mut planned = Vec::with_capacity(res.len());
         for (rid, old_values) in res {
-            let head_h = self.heap.read(rid)?.version_header()?;
-            check_write_conflict(&self.view, &head_h)?;
             let mut new_values = old_values.clone();
             for (col_idx, expr) in &self.assignments {
                 new_values[*col_idx] = evaluate(expr, &old_values)?;
             }
-            
-            for (i, col) in self.schema.columns.iter().enumerate() {
-                if !col.nullable && matches!(new_values[i], Value::Null) {
-                    return Err(FerroError::Constraint(format!(
-                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
-                        col.name, self.table
-                    )))
-                }
-            }
-            let pk = old_values[0].clone();
-            // **D225 — refuse a new index entry over `MAX_ENTRY_BYTES` before this row is written**,
-            // for the reason `execution::insert` gives: the tree would refuse it only after the
-            // heap update, and an abort does not undo the primary index. Only entries the writes
-            // below will make: a changed secondary value, and the tokens of changed text.
+            let pk = &old_values[0];
             for handle in &self.secondary_indexes {
                 let new_v = &new_values[handle.col_index];
                 if &old_values[handle.col_index] != new_v {
@@ -103,11 +98,27 @@ impl Modify for Update {
                 if indexed_text(&old_values[ft.col_index])? != new_text {
                     if let Some(text) = new_text {
                         for token in distinct_tokens(text) {
-                            admit_entry(&posting_key(&token, &pk), &())?;
+                            admit_entry(&posting_key(&token, pk), &())?;
                         }
                     }
                 }
             }
+            planned.push((rid, old_values, new_values));
+        }
+        let mut count = 0;
+        for (rid, old_values, new_values) in planned {
+            let head_h = self.heap.read(rid)?.version_header()?;
+            check_write_conflict(&self.view, &head_h)?;
+
+            for (i, col) in self.schema.columns.iter().enumerate() {
+                if !col.nullable && matches!(new_values[i], Value::Null) {
+                    return Err(FerroError::Constraint(format!(
+                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
+                        col.name, self.table
+                    )))
+                }
+            }
+            let pk = old_values[0].clone();
             let mut old_ver = self.heap.read(rid)?;
             old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
             let mut tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;

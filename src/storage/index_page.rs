@@ -75,10 +75,17 @@ const LEAF_HEADER_SIZE: usize = 27;
 /// `(C + k + 4) - C + 4 = k + 8` bytes: under `C` for any `k` a leaf admits. A new root is one
 /// key and two pointers, `k + 8` again.
 ///
-/// **What the bound does not cover:** a leaf an earlier build left at exactly `B` bytes (the count
-/// split could), holding an entry over this bound. There the insert is refused by name, because
-/// [`BPlusTreeLeafPage::split_point`] finds no cut, rather than a page being written that the next
-/// read cannot parse.
+/// **What the bound does not cover: data an earlier build wrote.** Its count split admitted any
+/// entry that happened to fit, so a database can hold entries over this bound, and each place
+/// that meets one refuses by name rather than guessing:
+///
+/// - a leaf left at exactly `B` bytes around such an entry, where [`BPlusTreeLeafPage::split_point`]
+///   can find no cut: the insert that needs the split is refused;
+/// - a heap row whose entry is over the bound, met by the crash-recovery rebuild: refused before
+///   any tree is freed (`wal::recovery`), and the database does not open until that row is
+///   shortened or deleted with the build that wrote it;
+/// - a branch whose stored capability envelope is over the bound: every rewrite of its record is
+///   refused (`TableBranchCatalog::write_record`).
 pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
 
 /// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry

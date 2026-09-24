@@ -39,9 +39,12 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::heap_file_manager::HeapFileManager;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::index_page::{BPlusTreePage, BTreeSerialize};
+use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::WalManager;
+use ferrodb::wal::recovery::rebuild_indexes;
 use ferrodb::wal::txn::TxnManager;
 
 /// A secondary index and a posting tree are both this.
@@ -426,4 +429,106 @@ fn an_update_to_a_value_over_the_entry_bound_is_refused_and_the_row_keeps_its_va
     let at = "z".repeat(2026);
     d.sql(&format!("UPDATE t SET v = '{at}' WHERE id = 1;"));
     assert_eq!(d.ids(&format!("SELECT id FROM t WHERE v = '{at}';")), vec![1]);
+}
+
+/// **A multi-row UPDATE is refused before its FIRST row is written, not at the row that fails.**
+///
+/// Two rows under VARCHAR primary keys of different lengths, set to one 2020-character value.
+/// Row `'a'` makes (3 + 2020) + (3 + 1) = 2027 bytes of entry, admitted; the 20-character key
+/// makes (3 + 2020) + (3 + 20) = 2046, refused. Asked row by row inside the write loop, row `'a'`
+/// would already be written when row two is refused, and the abort undoes only the heap. Two
+/// 1300-character filler rows share their heap page, so row `'a'` cannot grow in place: the heap
+/// moves it and its primary entry is repointed before the refusal (INFERRED from
+/// `HeapFileManager::update`, not measured). Both rows must read back unchanged, by value and by
+/// key.
+#[test]
+fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
+    let mut d = db();
+    d.sql("CREATE TABLE u (id VARCHAR(100) NOT NULL, n INTEGER, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iu ON u (v);");
+    let long_key = "k".repeat(20);
+    d.sql("INSERT INTO u VALUES ('a', 1, 'x');");
+    d.sql(&format!("INSERT INTO u VALUES ('{long_key}', 2, 'x');"));
+    d.sql(&format!("INSERT INTO u VALUES ('f1', 10, '{}');", "f".repeat(1300)));
+    d.sql(&format!("INSERT INTO u VALUES ('f2', 11, '{}');", "g".repeat(1300)));
+
+    let e = d.err(&format!("UPDATE u SET v = '{}' WHERE n < 3;", "z".repeat(2020)));
+    assert!(e.contains("index entry too large: 2046 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids("SELECT n FROM u WHERE v = 'x';"), vec![1, 2], "the refused update changed a row");
+    assert_eq!(d.ids("SELECT n FROM u WHERE id = 'a';"), vec![1], "row 'a' is unreachable by its key");
+    assert_eq!(d.ids(&format!("SELECT n FROM u WHERE id = '{long_key}';")), vec![2]);
+}
+
+/// **CREATE INDEX over a row too wide for an index entry is refused by name, registers nothing,
+/// and leaks nothing, however often it is retried.**
+///
+/// An unindexed `VARCHAR(3000)` column may hold 2100 characters; an index on it would need a
+/// (3 + 2100) + 5 = 2108-byte entry. The backfill's half-built tree must be freed on the refusal.
+/// Freed pages are handed out again lowest-first, so if it is, every retry reuses the same pages
+/// and the file's high-water mark stops moving; a leak raises it on every retry. Same for a
+/// full-text index, whose posting `('y' x 255, 'p' x 1800)` is (3 + 255) + (3 + 1800) = 2061
+/// bytes; the row itself is admitted, its primary entry being 3 + 1800 + 6 = 1809.
+#[test]
+fn a_create_index_the_entry_bound_refuses_registers_nothing_and_leaks_nothing() {
+    let mut d = db();
+    d.sql("CREATE TABLE w (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("INSERT INTO w VALUES (1, 'short');");
+    d.sql(&format!("INSERT INTO w VALUES (2, '{}');", "w".repeat(2100)));
+    let e = d.err("CREATE INDEX iw ON w (v);");
+    assert!(e.contains("index entry too large: 2108 bytes"), "not the named refusal: {}", abbreviate(&e));
+    let settled = d.bp.disk_manager.high_water().unwrap();
+    for _ in 0..3 {
+        d.err("CREATE INDEX iw ON w (v);");
+    }
+    assert_eq!(d.bp.disk_manager.high_water().unwrap(), settled, "each refused CREATE INDEX leaked its tree");
+    assert!(d.catalog.get_table("w").unwrap().indexes.is_empty(), "a refused index was registered");
+
+    d.sql("CREATE TABLE f (id VARCHAR(2000) NOT NULL, body VARCHAR(300));");
+    d.sql(&format!("INSERT INTO f VALUES ('{}', '{}');", "p".repeat(1800), "y".repeat(255)));
+    let e = d.err("CREATE FULLTEXT INDEX ff ON f (body);");
+    assert!(e.contains("index entry too large: 2061 bytes"), "not the named refusal: {}", abbreviate(&e));
+    let settled = d.bp.disk_manager.high_water().unwrap();
+    for _ in 0..3 {
+        d.err("CREATE FULLTEXT INDEX ff ON f (body);");
+    }
+    assert_eq!(d.bp.disk_manager.high_water().unwrap(), settled, "each refused full-text index leaked its tree");
+    assert!(d.catalog.get_table("f").unwrap().fulltext_indexes.is_empty(), "a refused full-text index was registered");
+}
+
+/// **A crash-recovery rebuild over a row an earlier build indexed is refused by name before any
+/// tree is freed.**
+///
+/// A build before D225 could store an entry over the bound whenever its count split happened to
+/// fit. This one cannot write such a row through SQL at all, so the row is put in the heap
+/// directly: `(v, id)` would be (3 + 2100) + 5 = 2108 bytes. The rebuild frees each old tree
+/// before refilling it and persists the catalog only at the end, so a refusal part-way would
+/// leave the catalog naming freed pages. It must refuse before the first free: the catalog still
+/// names the old trees, and they still answer.
+#[test]
+fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_freed() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    d.sql("INSERT INTO t VALUES (1, 'kept');");
+    let entry = d.catalog.get_table("t").unwrap().clone();
+    HeapFileManager::open(entry.first_directory_page_id, d.bp.clone())
+        .insert(Tuple::serialize(&[Value::Integer(2), Value::Varchar("w".repeat(2100))], &entry.schema, 1).unwrap())
+        .unwrap();
+    let index_before = d.index_root("t", "v");
+
+    let e = rebuild_indexes(&mut d.catalog, &d.bp).expect_err("the rebuild must refuse the oversized row");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("cannot rebuild the indexes of 't'") && msg.contains("index entry too large: 2108 bytes"),
+        "not the named refusal: {}",
+        abbreviate(&msg)
+    );
+    assert_eq!(d.catalog.get_table("t").unwrap().primary_index_root, entry.primary_index_root, "the primary tree was rebuilt");
+    assert_eq!(d.index_root("t", "v"), index_before, "the secondary tree was rebuilt");
+    let old = Tree::open(index_before, d.bp.clone());
+    assert_eq!(
+        old.search(&(Value::Varchar("kept".into()), Value::Integer(1))).unwrap(),
+        Some(()),
+        "the old secondary tree no longer answers: it was freed"
+    );
 }

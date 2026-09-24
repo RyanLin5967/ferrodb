@@ -655,21 +655,29 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                 drop(fresh);
                 published
             }
-            Err(refused) => {
-                // Nothing was written, so no page points at the ones the plan allocated. Give
-                // them back rather than leak them.
-                let allocated: Vec<u32> = fresh.iter().map(|(id, _)| *id).collect();
-                drop(fresh);
-                for id in allocated {
-                    if let Err(e) = self.buffer_pool.free_page(id) {
-                        return Err(FerroError::Internal(format!(
-                            "{refused}; and returning page {id}, which the refused split had \
-                             allocated, failed too: {e}"
-                        )));
-                    }
-                }
-                Err(refused)
-            }
+            Err(refused) => Err(self.release_unpublished(fresh, refused)),
+        }
+    }
+
+    /// Give back the pages a refused split allocated, and return the refusal.
+    ///
+    /// Nothing was written, so no page points at them. Every page is attempted: stopping at the
+    /// first failure would leak the rest. A failure is reported alongside the refusal, which stays
+    /// the cause.
+    fn release_unpublished(&self, fresh: Vec<(u32, PageWriteGuard<'_>)>, refused: FerroError) -> FerroError {
+        let allocated: Vec<u32> = fresh.iter().map(|(id, _)| *id).collect();
+        drop(fresh); // latches first: a freed id may be handed out again at once
+        let failures: Vec<String> = allocated
+            .iter()
+            .filter_map(|&id| self.buffer_pool.free_page(id).err().map(|e| format!("page {id}: {e}")))
+            .collect();
+        if failures.is_empty() {
+            refused
+        } else {
+            FerroError::Internal(format!(
+                "{refused}; and giving back the refused split's unused pages failed for {}",
+                failures.join(", ")
+            ))
         }
     }
 
@@ -1181,7 +1189,7 @@ mod tests {
 
     /// **An entry larger than a page must be REFUSED, not split into an empty leaf.**
     ///
-    /// `BPlusTreeLeafPage::split` takes `mid = len / 2`. On a leaf holding ONE entry that is
+    /// `BPlusTreeLeafPage::split` took `mid = len / 2`. On a leaf holding ONE entry that is
     /// `mid = 0`, so `split_off(0)` moves everything to the new page and leaves the old leaf
     /// EMPTY — and `serialize` on the new page then indexes past `PAGE_SIZE` and panics inside
     /// `copy_from_slice`. Measured before the guard, on this exact test: it panicked at
@@ -1352,5 +1360,25 @@ mod tests {
         assert_eq!(tree.search(&b"a".to_vec()).unwrap(), Some(vec![4u8; 991]));
         assert_eq!(tree.search(&b"m".to_vec()).unwrap(), Some(vec![1u8; 2991]));
         assert_eq!(tree.search(&b"z".to_vec()).unwrap(), Some(vec![2u8; 1060]));
+    }
+
+    /// **D225 — a refused split gives back every page it allocated.**
+    ///
+    /// The refusal paths after allocation (`split_at`'s guard, an internal node with no cut, a
+    /// `serialize` refusal) are unreachable while `split_point` is right, so the clean-up is
+    /// exercised here directly. Freed pages are handed out again lowest-first, so the next three
+    /// allocations must be the same three ids; a leak would hand out three new ones.
+    #[test]
+    fn a_refused_split_gives_back_every_page_it_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tree, bp) = vec_tree(&dir, "release.db");
+        let mut fresh = Vec::new();
+        let mut ids: Vec<u32> = (0..3).map(|_| tree.allocate_latched(&mut fresh).unwrap()).collect();
+        let refused = FerroError::Internal("the refusal".into());
+        assert_eq!(tree.release_unpublished(fresh, refused.clone()), refused, "a clean release returns the refusal itself");
+        let mut again: Vec<u32> = (0..3).map(|_| bp.new_page().unwrap()).collect();
+        ids.sort_unstable();
+        again.sort_unstable();
+        assert_eq!(again, ids, "a page the refused split allocated was not given back");
     }
 }
