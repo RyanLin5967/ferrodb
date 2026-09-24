@@ -500,13 +500,14 @@ impl TxnManager {
         self.history.get().cloned()
     }
 
-    /// **D212 (a') — write a REVERT history record into transaction `txn_id`'s log, now.**
+    /// **D212 (a') — bind a REVERT history record to transaction `txn_id`.**
     ///
-    /// Appended as `RecKind::RevertHistory` parts chained to the transaction, so its `Commit`
-    /// decides for the rows and the history together. The record itself is also held here, and
-    /// [`TxnManager::commit`] moves it onto the store's queue right after the `Commit` flush —
-    /// before `TxnEnd` and before the automatic checkpoint `commit` may run, whose hook then writes
-    /// it to the store before truncating the log. An abort drops it.
+    /// Held here, and written by [`TxnManager::commit`] FROM this binding, as `RunIdentity` is
+    /// (AMENDED 3, item 6): one copy of the bytes, so the log and the store cannot disagree. `commit`
+    /// appends it as `RecKind::RevertHistory` parts just before the `RunIdentity`/`Commit` pair, so the
+    /// `Commit` decides for the rows and the history together, and moves it onto the store's queue
+    /// right after the `Commit` flush — before the transaction leaves `att`, before `TxnEnd`, and
+    /// before the automatic checkpoint `commit` may run. An abort drops it.
     ///
     /// Refuses when no store is attached (the record would be written to the log and never kept)
     /// and for a transaction that is not active.
@@ -516,6 +517,18 @@ impl TxnManager {
                 "cannot bind REVERT history to txn {txn_id}: no history store is attached"
             )));
         }
+        if !self.att_read().contains_key(&txn_id) {
+            return Err(FerroError::Txn(format!(
+                "cannot bind REVERT history to txn {txn_id}: it is not active"
+            )));
+        }
+        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
+        Ok(())
+    }
+
+    /// Append `record` to `txn_id`'s log as `RevertHistory` parts of at most
+    /// [`crate::wal::log::REVERT_HISTORY_PART_BYTES`] each, the last one marked.
+    fn append_history(&self, txn_id: u64, record: &HistoryRecord) -> Result<(), FerroError> {
         let parts: Vec<&[u8]> = if record.body.is_empty() {
             vec![&record.body[..]]
         } else {
@@ -539,7 +552,6 @@ impl TxnManager {
                 },
             )?;
         }
-        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
         Ok(())
     }
 
@@ -931,6 +943,13 @@ impl TxnManager {
         // D211: a transaction whose rollback began may not commit its half-undone rows.
         if self.is_aborting(txn_id) {
             return Err(Self::rolling_back(txn_id));
+        }
+        // D212 (a'): the history records bound to it, written FROM the binding (AMENDED 3, item 6),
+        // after every other record of the transaction and ahead of the identity pair. Read rather
+        // than removed, so a failed append leaves them for the abort that follows.
+        let history = self.history_bindings.lock().unwrap().get(&txn_id).cloned();
+        for record in history.iter().flatten() {
+            self.append_history(txn_id, record)?;
         }
         // **Immediately before the `Commit`, with no append between them.** See `bind_run` for what
         // any other position costs. Read rather than removed, so a failed append leaves the binding
