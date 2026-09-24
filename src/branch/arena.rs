@@ -1121,11 +1121,8 @@ impl ArenaPageStore {
                         Ok(None) => break,
                         // A hole below the end of the file: never written.
                         Ok(Some(bytes)) if bytes.iter().all(|&b| b == 0) => {}
-                        // Written but unreadable, or unreadable at all: not a proven end.
-                        _ => {
-                            proven = false;
-                            break;
-                        }
+                        // MUTANT (fire-check only, never land): any unreadable page ends the prefix.
+                        _ => break,
                     }
                 }
             }
