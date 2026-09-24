@@ -148,10 +148,10 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // **Transaction 0 is not a transaction, so it is never a loser (D216).** DDL and run
     // declarations are logged under it (`TxnManager::append_ddl`, `replay_runs`), and it never
     // commits, so this used to take it for a loser and "abort" it. That appended an `Abort` and a
-    // `TxnEnd` under id 0 and undid nothing. While every non-empty log rebuilt, the rebuild's
-    // checkpoint discarded them at once. A log of declarations now rebuilds nothing and is left as
-    // it was, so they would stay, and a change-feed decoder reports every `Abort` it reads
-    // (`Decoded::aborted`).
+    // `TxnEnd` under id 0 and undid nothing. `open_recovered` checkpoints any non-empty log straight
+    // afterwards, which discards them, but `recover` does not know its caller: until that
+    // checkpoint (or for good, for a caller that takes none) a change-feed decoder reading the log
+    // reports every `Abort` it meets (`Decoded::aborted`).
     let mut losers: Vec<u64> = last_lsn.keys().copied().filter(|id| *id != 0 && !ended.contains(id)).collect();
     losers.sort_unstable();
     for id in losers {
@@ -471,7 +471,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     for rec in table_declarations(&catalog) {
         txn.retain_ddl(&rec);
     }
-    if recovered || stale {
+    let rebuild = recovered || stale;
+    if rebuild {
         rebuild_indexes(&mut catalog, &bp)?;
     }
     // **D216: a checkpoint for any log that holds records, and a rebuild only for a stale one.**
@@ -486,9 +487,12 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     //   actor is a log `LogicalDecoder` refuses whole. At 00f4c39 this checkpoint ran on every
     //   non-empty log, so that could not happen.
     let holds_records = wal.next_lsn.load(Ordering::SeqCst) != wal.base_lsn.load(Ordering::SeqCst);
-    if recovered || stale || holds_records {
+    if rebuild || holds_records {
         txn.checkpoint()?;
-        if stale {
+        // On the flag that decided the rebuild, not on `stale` alone, so the marker goes only with
+        // the rebuild it asked for (the D216 re-adversary's F1: removed on `stale` inside this
+        // branch, it went whether or not that rebuild ran).
+        if rebuild && stale {
             if let Err(e) = std::fs::remove_file(&marker) {
                 use std::io::Write;
                 let _ = writeln!(

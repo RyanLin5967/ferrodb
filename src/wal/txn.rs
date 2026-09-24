@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
 
 use crate::catalog::column::{DataType, Value};
 use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
@@ -100,7 +100,12 @@ pub struct TxnManager {
     /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a
     /// caller sees the size; nothing here caps it, because dropping declarations would silently
     /// make some writers unnameable and that is the failure this record exists to prevent.
-    run_log: Mutex<Vec<RunEntity>>,
+    ///
+    /// **Keyed by slot (`prov_id.0`) since D227**, so one declaration costs O(log R). Each entry
+    /// point now declares every run its provenance store knows at open
+    /// ([`TxnManager::declare_runs_of`]), and the linear scan a `Vec` needed per declaration made
+    /// that O(R²) (the D216 re-adversary's F3). Replayed in slot order.
+    run_log: Mutex<BTreeMap<u32, RunEntity>>,
     /// Open transaction -> the run that will be named immediately before its `Commit`.
     ///
     /// Held here rather than written when it is bound, and that is the whole correctness property.
@@ -284,7 +289,7 @@ impl TxnManager {
         // undoes it. A fresh log's header starts at 1, but `WalManager::truncate` writes whatever
         // it is given, and a snapshot install gives it 0.
         let start = wal.header_txn_id.max(1);
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(BTreeMap::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -617,7 +622,7 @@ impl TxnManager {
     /// stamped version carries, so two meanings for it would make every attribution ambiguous.
     pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
         let mut log = self.run_log.lock().unwrap();
-        if let Some(existing) = log.iter().find(|r| r.prov_id == run.prov_id) {
+        if let Some(existing) = log.get(&run.prov_id.0) {
             // `same_actor`, not `==`. Full equality compares `started_at`, which is when a session
             // began rather than part of who the actor is — so a second session of the same run
             // carries a different one and was being refused for having a later clock reading. The
@@ -633,7 +638,7 @@ impl TxnManager {
             }
             return Ok(());
         }
-        log.push(run);
+        log.insert(run.prov_id.0, run);
         Ok(())
     }
 
@@ -663,7 +668,7 @@ impl TxnManager {
     /// and transaction 0 never commits, so it binds nothing. `LogicalDecoder` relies on exactly
     /// that to tell a declaration from a binding.
     fn replay_runs(&self) -> Result<(), FerroError> {
-        let runs = self.run_log.lock().unwrap().clone();
+        let runs: Vec<RunEntity> = self.run_log.lock().unwrap().values().cloned().collect();
         if runs.is_empty() {
             return Ok(());
         }
@@ -1008,7 +1013,7 @@ impl TxnManager {
     /// `wal::recovery::open_recovered` hands every table in the catalog to this as a `CreateTable`
     /// carrying its current shape, which is exactly what the retained list would hold for it
     /// (an `AlterColumn` is retained as that same re-declaration, below).
-    pub fn retain_ddl(&self, rec: &DdlRecord) {
+    pub(crate) fn retain_ddl(&self, rec: &DdlRecord) {
         let mut log = self.schema_log.lock().unwrap();
         match &rec.op {
             DdlOp::CreateTable => {

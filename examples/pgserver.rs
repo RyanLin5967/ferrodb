@@ -44,9 +44,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // **D204: the one open path.** Recovery, then, if recovery replayed a data record or the
-    // stale-indexes marker asks, every index rebuilt from the recovered heap and a checkpoint,
-    // through the same function the CLI calls. This file used to spell the sequence out
+    // **D204: the one open path.** Recovery; every index rebuilt from the recovered heap if
+    // recovery replayed a data record or the stale-indexes marker asks; then a checkpoint of any
+    // log that holds records. Through the same function the CLI calls. This file used to spell the sequence out
     // itself, and from D9 until D202 its copy omitted the rebuild. Index pages are not logged, so a
     // row committed after the last checkpoint came back in the heap but not in its primary index: a
     // lookup by key missed it, and an INSERT of its key was admitted as a second live row
