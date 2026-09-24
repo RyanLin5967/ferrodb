@@ -2528,9 +2528,10 @@ fn a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay() {
 #[test]
 fn a_leaders_full_catch_up_append_of_membership_entries_is_delivered() {
     // **The stall the per-frame budget introduced.** A leader's `Append` carries up to
-    // `MAX_ENTRIES_PER_APPEND` entries, capped by count and nothing else (`replicate.rs`,
-    // `entries_from`), and `node.rs` discards a refused send by design. So a batch the codec refuses
-    // is rebuilt and refused on every turn: that follower receives nothing, and no meter moves.
+    // `MAX_ENTRIES_PER_APPEND` entries (`replicate.rs`, `entries_from`), which was then its only cap
+    // (D220 added a byte cap at the frame limit, which this batch is far inside), and `node.rs`
+    // discards a refused send by design. So a batch the codec refused was rebuilt and refused on
+    // every turn: that follower received nothing, and no meter moved.
     //
     // So any batch of legal entries must be deliverable. Here it is the largest Membership batch the
     // per-configuration cap allows: 64 configurations of 1024 voters and 1024 learners, 131,072 ids

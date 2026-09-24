@@ -1690,6 +1690,10 @@ fn an_append_is_cut_where_a_signed_frame_would_overflow_and_not_a_byte_before() 
         .expect("the probe fits a frame")
         .len()
         - 5;
+    // Pinned as a premise, not trusted: 45 (the Append envelope) + 4,194,333 (the 4 MiB entry) + 29
+    // (the empty one) + 32 (the MAC). A change common to the encoder and to the budget, such as a
+    // wider count prefix, moves both sides of this test together; this is what notices.
+    assert_eq!(probe_body, 4_194_439, "the signed probe is not the size this test's arithmetic is about");
     let exact = crate::replication::MAX_FRAME_BYTES - probe_body;
 
     for (second, want) in [(exact, 2usize), (exact + 1, 1)] {
