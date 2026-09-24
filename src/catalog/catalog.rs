@@ -518,8 +518,9 @@ impl Catalog {
         loop {
             // D230 review 8/9 (R8-1, R9-5): a `crate::cow::PageHandle`, the existing pin guard. Its own
             // doc records that every pin leak in this codebase came from a hand-written unpin on an
-            // error path, and this loop had one on every `?`: one leaked pin per refused persist
-            // (`tests/d141_long_identifier.rs`). A pinned page cannot be freed, so a later `drop_table`,
+            // error path, and this loop had one on every `?` between a fetch and its unpin: one leaked
+            // pin per refused persist (`tests/d141_long_identifier.rs`). A pinned page cannot be freed,
+            // so a later `drop_table`,
             // or a persist that orphans the page, failed with `PagePinned`. The handle unpins on every
             // return, and marks the page dirty only through `write()`. In `h.write().data = x?` the
             // right side is evaluated first, so a failed serialize never marks the page dirty.
