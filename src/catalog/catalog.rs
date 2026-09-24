@@ -349,6 +349,22 @@ impl Catalog {
     ///
     /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
     /// where those pages are.
+    /// **D250: finish a DROP that the log records but the catalog on disk does not**, without freeing
+    /// anything. Called only by `wal::recovery::open_recovered`, for a table whose `DropTable` record
+    /// is durable (it is written before the first free) while the catalog change never reached disk.
+    /// Recovery has skipped the table's records, so it must not stay in the catalog. Its pages are NOT
+    /// freed here: recovery may already have allocated one the interrupted DROP freed. The rest of
+    /// what [`Catalog::drop_table`] does after its frees is done the same way.
+    pub fn forget_dropped_table(&mut self, name: &str) -> Result<(), FerroError> {
+        self.require_table(name)?;
+        self.tables.remove(name);
+        self.stats.remove(name);
+        self.persist()?;
+        self.sync_root_cells();
+        self.epoch += 1;
+        Ok(())
+    }
+
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;

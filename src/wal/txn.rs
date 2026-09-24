@@ -1495,101 +1495,98 @@ impl TxnManager {
         &self,
         f: impl FnOnce() -> Result<T, FerroError>,
     ) -> Result<T, FerroError> {
-        self.ddl_unit(&[], f)
+        self.ddl_unit(None, f)
     }
 
-    /// [`TxnManager::ddl_checkpointed`] for a DROP. `f` frees every page of the heaps whose
-    /// directories start at `frees`: the table's heap and its time-travel heap. Lane §21.
+    /// [`TxnManager::ddl_checkpointed`] for a DROP. `record` is the DROP's `DropTable` record: it names
+    /// the heaps `f` frees, the table's heap and its time-travel heap.
     ///
-    /// **A DROP needs its truncation, not only its flush.** It frees its table's heap pages and
-    /// directory pages on disk at once, and `allocate` hands freed pages out first. So two things must
-    /// not outlive the drop:
-    /// - the log's records of those pages. The next open's redo would replay them onto whatever then
-    ///   holds the pages: a reused page is a zero page with LSN 0, so every record reapplies. The
-    ///   directory repair would write into the freed directory root.
-    /// - an owed release on the table. Its retry would write the page and tell a directory that no
-    ///   longer exists, whatever those pages hold by then.
+    /// **D250: the record is DURABLE before the first free, and recovery skips every record a later
+    /// DROP names** (`wal::recovery::recover`). A DROP frees its table's pages on disk at once, and
+    /// only a truncation removes their records from the log. That truncation does not always happen:
+    /// a WAL pin cancels it, and the checkpoint can fail after the frees. Without the skip, the next
+    /// open would replay the dropped table's records onto pages that are free or already reused. With
+    /// it, a kept log is harmless, so a DROP neither waits for pins nor for releases owed on other
+    /// tables. The parent lane's interim refusals for both are gone (lane
+    /// `lane_d250_drop_logged.md` §1).
     ///
-    /// So a DROP is refused BEFORE its mutation whenever its checkpoint would visibly keep the log:
-    /// - a release owed on ANOTHER table. The releases owed on the dropped table itself are discarded
-    ///   once the drop has succeeded, which lets a table holding a page that permanently fails be
-    ///   dropped: the part of review 2's Q3 this can grant.
-    /// - a WAL pin below the log's end (a replication stream, a base backup, a snapshot handoff).
-    ///   `WalManager::truncate` keeps the log, and answers `Ok`, while one is held; this was so at
-    ///   `9aa6968` too (lane §21.6, `rollback-review4` and the D216 lane). New pins are held off
-    ///   (`WalManager::fence_pins`) from this check through the truncation, so none can land between.
-    /// - a poisoned log, whose flush is refused, so the checkpoint would fail after the drop.
-    ///
-    /// **Stated:** while one table owes a release that never succeeds, or a reader stays pinned
-    /// behind the log's end, no OTHER table can be dropped. A checkpoint that fails after the drop
-    /// for a reason not visible beforehand (an I/O error in the flush or the truncation) still leaves
-    /// the dropped table's records in the log: D229, whose deferred frees retire this interim rule.
+    /// - **Refused before anything happens:** while a transaction is open, on a poisoned log, and while
+    ///   a page/log mismatch on one of the heaps it frees could not be recorded (review 4's finding 4:
+    ///   the truncation would remove the only record of it).
+    /// - **`f` fails after the record is durable:** the log is POISONED, and the error returned. The log
+    ///   now calls a table dropped that the running catalog may still hold, and every later write to
+    ///   it would sit behind a record recovery reads as "skip everything before me". The next open
+    ///   completes the DROP (`wal::recovery::open_recovered`).
+    /// - **The releases owed on the dropped table** are discarded once the drop has succeeded: their
+    ///   pages are free, and recovery skips their records too.
+    /// - **Readers of the change feed** still learn of the DROP when the checkpoint truncates past its
+    ///   record: it is appended once more after the replays, where the executor used to log it.
     pub fn drop_checkpointed<T>(
         &self,
-        frees: &[u32],
+        record: DdlRecord,
         f: impl FnOnce() -> Result<T, FerroError>,
     ) -> Result<T, FerroError> {
-        self.ddl_unit(frees, f)
+        self.ddl_unit(Some(record), f)
     }
 
-    /// The body of [`TxnManager::ddl_checkpointed`] and [`TxnManager::drop_checkpointed`]. `frees`
-    /// is empty for a create.
-    fn ddl_unit<T>(&self, frees: &[u32], f: impl FnOnce() -> Result<T, FerroError>) -> Result<T, FerroError> {
+    /// The body of [`TxnManager::ddl_checkpointed`] and [`TxnManager::drop_checkpointed`]. `dropping`
+    /// is `None` for a create.
+    fn ddl_unit<T>(&self, dropping: Option<DdlRecord>, f: impl FnOnce() -> Result<T, FerroError>) -> Result<T, FerroError> {
         let att = self.att_read();
         if !att.is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
         // Held from the retry to the truncation decision, as for every other retry (C1).
         let _retry = self.release_retry.lock().unwrap();
-        // A DROP's pin check must still hold at its truncation, so no new pin may land in between
-        // (lane §21.6). Lock order: `att`, `release_retry`, then the fence.
-        let _fence = (!frees.is_empty()).then(|| self.wal.fence_pins());
         // Retried HERE, before `f`. Once a DROP has freed pages on disk, nothing but the flush may stand
         // between those frees and the sync (D229's window; lane §21.2).
         self.retry_pending_releases_held();
-        if !frees.is_empty() {
-            if let Some(why) = self.wal.poisoned() {
-                return Err(FerroError::Wal(format!(
-                    "DROP refused: the log is poisoned ({why}), so the checkpoint a DROP needs cannot flush \
-                     it, and the table would be dropped and the statement reported failed; reopen the \
-                     database first"
-                )));
-            }
-            let end = self.wal.next_lsn.load(Ordering::SeqCst);
-            if let Some(pinned) = self.wal.min_pinned_lsn().filter(|&lsn| lsn < end) {
-                return Err(FerroError::Wal(format!(
-                    "DROP refused: a reader (a replication stream, a base backup or a snapshot handoff) \
-                     has the log pinned at lsn {pinned}, below its end {end}, so the checkpoint a DROP \
-                     needs could not truncate it, and the next open would replay the dropped table's \
-                     records onto pages the DROP freed; retry once the reader has moved on"
-                )));
-            }
-            let elsewhere =
-                self.pending_releases.lock().unwrap().iter().filter(|(_, r)| !frees.contains(&r.dir_root)).count();
-            if elsewhere > 0 {
-                return Err(FerroError::Wal(format!(
-                    "DROP refused: {elsewhere} release(s) owed by committed transactions on other tables still \
-                     fail, and a DROP must truncate the log, or the next open would replay the dropped table's \
-                     records onto pages the DROP freed"
-                )));
-            }
-            // Review 4's finding 4: the retry above was this DROP's attempt to record them.
-            let unrecorded =
-                self.unrecorded.lock().unwrap().iter().filter(|(_, r)| frees.contains(&r.dir_root)).count();
-            if unrecorded > 0 {
-                return Err(FerroError::Wal(format!(
-                    "DROP refused: {unrecorded} page/log mismatch(es) on this table could not be written to the \
-                     quarantine at {}, and the DROP would discard them and truncate the log that holds the only \
-                     record of them; make that path writable and retry",
-                    release_quarantine(&self.wal.path).display()
-                )));
-            }
+        let Some(record) = dropping else {
+            let out = f()?;
+            self.checkpoint_or_keep_held(false)?;
+            return Ok(out);
+        };
+        let frees = [record.dir_root, record.time_travel_root];
+        if let Some(why) = self.wal.poisoned() {
+            return Err(FerroError::Wal(format!(
+                "DROP refused: the log is poisoned ({why}), so the checkpoint a DROP needs cannot flush \
+                 it, and the table would be dropped and the statement reported failed; reopen the \
+                 database first"
+            )));
         }
-        let out = f()?;
-        if !frees.is_empty() {
-            self.discard_releases_on(frees);
+        // Review 4's finding 4: the retry above was this DROP's attempt to record them.
+        let unrecorded =
+            self.unrecorded.lock().unwrap().iter().filter(|(_, r)| frees.contains(&r.dir_root)).count();
+        if unrecorded > 0 {
+            return Err(FerroError::Wal(format!(
+                "DROP refused: {unrecorded} page/log mismatch(es) on this table could not be written to the \
+                 quarantine at {}, and the DROP would discard them and truncate the log that holds the only \
+                 record of them; make that path writable and retry",
+                release_quarantine(&self.wal.path).display()
+            )));
         }
+        // D250: durable before the first free. `log_ddl` appends and flushes, and takes the table out
+        // of the retained schema.
+        let logged_at = self.wal.next_lsn.load(Ordering::SeqCst);
+        self.log_ddl(record.clone())?;
+        let out = match f() {
+            Ok(out) => out,
+            Err(e) => {
+                self.wal.poison(&format!(
+                    "the DROP of `{}` was logged but did not complete ({e}); the next open completes it",
+                    record.table
+                ));
+                return Err(e);
+            }
+        };
+        self.discard_releases_on(&frees);
         self.checkpoint_or_keep_held(false)?;
+        if self.wal.base_lsn.load(Ordering::SeqCst) > logged_at {
+            // The truncation discarded the record with the table's own. A reader starting at the new
+            // base must still learn the table is gone.
+            self.append_ddl(&record)?;
+            self.wal.flush()?;
+        }
         Ok(out)
     }
 
@@ -3182,7 +3179,16 @@ use super::*;
         let (_bp, _wal, txn, t2, r, quarantine, _dir) = committed_mismatch(true);
         assert_eq!(txn.pending_releases.lock().unwrap().len(), 1, "premise: the unrecorded mismatch is not owed");
         let ran = std::cell::Cell::new(false);
-        let e = match txn.drop_checkpointed(&[r.dir_root], || {
+        // D250 (lane `lane_d250_drop_logged.md` §2): `drop_checkpointed` takes the DROP's record now.
+        // This raw heap has no time-travel heap, so the record names its one root twice.
+        let record = || DdlRecord {
+            op: DdlOp::DropTable,
+            table: "raw".into(),
+            dir_root: r.dir_root,
+            time_travel_root: r.dir_root,
+            columns: Vec::new(),
+        };
+        let e = match txn.drop_checkpointed(record(), || {
             ran.set(true);
             Ok(())
         }) {
@@ -3193,7 +3199,7 @@ use super::*;
         assert!(e.to_string().contains("quarantine"), "the DROP was refused, but not for the unrecorded mismatch: {e}");
 
         std::fs::remove_dir(&quarantine).unwrap();
-        txn.drop_checkpointed(&[r.dir_root], || {
+        txn.drop_checkpointed(record(), || {
             ran.set(true);
             Ok(())
         })
