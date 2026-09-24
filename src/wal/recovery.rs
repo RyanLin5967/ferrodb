@@ -1295,9 +1295,12 @@ use super::*;
     ///
     /// A heap page is written only after the log is durable up to ITS LSN, and a record appended
     /// after that is not forced out with it. Here the INSERT's commit made the log durable through
-    /// the `Commit`, the `TxnEnd` after it is still buffered, and writing the heap page must leave
-    /// it buffered. A gate that flushed the whole log for every page would fail this, and would pay
-    /// a log write on every heap eviction to do so.
+    /// its records, another transaction's `Begin` is still buffered, and writing the heap page must
+    /// leave it buffered. A gate that flushed the whole log for every page would fail this, and
+    /// would pay a log write on every heap eviction to do so.
+    ///
+    /// ⚖ ruled by the lead (lane PREREG (D)): until D252 the buffered record was the INSERT's own
+    /// `TxnEnd`, which a commit now writes with its `Commit`, so the `Begin` is planted instead.
     ///
     /// Passes at `00f4c39` and must keep passing.
     #[test]
@@ -1309,6 +1312,9 @@ use super::*;
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+        // Something waits in the log buffer: another transaction's `Begin`, as under any concurrent
+        // load. (At `00f4c39` the INSERT's own `TxnEnd` did; D252 writes it with the `Commit`.)
+        let _open = o.txn.begin().unwrap();
         let rid = BPlusTreeManager::<Value, RecordId>::open_shared(o.catalog.root_cell("t", None).expect("a cell for t"), o.bp.clone())
             .search(&Value::Integer(3))
             .unwrap()
@@ -1330,11 +1336,14 @@ use super::*;
     /// does not flush the log.**
     ///
     /// The gate's first version flushed the whole log for every such page (the D216 adversary's
-    /// F4). A commit leaves its `TxnEnd` in the buffer, so the buffer is almost never empty, and
-    /// every eviction of a dirty index, directory or catalog page paid a log write and an fsync,
-    /// in a 1024-frame pool. The page needs only the records appended before it last changed.
-    /// Here those are the INSERT's, which its commit made durable, so writing the leaf must leave
-    /// the `TxnEnd` buffered.
+    /// F4). The buffer is seldom empty under load (open transactions' records; at `00f4c39` also
+    /// every commit's `TxnEnd`), so every eviction of a dirty index, directory or catalog page paid
+    /// a log write and an fsync, in a 1024-frame pool. The page needs only the records appended
+    /// before it last changed. Here those are the INSERT's, which its commit made durable, so
+    /// writing the leaf must leave another transaction's `Begin`, planted after it, buffered.
+    ///
+    /// ⚖ ruled by the lead (lane PREREG (D)): until D252 the buffered record was the INSERT's own
+    /// `TxnEnd`, which a commit now writes with its `Commit`, so the `Begin` is planted instead.
     ///
     /// Passes at `00f4c39`, where the gate skipped these pages. Must keep passing.
     #[test]
@@ -1346,6 +1355,9 @@ use super::*;
         let lock = DbLock::acquire(&db).unwrap();
         let mut o = open_recovered(&db, &lock).unwrap();
         d216_sql(&mut o, &mut Session::new(), "INSERT INTO t VALUES (3, 30);").unwrap();
+        // Something waits in the log buffer: another transaction's `Begin`, as under any concurrent
+        // load. (At `00f4c39` the INSERT's own `TxnEnd` did; D252 writes it with the `Commit`.)
+        let _open = o.txn.begin().unwrap();
         let flushed = o.wal.flushed_lsn.load(Ordering::SeqCst);
         assert!(
             flushed < o.wal.next_lsn.load(Ordering::SeqCst),
@@ -1578,9 +1590,10 @@ use super::*;
     /// A log written before D227 can be empty while the database has tables: a clean close by a
     /// process that ran no DDL re-declared nothing. `open_recovered` retains the tables (D227) but
     /// took no checkpoint over an empty log. Since D234, a checkpoint that a pin keeps from
-    /// truncating re-declares nothing, so tables retained and never written could stay out of the
-    /// log for as long as a change stream lags. The open therefore checkpoints whenever it has a
-    /// declaration to make, and at an open nothing holds a pin yet.
+    /// truncating re-declares the schema only once a pin has passed its last declaration, so a
+    /// change stream that pinned the log first would meet changes to tables nothing had declared,
+    /// until some later checkpoint re-declared them. The open therefore checkpoints whenever it has
+    /// a declaration to make, and at an open nothing holds a pin yet.
     ///
     /// Pre-registered from source, UNBUILT: FAILS at `00f4c39`, and at `e2611bf`, at the
     /// declaration assertion (the open takes no checkpoint, and the log stays empty).
