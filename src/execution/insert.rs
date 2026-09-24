@@ -56,8 +56,8 @@ use crate::catalog::column::Value;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
-use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
-use crate::storage::index_page::admit_entry;
+use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_page::{entry_refusal, first_entry_over_bound};
 use crate::provenance::{ProvId, ProvenanceStore};
 use std::sync::Arc;
 
@@ -115,18 +115,13 @@ impl Modify for Insert {
         // primary entry are already written. The abort undoes only the heap, so the primary entry
         // would be left pointing at a deleted slot, and every later INSERT of that key would fail
         // reading it (`SlotDeleted`) — a key refused once could never be used again. So the same
-        // bound is asked here, for the entries the writes below will make, in the shapes they make
-        // them: `(pk, rid)`, `(value, pk)` per index, `(token, pk)` per distinct token.
-        admit_entry(&vals[0], &RecordId::new(0, 0))?;
-        for sec_idx in &self.secondary_indexes {
-            admit_entry(&(vals[sec_idx.col_index].clone(), vals[0].clone()), &())?;
-        }
-        for ft in &self.fulltext_indexes {
-            if let Some(text) = indexed_text(&vals[ft.col_index])? {
-                for token in distinct_tokens(text) {
-                    admit_entry(&posting_key(&token, &vals[0]), &())?;
-                }
-            }
+        // bound is asked here, for every entry the writes below will make, through the one builder
+        // of entry shapes (`index_page::row_entry_sizes`, review 7 K9): the primary entry, each
+        // secondary entry, and each posting of each distinct token.
+        let secondary: Vec<usize> = self.secondary_indexes.iter().map(|h| h.col_index).collect();
+        let fulltext: Vec<usize> = self.fulltext_indexes.iter().map(|h| h.col_index).collect();
+        if let Some((_, len)) = first_entry_over_bound(&vals, true, &secondary, &fulltext)? {
+            return Err(entry_refusal(len));
         }
         // **An index entry outlives the row it points at.** DELETE stamps `end_ts` on the version
         // in place and leaves the entry alone, so `search` finding a key does NOT mean the key is

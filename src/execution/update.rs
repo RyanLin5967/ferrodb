@@ -12,8 +12,10 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
-use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
-use crate::storage::index_page::{admit_entry, entry_over_bound, entry_too_large, OPEN_TABLE_REMEDY};
+use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_page::{
+    entries_an_update_writes, entry_refusal, entry_too_large, first_entry_over_bound, EntryOf, OPEN_TABLE_REMEDY,
+};
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -52,10 +54,12 @@ impl Modify for Update {
         // there IS something to do: as of E63 a deleted key can be used again, so DELETE-then-INSERT
         // works rather than being advice that would have failed.
         //
-        // **With one caveat (D225, review 6):** the deleted tuple is never purged. Every entry an
-        // index over its values would need, including a CREATE INDEX added later, is still asked of
-        // it, so a row whose value is too long for an index entry leaves a tuple that refuses that
-        // index for good. The remedy then is the table copy, `index_page::OPEN_TABLE_REMEDY`.
+        // **With one caveat (D225, reviews 6 and 7):** the old key's deleted tuple stays in the heap
+        // until THAT key is inserted again (then its dead version moves to the table's history;
+        // D202, #16), and nothing else removes it (there is no VACUUM). Every entry an index over
+        // its values would need, including a CREATE INDEX added later, is still asked of it, so a
+        // row whose value is too long for an index entry leaves a tuple that refuses that index
+        // until then. The backfill's refusal names both remedies (`Catalog::backfill_refusal`).
         if let Some((col, _)) = self.assignments.iter().find(|(col, _)| *col == 0) {
             return Err(FerroError::Constraint(format!(
                 "column '{}' of '{}' is the primary key and cannot be updated: moving a key means \
@@ -87,6 +91,8 @@ impl Modify for Update {
         // and the tokens of changed text. The assignments are evaluated here too, still once per row, and the NOT
         // NULL check moves with them: it reads only the new values, and inside the loop it had
         // the same late-refusal shape.
+        let secondary: Vec<usize> = self.secondary_indexes.iter().map(|h| h.col_index).collect();
+        let fulltext: Vec<usize> = self.fulltext_indexes.iter().map(|ft| ft.col_index).collect();
         let mut planned = Vec::with_capacity(res.len());
         for (rid, old_values) in res {
             let mut new_values = old_values.clone();
@@ -105,32 +111,29 @@ impl Modify for Update {
             // The primary re-point, `upsert(pk, new_rid)`, happens only if the heap moves the row,
             // which is not known until it is written, so it is asked for every row. This build
             // cannot write a key over the bound; an earlier build could. The refusal names the one
-            // remedy that works for a key (review 5): a primary key cannot be UPDATEd, and DELETE
-            // then INSERT would leave the deleted tuple under the key for good.
-            if let Some(len) = entry_over_bound(pk, &RecordId::new(0, 0)) {
-                let shown: String = format!("{pk:?}").chars().take(60).collect();
-                return Err(FerroError::Constraint(format!(
-                    "this UPDATE would re-point the primary-index entry of the row whose key is \
-                     {shown}: {}. A build before D225 could store such a key; this one cannot \
-                     re-point it. Nothing has been written. {OPEN_TABLE_REMEDY}",
-                    entry_too_large(len)
-                )));
-            }
-            for handle in &self.secondary_indexes {
-                let new_v = &new_values[handle.col_index];
-                if &old_values[handle.col_index] != new_v {
-                    admit_entry(&(new_v.clone(), pk.clone()), &())?;
+            // remedy that works for a key (review 5): a primary key cannot be UPDATEd, and the
+            // INSERT half of DELETE-then-INSERT is refused for a key over the bound, so the deleted
+            // tuple would stay under that key for good.
+            //
+            // Measured through the one builder of entry shapes (`index_page::row_entry_sizes`,
+            // review 7 K9), for the entries the loop below may write: the primary re-point, the
+            // secondary entry of each changed value, and the postings of each changed text.
+            // Which of those change is decided by `entries_an_update_writes`, which a MERGE's
+            // landing check also calls for the Update it publishes through this executor.
+            let (changed, retokenized) =
+                entries_an_update_writes(&old_values, &new_values, &secondary, &fulltext)?;
+            match first_entry_over_bound(&new_values, true, &changed, &retokenized)? {
+                Some((EntryOf::Primary, len)) => {
+                    let shown: String = format!("{pk:?}").chars().take(60).collect();
+                    return Err(FerroError::Constraint(format!(
+                        "this UPDATE would re-point the primary-index entry of the row whose key \
+                         is {shown}: {}. A build before D225 could store such a key; this one \
+                         cannot re-point it. Nothing has been written. {OPEN_TABLE_REMEDY}",
+                        entry_too_large(len)
+                    )));
                 }
-            }
-            for ft in &self.fulltext_indexes {
-                let new_text = indexed_text(&new_values[ft.col_index])?;
-                if indexed_text(&old_values[ft.col_index])? != new_text {
-                    if let Some(text) = new_text {
-                        for token in distinct_tokens(text) {
-                            admit_entry(&posting_key(&token, pk), &())?;
-                        }
-                    }
-                }
+                Some((_, len)) => return Err(entry_refusal(len)),
+                None => {}
             }
             planned.push((rid, old_values, new_values));
         }

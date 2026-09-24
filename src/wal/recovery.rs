@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::{entry_over_bound, entry_too_large, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -192,7 +192,9 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
 ///
 /// The database then does not open in this build until the table is repaired with a build that
 /// can still open it, `index_page::RECOVERY_REMEDY`. Deleting the row is not a repair: a deleted
-/// tuple is never purged, and this check reads every tuple the heap holds, as the rebuild does.
+/// tuple stays in the heap until its key is inserted again (then its dead version moves to the
+/// table's history; D202, #16), nothing else removes it (there is no VACUUM), and this check reads
+/// every tuple the heap holds, as the rebuild does.
 /// That is deliberate: the alternative is admitting an entry for which a leaf split is not
 /// guaranteed to exist.
 fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolManager>, names: &[String]) -> Result<(), FerroError> {
@@ -216,25 +218,20 @@ fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolMana
                     entry_too_large(len)
                 ))
             };
-            if let Some(len) = entry_over_bound(&vals[0], &RecordId::new(0, 0)) {
-                return Err(refuse("its primary entry", len));
-            }
-            for &col in &secondary {
-                if let Some(len) = entry_over_bound(&(vals[col].clone(), vals[0].clone()), &()) {
-                    return Err(refuse(&format!("its entry in the index on '{}'", entry.schema.columns[col].name), len));
-                }
-            }
-            for &col in &fulltext {
-                if let Some(text) = indexed_text(&vals[col])? {
-                    for token in distinct_tokens(text) {
-                        if let Some(len) = entry_over_bound(&posting_key(&token, &vals[0]), &()) {
-                            return Err(refuse(
-                                &format!("a posting in the full-text index on '{}'", entry.schema.columns[col].name),
-                                len,
-                            ));
-                        }
+            // Every entry the rebuild below makes, through the one builder of entry shapes
+            // (`index_page::row_entry_sizes`, review 7 K9): the primary entry, each secondary
+            // entry, and each posting.
+            if let Some((of, len)) = first_entry_over_bound(&vals, true, &secondary, &fulltext)? {
+                let what = match of {
+                    EntryOf::Primary => "its primary entry".to_string(),
+                    EntryOf::Secondary(col) => {
+                        format!("its entry in the index on '{}'", entry.schema.columns[col].name)
                     }
-                }
+                    EntryOf::Posting(col) => {
+                        format!("a posting in the full-text index on '{}'", entry.schema.columns[col].name)
+                    }
+                };
+                return Err(refuse(&what, len));
             }
         }
     }

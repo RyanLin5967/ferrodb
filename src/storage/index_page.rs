@@ -1,4 +1,5 @@
 use crate::{catalog::column::Value, error::FerroError, storage::{disk_manager::PAGE_SIZE, heap_file_manager::RecordId}};
+use crate::storage::index_fulltext::{distinct_tokens, indexed_text, posting_key};
 #[derive(PartialEq, Debug)]
 pub struct BPlusTreeInternalPage<K> {
     pub page_type: u8,
@@ -110,44 +111,67 @@ const LEAF_HEADER_SIZE: usize = 27;
 ///   refused.
 ///
 /// **The remedies.** For the rows of a table on a database this build has open, [`OPEN_TABLE_REMEDY`];
-/// for one crash recovery refuses to open, [`RECOVERY_REMEDY`]. There is no other, because a
-/// deleted row can take nothing in place: DELETE stamps the tuple and leaves it, nothing in this
-/// build purges it (there is no VACUUM), and a deleted row can be neither updated nor deleted
-/// again, so it is scanned, and refused, until its table is dropped. DELETE followed by INSERT
-/// therefore CREATES the problem for a key. For the envelope cases the remedy is
-/// `restrict_envelope` to an envelope below the bound, which is admitted; after it, charges and
-/// forks work again. The mid-record and migration cases have none in this build.
+/// for one crash recovery refuses to open, [`RECOVERY_REMEDY`]. Written for the tree D225 lands on,
+/// which has #16 (D202): there, INSERTing a deleted row's key again writes the new row into the
+/// dead version's slot and moves the dead version to the table's history (#16's `4296723`). So a
+/// deleted row whose KEY fits has an in-place remedy (insert the key again with values that fit,
+/// then delete it again if unwanted), and nothing else removes a deleted tuple (there is no
+/// VACUUM). A key OVER the bound has none: it cannot be updated, and inserting it again is
+/// refused, so only the table copy reaches it. On `d225-byte-split` alone, before #16 is merged,
+/// the in-place route does not work: the re-inserted row takes a new slot and the dead tuple stays.
+/// For the envelope cases the remedy is `restrict_envelope` to an envelope below the bound, which
+/// is admitted; after it, charges and forks work again. The mid-record and migration cases have
+/// none in this build.
 ///
 /// **This build writes nothing over the bound itself**, and that includes an ALTER that widens an
-/// indexed column: `catalog::alter::prepare_rewrite` asks the bound of every widened secondary
-/// entry (review 6 H1). **One residual is not a bound failure but its root cause:** a deleted
-/// tuple is never purged, so a deleted row whose value is too long for an index entry refuses
-/// every CREATE INDEX on that column, and every retype of an indexed column it sits in, until the
-/// table is copied and dropped. The refusals name that; they cannot cure it.
+/// indexed column (`catalog::alter::prepare_rewrite` asks every step, review 6 H1 and review 7 K6)
+/// and a MERGE that publishes rows into a shape it changes (`refuse_if_the_row_cannot_land`,
+/// review 7 H2). **One residual is not a bound failure but its root cause:** a deleted tuple stays
+/// until its key is inserted again, so a deleted row whose value is too long for an index entry
+/// refuses every CREATE INDEX on that column until then, or until the table is copied. The
+/// refusals name that; they cannot cure it.
 pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
 
 /// What a refusal of an entry over [`MAX_ENTRY_BYTES`] tells the user to do on a database THIS
-/// build has open: the ALTER, UPDATE and CREATE INDEX refusals. D225, reviews 5 and 6.
+/// build has open, when the row's KEY is the cause or nothing in place reaches it: the ALTER,
+/// UPDATE and CREATE INDEX refusals. D225, reviews 5 to 7.
 ///
 /// Every step is one this build can take. SELECT reads the rows, an INSERT under a key and values
 /// that fit is admitted, and `drop_table` frees the trees without asking the bound. It spells out
-/// the two steps this SQL surface lacks (INSERT … SELECT and RENAME TABLE). It never suggests
-/// DELETE followed by INSERT, which leaves the deleted tuple behind for good.
+/// the steps this SQL surface lacks (INSERT … SELECT, RENAME TABLE) and the two the copy needs
+/// that are easy to miss: the indexes are created again, and the table's history is lost. It never
+/// suggests a delete, which for a key over the bound leaves the tuple behind for good.
 pub const OPEN_TABLE_REMEDY: &str = "With this build: copy the table's live rows into a new table, \
     each under a key and values whose index entries fit the bound (there is no INSERT ... SELECT, \
-    so SELECT the rows and INSERT each one), DROP the old table, then CREATE it again under its old \
-    name and copy the rows back (there is no RENAME TABLE). There is no in-place remedy: a deleted \
-    row's tuple is never purged (there is no VACUUM), so it keeps its entries until its table is \
-    dropped, and a primary key cannot be updated.";
+    so SELECT the rows and INSERT each one), DROP the old table, CREATE it again under its old \
+    name, copy the rows back and CREATE its indexes again (there is no RENAME TABLE). The copy \
+    discards the table's history: DROP frees its time-travel heap and its dead versions, so no \
+    older snapshot can read them any more. No in-place change repairs a key over the bound: a \
+    primary key cannot be updated and one over the bound cannot be inserted again, so a deleted \
+    row under it stays in the table (there is no VACUUM).";
 
-/// What the crash-recovery refusal tells the user to do: the same steps, with a build that can
-/// still open the database, because this one refuses to. D225, reviews 5 and 6.
+/// What the crash-recovery refusal tells the user to do, with a build that can still open the
+/// database, because this one refuses to. D225, reviews 5 to 7.
 pub const RECOVERY_REMEDY: &str = "This build cannot open the database until that is repaired. \
-    With a build before D225: copy the table's live rows into a new table, each under a key and \
-    values whose index entries fit the bound, DROP the old table, then CREATE it again under its \
-    old name and copy the rows back. There is no in-place remedy: a deleted row's tuple is never \
-    purged, so it keeps its entries until its table is dropped, and a primary key cannot be \
-    updated.";
+    With a build before D225: for a live row, UPDATE its value to fit; for a deleted row whose key \
+    fits, INSERT that key again with values that fit, if that build writes a re-inserted key into \
+    its dead version's slot (#16's D202 build does), then remove it again if it is not wanted; \
+    otherwise copy the table's live rows into a new table, each under a key and values whose index \
+    entries fit the bound, DROP the old table, CREATE it again under its old name, copy the rows \
+    back and CREATE its indexes again. The copy discards the table's history: DROP frees its \
+    time-travel heap and its dead versions. A primary key over the bound can be neither updated \
+    nor inserted again, so for it only the copy works.";
+
+/// Which index an entry belongs to, so a refusal can name it. D225, review 7 K9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryOf {
+    /// The primary index: `(key, RecordId)`.
+    Primary,
+    /// The secondary index on the column at this position: `((value, key), ())`.
+    Secondary(usize),
+    /// A posting in the full-text index on the column at this position: `((token, key), ())`.
+    Posting(usize),
+}
 
 /// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry
 /// bound cannot disagree about what an entry costs.
@@ -157,11 +181,105 @@ pub fn serialized_len<T: BTreeSerialize>(t: &T) -> usize {
     buf.len()
 }
 
+/// Whether an entry of `len` bytes is over [`MAX_ENTRY_BYTES`]. **The one comparison with the
+/// bound**: every other check, [`entry_over_bound`] and [`first_entry_over_bound`] included, asks
+/// this. D225, review 7.
+pub fn is_over_bound(len: usize) -> bool {
+    len > MAX_ENTRY_BYTES
+}
+
 /// The size of an entry that is over [`MAX_ENTRY_BYTES`], or `None` when it is admitted. The
 /// measurement behind [`admit_entry`], for refusals that give their own remedy. D225, review 6.
 pub fn entry_over_bound<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Option<usize> {
     let len = serialized_len(key) + serialized_len(value);
-    (len > MAX_ENTRY_BYTES).then_some(len)
+    is_over_bound(len).then_some(len)
+}
+
+/// The size of every index entry `row` makes, **measured on the trees' own entry types**, in this
+/// order: the primary entry when `primary` is set, then the secondary index on each position in
+/// `secondary`, then every posting of each position in `fulltext`. `row[0]` is the key. D225,
+/// review 7 K9.
+///
+/// **The one builder of entry shapes.** Every pre-check asks this instead of building
+/// `(value, key)` or a posting itself: INSERT, UPDATE's pre-pass, the ALTER, both backfills,
+/// recovery and the MERGE's landing check. So none of them can drift from what the trees store.
+/// Two of those guard paths with no backstop before a free (the ALTER, which writes no secondary
+/// entry, and recovery), where a drift would be review 6's H1 again.
+pub fn row_entry_sizes(
+    row: &[Value],
+    primary: bool,
+    secondary: &[usize],
+    fulltext: &[usize],
+) -> Result<Vec<(EntryOf, usize)>, FerroError> {
+    let key = row
+        .first()
+        .ok_or_else(|| FerroError::Internal("a row with no columns has no key to index".into()))?;
+    let column = |p: usize| {
+        row.get(p).ok_or_else(|| {
+            FerroError::Internal(format!("an index names column {p} of a {}-column row", row.len()))
+        })
+    };
+    let mut out = Vec::new();
+    if primary {
+        out.push((EntryOf::Primary, serialized_len(key) + serialized_len(&RecordId::new(0, 0))));
+    }
+    for &p in secondary {
+        let entry = (column(p)?.clone(), key.clone());
+        out.push((EntryOf::Secondary(p), serialized_len(&entry) + serialized_len(&())));
+    }
+    for &p in fulltext {
+        if let Some(text) = indexed_text(column(p)?)? {
+            for token in distinct_tokens(text) {
+                out.push((EntryOf::Posting(p), serialized_len(&posting_key(&token, key)) + serialized_len(&())));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The first of `row`'s index entries that is over [`MAX_ENTRY_BYTES`], with its size, in
+/// [`row_entry_sizes`]'s order. D225, review 7.
+pub fn first_entry_over_bound(
+    row: &[Value],
+    primary: bool,
+    secondary: &[usize],
+    fulltext: &[usize],
+) -> Result<Option<(EntryOf, usize)>, FerroError> {
+    Ok(row_entry_sizes(row, primary, secondary, fulltext)?
+        .into_iter()
+        .find(|&(_, len)| is_over_bound(len)))
+}
+
+/// The index entries an UPDATE from `old` to `new` writes besides the primary re-point: the
+/// `secondary` positions whose value changed, and the `fulltext` positions whose indexed text
+/// changed. The UPDATE executor's pre-pass asks these, and so does a MERGE's landing check for
+/// the Update it will publish through that executor, so the two ask the same set (review 7 H2).
+/// Asking more would refuse an UPDATE that writes nothing new.
+pub fn entries_an_update_writes(
+    old: &[Value],
+    new: &[Value],
+    secondary: &[usize],
+    fulltext: &[usize],
+) -> Result<(Vec<usize>, Vec<usize>), FerroError> {
+    // Borrowed, not cloned: the UPDATE pre-pass calls this for every row it plans.
+    fn at(row: &[Value], p: usize) -> Result<&Value, FerroError> {
+        row.get(p).ok_or_else(|| {
+            FerroError::Internal(format!("an index names position {p} of a {}-column row", row.len()))
+        })
+    }
+    let mut changed = Vec::new();
+    for &p in secondary {
+        if at(old, p)? != at(new, p)? {
+            changed.push(p);
+        }
+    }
+    let mut retokenized = Vec::new();
+    for &p in fulltext {
+        if indexed_text(at(old, p)?)? != indexed_text(at(new, p)?)? {
+            retokenized.push(p);
+        }
+    }
+    Ok((changed, retokenized))
 }
 
 /// The named part of every entry-bound refusal, and no remedy: the wrappers that carry
@@ -185,15 +303,21 @@ pub fn entry_too_large(len: usize) -> String {
 /// exceeds maximum". It reaches a client as a statement error (`23000` in `pgwire::sqlstate_of`),
 /// not as an internal one, because the fix is to shorten the value.
 pub fn admit_entry<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Result<(), FerroError> {
-    if let Some(len) = entry_over_bound(key, value) {
-        return Err(FerroError::Constraint(format!(
-            "index entry too large: {len} bytes (key and value as stored) does not fit under the \
-             B+tree entry limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}, the largest size for which \
-             every leaf split can leave both halves under a {PAGE_SIZE}-byte page; shorten the \
-             indexed value"
-        )));
+    match entry_over_bound(key, value) {
+        Some(len) => Err(entry_refusal(len)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// [`admit_entry`]'s refusal, for a pre-check that measured with [`first_entry_over_bound`] and
+/// refuses NEW data (INSERT, UPDATE's changed values), where shortening the value is the remedy.
+pub fn entry_refusal(len: usize) -> FerroError {
+    FerroError::Constraint(format!(
+        "index entry too large: {len} bytes (key and value as stored) does not fit under the \
+         B+tree entry limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}, the largest size for which \
+         every leaf split can leave both halves under a {PAGE_SIZE}-byte page; shorten the \
+         indexed value"
+    ))
 }
 // const CHILD_POINTER_SIZE: usize = 4;
 // HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (2)|
@@ -1229,6 +1353,25 @@ mod tests {
             node.num_keys = n as u16;
             assert_eq!(node.split_point(), Some(n / 2), "an internal node of {n} fixed-width keys");
         }
+    }
+
+    /// **D225, review 7 K4 (M4b): a leaf's tie goes to the count midpoint.** Entries of 30, 10,
+    /// 10, 10 and 10 bytes (`(Varchar, Integer)`, 3 + len + 5, sorted by the string). Cut 1 leaves
+    /// 30 | 40 and cut 2 leaves 40 | 30, both 10 bytes apart; `n / 2` = 2 breaks the tie. Without
+    /// the tie-break the first of the two, cut 1, wins. The fixed-width test cannot see this: for
+    /// one width the tied cuts sit either side of `n / 2` only when `n` is odd, and there the
+    /// first of them IS `n / 2`.
+    #[test]
+    fn a_leaf_tie_goes_to_the_count_midpoint() {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+        leaf.insert_entry((Value::Varchar("a".repeat(22)), Value::Integer(1)), ());
+        for (pk, c) in [(2, "b"), (3, "c"), (4, "d"), (5, "e")] {
+            leaf.insert_entry((Value::Varchar(c.repeat(2)), Value::Integer(pk)), ());
+        }
+        let sizes: Vec<usize> =
+            leaf.key_arr.iter().zip(&leaf.vals).map(|(k, v)| serialized_len(k) + serialized_len(v)).collect();
+        assert_eq!(sizes, vec![30, 10, 10, 10, 10], "premise: the entry widths");
+        assert_eq!(leaf.split_point(), Some(2), "a tie must go to the count midpoint");
     }
 
     /// **D225's guard, forced to fire: a cut that leaves a half full is refused, and the page is

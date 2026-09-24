@@ -31,11 +31,13 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
+use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::{DataType, Value};
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
+use ferrodb::error::FerroError;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
@@ -688,8 +690,8 @@ fn an_update_of_a_row_under_a_legacy_oversized_key_is_refused_before_it_is_writt
     // Review 5: a key cannot be UPDATEd, and DELETE then INSERT would leave the deleted tuple
     // under the key for good, so the message names the one remedy and never suggests that.
     assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
-    // Case-sensitive on purpose (review 6 F8): the remedy itself says a "deleted" row's tuple is
-    // never purged. What must not appear is the statement DELETE offered as advice. A lowercase
+    // Case-sensitive on purpose (review 6 F8): the remedy itself says a "deleted" row under such
+    // a key stays in the table. What must not appear is the statement DELETE offered as advice. A lowercase
     // "delete the row" suggestion would pass this guard; the text is one constant, reviewed.
     assert!(!e.contains("DELETE"), "the refusal suggests DELETE, which creates the problem for a key: {e}");
     assert!(!e.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {e}");
@@ -889,6 +891,8 @@ fn an_alter_that_widens_an_indexed_column_past_the_bound_is_refused_before_any_r
     );
     assert!(e.contains("copy the table's live rows into a new table"), "the refusal does not name the remedy: {e}");
     assert!(!e.to_lowercase().contains("shorten"), "the refusal suggests shortening in place: {e}");
+    // Review 7 K3: the refusal says how far the key is from fitting under the new type (2035 - 2034).
+    assert!(e.contains("shorter by at least 1 bytes"), "the refusal does not say how much shorter the key must be: {e}");
     assert_eq!(d.catalog.get_table("t").unwrap().schema.columns[1].data_type, DataType::Integer, "the refused ALTER installed the new shape");
     assert_eq!(d.ids("SELECT n FROM t;"), vec![7], "the refused ALTER changed the row");
 }
@@ -905,7 +909,13 @@ fn an_alter_that_widens_an_indexed_column_to_exactly_the_bound_is_accepted_and_r
 
     d.sql("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;");
     assert_eq!(d.catalog.get_table("t").unwrap().schema.columns[1].data_type, DataType::BigInt);
-    assert_eq!(d.rows("SELECT n FROM t;"), vec![vec![Value::BigInt(7)]]);
+    // `matches!`, not `assert_eq!`: `Value::eq` compares numbers by value, so it cannot tell
+    // `BigInt(7)` from `Integer(7)` (review 7 K7).
+    let rows = d.rows("SELECT n FROM t;");
+    assert!(
+        matches!(rows.as_slice(), [r] if matches!(r.as_slice(), [Value::BigInt(7)])),
+        "the retyped row did not read back as BIGINT 7: {rows:?}"
+    );
     rebuild_indexes(&mut d.catalog, &d.bp).expect("the database this build wrote must reopen");
 }
 
@@ -931,7 +941,7 @@ fn a_create_index_over_a_deleted_long_row_names_the_table_copy_and_the_copy_work
     let e = d.err("CREATE INDEX iv ON t (v);");
     assert!(
         e.contains("index entry too large: 2108 bytes")
-            && e.contains("deleted")
+            && e.contains("The row is deleted")
             && e.contains("copy the table's live rows into a new table")
             && !e.to_lowercase().contains("shorten"),
         "not the named backfill refusal: {}",
@@ -963,4 +973,212 @@ fn a_create_index_over_a_deleted_long_row_names_the_table_copy_and_the_copy_work
 
     d.sql("CREATE INDEX iv ON t (v);");
     assert_eq!(d.ids("SELECT id FROM t WHERE v = 'kept';"), vec![2], "the rebuilt table lost its row");
+}
+
+// ---- Review 7 (PREREG amendment 4) ---------------------------------------------------------------
+
+/// A database with an agent runtime, for the tests that MERGE a branch. Its shape is copied from
+/// `integration_merge_ddl_atomicity.rs`.
+struct MergeDb {
+    _dir: tempfile::TempDir,
+    catalog: Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    runtime: Arc<AgentRuntime>,
+    session: Session,
+}
+
+fn merge_db() -> MergeDb {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, txn) = stack(dir.path());
+    let catalog = Catalog::create(bp.clone()).unwrap();
+    let runtime = Arc::new(AgentRuntime::new());
+    let session = Session::with_runtime(runtime.clone());
+    MergeDb { _dir: dir, catalog, bp, txn, runtime, session }
+}
+
+impl MergeDb {
+    fn exec(&mut self, sql: &str, session: &mut Session) -> Result<Outcome, FerroError> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens()?;
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{}`: {:?}", abbreviate(sql), p.errors);
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), session)
+    }
+
+    fn sql(&mut self, sql: &str) -> Outcome {
+        let mut session = std::mem::replace(&mut self.session, Session::with_runtime(self.runtime.clone()));
+        let out = self.exec(sql, &mut session);
+        self.session = session;
+        out.unwrap_or_else(|e| panic!("`{}` failed: {e}", abbreviate(sql)))
+    }
+
+    fn branch(&mut self, name: &str) -> Session {
+        let mut s = Session::with_runtime(self.runtime.clone());
+        self.exec(&format!("BEGIN AGENT SESSION AS '{name}';"), &mut s).expect("open the branch");
+        s
+    }
+
+    fn shape(&self, table: &str) -> Vec<(String, DataType)> {
+        self.catalog
+            .get_table(table)
+            .unwrap_or_else(|| panic!("no table {table}"))
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone()))
+            .collect()
+    }
+
+    fn heap(&self, table: &str) -> Vec<(RecordId, Vec<u8>)> {
+        let root = self.catalog.get_table(table).unwrap().first_directory_page_id;
+        HeapFileManager::open(root, self.bp.clone())
+            .scan()
+            .map(|r| {
+                let (rid, tuple) = r.unwrap();
+                (rid, tuple.data)
+            })
+            .collect()
+    }
+}
+
+/// **H2: a MERGE whose row would land over the bound is refused before the schema moves.**
+///
+/// The trunk has `t (id VARCHAR(3000) NOT NULL, n INTEGER)`, indexed on `n`, and no rows, so the
+/// plan's own check (review 6 H1, trunk rows only) has nothing to ask. The branch inserts
+/// `('p' x 2023, 7)`, whose entry under INTEGER is 5 + 2026 = 2031, and stages `n TYPE BIGINT`.
+/// At landing that entry is 9 + 2026 = 2035. The INSERT executor that publishes the row refuses
+/// it, but only after `apply_plan` has retyped `t` durably: E82's half-merge. The landing check
+/// must refuse first. State is asserted before wording. Red at `3f9f41c`: "the refused MERGE
+/// retyped the table anyway".
+#[test]
+fn a_merge_whose_row_would_land_over_the_bound_is_refused_before_the_schema_moves() {
+    let mut d = merge_db();
+    d.sql("CREATE TABLE t (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("CREATE INDEX i ON t (n);");
+    let shape_before = d.shape("t");
+    let heap_before = d.heap("t");
+
+    let mut agent = d.branch("agent-h2");
+    d.exec(&format!("INSERT INTO t VALUES ('{}', 7);", "p".repeat(2023)), &mut agent)
+        .expect("the branch takes the row: its entry is 2031 bytes under INTEGER");
+    d.exec("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;", &mut agent).expect("the branch stages the retype");
+
+    let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
+    let msg = e.to_string();
+    assert_eq!(shape_before, d.shape("t"), "the refused MERGE retyped the table anyway: {}", abbreviate(&msg));
+    assert_eq!(heap_before, d.heap("t"), "the refused MERGE wrote to the heap");
+    assert!(
+        msg.contains("this MERGE would publish a row into 't'") && msg.contains("index entry too large: 2035 bytes"),
+        "not the landing check's refusal: {}",
+        abbreviate(&msg)
+    );
+}
+
+/// **K6: a chain is refused at the step that widens an entry past the bound**, as the statements
+/// typed one at a time would be. The trunk holds `('p' x 2023, 7)`, indexed on `n`. A branch
+/// stages `n TYPE BIGINT` (entry 9 + 2026 = 2035) and then `n TYPE DECIMAL`. The final entry,
+/// `Decimal("7")`, is 4 + 2026 = 2030, which fits. Measuring only the final shape accepts the
+/// chain; the first edit alone would be refused. Red at `3f9f41c`: the MERGE is accepted.
+#[test]
+fn a_chain_is_refused_at_the_step_that_widens_an_entry_past_the_bound() {
+    let mut d = merge_db();
+    d.sql("CREATE TABLE t (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("CREATE INDEX i ON t (n);");
+    d.sql(&format!("INSERT INTO t VALUES ('{}', 7);", "p".repeat(2023)));
+    let shape_before = d.shape("t");
+
+    let mut agent = d.branch("agent-k6");
+    d.exec("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;", &mut agent).expect("stage edit 1");
+    d.exec("ALTER TABLE t ALTER COLUMN n TYPE DECIMAL;", &mut agent).expect("stage edit 2");
+
+    let msg = match d.exec("MERGE;", &mut agent) {
+        Ok(_) => panic!("`MERGE;` was accepted; it must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(shape_before, d.shape("t"), "the refused MERGE retyped the table anyway: {}", abbreviate(&msg));
+    assert!(
+        msg.contains("index entry too large: 2035 bytes") && msg.contains("at edit 1 of 2"),
+        "not refused at the edit that widened the entry: {}",
+        abbreviate(&msg)
+    );
+}
+
+/// **K5: a VARCHAR widening over a legacy entry it does not grow is accepted.** `v VARCHAR(2500)`
+/// is indexed, and a legacy row puts `(2, 'x' x 2100)` in the heap: an entry of
+/// (3 + 2100) + 5 = 2108 bytes, which only an earlier build could store. `TYPE VARCHAR(3000)`
+/// moves no byte of it, so it writes nothing that was not already there, and it must not be
+/// refused. Red at `3f9f41c`: refused with "this ALTER would widen".
+#[test]
+fn a_varchar_widening_over_a_legacy_entry_it_does_not_grow_is_accepted() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(2500));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    d.sql("INSERT INTO t VALUES (1, 'short');");
+    d.legacy_row("t", &[Value::Integer(2), Value::Varchar("x".repeat(2100))]);
+
+    d.sql("ALTER TABLE t ALTER COLUMN v TYPE VARCHAR(3000);");
+    assert_eq!(d.catalog.get_table("t").unwrap().schema.columns[1].data_type, DataType::Varchar(3000));
+}
+
+/// **K1's control: the backfill says a LIVE row is live.** Without it, the deleted arm's own
+/// sentence would be the only one ever asserted, and a refusal that got the arm wrong would pass.
+/// This passes at `3f9f41c` too: it is a control, not a red test.
+#[test]
+fn a_create_index_over_a_live_long_row_says_the_row_is_live() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql(&format!("INSERT INTO t VALUES (2, '{}');", "x".repeat(2100)));
+    let e = d.err("CREATE INDEX iv ON t (v);");
+    assert!(
+        e.contains("index entry too large: 2108 bytes") && e.contains("The row is live") && !e.contains("The row is deleted"),
+        "not the live arm of the backfill refusal: {}",
+        abbreviate(&e)
+    );
+}
+
+/// **K4: the full-text backfill asks the bound of a deleted row's postings.** A deleted
+/// `('p' x 1800, 'y' x 255)`: primary entry 1809, posting (3 + 255) + (3 + 1800) = 2061. Without
+/// the backfill's own check, the tree refuses with its generic text and no row or arm is named.
+#[test]
+fn a_create_fulltext_index_over_a_deleted_row_with_an_over_bound_posting_is_refused_by_the_backfill() {
+    let mut d = db();
+    d.sql("CREATE TABLE f (id VARCHAR(2000) NOT NULL, body VARCHAR(300));");
+    let pk = "p".repeat(1800);
+    d.sql(&format!("INSERT INTO f VALUES ('{pk}', '{}');", "y".repeat(255)));
+    d.sql(&format!("DELETE FROM f WHERE id = '{pk}';"));
+    let e = d.err("CREATE FULLTEXT INDEX ff ON f (body);");
+    assert!(
+        e.contains("cannot build the index on 'f.body'")
+            && e.contains("index entry too large: 2061 bytes")
+            && e.contains("The row is deleted"),
+        "not the backfill's refusal: {}",
+        abbreviate(&e)
+    );
+}
+
+/// **K2, a merged-tree test: a deleted long row is replaced by inserting its key again, and the
+/// index then builds.** RED BY DESIGN on `d225-byte-split` alone; green on the merge with #16.
+///
+/// F2's fixture: `(1, 'x' x 2100)` inserted and deleted, so CREATE INDEX is refused. The remedy
+/// the refusal names for a deleted row whose key fits: INSERT the key again with a value that fits,
+/// remove it again, and create the index. On #16 (`4296723`) the re-inserted row takes the dead
+/// version's slot and the long dead version moves to the table's history, so the backfill no
+/// longer meets it. Without #16 the re-insert takes a new slot, the long tuple stays, and the
+/// last CREATE INDEX fails with "cannot build the index".
+#[test]
+fn a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_builds() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql(&format!("INSERT INTO t VALUES (1, '{}');", "x".repeat(2100)));
+    d.sql("INSERT INTO t VALUES (2, 'kept');");
+    d.sql("DELETE FROM t WHERE id = 1;");
+    let e = d.err("CREATE INDEX iv ON t (v);");
+    assert!(e.contains("The row is deleted"), "premise: the backfill refuses the deleted row: {}", abbreviate(&e));
+
+    d.sql("INSERT INTO t VALUES (1, 'x');");
+    d.sql("DELETE FROM t WHERE id = 1;");
+    // Red here on d225 alone: "cannot build the index".
+    d.sql("CREATE INDEX iv ON t (v);");
+    assert_eq!(d.ids("SELECT id FROM t WHERE v = 'kept';"), vec![2]);
 }
