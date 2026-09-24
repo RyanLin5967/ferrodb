@@ -146,3 +146,115 @@ link lived at least 2 s, which is twice the 1 s gate.
 
 - `heartbeat: 3` is at `consensus/mod.rs:472`, not `:473`;
 - `election_base` and the jittered timeout are at `:452-454`, not `:453-455` (READ at `12fb897`).
+
+---
+
+## Amendment 2 — the D224 review's caveats, written BEFORE their fixes (nothing built)
+
+Source: `artie-research frontier/d224_review.md` @ `d23d425`, verdict SOUND-WITH-CAVEATS. The mechanism stands. What
+follows corrects the record and the tests around it, and closes one hole (the review's F4, which the lead verified).
+
+### Red test at **`92373ff`** (additions only; it compiles against `7d9567f`)
+
+**H** = `a_link_left_holding_a_refusal_is_redialled_after_an_idle_gap`.
+
+- **The hole.** A refused handshake does not close silently. `conn_loop` still sends its own handshake, then an
+  `Error` frame, then closes (READ `7d9567f:transport.rs:2265-2278`). The dialler reads exactly the six handshake
+  bytes and keeps the connection. The `Error` frame and the FIN stay unread on it, so every `peek` returns
+  `Ok(1)`. `peer_has_closed` reads `Ok(_)` as "alive" (`:2068-2069`), which makes the probe blind on that link for
+  good.
+- **The test.** A hand-rolled peer writes exactly those bytes and closes. It reads all six of A's handshake bytes
+  first, so the close is a FIN and not a reset, and A writes nothing on that connection. After 600 ms (the gate is
+  150 ms), A sends ONE frame. The frame must arrive on a second connection, through one redial, with
+  `lost_in_flight` 0.
+- **Counts:** the transport module has 62 `#[test]` at `92373ff`, one of them macOS-only. Instrument:
+  `grep -cE '^\s*#\[test\]'`, with one `#[cfg(target_os = "macos")]` at `:2054`.
+
+**Run R2 at `92373ff` (predicted):** **61 passed, 1 failed** on macOS (60/1 elsewhere). H fails at its "A never
+redialled a link holding an unread refusal and a FIN" panic, after the 5 s accept deadline, reporting
+`idle_probes +1, idle_redials +0, lost_in_flight 0`. The probe ran and found the link alive; the frame went into the
+closed connection, which answered with a reset, and no later write came to fail.
+
+### The fixes, as they will be made
+
+1. **`peer_has_closed`: `Ok(_) => true`.** A sender only writes to its link. The one path on which the accepting side
+   writes after the handshake is the refusal, and it always closes. So an unread byte means either a refusal or a
+   state the protocol does not produce while the link is open. Either way the frame is carried to a redial, which
+   costs nothing. The doc's "after the handshake the accepting side never writes" is corrected.
+2. **`idle_redials` no longer counts a shutdown.** `Transport::shutdown` and `stop_started` both set `stop` before
+   they shut `st.live` (READ `:1823-1829`, `:1849-1855`). So a close caused by the shutdown is always seen with
+   `stop` set, and a `stop` check before the count skips it. The carried frame is then dropped uncounted, as the
+   queue is (`:1826`).
+   - **No test and no mutant.** The window between taking a frame and the peek is microseconds wide, so a test
+     cannot aim at it. The fix is stated as untested.
+3. **The premise is restated, in `idle_probe_gap`'s doc, `idle_deadline`'s doc and here.**
+   - The design needs only `D_r ≥ D_s / 2`: no node's `idle_deadline` may be below half of another's. Equal
+     deadlines are not needed.
+   - If the premise is violated, gaps in `(D_r, D_s / 2)` are closed but never probed. The pre-D224 loss returns
+     for that band only; there is no new failure mode.
+   - It is not enforced. The handshake carries no options (`:2096`), and `NodeOptions.transport` is a per-node pub
+     field (`node.rs:126`).
+   - In-repo, every node uses the default: `git grep -n idle_deadline -- src tests examples` finds no setter
+     outside `transport.rs` and `tests_transport.rs` (READ).
+4. **What "half" buys: tolerance, not a narrower race.** The race sits at the receiver's close wherever the gate is,
+   as long as the gate is at most D. Half tolerates a receiver whose deadline is as low as half the sender's. The
+   original's "why half" bullet ("the probe then lands on links still open…") is withdrawn as a reason.
+5. **The residual costs two frames, not one** (the review's F7). If the probe sees the link open just before the
+   close, the write succeeds and refreshes `last_used`. The frame after it, due under the gate, is not probed, so it
+   fails against the reset and is counted. That is the full pre-D224 cost, at a small probability. The docs that say
+   "one frame" are corrected.
+6. **The restart claim is RETRACTED.** The original's mechanism bullet says "It also catches a peer that restarted
+   during a gap". That is too broad.
+   - **Caught:** a restart is caught only when the next write comes at least G after the previous one, which in
+     practice means idle follower↔follower links.
+   - **Not caught:**
+     - a busy leader↔follower link, which costs two heartbeats;
+     - a peer that restarts mid-election, because campaign frames go out 0.5–1 s apart;
+     - a host that reboots, which sends no FIN or reset until we write;
+     - a peer shut down mid-handshake, which H now covers through fix 1.
+7. **Busy links pay two clock reads per frame, not nothing**, in the doc at the gate. The carried frame's policy
+   also gets a sentence. It sits outside the queue's drop-oldest bound and goes first on the new connection, the
+   stalest frame first; consensus refuses stale terms, so that is harmless.
+
+### Test changes, registered here before they are made
+
+- **I and P: add a 200 ms settle** after the wait loop, before the one send (the review's F2).
+  - The wait proves only that B *sent* its FIN (`live_inbound_conns` falls after `conn_loop`'s `shutdown`). On XNU,
+    loopback delivery can lag under load, so the peek could run before A's kernel processed the FIN.
+  - The red at `9b0f4af` is unaffected: nothing probes there, so the frame is lost whatever the delay. Run R measures
+    `9b0f4af`'s own I.
+  - The gap only grows further past the 150 ms gate.
+- **B: `idle_deadline` 8 s (gate 4 s), 60 frames 100 ms apart, and `elapsed ≥ 5 s`** (gate + 1 s), measured from an
+  `Instant` taken before `pair()`.
+  - B records `t_send[k]` before each send and `t_recv[k]` after each receive, and prints
+    `bound = max(t_recv[1] − t0, max_k (t_recv[k+1] − t_send[k]))` in its `idle_probes == 0` message. That bound is
+    an upper bound on every gap between A's writes.
+  - `bound < gate` means the probe is a defect. `bound ≥ gate` means the run stalled, so re-run it. **Both stay red.**
+- **`tests_transport.rs:1680-1682`** still says "Consensus heartbeats every few ticks, so silence past the deadline
+  is a gone peer". That is the premise D224 corrected in `conn_loop`, so it is replaced. Comment only.
+
+### Mutants, corrected and extended (the review's F1)
+
+| mutant | fails | change from amendment 1 |
+|---|---|---|
+| N1 `probe_removed` | I, P, H | + H |
+| N2 `probe_every_frame` | B, P, `a_broken_connection_is_reconnected_and_the_frame_lost_to_it_is_counted` | + P (the carried frame is probed again on the new link, so `idle_probes` rises by 2) and + the broken-connection test (every frame is probed, the probe sees the FIN, and the redial blocks in `dial` against a listener not yet accepting, so `lost_in_flight` stays 0) |
+| N3 `probe_result_ignored` | I, P, H | + H |
+| N4 `frame_not_carried` | I, P, H | + P (at `expect_recv` for term 2) and + H (the redial happens, but the frame never arrives) |
+| N5 `last_use_not_refreshed` | B | unchanged. H's gap is counted from the dial, so it does not see N5 |
+| **N6 `refusal_bytes_read_as_alive`** (new) | H | `Ok(_) => true` reverted to `false`, which is the code at `7d9567f` |
+
+The N2 row's reasoning is the review's (INFERRED there, and here). A failure outside a row is reported as an
+unregistered kill, never folded in.
+
+### Run G2 at the tip (predicted)
+
+- **The transport module: 62 passed on macOS** (61 elsewhere), which is 61 plus H.
+- **Per-target: 2601 + 1 = 2602** on macOS. The 2598 under it is the D207 lane's prediction and has never been run.
+
+### Errata (append-only; the lines above stand as written)
+
+- The original says "at 10–20 ticks (0.5–1 s, `mod.rs:453-455`)". The election timeout is `10 + rng % 10`, which is
+  **10–19 ticks** (0.5–0.95 s). Amendment 1 corrected the line numbers, not the range.
+- The lane report and the FAN-QUEUE row say "All 6 commits". `1b8d290..7d9567f` holds **5**
+  (`git rev-list --count 1b8d290..7d9567f`).
