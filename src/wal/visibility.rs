@@ -2,28 +2,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, tuple::{Tuple, VersionHeader}}, wal::txn::ReadView};
 
-/// **D194 new-wall audit, term 2: how far back a read had to walk.** This is every
-/// `tt_heap.read` that `resolve_visibility` made, meaning one per version the view could not see.
-/// For a branch reading through its pin, that is one per version committed to the row since the
-/// pin. Read it twice and subtract to scope it to one statement.
+/// **D194 new-wall audit, term 2: how far back a read had to walk.** It counts every `tt_heap.read`
+/// a scan's visibility checks made, which is one per version the view could not see. For a branch
+/// reading through its pin, that is one per version committed to the row since the pin. Read it
+/// twice and subtract to scope it to one statement.
 ///
-/// ⚠ **ONE atomic add per CALL THAT HOPPED, not one per hop.** A read that sees the head pays
-/// nothing extra: every read of main as it stands, and every pinned read of a row nothing has
-/// touched since the pin. A hopping row pays one add whatever its chain length. So the instrument
-/// adds a constant per row and cannot create the slope in hops it exists to measure. That is the
-/// rule `OURS_SCAN_EXAMINED` states in `agent_sql/runtime.rs`.
+/// ⚠ **ONE atomic add per SCAN, never per tuple (D176's rule, `execution::seq_scan`).** Each
+/// executor keeps its own [`HopCount`], and the count reaches this global once, when the scan is
+/// dropped, and only if it is non-zero. The first version added once per hopping tuple. The cost
+/// review (`d194_cost_review.md` §4) found that to be a contended write per tuple on the path every
+/// executor shares, which is the one shape that can create the slope it measures.
 pub static VISIBILITY_HOPS: AtomicU64 = AtomicU64::new(0);
 
-pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
-    let mut hops = 0u64;
-    let out = walk_back(view, tt_heap, head, &mut hops);
-    if hops > 0 {
-        VISIBILITY_HOPS.fetch_add(hops, Ordering::Relaxed);
+/// One scan's hops, added to [`VISIBILITY_HOPS`] once, when the scan that holds it is dropped.
+#[derive(Default)]
+pub struct HopCount(u64);
+
+impl HopCount {
+    /// The hops counted so far, not yet flushed.
+    pub fn get(&self) -> u64 {
+        self.0
     }
-    out
 }
 
-fn walk_back(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple, hops: &mut u64) -> Result<Option<Tuple>, FerroError> {
+impl Drop for HopCount {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            VISIBILITY_HOPS.fetch_add(self.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The version of `head`'s row that `view` can see, counting nothing. Every executor calls
+/// [`resolve_visibility_counted`] instead, so that its hops reach `VISIBILITY_HOPS`.
+pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
+    resolve_visibility_counted(view, tt_heap, head, &mut HopCount(0))
+}
+
+/// [`resolve_visibility`], adding each `tt_heap.read` to the caller's per-scan `hops`.
+pub fn resolve_visibility_counted(
+    view: &ReadView,
+    tt_heap: &HeapFileManager,
+    head: Tuple,
+    hops: &mut HopCount,
+) -> Result<Option<Tuple>, FerroError> {
     let mut current = head;
     loop {
         let h = current.version_header()?;
@@ -32,7 +54,7 @@ fn walk_back(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple, hops: &mut
         }
         match h.prev() {
             Some((page, slot)) => {
-                *hops += 1;
+                hops.0 += 1;
                 current = tt_heap.read(RecordId::new(page, slot))?
             }
             None => return Ok(None),

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::wal::visibility::resolve_visibility;
+use crate::wal::visibility::{resolve_visibility_counted, HopCount};
 use crate::{catalog::schema::Schema, error::FerroError, execution::executor::Executor, storage::range_scan::RangeScanner, wal::txn::ReadView};
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::catalog::column::Value;
@@ -71,6 +71,8 @@ pub struct IndexScan {
     /// D181 — entries pulled, accumulated locally and flushed once in `Drop`. Not `pub`: a caller
     /// that could set it could forge the measurement. See `SeqScan::pulled`.
     examined: u64,
+    /// D194 — version-chain hops, flushed once when the scan drops. See `VISIBILITY_HOPS`.
+    hops: HopCount,
 }
 
 impl IndexScan {
@@ -82,7 +84,7 @@ impl IndexScan {
         view: Arc<ReadView>,
         tt_heap: HeapFileManager,
     ) -> Self {
-        Self { heap, scanner, schema, view, tt_heap, examined: 0 }
+        Self { heap, scanner, schema, view, tt_heap, examined: 0, hops: HopCount::default() }
     }
 }
 
@@ -106,7 +108,7 @@ impl Executor for IndexScan {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e))
             };
-            let vt = match resolve_visibility(&self.view, &self.tt_heap, tuple) {
+            let vt = match resolve_visibility_counted(&self.view, &self.tt_heap, tuple, &mut self.hops) {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e))

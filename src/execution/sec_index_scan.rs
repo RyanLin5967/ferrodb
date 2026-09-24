@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::{ops::Bound, sync::Arc};
 
-use crate::{catalog::{column::Value, schema::Schema}, error::FerroError, execution::{executor::Executor, index_scan::{INDEX_SCANS, INDEX_SCAN_ENTRIES}}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager, range_scan::RangeScanner}, wal::{txn::ReadView, visibility::resolve_visibility}};
+use crate::{catalog::{column::Value, schema::Schema}, error::FerroError, execution::{executor::Executor, index_scan::{INDEX_SCANS, INDEX_SCAN_ENTRIES}}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager, range_scan::RangeScanner}, wal::{txn::ReadView, visibility::{resolve_visibility_counted, HopCount}}};
 
 pub struct SecondaryIndexScan {
     pub heap: HeapFileManager,
@@ -20,6 +20,8 @@ pub struct SecondaryIndexScan {
     pub col_index: usize,
     /// D181 — index entries pulled, flushed once in `Drop`. Not `pub`: see `IndexScan::examined`.
     examined: u64,
+    /// D194 — version-chain hops, flushed once when the scan drops. See `VISIBILITY_HOPS`.
+    hops: HopCount,
 }
 
 impl SecondaryIndexScan {
@@ -39,7 +41,19 @@ impl SecondaryIndexScan {
         tt_heap: HeapFileManager,
         col_index: usize,
     ) -> Self {
-        Self { heap, scanner, primary_index, schema, sec_lower, sec_upper, view, tt_heap, col_index, examined: 0 }
+        Self {
+            heap,
+            scanner,
+            primary_index,
+            schema,
+            sec_lower,
+            sec_upper,
+            view,
+            tt_heap,
+            col_index,
+            examined: 0,
+            hops: HopCount::default(),
+        }
     }
 }
 
@@ -108,7 +122,7 @@ impl Executor for SecondaryIndexScan {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e))
             };
-            let vt = match resolve_visibility(&self.view, &self.tt_heap, tuple) {
+            let vt = match resolve_visibility_counted(&self.view, &self.tt_heap, tuple, &mut self.hops) {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e))
