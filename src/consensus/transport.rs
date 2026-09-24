@@ -57,8 +57,10 @@
 //! lost with no number attached, and only the frame whose own write failed reaches `lost_in_flight`.
 //! That includes the first frame written after the peer closed its end, which is exactly what the
 //! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
-//! the next write that fails. So a live connection closed for silence costs its sender two frames,
-//! not nothing. The same is true of the receiving side. A connection closed on a frame with an
+//! the next write that fails. Since D224 a sender probes a link it has left idle before writing to
+//! it, and redials if the peer closed it ([`Transport::idle_probes`], [`Transport::idle_redials`]).
+//! So an idle close costs a frame only in the narrow race `idle_probe_gap` describes. The same is
+//! true of the receiving side. A connection closed on a frame with an
 //! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
 //! whatever the peer sends after it; of those closes, only the idle one is counted
 //! ([`Transport::idle_closed`]). Consensus re-sends, so none of these is a correctness loss; they
@@ -1143,15 +1145,18 @@ pub struct TransportOptions {
     /// A peer whose host vanishes without sending a FIN leaves a connection that is never readable
     /// and never errors, so its thread and descriptors are pinned for the life of the process.
     ///
-    /// **What closing a live peer costs**, stated because it used to say "only a reconnect". The
-    /// leader heartbeats its followers, and they answer it, so those connections are never silent
-    /// for long. **Followers send each other nothing** while a leader holds, so each follower's
-    /// connection *to* another is closed by the receiver after this long. The sender does not read
-    /// its socket and does not see the close. When the leader then dies, a surviving follower's
-    /// first campaign frame to the other survivor is written into the closed connection and lost
-    /// uncounted. Its second fails the write and is counted in `lost_in_flight`. Only then does it
-    /// redial. So a failover after a long stable term can take an election round or two longer than
-    /// one after a short term. See the module header for why neither loss is a correctness failure.
+    /// **What closing a live peer costs.** The leader heartbeats its followers, and they answer it,
+    /// so those connections are never silent for long. **Followers send each other nothing** while
+    /// a leader holds, so each follower's connection *to* another is closed by the receiver after
+    /// this long. The sender does not read its socket, so it does not see the close.
+    ///
+    /// Until D224, a surviving follower's first campaign frame after the leader died went into that
+    /// closed connection and was lost uncounted. Its second failed and was counted. Failover after a
+    /// long stable term took an election round or two longer.
+    ///
+    /// Now the sender probes a link idle for half of this before its next write, and redials first
+    /// if the link is closed (`idle_probe_gap`). Both ends must run the same value for that to hold,
+    /// as every node does through `NodeOptions`.
     pub idle_deadline: Duration,
     /// Most bytes of undelivered inbound messages held before further ones are refused.
     ///
@@ -1212,6 +1217,13 @@ struct Counters {
     /// Outbound messages refused because they were addressed to this node itself, or to a node this
     /// transport holds no address for: configuration mistakes that are otherwise a silent partition.
     unaddressable: AtomicU64,
+    /// Times a sender probed its link before the first write after an idle gap (D224). A link that
+    /// consensus keeps busy never reaches the gate, so this should move only on links it leaves
+    /// silent: follower to follower during a stable term.
+    idle_probes: AtomicU64,
+    /// Probes that found the peer had closed the link, so the sender redialled before writing
+    /// instead of losing the frame to the closed connection (D224).
+    idle_redials: AtomicU64,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1774,6 +1786,14 @@ impl Transport {
     pub fn unaddressable(&self) -> u64 {
         self.counters.unaddressable.load(Ordering::SeqCst)
     }
+    /// Links probed before the first write after an idle gap. See `Counters::idle_probes`.
+    pub fn idle_probes(&self) -> u64 {
+        self.counters.idle_probes.load(Ordering::SeqCst)
+    }
+    /// Probes that found the link closed by the peer and redialled first.
+    pub fn idle_redials(&self) -> u64 {
+        self.counters.idle_redials.load(Ordering::SeqCst)
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -1868,6 +1888,8 @@ impl std::fmt::Debug for Transport {
             .field("connect_failures", &self.connect_failures())
             .field("unencodable", &self.unencodable())
             .field("unaddressable", &self.unaddressable())
+            .field("idle_probes", &self.idle_probes())
+            .field("idle_redials", &self.idle_redials())
             // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
             // reports only whether there is one.
             .field("signed", &self.signs_its_traffic())
@@ -1885,6 +1907,14 @@ fn sender_loop(
     opts: TransportOptions,
 ) {
     let mut conn: Option<TcpStream> = None;
+    // When the current connection last carried a frame, or was dialled. The gap since then decides
+    // whether the link is probed before the next write (D224; the gate is just before the write).
+    let mut last_used = Instant::now();
+    // A frame already taken from the queue whose link the probe found closed. It is written first on
+    // the next connection, so finding the close costs the frame nothing.
+    let mut carried: Option<Vec<u8>> = None;
+    // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
+    let probe_gap = idle_probe_gap(&opts);
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -1911,6 +1941,7 @@ fn sender_loop(
                         }
                     }
                     conn = Some(s);
+                    last_used = Instant::now();
                 }
                 Err(_) => {
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
@@ -1922,8 +1953,11 @@ fn sender_loop(
             }
         }
 
-        // Take one frame, waiting a bounded time so the stop flag is checked regularly.
-        let frame = {
+        // Take one frame — the one a probe carried over, if there is one — waiting a bounded time so
+        // the stop flag is checked regularly.
+        let frame = if let Some(f) = carried.take() {
+            Some(f)
+        } else {
             let mut st = ob.state.lock().unwrap();
             while st.queue.is_empty() && !st.stopped && !stop.load(Ordering::SeqCst) {
                 let (g, timed_out) = ob.woken.wait_timeout(st, opts.poll_interval).unwrap();
@@ -1944,6 +1978,26 @@ fn sender_loop(
         let Some(frame) = frame else { continue };
 
         let s = conn.as_mut().expect("connected above");
+        // **Probe a link that has been idle before writing to it** (D224). The receiver closes a
+        // connection silent past its `idle_deadline`, and this thread never reads its socket, so it
+        // would not know: the frame would go into the closed connection and be lost with no number
+        // attached, and only the next write would fail. Consensus leaves follower-to-follower links
+        // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
+        // leader died. A link consensus keeps busy never reaches this gate, so it costs them nothing.
+        if last_used.elapsed() >= probe_gap {
+            counters.idle_probes.fetch_add(1, Ordering::SeqCst);
+            if peer_has_closed(s) {
+                counters.idle_redials.fetch_add(1, Ordering::SeqCst);
+                let mut st = ob.state.lock().unwrap();
+                if let Some(old) = st.live.take() {
+                    let _ = old.shutdown(Shutdown::Both);
+                }
+                drop(st);
+                conn = None;
+                carried = Some(frame);
+                continue;
+            }
+        }
         // A write that fails part way through has left a partial frame on the wire, and there is no
         // way to resume it — the peer's reader is now inside a frame that will never finish. So the
         // connection is dropped, which is what makes the peer's reader see EOF and reset. The frame
@@ -1961,6 +2015,8 @@ fn sender_loop(
             }
             drop(st);
             conn = None;
+        } else {
+            last_used = Instant::now();
         }
     }
 
@@ -1970,6 +2026,53 @@ fn sender_loop(
     }
     drop(st);
     drop(conn);
+}
+
+/// The idle gap after which a sender probes its link before writing (D224): half `idle_deadline`.
+///
+/// **Above the longest gap on any link consensus keeps busy.** A leader heartbeats every
+/// `heartbeat` ticks (3, at a 50 ms `NodeOptions::tick`: 150 ms), and every heartbeat is an `Append`
+/// each follower answers at once. So leader↔follower links see gaps of about one heartbeat, and at
+/// the default deadline this gate is 200 heartbeats away. A link that missed that many has lost its
+/// leader several election timeouts ago.
+///
+/// **At most `idle_deadline`, so every link the peer may have closed is probed.** The peer closes a
+/// link only after hearing nothing for longer than its `idle_deadline`, counted from its last read,
+/// which is no earlier than this sender's last write. So a gap under this cannot have been closed.
+/// Premise, stated: both ends run the same `idle_deadline`, as every node does through
+/// `NodeOptions`.
+///
+/// Half rather than all of it, so a link still open when probed is written to — which resets the
+/// peer's clock — well before the peer's close. What remains is a link whose gap lands within about
+/// one `poll_interval` and a round trip of the peer's close: the probe may see it open just before it
+/// closes, and one frame can still be lost uncounted. A follower-to-follower link idle for a whole
+/// term is far outside that window.
+fn idle_probe_gap(opts: &TransportOptions) -> Duration {
+    opts.idle_deadline / 2
+}
+
+/// Whether the peer has closed this connection: asked without blocking and without consuming
+/// anything (D224).
+///
+/// After the handshake the accepting side never writes, so the only readable states on a sender's
+/// socket are a FIN (`peek` returns 0) or an error (a reset). Nothing to read means the link is up.
+/// A socket that cannot be put back into blocking mode is treated as closed: the sender redials
+/// rather than write through a socket in the wrong mode.
+fn peer_has_closed(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let closed = match s.peek(&mut probe) {
+        Ok(0) => true,
+        // Bytes the peer should never have sent: whatever this is, the link is alive.
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    s.set_nonblocking(false).is_err() || closed
 }
 
 /// Dial a peer and complete the handshake as the **connecting** side: write ours, then read theirs.
@@ -2184,8 +2287,14 @@ fn conn_loop(
         }
         // A peer whose host vanished without a FIN leaves a socket that never becomes readable and
         // never errors. Without this, its thread and both its descriptors are held for the life of
-        // the process. Consensus heartbeats every few ticks, so silence past this deadline is not a
-        // slow peer — it is a gone one.
+        // the process.
+        //
+        // **Silence is not proof the peer is gone.** This used to say it was, because consensus
+        // heartbeats every few ticks. That is true of a leader's links and false of
+        // follower-to-follower links, which carry nothing for a whole stable term. Those are closed
+        // here too. The cost is paid by the sender, which probes a link it has left idle before
+        // writing to it, and redials if the link is closed (`idle_probe_gap`, `peer_has_closed`;
+        // D224).
         if last_heard.elapsed() > opts.idle_deadline {
             counters.idle_closed.fetch_add(1, Ordering::SeqCst);
             break;
