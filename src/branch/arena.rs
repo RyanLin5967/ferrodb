@@ -2264,10 +2264,13 @@ impl ArenaPageStore {
         // open after an unclean exit. A clean CLI exit writes a full image first (the exit
         // `store.checkpoint` in `src/cli/cli.rs`), so it never reaches this path with a long tail.
         //
-        // Now the log is taken out of `state` once and indexed once (O(P)). Every record then
-        // applies ITS OWN entries by key, and the result is written back once. Total: O(P + tail
-        // records + the entries they carry). [`PendingReplay`] states the rules it has to keep,
-        // and `replay_of_the_pending_log_keeps_every_rule_the_per_record_scans_had` pins them.
+        // Now the log is taken out of `state` once and indexed at most once (O(P)), by the first
+        // record that touches it. A tail with no such record, which is every clean open, does no
+        // work on the log at all. Every record then applies ITS OWN entries by key, and the result
+        // is written back once. Total: O(P + tail records + the entries they carry).
+        // [`PendingReplay`] states the rules it has to keep, and
+        // `replay_of_the_pending_log_keeps_every_rule_the_per_record_scans_had` and
+        // `a_repark_of_a_key_already_in_the_log_keeps_the_first_entry` pin them.
         let mut pending = PendingReplay::new(std::mem::take(&mut self.state.lock().unwrap().pending));
         let applied = self.replay_records(tail, &mut pending);
         // Written back on the error path too. The open fails either way, but a store whose log
@@ -2662,31 +2665,42 @@ impl ArenaPageStore {
 
 use pending_replay::PendingReplay;
 
-/// **D183 tail replay: the pending-free log, indexed once for a whole replay.**
+/// **D183 tail replay: the pending-free log, indexed at most once for a whole replay.**
 ///
-/// A module of its own so the log's slots are PRIVATE. `apply_tail_record` can change the log only
-/// through these methods, so it cannot walk the whole log per record again without a new method
-/// here, where every visit is counted.
+/// A module of its own so the log's slots are PRIVATE, and `apply_tail_record` changes the log only
+/// through these methods. ⚠ **That narrows the instrument's blind spot; it does not remove it.** The
+/// counter sees a rescan only if the rescan bumps `visits`. A scan written inside this module without
+/// that bump is invisible to the count test. Mutant MR5 in `frontier/lane_d183_tail_replay.md` is
+/// exactly that, and it is expected to survive. Outside the module a rescan is not possible at all,
+/// because `st.pending` is empty for the whole replay.
+///
+/// **Lazily.** The log is indexed by the first record that touches it (`index`). A replay where no
+/// record does, which covers an empty tail (every clean open) and a tail of claims only, does no work
+/// on the log. That is what the per-record code did there.
 ///
 /// **The rules it keeps**, each one what a per-record scan of `Vec<PendingFree>` did:
 /// * order is log order, and an entry pushed after a removal goes to the END;
 /// * [`PendingReplay::contains`] means "some live entry has this key". PARKED asks it before every
-///   push, so the first entry for a key wins, within one record as well as across records;
+///   push, so the FIRST entry for a key wins, within one record as well as across records;
 /// * [`PendingReplay::remove_key`] removes EVERY live entry with the key (a `retain`), and a
 ///   missing key is a no-op;
 /// * [`PendingReplay::remove_arena`] removes every live entry of the arena;
 /// * [`PendingReplay::replace`] takes the new log as given, duplicates included.
 ///
-/// Cost: `new` and `finish` are one pass each over the log. Every other method is O(1) plus the
-/// entries it actually removes; `remove_arena` also walks that arena's positions that other
-/// records already removed. Each position is pushed once and dropped at most once, so a whole
-/// replay is O(P + records + the entries the records carry).
+/// Cost: indexing and `finish` are one pass each over the log, and only if some record touched it.
+/// Every other method is O(1) plus the entries it actually removes; `remove_arena` also walks that
+/// arena's positions that other records already removed. Each position is pushed once and dropped at
+/// most once, so a whole replay is O(P + records + the entries the records carry), and O(records)
+/// when no record touches the log.
 mod pending_replay {
     use crate::branch::record::PendingFree;
     use crate::branch::types::{ArenaId, PageId};
     use std::collections::HashMap;
 
     pub(super) struct PendingReplay {
+        /// The log as the replay found it, until a record first touches it. [`Self::index`] moves
+        /// it into `slots`.
+        untouched: Option<Vec<PendingFree>>,
         /// Log order. `None` is an entry a later record removed; [`Self::finish`] drops the holes.
         slots: Vec<Option<PendingFree>>,
         /// LIVE slots per key, oldest first. A key is absent once its last live slot goes.
@@ -2700,21 +2714,29 @@ mod pending_replay {
     }
 
     impl PendingReplay {
-        /// Index `log` once. O(its length).
+        /// Hold `log` unindexed. O(1).
         pub(super) fn new(log: Vec<PendingFree>) -> PendingReplay {
-            let mut r = PendingReplay {
-                slots: Vec::with_capacity(log.len()),
-                by_key: HashMap::with_capacity(log.len()),
+            PendingReplay {
+                untouched: Some(log),
+                slots: Vec::new(),
+                by_key: HashMap::new(),
                 by_arena: HashMap::new(),
                 visits: 0,
-            };
-            for e in log {
-                r.push(e);
             }
-            r
+        }
+
+        /// Index the log `new` was given, once, at the first call that needs it. O(its length).
+        fn index(&mut self) {
+            let Some(log) = self.untouched.take() else { return };
+            self.slots.reserve(log.len());
+            self.by_key.reserve(log.len());
+            for e in log {
+                self.push_indexed(e);
+            }
         }
 
         pub(super) fn contains(&mut self, key: (PageId, ArenaId)) -> bool {
+            self.index();
             self.visits += 1;
             self.by_key.contains_key(&key)
         }
@@ -2722,6 +2744,11 @@ mod pending_replay {
         /// Append at the END of the log. Does not deduplicate; callers that must, ask
         /// [`Self::contains`] first, exactly as the scan they replace did.
         pub(super) fn push(&mut self, e: PendingFree) {
+            self.index();
+            self.push_indexed(e);
+        }
+
+        fn push_indexed(&mut self, e: PendingFree) {
             self.visits += 1;
             let at = self.slots.len();
             self.slots.push(Some(e));
@@ -2731,6 +2758,7 @@ mod pending_replay {
 
         /// Remove every live entry with this key.
         pub(super) fn remove_key(&mut self, key: (PageId, ArenaId)) {
+            self.index();
             self.visits += 1;
             let Some(at) = self.by_key.remove(&key) else { return };
             for i in at {
@@ -2741,6 +2769,7 @@ mod pending_replay {
 
         /// Remove every live entry of this arena.
         pub(super) fn remove_arena(&mut self, arena: ArenaId) {
+            self.index();
             let Some(at) = self.by_arena.remove(&arena) else { return };
             for i in at {
                 self.visits += 1;
@@ -2759,15 +2788,20 @@ mod pending_replay {
             }
         }
 
-        /// The log becomes exactly `log`. Costs its length, plus dropping the index it replaces.
+        /// The log becomes exactly `log`, unindexed until something touches it. Costs dropping the
+        /// index it replaces.
         pub(super) fn replace(&mut self, log: Vec<PendingFree>) {
             let carried = self.visits + self.slots.len() as u64;
             *self = PendingReplay::new(log);
             self.visits += carried;
         }
 
-        /// The log in order, holes dropped, and the visits this replay made. O(slots).
+        /// The log in order, holes dropped, and the visits this replay made. O(slots), or O(1) if
+        /// no record ever touched the log.
         pub(super) fn finish(self) -> (Vec<PendingFree>, u64) {
+            if let Some(log) = self.untouched {
+                return (log, self.visits);
+            }
             let visits = self.visits + self.slots.len() as u64;
             (self.slots.into_iter().flatten().collect(), visits)
         }
@@ -5433,7 +5467,25 @@ mod tests {
             kinds.len(),
             kinds.len()
         );
+
+        // The tail was REPLAYED, not skipped (review F2). A store that replayed no record would
+        // pass every bound above, since it visits only the image's log, and its pending log would
+        // still be the image's original 64 entries. Memory holds entries 13..64 plus the 12
+        // re-parks, and a full image of memory is the independent reference.
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-visits-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint(&control).unwrap();
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            target.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from image + tail is not the map a full image of memory holds, so \
+             the visit count above was taken over a replay that skipped records"
+        );
         let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
     }
 
     /// The same image and tail through the real writers, restored and compared byte for byte with
@@ -5582,6 +5634,84 @@ mod tests {
             "the replayed pending log breaks a rule the per-record scans kept (order, first-wins, \
              dead-arena skip, duplicate handling)"
         );
+    }
+
+    /// **The FIRST entry for a key wins, which is the rule the PARKED arm's comment gives, pinned with
+    /// entries that can be told apart.** A resumed reap re-parks a page with the same `birth_epoch`
+    /// and owner but, possibly, a different `free_epoch`. `drain_pending` decides on the first entry
+    /// it meets, so replay must keep that one, not the later one.
+    ///
+    /// The rules test above re-parks an entry byte-identical to the one in the log, so it pins "no
+    /// duplicate" and not WHICH copy survives: a last-wins index passes it (lead review F1, mutant
+    /// MC6). Here the two entries differ in `free_epoch` only.
+    ///
+    /// Passes at `731a7fa` (the per-record `HashSet` kept the first) and must pass with the index.
+    #[test]
+    fn a_repark_of_a_key_already_in_the_log_keeps_the_first_entry() {
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let parked = |free: u64| PendingFree {
+            page_id: 11,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(free),
+            owner,
+        };
+        let (first, again) = (parked(2), parked(5));
+        let live = h.store.live_page_count().unwrap();
+        let record = |e: &PendingFree| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&1u32.to_be_bytes());
+            ArenaPageStore::encode_pending_entry(&mut p, e);
+            p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PAGES_PARKED, &p)
+        };
+        let mut tail = record(&first);
+        tail.extend(record(&again));
+
+        let applied = h.store.replay_tail(&tail).unwrap();
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        let log = h.store.state.lock().unwrap().pending.clone();
+        assert_eq!(
+            log,
+            vec![first],
+            "a re-park of a key already in the log did not keep the FIRST entry (free_epoch 2)"
+        );
+    }
+
+    /// **A clean open does no work on the pending-free log** (lead review F4). The CLI's clean exit
+    /// writes a full image (`store.checkpoint` in `src/cli/cli.rs`), so the next open replays an
+    /// EMPTY tail. The per-record code did nothing there. An index built up front would cost two
+    /// passes over the log on every open, for nothing.
+    #[test]
+    fn a_clean_open_does_no_work_on_the_pending_log() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-clean-open-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..16 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), 16, "fixture: the retire parked 16 pages");
+        h.store.checkpoint(&armed).unwrap();
+        assert!(ArenaPageStore::tail_kinds(&armed).is_empty(), "fixture: the tail is not empty");
+
+        let target = h.fresh_store();
+        let v0 = target.replay_pending_visits();
+        assert!(target.restore(&armed).unwrap());
+        assert_eq!(target.pending_len(), 16, "the image's pending log did not come back");
+        assert_eq!(
+            target.replay_pending_visits() - v0,
+            0,
+            "replaying an EMPTY tail still walked the pending log"
+        );
+        let _ = std::fs::remove_file(&armed);
     }
 
     #[test]
