@@ -67,8 +67,8 @@ MUTANTS = {
                 "                self.path.display()\n"
                 "            ))\n"
                 "        })?;\n"
-                "        self.refuse_if_poisoned()\n",
-                "        self.refuse_if_poisoned()\n",
+                "        self.refuse_if_poisoned()?;\n",
+                "        self.refuse_if_poisoned()?;\n",
             ),
         ],
     ),
@@ -94,11 +94,8 @@ MUTANTS = {
     # A repeat run's fork syncs anyway: per FORK, not per new run.
     "M11_repeat_run_syncs": (
         DURABLE,
-        "                // Interned by `intern`, recovered from the file, or already seen durable here.\n"
-        "                return Ok(());\n",
-        "                // Interned by `intern`, recovered from the file, or already seen durable here.\n"
-        "                drop(file);\n"
-        "                return self.sync_runs();\n",
+        "                return Ok(());\n            };\n            let written = file.queued",
+        "                drop(file);\n                return self.sync_runs();\n            };\n            let written = file.queued",
     ),
     # D219's M12 at its D246 site: pending records written AFTER the call's own.
     "M15_pending_written_last": (
@@ -173,8 +170,8 @@ MUTANTS = {
         "                self.path.display()\n"
         "            ))\n"
         "        })?;\n"
-        "        self.refuse_if_poisoned()\n",
-        "        Ok(())\n",
+        "        self.refuse_if_poisoned()?;\n",
+        "",
     ),
     # await_run writes every pending record, stamps included, and leaves them unsynced.
     "M20_await_writes_every_pending_record": (
@@ -191,12 +188,12 @@ MUTANTS = {
         "        let (id, body) = self.intern_locked(run)?;\n"
         "        if let Some(body) = body {\n",
     ),
-    # await_run on a poisoned store: appends, and vouches for runs it holds no number for.
+    # await_run on a poisoned store writes a pending run record after the failed append.
     "M22_await_run_ignores_the_poison": (
         DURABLE,
-        "            self.refuse_if_poisoned()?;\n"
-        "            let Some(&seq) = file.run_seqs.get(&id) else {\n",
-        "            let Some(&seq) = file.run_seqs.get(&id) else {\n",
+        "                self.refuse_if_poisoned()?;\n"
+        "                let runs_ahead =\n",
+        "                let runs_ahead =\n",
     ),
     # A3's await back after the schema apply: a refusal there returns with the edits installed.
     "M23_await_after_the_schema_apply": (
@@ -235,6 +232,83 @@ MUTANTS = {
         "                    store.stamp_pending(*rid, *who)?;\n"
         "                }\n"
         "                store.flush()?;\n",
+    ),
+    # ---- PREREG A4c ----------------------------------------------------------------------------
+    # D219's M19 re-cut: the rewrite never stamps its moved rows.
+    "M26_d219m19_rewrite_does_not_stamp": (
+        ALTER,
+        "                let queued =\n"
+        "                    moved.iter().try_for_each(|(rid, who)| store.stamp_pending(*rid, *who));\n"
+        "                let flushed = store.flush();\n"
+        "                queued.and(flushed)?;\n",
+        "",
+    ),
+    # D219's M22 re-cut: a failed flush is swallowed.
+    "M27_d219m22_flush_error_swallowed": (
+        ALTER,
+        "                queued.and(flushed)?;\n",
+        "                queued?;\n                let _ = flushed;\n",
+    ),
+    # D219's M23 re-cut: every restamp refusal is swallowed.
+    "M28_d219m23_stamp_refusal_swallowed": (
+        ALTER,
+        "                let queued =\n"
+        "                    moved.iter().try_for_each(|(rid, who)| store.stamp_pending(*rid, *who));\n",
+        "                let queued: Result<(), FerroError> = {\n"
+        "                    for (rid, who) in &moved {\n"
+        "                        let _ = store.stamp_pending(*rid, *who);\n"
+        "                    }\n"
+        "                    Ok(())\n"
+        "                };\n",
+    ),
+    # D219's M24 re-cut: the rewrite syncs once per moved row again.
+    "M29_d219m24_rewrite_stamps_eagerly": (
+        ALTER,
+        "|(rid, who)| store.stamp_pending(*rid, *who));\n",
+        "|(rid, who)| store.stamp(*rid, *who));\n",
+    ),
+    # await_run refuses on a poisoned store even a run that is already durable (R2-D5 undone).
+    "M30_await_refuses_durable_runs": (
+        DURABLE,
+        "            let Some(&seq) = file.run_seqs.get(&id) else {\n",
+        "            self.refuse_if_poisoned()?;\n            let Some(&seq) = file.run_seqs.get(&id) else {\n",
+    ),
+    # The sync handle shares the append descriptor's error cursor again. Pre-registered SURVIVOR.
+    "M31_shared_description": (
+        DURABLE,
+        "        let sync_handle = OpenOptions::new()\n"
+        "            .write(true)\n"
+        "            .open(&path)\n",
+        "        let sync_handle = file\n"
+        "            .try_clone()\n",
+    ),
+    # The post-fsync poison check without the lock. Pre-registered SURVIVOR.
+    "M32_post_check_without_the_lock": (
+        DURABLE,
+        "        let _file = self.file.lock().map_err(|_| {\n"
+        "            FerroError::Provenance(format!(\n"
+        "                \"{}: the provenance lock was poisoned by a panicking writer; refusing to sync\",\n"
+        "                self.path.display()\n"
+        "            ))\n"
+        "        })?;\n"
+        "        self.refuse_if_poisoned()?;\n",
+        "        self.refuse_if_poisoned()?;\n",
+    ),
+    # A completion site that does not close the session it opened. Pre-registered SURVIVORS.
+    "M33_executor_site_uses_complete": (
+        "src/execution/executor.rs",
+        "        d.complete_for(&mut session.agent)?;\n",
+        "        d.complete()?;\n",
+    ),
+    "M34_dispatch_site_uses_complete": (
+        "src/agent_sql/dispatch.rs",
+        "        d.complete_for(&mut session.agent)?;\n",
+        "        d.complete()?;\n",
+    ),
+    "M35_pgwire_site_uses_complete": (
+        "src/pgwire/extended.rs",
+        "                                d.complete_for(&mut session.agent)?;\n",
+        "                                d.complete()?;\n",
     ),
 }
 
