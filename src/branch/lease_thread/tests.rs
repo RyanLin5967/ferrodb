@@ -578,6 +578,47 @@ fn a_seal_whose_reap_fails_after_the_flip_is_still_attested() {
     assert_eq!(rt.attestation_refusals(), 0, "a second attestation was attempted");
 }
 
+/// **D199's seal route, the third case: a record `seal` cannot read after its reap is counted, not
+/// guessed.** Whether this call's reap landed is read back from the catalog. If that read fails,
+/// `seal` must not attest, because guessing "landed" could attest a reap that never happened. It
+/// must count a refusal instead, since the branch still holds a head, rather than treat the read
+/// silently as "not landed". This is the rule D199 set for the forget paths
+/// (`an_unreadable_record_is_counted_not_guessed`), applied to `seal`. `a0bf5d3`'s seal attested
+/// after an `Ok` reap without reading anything.
+///
+/// The double lets every read of the record succeed until it reads `Reaped`, and fails every read
+/// after that, however many the reap itself makes.
+///
+/// Hand-worked: `[Fork]` and 1 refusal after the abandon, whether the abandon itself returned `Ok`
+/// or `Err`.
+#[test]
+fn a_seal_that_cannot_read_its_record_after_the_flip_counts_it_not_guesses() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::clone(&f.h.store),
+    ));
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+    .with_reaper(reaper);
+    let branch = rt.begin_session("seal-unreadable", Some("r_6"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    refusing.arm_raw_once_reaped(branch.id);
+    let _ = rt.abandon(branch);
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested without reading the record back");
+    assert_eq!(rt.attestation_refusals(), 1, "the unreadable record was not counted");
+}
+
 // -------------------------------------------------------------------------------------------
 // Stoppable cleanly.
 // -------------------------------------------------------------------------------------------
@@ -1013,6 +1054,9 @@ struct RefusesLiveChildren {
     /// The same convention, for `detach_child`, keyed by the PARENT id (D199's seal route): the
     /// reaper's first step after its durable `Reaped` flip.
     detach_armed: AtomicU64,
+    /// The same convention, for `get_raw` of one id, but only once that record reads `Reaped`:
+    /// every read before the flip succeeds, every read after it fails, however many there are.
+    raw_armed_once_reaped: AtomicU64,
 }
 
 impl RefusesLiveChildren {
@@ -1022,6 +1066,7 @@ impl RefusesLiveChildren {
             armed: AtomicU64::new(u64::MAX),
             raw_armed: AtomicU64::new(u64::MAX),
             detach_armed: AtomicU64::new(u64::MAX),
+            raw_armed_once_reaped: AtomicU64::new(u64::MAX),
         })
     }
     fn arm(&self, parent_id: u64) {
@@ -1038,6 +1083,9 @@ impl RefusesLiveChildren {
     }
     fn disarm_detach(&self) {
         self.detach_armed.store(u64::MAX, Ordering::SeqCst);
+    }
+    fn arm_raw_once_reaped(&self, id: u64) {
+        self.raw_armed_once_reaped.store(id, Ordering::SeqCst);
     }
 }
 
@@ -1071,7 +1119,14 @@ impl BranchCatalog for RefusesLiveChildren {
             ))
             .into());
         }
-        self.inner.get_raw(id)
+        let rec = self.inner.get_raw(id)?;
+        if id == self.raw_armed_once_reaped.load(Ordering::SeqCst) && rec.state == BranchState::Reaped {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "record {id} could not be read once reaped (armed by the test)"
+            ))
+            .into());
+        }
+        Ok(rec)
     }
     fn reparent(
         &self,
