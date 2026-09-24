@@ -1530,8 +1530,10 @@ fn lease_end(stats: &LeaseStats, at: &str, failures: &mut Vec<String>) {
 fn reopen_for_merges(db: OpenDatabase, db_path: &str, failures: &mut Vec<String>) -> OpenDatabase {
     let (lease_stats, closed) = db.close();
     lease_end(&lease_stats, "(the close before a merge batch)", failures);
-    // A21.1: returned to `main` through `failures`, not a panic, so the summary prints it.
+    // A21.1: returned to `main` through `failures`, not a panic, so the summary prints it. A22.5:
+    // mirrored on stderr at once, like the child's, so a reopen that panics next cannot lose it.
     if let Err(e) = closed {
+        eprintln!("the parent's close failed (the close before a merge batch): {e}");
         failures.push(format!("CLOSE (the close before a merge batch): {e}"));
     }
     parent_open(db_path, failures)
@@ -2037,7 +2039,9 @@ fn main() {
                 let (lease_stats, closed) = db.take().expect("the production database is open").close();
                 lease_end(&lease_stats, &format!("N={done} (the parent's close before the restart)"), &mut failures);
                 // A21.1: returned to `main` through `failures`, not a panic, so the summary prints it.
+                // A22.5: mirrored on stderr at once, so a reopen that panics next cannot lose it.
                 if let Err(e) = closed {
+                    eprintln!("the parent's close failed (N={done}, before the restart): {e}");
                     failures.push(format!("CLOSE N={done} (the parent's close before the restart): {e}"));
                 }
                 // Every handle into the files goes before the child opens them.
