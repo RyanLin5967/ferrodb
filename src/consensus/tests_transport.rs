@@ -2316,3 +2316,179 @@ fn a_frame_whose_configurations_exceed_the_budget_is_refused_to_its_sender() {
     let m = append(4);
     assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "four configurations must round trip");
 }
+
+// ---------------------------------------------------------------------------------------------
+// D207 — tests that need the ported API, so they could not be written red against 9aa6968. Their
+// red evidence is the mutants in bench/d207/PREREG.md (amendment 1), not a run on main.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_outbound_byte_count_returns_to_zero_as_the_sender_drains() {
+    // The byte bound's other half. `OutboxState::bytes` is charged at `push` and must be given back
+    // at the sender's pop. A counter that only grew would, once a peer had been sent `queue_bytes`
+    // over its whole life, make every later push drop everything queued before it — and a peer that
+    // is never more than one frame behind would never show it. So the counter itself is read.
+    let (a, b) = pair(fast());
+    const SENT: u64 = 20;
+    for term in 1..=SENT {
+        a.send(&Message {
+            from: NodeId(1),
+            to: NodeId(2),
+            term,
+            body: Body::PreVoteResp { granted: true },
+        })
+        .unwrap();
+        assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, term);
+    }
+    // The sender pops a frame, under the lock, before it writes it. So once b holds the last one,
+    // nothing is left to pop and the counter has nothing left to give back.
+    let st = a.outboxes[&NodeId(2)].state.lock().unwrap();
+    assert!(st.queue.is_empty(), "all {SENT} were delivered and {} are still queued", st.queue.len());
+    assert_eq!(
+        st.bytes, 0,
+        "all {SENT} frames were delivered and the queue still charges {} bytes, so the sender's pop \
+         does not give a frame's bytes back",
+        st.bytes
+    );
+}
+
+#[test]
+fn whichever_bound_binds_first_and_a_frame_over_the_whole_byte_bound_is_still_queued_alone() {
+    let outbox = |depth: usize, max_bytes: usize| Outbox {
+        addr: "127.0.0.1:1".parse().unwrap(),
+        state: Mutex::new(OutboxState {
+            queue: VecDeque::new(),
+            bytes: 0,
+            live: None,
+            stopped: false,
+        }),
+        woken: Condvar::new(),
+        depth,
+        max_bytes,
+        dropped: std::sync::atomic::AtomicU64::new(0),
+    };
+    // The queue as the sender would see it: each frame's first byte, in order. And the counter,
+    // checked against a sum recomputed from the frames themselves every time, not trusted.
+    let view = |ob: &Outbox| {
+        let st = ob.state.lock().unwrap();
+        let sum: usize = st.queue.iter().map(|f| f.len()).sum();
+        assert_eq!(st.bytes, sum, "the byte counter disagrees with the frames it counts");
+        let firsts: Vec<u8> = st.queue.iter().map(|f| f[0]).collect();
+        firsts
+    };
+    let dropped = |ob: &Outbox| ob.dropped.load(std::sync::atomic::Ordering::SeqCst);
+
+    // The bytes bind: ten-byte frames against a 100-byte bound and a depth of 1000. Ten fit exactly.
+    let ob = outbox(1000, 100);
+    for i in 1..=15u8 {
+        ob.push(vec![i; 10]);
+    }
+    assert_eq!(view(&ob), (6..=15).collect::<Vec<u8>>(), "the byte bound must keep the ten newest");
+    assert_eq!(dropped(&ob), 5);
+
+    // The depth binds: the same frames, a bound they never reach, and a depth of 3.
+    let ob = outbox(3, 1_000_000);
+    for i in 1..=15u8 {
+        ob.push(vec![i; 10]);
+    }
+    assert_eq!(view(&ob), vec![13, 14, 15], "the depth must still bind when the bytes do not");
+    assert_eq!(dropped(&ob), 12);
+
+    // A frame larger than the whole byte bound is queued, alone, rather than refused: the bound
+    // exists to keep sending possible, so it must not make any message unsendable...
+    let ob = outbox(1000, 100);
+    for i in 1..=5u8 {
+        ob.push(vec![i; 10]);
+    }
+    ob.push(vec![99; 500]);
+    assert_eq!(view(&ob), vec![99], "a frame over the whole bound must be queued, alone");
+    assert_eq!(dropped(&ob), 5);
+    // ...and the next frame displaces it, so the bound holds again from there.
+    ob.push(vec![7; 10]);
+    assert_eq!(view(&ob), vec![7]);
+    assert_eq!(dropped(&ob), 6);
+}
+
+#[test]
+fn learners_spend_the_same_frame_budget_as_members() {
+    // The quadratic term is learners x members, so a budget that charged only members would bound
+    // nothing about the half that costs. Two configurations of 1024 members and 1024 disjoint
+    // learners are 4096 ids and fill the budget exactly; a third must be refused, by the decoder
+    // and by the encoder alike.
+    let per = MAX_CONFIG_NODES as u32;
+    let members = 1..=per;
+    let learners = (per + 1)..=(2 * per);
+
+    // Decoder: hand-built, because the encoder now refuses the frame this half needs.
+    let frame = |configs: u32| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_be_bytes()); // from
+        b.extend_from_slice(&2u32.to_be_bytes()); // to
+        b.extend_from_slice(&1u64.to_be_bytes()); // term
+        b.push(4); // Append
+        b.extend_from_slice(&[0u8; 24]); // prev_round, prev_term, commit
+        b.extend_from_slice(&configs.to_be_bytes()); // entries
+        for e in 0..u64::from(configs) {
+            b.extend_from_slice(&1u64.to_be_bytes()); // entry term
+            b.extend_from_slice(&(e + 1).to_be_bytes()); // entry round
+            b.push(7); // Membership
+            b.extend_from_slice(&1u64.to_be_bytes()); // config version
+            b.extend_from_slice(&1u64.to_be_bytes()); // config term
+            for list in [members.clone(), learners.clone()] {
+                b.extend_from_slice(&per.to_be_bytes());
+                for i in list {
+                    b.extend_from_slice(&i.to_be_bytes());
+                }
+            }
+        }
+        b
+    };
+    match decode(&frame(3)) {
+        Ok(_) => panic!("three configurations of {per} + {per} ids were accepted in one frame"),
+        Err(e) => {
+            let e = format!("{e}");
+            assert!(e.contains("budget is left"), "refused, but not by the frame budget: {e}");
+            assert!(e.contains("entry 2 of 3"), "refused at the wrong entry: {e}");
+        }
+    }
+    decode(&frame(2)).expect("two configurations totalling exactly the budget must decode");
+
+    // Encoder: the same line, from the sending side.
+    let cfg = Config::new(members.clone().map(NodeId), 1, 1).with_learners(learners.map(NodeId));
+    assert_eq!(cfg.learners().len(), MAX_CONFIG_NODES, "the learners did not survive `Config`");
+    let append = |n: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: (1..=n)
+                .map(|round| Entry {
+                    term: 1,
+                    round,
+                    command: Command::Membership { config: cfg.clone() },
+                })
+                .collect(),
+            commit: 0,
+        },
+    };
+    match encode(&append(3)) {
+        Ok(f) => panic!("three configurations of {per} + {per} ids were framed ({} bytes)", f.len()),
+        Err(e) => {
+            assert!(format!("{e}").contains("budget"), "refused, but not by the frame budget: {e}")
+        }
+    }
+    let m = append(2);
+    assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "two must round trip");
+}
+
+#[test]
+fn the_frame_budget_is_four_maximal_member_lists() {
+    // `one_frame_cannot_spend_more_config_nodes_than_its_whole_budget` was written before
+    // `MAX_FRAME_CONFIG_NODES` existed, so it states the budget only as arithmetic: four
+    // configurations of `MAX_CONFIG_NODES` members fill it exactly and a fifth does not fit, and
+    // `learners_spend_the_same_frame_budget_as_members` relies on two full configurations doing the
+    // same. This pins that premise to the constants, so moving either limit fails here, by name.
+    assert_eq!(MAX_FRAME_CONFIG_NODES, 4 * MAX_CONFIG_NODES);
+}
