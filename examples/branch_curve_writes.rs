@@ -34,6 +34,7 @@
 //! with it. It stops at the budget and SAYS SO, naming the N it reached. "Stopped early on space" is
 //! the result, not a failure of the run — and if it does NOT stop early, that kills D31, which is
 //! the outcome D31's own falsifier asks for.
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -42,12 +43,14 @@ use ferrodb::agent_sql::runtime::{merge_log_counters, table_id, AgentRuntime, St
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::lease_thread::{scan_interval_from_env, CatalogLock};
 use ferrodb::branch::table_catalog::TableBranchCatalog;
-use ferrodb::branch::types::{BranchId, LeaseDeadline, PageId, ARENA_EXTENT_PAGES};
+use ferrodb::branch::types::{BranchId, BranchState, LeaseDeadline, PageId, ARENA_EXTENT_PAGES};
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::buffer::read_census::{this_thread, ReadCensus};
 use ferrodb::catalog::column::Value;
 use ferrodb::cli::cli::{open_database, OpenDatabase};
+use ferrodb::cluster::ClusterScope;
+use ferrodb::consensus::NodeId;
 use ferrodb::cow::page_header::PageType;
 use ferrodb::cow::{stamp_checksum, PageStore, PAGE_HEADER_SIZE};
 use ferrodb::execution::executor::{run, Outcome};
@@ -56,6 +59,7 @@ use ferrodb::execution::seq_scan::seq_scan_counters;
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
+use ferrodb::storage::db_lock::DbLock;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use ferrodb::wal::log::FSYNC_CALLS;
 use ferrodb::storage::index::BPlusTreeManager;
@@ -299,30 +303,59 @@ enum Fire {
     WrongDelta,
     /// M5: the parent expects one live branch more after a merge batch than before it.
     WrongLiveMerge,
+    // ---- IN PATH (PREREG A7 item 5): a real state change that the measured code sees ---------
+    /// G1: a real fork at the first checkpoint that `branches` never records.
+    ExtraBranch,
+    /// H1: the parent HOLDS `{db}.lock` while the child opens, so the child's `DbLock::acquire`
+    /// refuses and it exits non-zero.
+    ChildLocked,
+    /// H2: the child reports the reaper's REAL `sweep_visits()`, read after the first pass (both
+    /// sweeps, ~2(N+1)), in place of `open_sweep_visits()`.
+    WrongSweepRead,
+    /// H4: before each restart, a real fork claims an empty extent and is then marked `Reaped` —
+    /// the D40 crash-orphan shape — so the child's open sweep frees it.
+    OrphanExtent,
+    /// H5: at the LAST checkpoint the child is a cluster member with no applied `LeaseTick`, so its
+    /// lease passes refuse before the orphan sweep and `LeaseStats::finished` never rises.
+    NoClusterTime,
 }
 
 impl Fire {
     fn from_env() -> Fire {
-        match std::env::var("CURVE_FIRECHECK").as_deref() {
-            Err(_) | Ok("") => Fire::None,
-            Ok("wrong-page") => Fire::WrongPage,
-            Ok("census-off") => Fire::CensusOff,
-            Ok("control-catalog") => Fire::ControlCatalog,
-            Ok("control-cold") => Fire::ControlCold,
-            Ok("wrong-height") => Fire::WrongHeight,
-            Ok("control-drift") => Fire::ControlDrift,
-            Ok("wrong-arenas") => Fire::WrongArenas,
-            Ok("wrong-live") => Fire::WrongLive,
-            Ok("merge-quarantined") => Fire::MergeQuarantined,
-            Ok("wrong-start") => Fire::WrongStart,
-            Ok("wrong-visits") => Fire::WrongVisits,
-            Ok("wrong-delta") => Fire::WrongDelta,
-            Ok("wrong-live-merge") => Fire::WrongLiveMerge,
-            Ok(other) => panic!(
+        match std::env::var("CURVE_FIRECHECK") {
+            Err(_) => Fire::None,
+            Ok(mode) => Fire::parse(&mode),
+        }
+    }
+
+    /// One mode by name. Refuses a name it does not know rather than running unguarded.
+    fn parse(mode: &str) -> Fire {
+        match mode {
+            "" | "none" => Fire::None,
+            "wrong-page" => Fire::WrongPage,
+            "census-off" => Fire::CensusOff,
+            "control-catalog" => Fire::ControlCatalog,
+            "control-cold" => Fire::ControlCold,
+            "wrong-height" => Fire::WrongHeight,
+            "control-drift" => Fire::ControlDrift,
+            "wrong-arenas" => Fire::WrongArenas,
+            "wrong-live" => Fire::WrongLive,
+            "merge-quarantined" => Fire::MergeQuarantined,
+            "wrong-start" => Fire::WrongStart,
+            "wrong-visits" => Fire::WrongVisits,
+            "wrong-delta" => Fire::WrongDelta,
+            "wrong-live-merge" => Fire::WrongLiveMerge,
+            "extra-branch" => Fire::ExtraBranch,
+            "child-locked" => Fire::ChildLocked,
+            "wrong-sweep-read" => Fire::WrongSweepRead,
+            "orphan-extent" => Fire::OrphanExtent,
+            "no-cluster-time" => Fire::NoClusterTime,
+            other => panic!(
                 "CURVE_FIRECHECK: unknown mode {other:?}; the modes are wrong-page, census-off, \
                  control-catalog, control-cold, wrong-height, control-drift, wrong-arenas, \
                  wrong-live, merge-quarantined, wrong-start, wrong-visits, wrong-delta, \
-                 wrong-live-merge"
+                 wrong-live-merge, extra-branch, child-locked, wrong-sweep-read, orphan-extent, \
+                 no-cluster-time"
             ),
         }
     }
@@ -678,6 +711,14 @@ struct RestartRow {
     expect_arenas: u64,
     expect_live: u64,
     child: std::collections::HashMap<String, u64>,
+    /// The child's `RESTART_RESULT` line, verbatim, so nothing it measured can be dropped (A7.2).
+    raw: String,
+    /// What the child is about to replay, sized by the parent after its clean close (A7.1, A7.3).
+    wal_bytes: u64,
+    tel_bytes: u64,
+    prov_bytes: u64,
+    /// Rows arm 2 has published into table `m` so far: the heap `open_recovered` rebuilds over.
+    m_rows: u64,
     parent_total_us: u64,
     parent_lease_us: u64,
 }
@@ -694,7 +735,10 @@ impl RestartRow {
 /// A fresh process because a real restart is one (D65 adversary, finding e): the parent has a
 /// large live heap and warm allocator. The OS page cache is warm either way — purging it needs
 /// root — so this is a WARM-CACHE restart, and PREREG says so.
-fn open_only_child(db_path: &str) -> ! {
+fn open_only_child(db_path: &str, fire: Fire) -> ! {
+    // H5's in-path fire (PREREG A7.5): a cluster member with no applied `LeaseTick`, held from
+    // before the open to after the close. Its lease passes refuse before the orphan sweep.
+    let _cluster = (fire == Fire::NoClusterTime).then(|| ClusterScope::joined(NodeId(1)));
     let interval = scan_interval_from_env().expect("lease scan interval");
     let c0 = this_thread();
     let db = open_database(db_path, interval).expect("open the database");
@@ -705,6 +749,8 @@ fn open_only_child(db_path: &str) -> ! {
     let bound = Duration::from_secs(60) + t.lease_start * 10;
     let first = wait_first_pass(&db, bound);
     let visits_total = db.reaper.sweep_visits();
+    // H2's in-path fire: the REAL shared counter, read after the first pass — both sweeps.
+    let open_visits = if fire == Fire::WrongSweepRead { visits_total } else { open_visits };
     let descents_total = db.reaper.sweep_descents();
     // Untimed positive control (PREREG H3): the database that opened is the populated one.
     let live = db.branches.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
@@ -749,12 +795,17 @@ fn open_only_child(db_path: &str) -> ! {
     std::process::exit(0);
 }
 
-/// Run the child on `db_path` and parse its line. `Err` names what went wrong (PREREG H1).
-fn run_child(db_path: &str) -> Result<std::collections::HashMap<String, u64>, String> {
+/// Run the child on `db_path` with the fire mode it should apply (`"none"` for none), and parse its
+/// line. Returns the fields and the line itself, verbatim. `Err` names what went wrong (PREREG H1).
+fn run_child(
+    db_path: &str,
+    child_fire: &str,
+) -> Result<(std::collections::HashMap<String, u64>, String), String> {
     let exe = std::env::current_exe().map_err(|e| format!("own path: {e}"))?;
     let out = std::process::Command::new(exe)
         .arg("--open-only")
         .arg(db_path)
+        .arg(child_fire)
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|e| format!("spawn: {e}"))?;
@@ -772,15 +823,17 @@ fn run_child(db_path: &str) -> Result<std::collections::HashMap<String, u64>, St
         let v: u64 = v.parse().map_err(|e| format!("field {k}={v:?}: {e}"))?;
         map.insert(k.to_string(), v);
     }
-    Ok(map)
+    Ok((map, lines[0].to_string()))
 }
 
 fn print_restart_header() {
     println!(
         "  RESTART       N   arenas   total ms  lease_st ms   arena ms  br_cat ms  recover ms  \
          tel ms  prov ms  open visits  1st-pass visits  1st-pass ms  c.desc/v  c.att/v  c.fault/v  \
-         freed  live  parent ms"
+         freed  live  parent ms  lock ms  files ms  sqlcat ms  rebuild ms  runtime ms  descents  \
+         wal B  tel B  prov B  m rows"
     );
+    println!("  RESTART-RAW N=<n> <the child's RESTART_RESULT line, verbatim: every field it measured>");
 }
 
 fn print_restart_row(r: &RestartRow) {
@@ -790,7 +843,8 @@ fn print_restart_row(r: &RestartRow) {
     let first_pass_visits = r.get("visits_total").saturating_sub(visits);
     println!(
         "  RESTART {:>8} {:>8} {:>10.3} {:>12.3} {:>10.3} {:>10.3} {:>11.3} {:>7.3} {:>8.3} {:>12} \
-         {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3}",
+         {:>16} {:>12.3} {:>9.3} {:>8.3} {:>10.4} {:>6} {:>5} {:>10.3} {:>8.3} {:>9.3} {:>9.3} \
+         {:>11.3} {:>11.3} {:>9} {:>6} {:>6} {:>7} {:>7}",
         r.n,
         r.expect_arenas,
         ms("total_us"),
@@ -809,7 +863,19 @@ fn print_restart_row(r: &RestartRow) {
         r.get("freed"),
         r.get("live"),
         r.parent_total_us as f64 / 1000.0,
+        ms("lock_us"),
+        ms("files_us"),
+        ms("sql_catalog_us"),
+        ms("rebuild_us"),
+        ms("runtime_us"),
+        r.get("descents_total"),
+        r.wal_bytes,
+        r.tel_bytes,
+        r.prov_bytes,
+        r.m_rows,
     );
+    // A7.2: every field the child measured, verbatim, whether or not a column above shows it.
+    println!("  RESTART-RAW N={} {}", r.n, r.raw);
 }
 
 /// PREREG H2-H5 on one restart.
@@ -880,6 +946,13 @@ struct MergeOne {
     index_scans: u64,
     fsyncs: u64,
     census: ReadCensus,
+    /// `TxnManager::retained_runs` before and after: the run declarations every checkpoint
+    /// re-appends (A7.4).
+    runs_before: u64,
+    runs_after: u64,
+    /// The publish commit's automatic checkpoint ran inside this `MERGE;` (A7.4): the commit counter
+    /// did not rise, which only a checkpoint's reset explains.
+    checkpointed: bool,
 }
 
 /// One agent task: `BEGIN AGENT SESSION`, one INSERT of a row nobody has written, `MERGE;`.
@@ -893,6 +966,8 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
         db.runtime.quarantine(b, "READ-VS-N merge-quarantined fire check").expect("quarantine");
     }
     let before = db.runtime.state_sizes();
+    let runs_before = db.txn.retained_runs() as u64;
+    let commits0 = db.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst);
     let (v0, c0) = merge_log_counters();
     let seq0 = seq_scan_counters().1;
     let ix0 = index_scan_counters().0;
@@ -906,6 +981,8 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
     let index_scans = index_scan_counters().0 - ix0;
     let seq_tuples = seq_scan_counters().1 - seq0;
     let (v1, c1) = merge_log_counters();
+    let commits1 = db.txn.commits_since_checkpoint.load(std::sync::atomic::Ordering::SeqCst);
+    let runs_after = db.txn.retained_runs() as u64;
     let after = db.runtime.state_sizes();
     let applied_to_target =
         matches!(&out, Ok(Outcome::Agent(AgentOutput::Merge(r))) if r.applied_to_target);
@@ -921,6 +998,9 @@ fn merge_cycle(db: &OpenDatabase, id: i64, fire: Fire) -> MergeOne {
         index_scans,
         fsyncs,
         census,
+        runs_before,
+        runs_after,
+        checkpointed: commits1 <= commits0,
     }
 }
 
@@ -970,7 +1050,7 @@ fn print_merge_header() {
     println!(
         "  MERGE axis        N        M  merges   ns/merge  ns median     V_hi   V_cell  d.applied  \
          applied  captures   merges  versions  wkspaces  attested  seq tup  ix scans   fsyncs   \
-         c.desc  c.fault    c.att"
+         c.desc  c.fault    c.att  ret runs  d.runs  ckpts"
     );
 }
 
@@ -978,7 +1058,7 @@ fn print_merge_row(r: &MergeRow) {
     let last = r.ones.last().copied().unwrap_or_default();
     println!(
         "  MERGE {:>4} {:>8} {:>8} {:>7} {:>10.0} {:>10.0} {:>8.1} {:>8.2} {:>10.2} {:>8} {:>9} \
-         {:>8} {:>9} {:>9} {:>9} {:>8.2} {:>9.2} {:>8.2} {:>8.2} {:>8.3} {:>8.2}",
+         {:>8} {:>9} {:>9} {:>9} {:>8.2} {:>9.2} {:>8.2} {:>8.2} {:>8.3} {:>8.2} {:>9} {:>7.2} {:>6}",
         r.axis,
         r.n,
         r.m,
@@ -1000,6 +1080,9 @@ fn print_merge_row(r: &MergeRow) {
         r.mean(|o| o.census.descents),
         r.mean(|o| o.census.faults),
         r.mean(|o| o.census.attempts),
+        last.runs_after,
+        r.mean(|o| o.runs_after - o.runs_before),
+        r.ones.iter().filter(|o| o.checkpointed).count(),
     );
 }
 
@@ -1021,7 +1104,10 @@ fn main() {
     // before anything else is parsed, so a child cannot mistake its database path for checkpoints.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("--open-only") {
-        open_only_child(argv.get(2).expect("usage: --open-only <database path>"));
+        open_only_child(
+            argv.get(2).expect("usage: --open-only <database path> <fire mode>"),
+            Fire::parse(argv.get(3).map(String::as_str).unwrap_or("none")),
+        );
     }
     let arms = Arms::from_env();
     let fire = Fire::from_env();
@@ -1137,6 +1223,8 @@ fn main() {
     // count, which every later merge is held to (M4).
     let mut merge_rows: Vec<MergeRow> = Vec::new();
     let mut next_merge_row: i64 = 1;
+    // Rows published into table `m`: the heap every recovering open rebuilds over (A7.1).
+    let mut m_rows: u64 = 0;
     let mut merge_delta: Option<u64> = None;
     if let (Some(arms), Some(rt), Some(statement_lock)) =
         (arms, hd.runtime.clone(), hd.statement_lock.clone())
@@ -1398,6 +1486,11 @@ fn main() {
 
         // ---- READ-VS-N, at this checkpoint (bench/read_vs_n/PREREG.md) -------------------------
         if let Some(arms) = arms {
+            // G1's in-path fire (A7.5): a real fork at the first checkpoint that `branches` never
+            // records, so the catalog holds one live branch more than this run created.
+            if fire == Fire::ExtraBranch && checkpoint_index == 0 {
+                hd.cat.fork(BranchId::TRUNK, lease).expect("extra-branch fire: fork");
+            }
             // G1: the branches read below are exactly the ones this run created, all live.
             let live = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
             if branches.len() != done || live != done as u64 + 1 {
@@ -1443,17 +1536,55 @@ fn main() {
                 }
             }
             if arms.restart {
+                // H4's in-path fire (A7.5): the D40 crash-orphan shape, made on purpose. A fork
+                // claims an EMPTY extent, then its record is marked `Reaped` without the reaper, so
+                // the extent is charged to an owner that no longer exists at that generation. The
+                // child's open sweep must free it. Done BEFORE the arena count, which includes it.
+                if fire == Fire::OrphanExtent {
+                    let orphan = hd.cat.fork(BranchId::TRUNK, lease).expect("orphan fire: fork").branch_id;
+                    hd.store.arena_for(orphan).expect("orphan fire: claim an extent");
+                    hd.cat
+                        .set_state(orphan, BranchState::Live, BranchState::Reaped)
+                        .expect("orphan fire: mark reaped");
+                }
                 // Counted BEFORE the close, independently of anything the child reports (H2, H3).
                 let expect_arenas = hd.store.live_arenas().len() as u64;
                 let (_, closed) = db.take().expect("the production database is open").close();
                 closed.expect("close cleanly before the restart");
                 // Every handle into the files goes before the child opens them.
                 drop(hd);
-                let mut row = RestartRow { n: done, expect_arenas, expect_live: live, ..Default::default() };
-                match run_child(&db_path_str) {
-                    Ok(child) => row.child = child,
+                // What the child is about to replay (A7.1, A7.3), sized after the clean close.
+                let bytes = |ext: &str| {
+                    std::fs::metadata(format!("{db_path_str}.{ext}")).map(|m| m.len()).unwrap_or(0)
+                };
+                let mut row = RestartRow {
+                    n: done,
+                    expect_arenas,
+                    expect_live: live,
+                    wal_bytes: bytes("wal"),
+                    tel_bytes: bytes("tel"),
+                    prov_bytes: bytes("provenance"),
+                    m_rows,
+                    ..Default::default()
+                };
+                // H1's in-path fire: the parent holds the lock file, so the child's open refuses.
+                let held = (fire == Fire::ChildLocked).then(|| {
+                    DbLock::acquire(Path::new(&db_path_str)).expect("child-locked fire: hold the lock")
+                });
+                let is_last = checkpoints.last() == Some(&target);
+                let child_fire = match fire {
+                    Fire::WrongSweepRead => "wrong-sweep-read",
+                    Fire::NoClusterTime if is_last => "no-cluster-time",
+                    _ => "none",
+                };
+                match run_child(&db_path_str, child_fire) {
+                    Ok((child, raw)) => {
+                        row.child = child;
+                        row.raw = raw;
+                    }
                     Err(why) => failures.push(format!("H1 N={done}: {why}")),
                 }
+                drop(held);
                 // The parent's own reopen: the same open, in a warm process. A comparison only.
                 let reopened = parent_open(&db_path_str, &mut failures);
                 row.parent_total_us = reopened.timings.total.as_micros() as u64;
@@ -1489,6 +1620,7 @@ fn main() {
                 for _ in 0..merge_k {
                     let one = merge_cycle(open, next_merge_row, fire);
                     next_merge_row += 1;
+                    m_rows += one.applied_to_target as u64;
                     merge_guards(&format!("axis i N={done}"), &one, fire, &mut merge_delta, &mut failures);
                     ones.push(one);
                 }
@@ -1573,6 +1705,7 @@ fn main() {
             while m_done < target {
                 let one = merge_cycle(open, next_merge_row, fire);
                 next_merge_row += 1;
+                m_rows += one.applied_to_target as u64;
                 m_done += 1;
                 merge_guards(&format!("axis ii M={m_done}"), &one, fire, &mut merge_delta, &mut failures);
                 if m_done + MERGE_BLOCK > target {
@@ -1634,12 +1767,14 @@ fn read_vs_n_summary(
         // log-log slopes from the previous row of the same axis.
         for (axis, against) in [("i", "N"), ("ii", "M")] {
             let rows: Vec<&MergeRow> = merge_rows.iter().filter(|r| r.axis == axis).collect();
-            println!("arm 2, axis ({axis}) — per-merge means, against {against}:");
-            println!("         N        M   ns/merge   slope     V_hi   slope(V_hi)   V_cell  captures  attested  seq tup  c.fault");
+            // A7.4: Q10 is judged on the MEDIAN. The mean is printed beside it and not judged,
+            // because each axis-(ii) block's last merge pays the auto-checkpoint (`ckpts`).
+            println!("arm 2, axis ({axis}) — per-merge, against {against}; ns slope on the MEDIAN:");
+            println!("         N        M  ns median   slope    ns mean     V_hi   slope(V_hi)   V_cell  captures  attested  seq tup  c.fault  ret runs  ckpts");
             let mut prev: Option<(usize, f64, f64)> = None;
             for r in &rows {
                 let x = if axis == "i" { r.n } else { r.m };
-                let (ns, vhi) = (r.mean(|o| o.nanos as u64), r.mean(|o| o.v_hi));
+                let (ns, vhi) = (r.ns_median(), r.mean(|o| o.v_hi));
                 let (s_ns, s_v) = match prev {
                     // A zero V_hi (the first rows of a batch) has no logarithm; say so, not NaN.
                     Some((px, pns, pv)) if pv > 0.0 && vhi > 0.0 => (
@@ -1651,16 +1786,19 @@ fn read_vs_n_summary(
                 };
                 let last = r.ones.last().copied().unwrap_or_default();
                 println!(
-                    "  {:>8} {:>8} {:>10.0} {s_ns} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3}",
+                    "  {:>8} {:>8} {:>10.0} {s_ns} {:>10.0} {:>8.1} {s_v} {:>8.2} {:>9} {:>9} {:>8.2} {:>8.3} {:>9} {:>6}",
                     r.n,
                     r.m,
                     ns,
+                    r.mean(|o| o.nanos as u64),
                     vhi,
                     r.mean(|o| o.v_cell),
                     last.after.captures,
                     last.attested_after,
                     r.mean(|o| o.seq_tuples),
                     r.mean(|o| o.census.faults),
+                    last.runs_after,
+                    r.ones.iter().filter(|o| o.checkpointed).count(),
                 );
                 prev = Some((x, ns, vhi));
             }
@@ -1728,7 +1866,8 @@ fn read_vs_n_summary(
     }
     if arms.restart {
         println!("arm 3 (fresh-process open; microsecond timers in the child, printed here in ms):");
-        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms");
+        // A7.1: `recover` and `rebuild` are D216's before/after pair; `wal B` and `m rows` are their input.
+        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows");
         let mut prev: Option<(usize, f64, f64)> = None;
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
             let total = r.get("total_us") as f64 / 1000.0;
@@ -1741,7 +1880,7 @@ fn read_vs_n_summary(
                 None => (format!("{:>7}", "-"), format!("{:>7}", "-")),
             };
             println!(
-                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3}",
+                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3} {:>12.3} {:>12.3} {:>8} {:>8}",
                 r.n,
                 total,
                 lease,
@@ -1750,6 +1889,10 @@ fn read_vs_n_summary(
                 r.get("first_pass_us") as f64 / 1000.0,
                 r.parent_total_us as f64 / 1000.0,
                 r.parent_lease_us as f64 / 1000.0,
+                r.get("recover_us") as f64 / 1000.0,
+                r.get("rebuild_us") as f64 / 1000.0,
+                r.wal_bytes,
+                r.m_rows,
             );
             prev = Some((r.n, total, lease));
         }
