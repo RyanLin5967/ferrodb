@@ -350,6 +350,66 @@ fn a_nested_task_forks_from_its_parents_state_and_then_diverges() {
     assert_eq!(qty_of(&mut db, 1), 20);
 }
 
+/// **D194: a branch reads main AS OF ITS FORK, plus its own edits — never main's later commits.**
+///
+/// Every branch read goes through `AgentRuntime::visible_rows_where`, which reads the base with
+/// `scan_table_where`, and that builds its `ReadView` from `read_snapshot_cached()`: main's CURRENT
+/// snapshot, per statement. So a commit to main after the fork shows through the branch. This pins
+/// all three ways it can: a row main UPDATED (the branch must see the old version, reached through
+/// the time-travel heap), a row main INSERTED (must be absent), and a row main DELETED (must still
+/// be there). The branch's own UPDATE is in the fixture so the overlay is exercised on the same read.
+#[test]
+fn a_branch_reads_main_as_of_its_fork_not_as_of_now() {
+    let mut db = Db::new();
+    db.seed(); // (1, 20), (2, 5)
+    let mut main = db.session();
+    db.ok("INSERT INTO inventory VALUES (3, 7);", &mut main);
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+    db.ok("UPDATE inventory SET qty = 6 WHERE id = 2;", &mut a);
+
+    // Main moves AFTER the fork, one statement of each kind.
+    db.ok("UPDATE inventory SET qty = 99 WHERE id = 1;", &mut main);
+    db.ok("INSERT INTO inventory VALUES (4, 40);", &mut main);
+    db.ok("DELETE FROM inventory WHERE id = 3;", &mut main);
+
+    // Premise: main really moved, read through main. Without this every assertion below could pass
+    // because the fixture's writes never landed.
+    let on_main = pairs(rows(db.ok("SELECT id, qty FROM inventory;", &mut main)));
+    assert_eq!(on_main, vec![(1, 99), (2, 5), (4, 40)], "fixture: main did not move as written");
+
+    let expected = vec![(1, 20), (2, 6), (3, 7)];
+    let seen = pairs(rows(db.ok("SELECT id, qty FROM inventory;", &mut a)));
+    assert_eq!(
+        seen, expected,
+        "the branch read main as of NOW: it must see row 1's fork-time version, not row 4 (inserted \
+         on main after the fork), and row 3 (deleted on main after the fork)"
+    );
+
+    // The same view from outside the branch.
+    let mut observer = db.session();
+    let seen = pairs(rows(db.ok("SELECT id, qty FROM inventory AS OF BRANCH b_1;", &mut observer)));
+    assert_eq!(seen, expected, "AS OF BRANCH disagrees with the branch's own read");
+
+    // And it is repeatable: a second read inside the branch, after yet another commit to main.
+    db.ok("UPDATE inventory SET qty = 1000 WHERE id = 1;", &mut main);
+    let again = pairs(rows(db.ok("SELECT id, qty FROM inventory;", &mut a)));
+    assert_eq!(again, expected, "two reads on one branch disagreed: a non-repeatable read");
+}
+
+fn pairs(r: Vec<Vec<Value>>) -> Vec<(i32, i32)> {
+    let mut v: Vec<(i32, i32)> = r
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Integer(id), Value::Integer(q)) => (*id, *q),
+            other => panic!("not an (INTEGER, INTEGER) row: {:?}", other),
+        })
+        .collect();
+    v.sort();
+    v
+}
+
 // ---- exit criterion 4: DIFF is structured ---------------------------------------------------
 
 #[test]
