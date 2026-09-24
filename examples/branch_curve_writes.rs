@@ -2607,9 +2607,10 @@ fn read_vs_n_summary(
     println!();
     if fire == Fire::CkptDdl {
         println!(
-            "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads the replay-bytes integer; the \
-             only NOT A RESULT that may appear below is A14.1's refusal of a moved base (A15.4). The replay-bytes \
-             line above must carry the pre-registered intercept (A16.2)."
+            "FIRECHECK {fire:?}: a JUDGE fire (A13.1). No harness guard reads the replay-bytes integer. The \
+             NOT A RESULT lines that may appear below are A14.1's refusal of a moved base (A15.4), A13.9's \
+             refusal (no axis-(ii) checkpoint truncated: the fire did not inject) and a failed close; any other \
+             is a finding (A17.1). The replay-bytes line above must carry the pre-registered intercept."
         );
     } else if fire != Fire::None {
         println!("FIRECHECK {fire:?}: exactly the guard this mode breaks must appear below, and no other.");
