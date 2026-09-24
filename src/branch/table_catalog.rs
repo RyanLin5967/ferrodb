@@ -359,10 +359,8 @@ impl TableBranchCatalog {
     /// one fsync instead of queueing for private ones (see `group_commit`).
     fn mutate<T>(&self, body: impl FnOnce() -> Result<T, FerroError>) -> Result<(T, u64), FerroError> {
         let _g = self.logical.lock().unwrap();
-        let out = body();
-        let published = self.publish_root();
-        let out = out?;
-        published?;
+        let out = body()?; // D244 MUTANT MB: an error exit skips the publish
+        self.publish_root()?;
         Ok((out, self.commit_group.ticket()))
     }
 
