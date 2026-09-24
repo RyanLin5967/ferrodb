@@ -22,6 +22,13 @@
 //! `end_ts` decides: zero means the row is still live and this is an `Update`; non-zero means the
 //! version was killed and this is a `Delete`.
 //!
+//! **1b. A reused primary key is an MVCC `HeapUpdate` too.** `DELETE k; INSERT k` writes the new
+//! row into the dead version's slot so that older snapshots can still reach the old version through
+//! the index (`execution::insert`). The record's OLD image is then dead and its new image is live,
+//! and that is an `Insert`: the consumer applied the `Delete` when it committed. If the new row has
+//! to relocate, the dead image leaves its slot as a `HeapDelete`. That is bookkeeping, counted in
+//! [`Decoded::internal`] like the time-travel records below.
+//!
 //! **2. Half the records are internal MVCC traffic.** An update also writes the superseded version
 //! into the table's separate `time_travel_root` heap. Those `HeapInsert`s are not user-visible
 //! changes — emitting them would double-count every update as an insert as well — but they are not
@@ -296,7 +303,8 @@ pub struct Decoded {
     /// Schema changes seen, in log order: `(lsn, table, change)`.
     pub schema_changes: Vec<(u64, String, SchemaChange)>,
     /// Records that belong to a table's time-travel heap: superseded versions archived by MVCC.
-    /// Correctly not emitted, and correctly not an error.
+    /// Also a reused key's dead version leaving its slot when the new row relocates (point 1b of
+    /// the module doc). Correctly not emitted, and correctly not an error.
     pub internal: usize,
     /// Transactions that rolled back. Their changes are correctly absent.
     pub aborted: BTreeSet<u64>,
@@ -854,6 +862,14 @@ impl LogicalDecoder {
                         }
                     }
                 }
+                // A dead version being relocated: a reused key's new row did not fit the dead
+                // version's slot, and `HeapFileManager::update` logs the move as a delete of the
+                // slot's current bytes. Those bytes were already deleted, and the consumer was told
+                // when that DELETE committed. No other writer logs a `HeapDelete` of a dead image:
+                // DELETE never relocates (it rewrites the same bytes with a new `end_ts`), and an
+                // UPDATE never writes over a dead head (its scan yields only versions visible to it,
+                // and `check_write_conflict` refuses a head whose deleter it cannot see).
+                RecKind::HeapDelete { old, .. } if Self::is_dead(old) => out.internal += 1,
                 RecKind::HeapDelete { dir_root, old, .. } => match Self::row_in(&tables, *dir_root, old) {
                     RowResult::Row(table, columns, old) => staged
                         .entry(txn)
@@ -866,12 +882,20 @@ impl LogicalDecoder {
                     // Decided BEFORE the images are turned into values, because it is a property of
                     // the version header rather than of the columns.
                     let killed = Self::is_dead(new);
+                    // The mirror image: a dead version replaced by a live one under the same key.
+                    // That is a reused primary key written into its dead version's slot
+                    // (`execution::insert`), and the consumer has already applied the DELETE.
+                    let revived = !killed && Self::is_dead(old);
                     match (Self::row_in(&tables, *dir_root, old), Self::row_in(&tables, *dir_root, new)) {
                         (RowResult::Row(table, columns, old), RowResult::Row(_, _, new)) => {
                             let op = if killed {
                                 // A SQL DELETE. Reporting it as an update would leave a consumer
                                 // holding a row the database no longer has.
                                 ChangeOp::Delete { old }
+                            } else if revived {
+                                // Reporting it as an update would tell a consumer to modify a
+                                // row it has already deleted.
+                                ChangeOp::Insert { new }
                             } else {
                                 ChangeOp::Update { old, new }
                             };
