@@ -1178,9 +1178,15 @@ impl ArenaPageStore {
         let (payload, dirty, covered, kind) = {
             let mut st = self.state.lock().unwrap();
             // **D183 de-dup at push**: an entry whose page is already pending again is skipped, first
-            // wins. Only a park between the take and this put can do that, and such a park's record
-            // could not append: the take's bump left the log unlevel, so it rewrote the image, which
-            // moved `rewrites` and voids `mark` below. This put then restates the log, REPLACED.
+            // wins. Only a park between the take and this put can do that.
+            //   * A RECORDED park (a retire) could not append its record: the take's bump left the log
+            //     unlevel, so it rewrote the image, which moved `rewrites` and voids `mark` below. This
+            //     put then restates the log, REPLACED.
+            //   * An UNRECORDED park (`free_page` of a page this drain holds: a double free no caller
+            //     makes) moves neither counter, so this put still goes DRAINED. Memory keeps the new
+            //     entry and the file the taken one, until the next persist rewrites, because `covered`
+            //     below is `base + 1` and the park bumped past it. That is the window every unrecorded
+            //     park already has.
             st.pending.extend_absent(entries);
             let dirty = std::mem::take(&mut st.recycled_dirty);
             // ⚠ **`dirty` alone, where `retire_arenas_by_rule` passes `dirty ∪ rec.arenas`, and
@@ -1447,11 +1453,18 @@ impl ArenaPageStore {
         // After a restart the two epochs can be in either order, but the owner is Reaping, so no child
         // of it forked between them and the two decisions are equal (§B2 point 1).
         //
-        // Filtered under `persist` and `state` together. ⚠ Blind spot: between this filter and
-        // `release_page` below, only an UNRECORDED push can land, since recorded ones need `persist`.
-        // That is `free_page`, and `free_page` of a page whose owner is Reaping does not happen,
-        // because a Reaping owner writes nothing (§B2 reason 2). On the park arm, `push_if_absent`
-        // closes the gap anyway.
+        // Filtered under `persist` and `state` together. ⚠ Two blind spots, both closed today by
+        // something other than this filter:
+        //   * Between this filter and `release_page` below, only an UNRECORDED push can land, since
+        //     recorded ones need `persist`. That is `free_page`, and `free_page` of a page whose owner is
+        //     Reaping does not happen, because a Reaping owner writes nothing (§B2 reason 2). On the
+        //     park arm, `push_if_absent` closes the gap anyway.
+        //   * An entry a drain is HOLDING, between its `take_pending` and its `put_pending`, is not in
+        //     the log, so this filter cannot see it. A retire in that window can release K, and the
+        //     drain then puts `K(e_f)` back: K is pending and recycled. The statement lock keeps every
+        //     retire out of a drain's window (§B2 reason 4). Closing it without that lock means deciding
+        //     against the page's incarnation, which is the `release_page` check recorded as a
+        //     precondition for removing the lock (lane AMENDMENT 3, review F1).
         let plan: Vec<(PageId, ArenaId, Epoch, bool)> = {
             let st = self.state.lock().unwrap();
             plan.into_iter()
@@ -2496,6 +2509,12 @@ impl ArenaPageStore {
                     // earlier park, which is also the first to reach the log. Keeping the later
                     // one instead would make a restarted database release a page on a different
                     // rule than the running one does.
+                    //
+                    // **Since de-dup at push, memory never holds the second entry at all**: every push
+                    // is first-wins (`PendingLog`), so this arm and memory keep the same one by
+                    // construction. `finish` also builds first-wins, so what this lookup still buys is
+                    // no slot per re-park, which
+                    // `a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot` pins.
                     //
                     // "Already in the log" is asked of the replay's key index. This used to be a
                     // `HashSet` rebuilt from the WHOLE log for every parked record.
@@ -6209,6 +6228,53 @@ mod tests {
             a1 - a0
         );
         let _ = std::fs::remove_file(&armed);
+    }
+
+    /// **The PARKED arm's lookup is what keeps a re-park from costing a slot** (lane AMENDMENT 3, review
+    /// F2). Since de-dup at push, `finish` builds the log first-wins, so the lookup no longer decides the
+    /// log's CONTENTS: a PARKED arm that pushed every entry would come back with the same log. What it
+    /// still decides is the cost: without it, every re-park of a key already pending takes a slot that
+    /// `finish` then walks. Resumed reaps written before the fix re-park whole branches this way.
+    ///
+    /// Accounting by hand from `PendingReplay`: indexing the one-entry log is 1 visit, each of the N
+    /// lookups is 1, and `finish` walks 1 slot. So `N + 2`. Pushing without the lookup costs `2N + 2`,
+    /// and a lookup that always answers "absent" costs `3N + 2`.
+    #[test]
+    fn a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot() {
+        const N: usize = 32;
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let k = PendingFree {
+            page_id: 21,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner,
+        };
+        // Unarmed store: this seeds memory only, which is what an image load leaves behind.
+        h.store.put_pending(vec![k]).unwrap();
+        let mut p = h.store.live_page_count().unwrap().to_be_bytes().to_vec();
+        p.extend_from_slice(&(N as u32).to_be_bytes());
+        for i in 0..N {
+            let again = PendingFree { free_epoch: Epoch(3 + i as u64), ..k };
+            ArenaPageStore::encode_pending_entry(&mut p, &again);
+        }
+        p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+        let tail = ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PAGES_PARKED, &p);
+
+        let v0 = h.store.replay_pending_visits();
+        let applied = h.store.replay_tail(&tail).unwrap();
+        let visits = h.store.replay_pending_visits() - v0;
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        assert_eq!(pending_of(&h.store), vec![k], "a re-park of a key already pending changed the log");
+        assert!(visits >= N as u64, "the counter saw {visits} visits for {N} re-parks: it is not wired");
+        assert!(
+            visits <= N as u64 + 2,
+            "{N} re-parks of one key already pending cost {visits} visits; one lookup each plus the \
+             one-entry log is {}. Each re-park took a slot",
+            N + 2
+        );
     }
 
     #[test]
