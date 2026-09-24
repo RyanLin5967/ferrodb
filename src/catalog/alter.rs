@@ -1078,6 +1078,20 @@ fn commit_rewrite(
         }
     }
 
+    // **D219 — this rewrite's stamps are durable when it returns, whoever called it.** A MERGE
+    // hands the rewrite a store whose `stamp` only queues (`ProvenanceFlush::stamper`), so the
+    // moved rows' stamps are in the index and not yet in the file. From here on the buffer pool may
+    // write this table's rewritten pages to the database file at any eviction, and the caller's
+    // `finish` persists the catalog that makes them reachable; a merge altering a second table does
+    // both while that table is rewritten. Flushing here, before `finish`, means no state in which
+    // this ALTER can be read from disk lacks its stamps — one sync per rewrite, not one per moved
+    // row. For a store that stamps eagerly (a plain `ALTER TABLE`) nothing is pending and this is
+    // not a write. A failure here is an environmental failure after the heap moved, the same class
+    // as a stamp failing inside the loop above always was.
+    if let Some(store) = prov {
+        store.flush()?;
+    }
+
     // A split during the repointing above can move the tree's root, and the caller records it.
     //
     // **This used to be a refusal, and a refusal was the wrong answer.** The observation behind it

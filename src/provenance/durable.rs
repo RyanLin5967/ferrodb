@@ -781,7 +781,7 @@ impl ProvenanceStore for DurableProvenanceStore {
 
     /// Write and sync every pending record: one append, one sync, booked under `stamps` because
     /// pending records are physical stamps. Nothing pending is not a write — no sync, and no
-    /// refusal even from a poisoned store.
+    /// refusal even from a poisoned store. A lock poisoned by a PANIC is refused either way.
     fn flush(&self) -> Result<(), FerroError> {
         // Not `unwrap`, unlike every other write path: this one is called from two `Drop`s, and a
         // panic inside a drop that runs during unwinding aborts the process. A lock poisoned by a
@@ -1525,9 +1525,9 @@ mod tests {
         let err = s.flush().expect_err("a poisoned store flushed its pending stamps");
         assert!(format!("{err}").contains("refusing further writes"), "{err}");
         let empty = DurableProvenanceStore::open(dir.path().join("empty.log")).unwrap();
-        empty.intern(&run("restock", "run-1")).unwrap();
+        let empty_id = empty.intern(&run("restock", "run-1")).unwrap();
         empty.fail_next_append.store(true, Ordering::SeqCst);
-        assert!(empty.stamp_row(1, 1, id).is_err());
+        assert!(empty.stamp_row(1, 1, empty_id).is_err(), "the injected failure was swallowed");
         empty.flush().expect("a poisoned store refused a flush with nothing pending");
     }
 

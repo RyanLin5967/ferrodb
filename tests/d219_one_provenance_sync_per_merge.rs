@@ -407,10 +407,10 @@ fn every_provenance_sync_a_merge_issues_is_one_whatever_delta_is() {
 /// | `86e1762`, every stamp deferred to the final sync | 0 | 1 | 1: RED, the rewrite's stamps waited for the publish |
 /// | the fix | 1 | 1 | 2 |
 ///
-/// The rows are staged BEFORE the ALTER, in the table's current shape; the merge lands the schema
-/// first and carries them into the widened shape (`conform_to`), the path
-/// `integration_alter_column.rs::a_row_written_before_a_sibling_widened_the_table_still_publishes`
-/// covers for a sibling's ALTER.
+/// The rows are staged BEFORE the ALTER, in the table's current shape (`branch_update` binds against
+/// the shared shape either way); the merge lands the schema first and carries them into the widened
+/// shape (`conform_to`). `integration_merge_ddl_atomicity.rs` merges an ALTER and an UPDATE from one
+/// branch the same way.
 #[test]
 fn a_merge_that_alters_a_table_makes_the_rewrites_stamps_durable_with_the_rewrite() {
     let dir = tempfile::tempdir().unwrap();
