@@ -64,7 +64,7 @@ fn main() {
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
     // D212 (a'): REVERT's history store, before recover, as `cli.rs` does.
-    txn.attach_history_store(ferrodb::wal::history::HistoryStore::open_for_database(&db).unwrap())
+    txn.attach_history_store(ferrodb::wal::history::HistoryStore::open_for_database(&db, existed).unwrap())
         .unwrap();
     recover(&txn).unwrap();
     let catalog = if existed {

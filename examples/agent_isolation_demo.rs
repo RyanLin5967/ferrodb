@@ -1172,7 +1172,9 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
     let mut a = db.session();
     db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
     db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut a);
-    report_of(db.ok("MERGE;", &mut a));
+    // D212 addendum: merge ids name the run that minted them (`m_<nonce>_<n>`), so the id to
+    // revert is the one this merge was given, not a literal.
+    let first = report_of(db.ok("MERGE;", &mut a)).merge_id;
     println!("      qty(1) = {}", db.qty(1));
 
     println!("\n  (b) agent-b READS row 1, then writes row 2 on the strength of what it read");
@@ -1188,7 +1190,7 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
 
     println!("\n  (c) now revert agent-a's merge. HALT is the default.");
     let mut main = db.session();
-    let plan = match agent_out(db.ok("REVERT MERGE m_1;", &mut main)) {
+    let plan = match agent_out(db.ok(&format!("REVERT MERGE {first};"), &mut main)) {
         AgentOutput::Revert(p) => p,
         other => panic!("expected a revert plan, got {}", other),
     };
@@ -1200,7 +1202,7 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
     let halted = plan.is_blocked() && plan.blocked_by.len() == 1 && db.qty(1) == 15;
 
     println!("\n  (d) CASCADE, on explicit request only. Dependents are undone first.");
-    let plan = match agent_out(db.ok("REVERT MERGE m_1 CASCADE;", &mut main)) {
+    let plan = match agent_out(db.ok(&format!("REVERT MERGE {first} CASCADE;"), &mut main)) {
         AgentOutput::Revert(p) => p,
         other => panic!("expected a revert plan, got {}", other),
     };

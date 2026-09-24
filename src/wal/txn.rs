@@ -707,7 +707,10 @@ impl TxnManager {
         // (refused while this transaction is still in `att`), drains the queue into the store
         // before its truncation. Queued any later, that checkpoint would discard the record's only
         // copy while its rows became durable.
-        if let Some(records) = self.history_bindings.lock().unwrap().remove(&txn_id) {
+        // Taken out first, so no other transaction's commit or abort waits on this map while a
+        // bounded drain below fsyncs.
+        let bound = self.history_bindings.lock().unwrap().remove(&txn_id);
+        if let Some(records) = bound {
             if let Some(store) = self.history.get() {
                 store.enqueue(records);
                 // AMENDED 2, F7: an idle open transaction blocks every checkpoint, so the queue is

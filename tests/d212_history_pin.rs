@@ -12,8 +12,8 @@
 //! Pre-registered mutants (in `src/wal/history.rs` / `src/wal/txn.rs`), each RED here:
 //! - the hook re-reads the retained log for committed history (the report's design) — WAL bytes
 //!   read per checkpoint are non-zero and grow with M;
-//! - `drain` writes one record per call instead of the queue at once — more than one store write
-//!   per checkpoint.
+//! - `drain` writes one record per call instead of the queue at once — two merges precede each
+//!   checkpoint, so that is two store writes in one checkpoint.
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -74,15 +74,18 @@ fn falsifier_4_under_a_pin_the_hook_reads_no_log_and_writes_once_per_checkpoint(
     for m in [W, 4 * W] {
         let mut phase = (0u64, 0u64, 0u64);
         while made < m {
-            made += 1;
-            let mut a = Session::with_runtime(runtime.clone());
-            exec(&format!("BEGIN AGENT SESSION AS 't{made}' RUN 'r{made}';"), &mut a);
-            exec(&format!("UPDATE inventory SET qty = qty + 1 WHERE id = {};", made % 4 + 1), &mut a);
-            match exec("MERGE;", &mut a) {
-                Outcome::Agent(AgentOutput::Merge(r)) => assert!(r.applied_to_target, "{r}"),
-                _ => panic!("MERGE did not return a report"),
+            // TWO merges per checkpoint, so a drain that wrote one record per call would show as
+            // two store writes in one checkpoint.
+            for _ in 0..2 {
+                made += 1;
+                let mut a = Session::with_runtime(runtime.clone());
+                exec(&format!("BEGIN AGENT SESSION AS 't{made}' RUN 'r{made}';"), &mut a);
+                exec(&format!("UPDATE inventory SET qty = qty + 1 WHERE id = {};", made % 4 + 1), &mut a);
+                match exec("MERGE;", &mut a) {
+                    Outcome::Agent(AgentOutput::Merge(r)) => assert!(r.applied_to_target, "{r}"),
+                    _ => panic!("MERGE did not return a report"),
+                }
             }
-            drop(a);
             let (read0, c0) = (wal_read_counters().1, store.counters());
             txn.checkpoint().unwrap();
             let (read1, c1) = (wal_read_counters().1, store.counters());
@@ -97,6 +100,19 @@ fn falsifier_4_under_a_pin_the_hook_reads_no_log_and_writes_once_per_checkpoint(
         worst.push(phase);
     }
     assert!(store.counters().prunes > 0, "the fixture never pruned, so the ≤ 2 arm tests nothing");
+    // The pin did keep the log (read only now, after every measured checkpoint).
+    let kept = {
+        use std::sync::atomic::Ordering;
+        let (mut lsn, end) = (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst));
+        let mut n = 0;
+        while lsn < end {
+            let (r, next) = wal.read_record(lsn).unwrap();
+            n += usize::from(matches!(r.kind, ferrodb::wal::log::RecKind::RevertHistory { .. }));
+            lsn = next;
+        }
+        n
+    };
+    assert!(kept as u64 >= 4 * W, "the pin did not keep the log, so the hook had nothing to re-read");
     for (m, (read, appends, rewrites)) in [W, 4 * W].iter().zip(&worst) {
         assert_eq!(*read, 0, "at M = {m} a checkpoint read {read} bytes of the pinned log");
         // ≤ 1 fsync for an append, ≤ 2 (the temporary, then the directory) for a prune's rewrite.

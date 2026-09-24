@@ -157,8 +157,9 @@ pub struct HistoryStore {
 struct StoreState {
     /// Durable records, by `hseq`.
     window: BTreeMap<u64, HistoryRecord>,
-    /// Committed records not yet durable in the file, in the order they were queued.
-    queue: Vec<HistoryRecord>,
+    /// Committed records not yet durable in the file, by `hseq`. A map, so the open's catch-up
+    /// tests membership in O(log n) per record rather than rescanning the queue.
+    queue: BTreeMap<u64, HistoryRecord>,
     /// Bytes of `queue`'s records as they will be written.
     queued_bytes: usize,
     /// Whether THIS process wrote the image in the file, and no write has failed since. Until then
@@ -170,9 +171,19 @@ struct StoreState {
     counters: HistoryCounters,
 }
 
+/// Names the file and the window; the records are not printed.
+impl std::fmt::Debug for HistoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryStore")
+            .field("path", &self.path)
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StoreState {
     fn holds(&self, hseq: u64) -> bool {
-        self.window.contains_key(&hseq) || self.queue.iter().any(|q| q.hseq == hseq)
+        self.window.contains_key(&hseq) || self.queue.contains_key(&hseq)
     }
 }
 
@@ -184,8 +195,26 @@ impl HistoryStore {
 
     /// **What an entry point calls, before `recover`:** `<db>.history` with the window from
     /// `FERRODB_REVERT_RETENTION_MERGES`.
-    pub fn open_for_database(db_path: &str) -> Result<Arc<HistoryStore>, FerroError> {
-        HistoryStore::open(HistoryStore::path_for_database(db_path), retention_from_env()?)
+    ///
+    /// **Refuses a history file beside a database file that does not exist yet:** it was left by
+    /// another database at that path, and reading it would give a new, empty database the merge
+    /// history of an old one — history without its rows.
+    /// `database_existed` is whether the database file was there BEFORE this open created it, which
+    /// only the caller can know: every entry point creates the file before it attaches the store.
+    pub fn open_for_database(
+        db_path: &str,
+        database_existed: bool,
+    ) -> Result<Arc<HistoryStore>, FerroError> {
+        let history = HistoryStore::path_for_database(db_path);
+        if !database_existed && history.exists() {
+            return Err(FerroError::Internal(format!(
+                "{} exists but the database {db_path} does not: it is another database's REVERT \
+                 history, and a new database must not inherit it. Move it away to create the \
+                 database here",
+                history.display()
+            )));
+        }
+        HistoryStore::open(history, retention_from_env()?)
     }
 
     /// Open the store at `path`, reading it whole if it exists.
@@ -218,7 +247,7 @@ impl HistoryStore {
         let held = window.values().filter(|r| r.ordinal > 0).count() as u64;
         let state = StoreState {
             window,
-            queue: Vec::new(),
+            queue: BTreeMap::new(),
             queued_bytes: 0,
             image_written: false,
             publishes_since_prune: held.saturating_sub(retention),
@@ -236,7 +265,7 @@ impl HistoryStore {
     pub fn last_hseq(&self) -> u64 {
         let s = self.state.lock().unwrap();
         let durable = s.window.keys().next_back().copied().unwrap_or(0);
-        s.queue.iter().map(|r| r.hseq).fold(durable, u64::max)
+        s.queue.keys().next_back().copied().map_or(durable, |q| q.max(durable))
     }
 
     /// Queue committed records for the next drain, skipping any whose `hseq` is already held.
@@ -250,7 +279,7 @@ impl HistoryStore {
         for r in records {
             if !s.holds(r.hseq) {
                 s.queued_bytes += RECORD_FRAME + r.body.len();
-                s.queue.push(r);
+                s.queue.insert(r.hseq, r);
             }
         }
     }
@@ -265,7 +294,7 @@ impl HistoryStore {
     pub fn records(&self) -> Vec<HistoryRecord> {
         let s = self.state.lock().unwrap();
         let mut all: Vec<HistoryRecord> =
-            s.window.values().chain(s.queue.iter()).cloned().collect();
+            s.window.values().chain(s.queue.values()).cloned().collect();
         all.sort_by_key(|r| r.hseq);
         all
     }
@@ -287,17 +316,17 @@ impl HistoryStore {
         if s.queue.is_empty() {
             return Ok(());
         }
-        let queued_publishes = s.queue.iter().filter(|r| r.ordinal > 0).count() as u64;
+        let queued_publishes = s.queue.values().filter(|r| r.ordinal > 0).count() as u64;
         let since = s.publishes_since_prune + queued_publishes;
         let held =
-            s.window.values().chain(s.queue.iter()).filter(|r| r.ordinal > 0).count() as u64;
+            s.window.values().chain(s.queue.values()).filter(|r| r.ordinal > 0).count() as u64;
         let prune = since >= (self.retention / 8).max(1) && held > self.retention;
         let written = if prune || !s.image_written {
             let cut = if prune { window_start(&s, self.retention) } else { 0 };
             let mut kept: Vec<HistoryRecord> = s
                 .window
                 .values()
-                .chain(s.queue.iter())
+                .chain(s.queue.values())
                 .filter(|r| r.hseq >= cut)
                 .cloned()
                 .collect();
@@ -309,7 +338,7 @@ impl HistoryStore {
             .map(|()| Some(kept))
         } else {
             let mut tail = Vec::new();
-            s.queue.iter().try_for_each(|r| r.encode_into(&mut tail)).and_then(|()| {
+            s.queue.values().try_for_each(|r| r.encode_into(&mut tail)).and_then(|()| {
                 append_durably(&*self.ops, &self.path, &tail).map_err(|e| {
                     FerroError::Io(format!("appending to {}: {e}", self.path.display()))
                 })
@@ -336,8 +365,8 @@ impl HistoryStore {
                 Ok(())
             }
             Ok(None) => {
-                let queued: Vec<HistoryRecord> = s.queue.drain(..).collect();
-                for r in queued {
+                let queued = std::mem::take(&mut s.queue);
+                for r in queued.into_values() {
                     s.window.insert(r.hseq, r);
                 }
                 s.queued_bytes = 0;
@@ -355,7 +384,7 @@ fn window_start(s: &StoreState, retention: u64) -> u64 {
     let mut publishes: Vec<u64> = s
         .window
         .values()
-        .chain(s.queue.iter())
+        .chain(s.queue.values())
         .filter(|r| r.ordinal > 0)
         .map(|r| r.hseq)
         .collect();
@@ -806,5 +835,69 @@ mod tests {
         let s = open_in(&dir, 8);
         let hseqs: Vec<u64> = s.records().iter().map(|r| r.hseq).collect();
         assert_eq!(hseqs, [1, 2, 3]);
+    }
+
+    /// **The hook's position and its failure** (review of 816321d, finding 1): the store is written
+    /// BEFORE the log is truncated, and a failed write refuses the truncation, so the log keeps the
+    /// only other copy of every record the store does not hold.
+    ///
+    /// Mutant: `truncate` moved before the hook — the failed checkpoint leaves no history in the log.
+    /// Mutant: the hook's error ignored — the failing checkpoint returns `Ok`.
+    #[test]
+    fn a_failed_hook_write_refuses_the_truncation_and_keeps_the_history_in_the_log() {
+        use crate::buffer::buffer_pool::BufferPoolManager;
+        use crate::storage::disk_manager::DiskManager;
+        use crate::wal::log::{RecKind, WalManager};
+        use crate::wal::txn::TxnManager;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("h.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("h.wal")).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp);
+        let faulty = Arc::new(Faulty::new());
+        struct Shared(Arc<Faulty>);
+        impl FileOps for Shared {
+            fn write(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { self.0.write(p, b) }
+            fn append(&self, p: &std::path::Path, b: &[u8]) -> std::io::Result<()> { self.0.append(p, b) }
+            fn sync_file(&self, p: &std::path::Path) -> std::io::Result<()> { self.0.sync_file(p) }
+            fn rename(&self, f: &std::path::Path, t: &std::path::Path) -> std::io::Result<()> { self.0.rename(f, t) }
+            fn sync_dir(&self, d: &std::path::Path) -> std::io::Result<()> { self.0.sync_dir(d) }
+        }
+        let store =
+            HistoryStore::open_with_ops(dir.path().join("h.history"), 8, Box::new(Shared(faulty.clone())))
+                .unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+
+        let t = txn.begin().unwrap();
+        txn.bind_history(t, rec(1, 1)).unwrap();
+        txn.commit(t).unwrap();
+        let parts_in_log = || {
+            let (mut lsn, end) = (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst));
+            let mut n = 0;
+            while lsn < end {
+                let (r, next) = wal.read_record(lsn).unwrap();
+                n += usize::from(matches!(r.kind, RecKind::RevertHistory { .. }));
+                lsn = next;
+            }
+            n
+        };
+        assert_eq!(parts_in_log(), 1, "fixture: the committed record is in the log");
+
+        // The first write of the process is a rewrite; fail its rename.
+        faulty.fail_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(txn.checkpoint().is_err(), "a checkpoint whose history write failed reported success");
+        assert_eq!(parts_in_log(), 1, "the log was truncated past history the store never took");
+
+        txn.checkpoint().unwrap();
+        assert_eq!(parts_in_log(), 0, "anti-vacuity: a checkpoint that wrote the store truncates");
+        assert_eq!(store.records(), vec![rec(1, 1)]);
     }
 }

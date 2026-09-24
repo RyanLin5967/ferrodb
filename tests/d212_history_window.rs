@@ -260,8 +260,11 @@ fn falsifier_3_after_a_checkpoint_the_history_is_in_the_store_and_not_the_log() 
     assert!(db.history_parts_in_log() >= 5, "the fixture's log holds no history, so it tests nothing");
     db.txn.checkpoint().unwrap();
     assert_eq!(db.history_parts_in_log(), 0, "a checkpoint left history in the log");
-    let publishes = db.store.as_ref().unwrap().records().iter().filter(|r| r.ordinal > 0).count();
-    assert_eq!(publishes, 5, "a committed publish record is not in the store");
+    // What the FILE holds, read by a second handle: the running store's `records()` would also
+    // count its in-memory queue.
+    let on_disk = HistoryStore::open(dir.path().join("d212w.db.history"), 1024).unwrap();
+    let publishes = on_disk.records().iter().filter(|r| r.ordinal > 0).count();
+    assert_eq!(publishes, 5, "a committed publish record is not in the store's file");
 }
 
 /// **AMENDED 2, F5.** A process that opens the database without the store must not truncate away

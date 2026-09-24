@@ -100,7 +100,7 @@ fn main() {
     bp.attach_wal(wal);
     // D212 (a'): REVERT's history store, before recover, which refuses a log carrying history
     // without one.
-    let history = ferrodb::wal::history::HistoryStore::open_for_database(&db).unwrap_or_else(|e| {
+    let history = ferrodb::wal::history::HistoryStore::open_for_database(&db, true).unwrap_or_else(|e| {
         eprintln!("table_dump: open the REVERT history: {e}");
         std::process::exit(1);
     });

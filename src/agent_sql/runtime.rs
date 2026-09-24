@@ -466,6 +466,10 @@ pub(crate) struct AppliedOp {
 struct MergeRecord {
     branch: BranchId,
     txns: Vec<TxnId>,
+    /// D212 (a'): its publish ordinal, once its history record has committed — what the retention
+    /// window is measured in while this run still holds the merge in memory. `None` on a database
+    /// with no history store.
+    ordinal: Option<u64>,
 }
 
 /// One row's worth of a staged change, so a whole statement can be checked before any of it lands.
@@ -938,10 +942,6 @@ struct RevertState {
     /// it the answer is gone. A `REVERT` hands each undone row back to this author; without it
     /// `who_wrote_row` went on naming the reverted run as the author of a value it no longer wrote.
     prior_author: BTreeMap<(u64, u32, u64), ProvId>,
-    /// **D212 (a') — the publish ordinal of each merge THIS run published**, by merge id: what the
-    /// retention window is measured in for a merge whose history this runtime still holds in
-    /// memory, so a REVERT reaches the same merges before a restart as after one.
-    ordinal_of: BTreeMap<String, u64>,
     /// **D212 (a') — set when a commit that carried a history record returned an error.**
     ///
     /// `commit` can fail after its `Commit` record is durable (the `TxnEnd` append, or the
@@ -5560,7 +5560,6 @@ impl AgentRuntime {
                 cursor.last_hseq = record.hseq;
                 cursor.last_ordinal = record.ordinal;
             }
-            state.revert.ordinal_of.insert(merge_id.clone(), record.ordinal);
         }
 
         if let Err(e) = self.record_applied(
@@ -5583,6 +5582,9 @@ impl AgentRuntime {
             let mut state = self.state.lock().unwrap();
             for ((tbl, row), author) in prior_authors {
                 state.revert.prior_author.insert((snapshot.txn.0, tbl, row), author);
+            }
+            if let (Some(record), Some(merged)) = (&history, state.merges.get_mut(&merge_id)) {
+                merged.ordinal = Some(record.ordinal);
             }
             #[cfg(debug_assertions)]
             audit_durable_effects(&state, snapshot.txn, &effects);
@@ -5859,7 +5861,7 @@ impl AgentRuntime {
         }
         state.merges.insert(
             merge_id.to_string(),
-            MergeRecord { branch, txns: vec![txn] },
+            MergeRecord { branch, txns: vec![txn], ordinal: None },
         );
         Ok(())
     }
@@ -6218,12 +6220,13 @@ impl AgentRuntime {
                 }
                 // This run's nonce: its history is in memory.
                 MergeIdForm::Nonced { nonce, n } if nonce == self.nonce => {
-                    // The window applies whether or not the server has restarted since, so what a
-                    // REVERT reaches does not depend on when the last restart happened.
+                    // The window is measured the same way here and for an earlier run's merge
+                    // below — `W` publishes back from the newest — so what a REVERT reaches does
+                    // not depend on when the last restart happened.
                     if let (Some(store), Some(ordinal)) =
-                        (&cursor.store, state.revert.ordinal_of.get(merge_id))
+                        (&cursor.store, state.merges.get(merge_id).and_then(|m| m.ordinal))
                     {
-                        if cursor.last_ordinal.saturating_sub(*ordinal) >= store.retention() {
+                        if cursor.last_ordinal.saturating_sub(ordinal) >= store.retention() {
                             return Err(outside_window(merge_id, store.retention()));
                         }
                     }
@@ -6244,16 +6247,23 @@ impl AgentRuntime {
                     Some(store) => Found::EarlierRun {
                         store: Arc::clone(store),
                         floor_txn: cursor.boot_txn_floor,
+                        last_ordinal: cursor.last_ordinal,
                     },
                 },
             }
         };
         let (target, durable) = match found {
             Found::ThisRun(txn) => (txn, None),
-            Found::EarlierRun { store, floor_txn } => {
+            Found::EarlierRun { store, floor_txn, last_ordinal } => {
                 let records = store.records();
-                let (hseq, _, publish) = revert_store::find_publish(&records, merge_id)?
+                let (hseq, ordinal, publish) = revert_store::find_publish(&records, merge_id)?
                     .ok_or_else(|| earlier_run_not_in_history(merge_id, store.retention()))?;
+                // The store may still hold a merge the window has left — up to `W/8` publishes wait
+                // for the next prune, and the open can bring back a pruned record the log kept.
+                // Refused by ordinal, exactly as for this run's merges.
+                if last_ordinal.saturating_sub(ordinal) >= store.retention() {
+                    return Err(outside_window(merge_id, store.retention()));
+                }
                 // From this merge's record forward only: every dependent of it was published after
                 // it, so nothing before it can be one.
                 let history = revert_store::history_from(&records, hseq)?;
@@ -6318,6 +6328,12 @@ impl AgentRuntime {
         let writes = plan_undo(&ctx.read(), &ops)?;
         let undone: Vec<TxnId> =
             order.iter().copied().filter(|t| ops.iter().any(|a| a.txn == *t)).collect();
+        // Nothing to invert — a read-only merge, whose dependents (if any) had nothing either. No
+        // transaction and no marker: a marker recording nothing, repeatable without limit, would
+        // grow the history outside the window's count.
+        if undone.is_empty() {
+            return Ok(plan);
+        }
 
         // ---- D212 (a'): the record of what this revert inverted, in the revert's own transaction --
         //
@@ -6390,8 +6406,8 @@ enum Found {
     /// Published by this server run: its ops and captures are in memory.
     ThisRun(TxnId),
     /// Published by an earlier run: only the store has it. `floor_txn` is the highest txn id the
-    /// history named when this runtime attached.
-    EarlierRun { store: Arc<HistoryStore>, floor_txn: u64 },
+    /// history named when this runtime attached; `last_ordinal` the newest publish's ordinal.
+    EarlierRun { store: Arc<HistoryStore>, floor_txn: u64, last_ordinal: u64 },
 }
 
 /// The dependency graph over this run's captures plus the store's captures of earlier-run txns.
