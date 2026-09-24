@@ -335,13 +335,22 @@ impl TwoTierReaper {
     /// log is older than the reap's owner filter, so a slow-path reap over an aliased key before
     /// D232 left durable entries naming another branch's extent, and a drain now drops them
     /// instead of releasing them. One more case counts, and it needs no alias: an entry whose
-    /// extent no longer exists. **No serial path leaves one** (review 3 A1): every path that
-    /// removes an extent also prunes the pending entries naming it (`free_arena_locked`, and the
-    /// replay of a free record). It takes a free, or a snapshot install, landing while a drain has
-    /// the log out between `take_pending` and `put_pending`, which `RuntimeLock` rules out today.
-    /// A non-zero count of this kind is a concurrency or install anomaly, not a past read error.
-    /// The units differ (an arena, a page); both mean "not this entry's to free", and both are
-    /// zero on a healthy database.
+    /// extent no longer exists. **No serial path leaves one** (review 3 A1, review 4 B1): every
+    /// path that removes an extent an entry can name also prunes the entries naming it
+    /// (`free_arena_locked`, and the replay of a free record). H2b removes only an unpublished
+    /// claim, in which nothing was ever allocated or parked. It takes a free or a snapshot install
+    /// landing between a read of the extent and the push of its entry: in a drain, between
+    /// `take_pending` and `put_pending`; in `free_page`, between `arena_owner` and the push; in
+    /// `retire_arenas_by_rule`, between `allocated_pages` and the push.
+    ///
+    /// What keeps each out today is different. A free cannot land there: the fast-path reap, like
+    /// every statement, runs under `RuntimeLock`, and the sweeps free only empty extents, which an
+    /// extent still holding that page is not. An install is held off by no lock
+    /// (`PageStoreSnapshots::install`, called from `consensus/node.rs`, takes none); it cannot land
+    /// only because no production code constructs a `PageStoreSnapshots`. So a non-zero count of
+    /// this kind is a concurrency defect, or an install on a build that wires consensus to a
+    /// reaping store; never a past read error. The units differ (an arena, a page); both mean "not
+    /// this entry's to free", and both are zero on a healthy database.
     pub fn foreign_arenas_skipped(&self) -> u64 {
         self.foreign_arenas_skipped.load(Ordering::Relaxed)
     }
@@ -869,15 +878,19 @@ impl TwoTierReaper {
                 // this entry's. Asked before the catalog, so the drop does not depend on the
                 // parking branch's record being readable.
                 //
-                // **Not re-asked before the release below, and what makes that safe is that reaps
-                // are serialised, not that the extent is non-empty** (review 3 A2). Emptiness keeps
-                // the SWEEPS off it, since they free only empty extents. But the owner's own
-                // fast-path reap frees an extent whole, empty or not, and a snapshot install
-                // replaces the map; either landing between this check and `release_page` sends the
-                // release into a gone extent. The drain runs only inside `reap`, and `RuntimeLock`
-                // serialises reaps and claims today. W4 removes that lock and must close this
-                // window too; it is on W4's list. The same window sat between `get_raw` and the
-                // release before this check existed, so it is not new.
+                // **Not re-asked before the release below. What makes that safe today is that
+                // nothing that removes an extent can land in between, not that the extent is
+                // non-empty** (review 3 A2, review 4 B1). Emptiness keeps the SWEEPS off it, since
+                // they free only empty extents. But the owner's own fast-path reap frees an extent
+                // whole, empty or not, and a snapshot install replaces the map; either landing
+                // between this check and `release_page` sends the release into a gone extent. The
+                // reap is kept out by `RuntimeLock`: the drain runs only inside `reap`, and the
+                // lock serialises reaps with statements and claims. The install is kept out by no
+                // lock (`PageStoreSnapshots::install` takes none); it cannot land only because no
+                // production code constructs a `PageStoreSnapshots`. So the reap half goes with
+                // whatever removes that lock (`bench/w4/DECISION.md`, addendum 7), and the install
+                // half with the consensus wiring (D232 review 2 F4). The same window sat between
+                // `get_raw` and the release before this check existed, so it is not new.
                 if self.store.arena_owner(pf.arena_id) != Some(pf.owner) {
                     self.foreign_arenas_skipped.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -3612,10 +3625,11 @@ mod tests {
 
     /// **D232, review 2 F3, the absent half: a drain never touches a page whose extent is gone.**
     /// This test PLANTS the state: no serial path produces it, because every path that removes an
-    /// extent also prunes the pending entries naming it (review 3 A1). It takes a free or a
-    /// snapshot install landing while a drain has the log out between `take_pending` and
-    /// `put_pending`. The free here runs first and the entry is put back after it, which is that
-    /// interleaving laid out in sequence. The free already evicted the range from the pool, and
+    /// extent an entry can name also prunes the entries naming it (review 3 A1, review 4 B1). It
+    /// takes a free or a snapshot install landing between a read of the extent and the push of its
+    /// entry; here, while a drain has the log out between `take_pending` and `put_pending`. The
+    /// free here runs first and the entry is put back after it, which is that interleaving laid
+    /// out in sequence. The free already evicted the range from the pool, and
     /// the page went back with the extent. Releasing the entry evicted the id a second time, and
     /// once the range had been handed to another extent that was the new tenant's page: its
     /// unflushed write went with the frame.

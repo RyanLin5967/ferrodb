@@ -862,9 +862,12 @@ fn scan_once(
              an aliased catalog key: a claim whose catalog write outlived a crash that lost its \
              map record, before D232 put the map record first, after which a restart issued the \
              same arena id again. A parked page whose extent is gone has no serial cause: it \
-             takes an extent free or a snapshot install landing while a drain had the pending \
-             log out, which the statement lock rules out, so it is a concurrency or install \
-             anomaly. Every other extent's data is intact because of this refusal.",
+             takes an extent free or a snapshot install landing between the page being parked, \
+             or taken out for a drain, and its entry going back. The statement lock and the \
+             sweeps' emptiness check keep every such free out, and no shipped server installs \
+             snapshots into this store, so it is a concurrency defect, or an install on a build \
+             that wires consensus to it. Every other extent's data is intact because of this \
+             refusal.",
             foreign - seen
         ));
     }
