@@ -4,14 +4,14 @@
 # section 9.4 (supersedes 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
-# Blind spots, stated: it runs three selections per mutant (the attest lib module, the two D199
-# lease tests, and integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
+# Blind spots, stated: it runs three selections per mutant (the attest lib module, the three D199
+# lease tests (`is_attested`), and integration_branch_attestation), not the whole suite, so a mutant killed only elsewhere reads as
 # a survivor here. It judges kills by cargo's own "test result" line and FAILED names, not by exit
 # code alone: a compile error is recorded as COMPILE-FAIL, which is not a kill.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=a5e9423           # the tree these mutants were written against
+SUBJECT_SHA=3359f58           # the tree these mutants were written against
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -25,6 +25,7 @@ if [ -n "$(git status --porcelain -- src/ tests/ examples/)" ]; then
 fi
 
 # name|file|old text (python literal)|new text (python literal)
+# '|' is the field separator, so a literal pipe inside mutant text is written \u007c.
 A=src/branch/attest.rs
 R=src/agent_sql/runtime.rs
 MUTANTS=(
@@ -34,16 +35,17 @@ MUTANTS=(
   "M4_refusal_not_counted|$A|"'"        self.refused += 1;\n"|""'
   "M5_trunk_exemption_removed|$A|"'"            None if branch.is_trunk() => Attestation::genesis(),\n"|""'
   "M6_reap_keeps_head|$A|"'"        if e.op == BranchOp::Reap {\n            self.heads.remove(&e.branch);\n        } else {\n            self.heads.insert(e.branch, att);\n        }\n"|"        self.heads.insert(e.branch, att);\n"'
-  "M7_scan_forget_does_not_attest|$R|"'"            // D199: attested once the state lock is released. See `attest_forgotten_reaps`.\n            self.attest_forgotten_reaps(\u0026sealed);\n"|""'
-  "M8_sweep_forget_does_not_attest|$R|"'"                // D199: attested once the state lock is released. See `attest_forgotten_reaps`.\n                self.attest_forgotten_reaps(\u0026sealed);\n"|""'
-  "M9_attest_every_gone_branch|$R|"'"                    if forget_one_branch(\u0026mut state, bid) {\n                        forgotten += 1;\n                        sealed.push(bid);\n                    }\n"|"                    sealed.push(bid);\n                    if forget_one_branch(\u0026mut state, bid) {\n                        forgotten += 1;\n                    }\n"'
-  "M10_lease_reap_published|$R|"'"            let _ = self.attest_reap(branch, epoch, false);\n"|"            let _ = self.attest_reap(branch, epoch, true);\n"'
+  "M7_scan_forget_does_not_attest|$R|"'"\n            self.attest_landed_reaps(&gone);\n"|"\n"'
+  "M8_sweep_forget_does_not_attest|$R|"'"\n                self.attest_landed_reaps(&gone);\n"|"\n"'
+  "M9_no_head_check|$R|"'"            if h.head_of(branch).is_none() {\n                continue;\n            }\n"|""'
+  "M10_lease_reap_published|$R|"'"            let _ = Self::append_reap(&mut h, branch, epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, epoch, true);\n"'
+  "M11_attest_before_landed|$R|"'".filter(\u007cb\u007c self.branches.get_raw(b.id).is_ok_and(\u007cr\u007c r.generation > b.generation))"|".filter(\u007c_\u007c true)"'
 )
 
 run_targets() { # $1 = label
   timeout 1800 cargo test --lib branch::attest > "$OUT/$1.lib.txt" 2>&1
   echo "lib_rc=$?" >> "$OUT/$1.lib.txt"
-  timeout 1800 cargo test --lib attested_exactly_once > "$OUT/$1.d199.txt" 2>&1
+  timeout 1800 cargo test --lib is_attested > "$OUT/$1.d199.txt" 2>&1
   echo "d199_rc=$?" >> "$OUT/$1.d199.txt"
   timeout 1800 cargo test --test integration_branch_attestation > "$OUT/$1.integ.txt" 2>&1
   echo "integ_rc=$?" >> "$OUT/$1.integ.txt"
