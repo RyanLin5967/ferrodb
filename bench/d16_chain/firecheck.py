@@ -4,19 +4,20 @@
 Every mutant edits the engine (`src/`). None edits `examples/d16_chain_retention.rs`: a forced result
 at the call site would exercise nothing inside the reaper, the catalog or the store. The pattern is
 `bench/d154_mutate.py`'s. What this adds is recorded in `bench/d16_chain/PREREG.md` A2.6, A3.4 and
-amendments 4-5:
+amendments 4-6:
 
   * It REFUSES to start unless the cwd is the repository top level and no tracked file is modified.
     It pins HEAD at start. Before EVERY build it re-checks the whole tree and HEAD, and before every
     mutant, the target file's blob.
   * It applies and restores the mutated file atomically (a sibling temp file, then `os.replace`),
     from the exact bytes it read, with SIGTERM, SIGHUP and SIGINT BLOCKED meanwhile: a signal
-    arriving then is delivered once the write is done, not lost. The handler is one-shot, so a second
-    signal cannot interrupt the unwind, and every ending goes through `finish`, which restores and
-    verifies against HEAD. No git: `git checkout --` needs the index lock, and a stale lock
-    left by a killed build would strand the mutant. If the file no longer holds the bytes the script
-    wrote (nor HEAD's), another writer changed it mid-run. Their bytes are saved to the run directory
-    before HEAD's go back, and the run stops.
+    arriving then is delivered once the write is done, not lost. The first signal makes every later
+    one record-only, so nothing can interrupt the unwind. Every ending goes through `finish`, which
+    stops letting signals interrupt, restores, and verifies against HEAD. No git: `git checkout --`
+    needs the index lock, and a stale lock left by a killed build would strand the mutant. If the
+    file holds anything but what the script last put there (HEAD's bytes included, once the mutant
+    reached disk), another writer changed it mid-run. Their bytes are saved to the run directory
+    before HEAD's go back, and the run stops with exit 2.
   * Raw output goes to a NEW directory per run, `bench/d16_chain/firecheck/<head>-<utc>/`, with the
     environment in ENV.txt and every build log beside its run. A re-run can neither overwrite an
     earlier run's raw files nor dirty a committed copy of them.
@@ -280,20 +281,31 @@ class Terminated(BaseException):
 
 
 HANDLED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-# The first signal received, by name, or None. `__main__` reports it even when a stop condition
-# (exit 2) takes precedence over the interrupt.
+# The first signal received, by name, or None. `finish` reports it on every exit path, including
+# every exit 2 that takes precedence over the interrupt.
 INTERRUPTED = None
 
 
+def record_only(signum, _frame):
+    """Note a signal and carry on. Installed after the first signal and for the whole of `finish`, so
+    nothing can interrupt the restore-and-verify that ends every run (amendment 6)."""
+    global INTERRUPTED
+    if INTERRUPTED is None:
+        INTERRUPTED = signal.Signals(signum).name
+
+
+def stop_interrupting():
+    for s in HANDLED:
+        signal.signal(s, record_only)
+
+
 def on_signal(signum, _frame):
-    """ONE-SHOT. The first SIGTERM, SIGHUP or SIGINT turns every later one into a no-op, then unwinds
+    """ONE-SHOT. The first SIGTERM, SIGHUP or SIGINT makes every later one record-only, then unwinds
     through the `finally`s that restore the mutated file. Python's default for SIGTERM and SIGHUP is to
     die running none of them. A second signal, which GNU `timeout` can send by signalling the child and
     then its group, can no longer interrupt that unwind."""
-    global INTERRUPTED
-    for s in HANDLED:
-        signal.signal(s, signal.SIG_IGN)
-    INTERRUPTED = signal.Signals(signum).name
+    stop_interrupting()
+    record_only(signum, _frame)
     raise Terminated(INTERRUPTED)
 
 
@@ -463,11 +475,15 @@ def slot_diffs(slots, expect):
 APPLIED = None
 APPLIED_BYTES = None
 APPLIED_MUTANT = None
+# True once the mutant's bytes are on disk. Set with signals held, together with the write.
+APPLIED_ON_DISK = False
 # The last file ever mutated, so an interrupt can verify it against HEAD; where evidence goes; and
 # where another writer's bytes were saved, if restore found any.
 LAST_PATH = None
 EVIDENCE_DIR = None
 FOREIGN_EDIT = None
+# Whether the loop has already named FOREIGN_EDIT, so `finish` does not name it twice.
+FOREIGN_REPORTED = False
 
 
 def atomic_write(path, data):
@@ -484,30 +500,33 @@ def restore():
 
     Blind spot (amendment 5): a foreign write landing between this read and the `os.replace` is
     overwritten and not saved."""
-    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, FOREIGN_EDIT
+    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, APPLIED_ON_DISK, FOREIGN_EDIT
     with held_signals():
         if APPLIED is None:
             return
         p = pathlib.Path(APPLIED)
         current = p.read_bytes() if p.exists() else b""
-        if current not in (APPLIED_MUTANT, APPLIED_BYTES):
-            # Neither the mutant nor the original: another writer changed this file while the
-            # mutant was in place. Keep their bytes as evidence before HEAD's go back.
+        # What should be there now: the mutant once it reached disk, the original before. Anything
+        # else, INCLUDING HEAD's bytes after the mutant reached disk (a foreign checkout, stash or
+        # reset), is another writer's edit (amendment 6). Keep it as evidence before HEAD's go back.
+        expected = APPLIED_MUTANT if APPLIED_ON_DISK else APPLIED_BYTES
+        if current != expected:
             dest = (EVIDENCE_DIR or pathlib.Path(".")) / (APPLIED.replace("/", "_") + ".foreign-edit")
             dest.write_bytes(current)
             FOREIGN_EDIT = str(dest)
         atomic_write(p, APPLIED_BYTES)
-        APPLIED, APPLIED_BYTES, APPLIED_MUTANT = None, None, None
+        APPLIED, APPLIED_BYTES, APPLIED_MUTANT, APPLIED_ON_DISK = None, None, None, False
 
 
 def apply_mutant(path, original, mutated):
     """Record what is about to be applied, then apply it, with signals held across both, so no
     interrupt can observe one without the other."""
-    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, LAST_PATH
+    global APPLIED, APPLIED_BYTES, APPLIED_MUTANT, APPLIED_ON_DISK, LAST_PATH
     with held_signals():
-        APPLIED_BYTES, APPLIED_MUTANT, LAST_PATH = original, mutated, path
+        APPLIED_BYTES, APPLIED_MUTANT, LAST_PATH, APPLIED_ON_DISK = original, mutated, path, False
         APPLIED = path
         atomic_write(pathlib.Path(path), mutated)
+        APPLIED_ON_DISK = True
 
 
 def tree_moved(head_full):
@@ -552,7 +571,7 @@ def baseline(outdir, label, expect_slots, head):
 
 
 def main():
-    global EVIDENCE_DIR
+    global EVIDENCE_DIR, FOREIGN_REPORTED
     top = git("rev-parse", "--show-toplevel")
     here = pathlib.Path.cwd().resolve()
     if here != pathlib.Path(top).resolve() or not pathlib.Path("build.rs").is_file():
@@ -640,6 +659,7 @@ def main():
                 print(f"{label}: {path} was changed by another writer during this run. Their bytes "
                       f"are saved at {FOREIGN_EDIT}; HEAD's are back (verified). Stopping.",
                       flush=True)
+                FOREIGN_REPORTED = True
                 return 2
         cells, values, compares, slots, builds, shas = parse(stdout)
         diffs = compare_cells(cells, expect) + compare_lines(compares, expect_cmp)
@@ -684,20 +704,23 @@ def main():
 
 
 def finish(code):
-    """The one exit path (amendment 5). Whatever `main` did, restore, then verify the last mutated
-    file against HEAD, and let a tree that is not at HEAD override every other outcome."""
-    foreign_before = FOREIGN_EDIT
+    """The one exit path (amendments 5-6). Whatever `main` did: stop letting signals interrupt, restore,
+    verify the last mutated file against HEAD, and let a tree not at HEAD, or a foreign edit, override
+    every other outcome. An interrupt is reported on every path."""
+    stop_interrupting()
     try:
         restore()
     except Exception as e:
-        print(f"RESTORE FAILED ({e!r}); {LAST_PATH} may still hold a mutant. Exit 2.")
+        print(f"RESTORE FAILED ({e!r}); {LAST_PATH} may still hold a mutant. Exit 2.{interrupt_note()}")
         return 2
     if LAST_PATH is not None and not at_head(LAST_PATH):
-        print(f"{LAST_PATH} does NOT match HEAD. Exit 2.")
+        print(f"{LAST_PATH} does NOT match HEAD. Exit 2.{interrupt_note()}")
         return 2
-    if FOREIGN_EDIT and not foreign_before:
-        print(f"{LAST_PATH} had been changed by another writer (saved at {FOREIGN_EDIT}); HEAD's "
-              f"bytes are back (verified). Exit 2.")
+    if FOREIGN_EDIT:
+        if not FOREIGN_REPORTED:
+            print(f"{LAST_PATH} had been changed by another writer; their bytes are saved at "
+                  f"{FOREIGN_EDIT}, and HEAD's are back (verified).")
+        print(f"Exit 2 (foreign edit).{interrupt_note()}")
         return 2
     checked = ("no mutant was ever applied" if LAST_PATH is None
                else f"{LAST_PATH} matches HEAD (verified)")
@@ -708,14 +731,25 @@ def finish(code):
     return code
 
 
+def interrupt_note():
+    return f" An interrupt ({INTERRUPTED}) also arrived." if INTERRUPTED else ""
+
+
 if __name__ == "__main__":
     for s in HANDLED:
         signal.signal(s, on_signal)
+    outcome = 1
     try:
-        outcome = main()
+        try:
+            outcome = main()
+        except Exception:
+            stop_interrupting()
+            traceback.print_exc()
+            outcome = 1
+        # Disarm INSIDE the try that catches a first signal. A signal landing anywhere up to here
+        # becomes outcome 3; after this line every signal is record-only, so nothing between here and
+        # the end of `finish` can escape with a traceback and skip the restore.
+        stop_interrupting()
     except Terminated:
         outcome = 3
-    except Exception:
-        traceback.print_exc()
-        outcome = 1
     sys.exit(finish(outcome))
