@@ -160,3 +160,21 @@ uses.
 | `taskpolicy -b` | 58 | 2151 | 2 (+ `sync.rs:402`) | 2 |
 
 The seam adds no `workspaces.get_mut(`, so the tripwire's count stays 5.
+
+## Amendment 3 (append-only, still before any run): A's fire-check, stated as it can actually be observed
+
+Amendment 2 A said that with the re-check forced to `true`, "the two `moved while` cases FAIL and the
+`sealed` case still PASSES". The first half is right. The second half cannot be observed: all four
+cases run inside ONE test function, which stops at its first failure. So under that mutant the
+`sealed` case never runs, and saying it "passes" would be a claim nothing measured. Replacing it with
+two mutants, each of which removes one half of the re-check:
+
+| mutant | edit | expected |
+|---|---|---|
+| A1 | the workspace half: `unchanged` forced to `true` | the control and the main-moved case PASS (the `apply_seq` half still refuses); the test FAILS at the staged-write case, with `unwrap_err` on an `Ok` |
+| A2 | the clock half: `|| state.apply_seq != new_seq` removed | the control PASSES; the test FAILS at the main-moved case, with `unwrap_err` on an `Ok` |
+
+The `sealed` case is the last step. It passes only when neither half is broken, and its own guard (the
+workspace-existence lookup) is not a mutant here.
+
+`cargo test --lib rebase` now selects 4 tests (parser, binder, dispatch and the race test): **4 passed.**
