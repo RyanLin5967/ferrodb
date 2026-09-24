@@ -1135,6 +1135,12 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
     // H6 (A12.2): the one thing besides `recovered` that makes the child's open rebuild. Nothing in
     // this harness rolls back, so a marker means an index undo failed in the parent, and the row's
     // `rebuild` is D205's, not a clean restart's.
+    if r.get("stale") != 0 {
+        failures.push(format!(
+            "H6 {at}: the stale-index marker was present at the child's open, so its rebuild is not a \
+             clean restart's"
+        ));
+    }
     // A20.4: the child's own close, judged here. A missing field reads u64::MAX, so it fires.
     let (lp, lf, lr) = (r.get("lease_panicked"), r.get("lease_failed"), r.get("lease_refused_branches"));
     if lp != 0 || lf != 0 || lr != 0 {
@@ -1145,12 +1151,6 @@ fn restart_guards(r: &RestartRow, fire: Fire, failures: &mut Vec<String>) {
     }
     if r.get("close_ok") != 1 {
         failures.push(format!("CLOSE {at} (the child's close): the child's database did not close cleanly"));
-    }
-    if r.get("stale") != 0 {
-        failures.push(format!(
-            "H6 {at}: the stale-index marker was present at the child's open, so its rebuild is not a \
-             clean restart's"
-        ));
     }
 }
 
