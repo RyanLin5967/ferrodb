@@ -349,6 +349,18 @@ enum Fire {
     CkptDdl,
 }
 
+/// Where the verdict script grades a fire's guard (A22.4): at any N, or at named checkpoints of the
+/// run, printed as concrete `N=<n>` or `axis ii M=<m>` from the run's registered lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum At {
+    Any,
+    First,
+    Last,
+    Every,
+    AfterFirst,
+    AxisTwo,
+}
+
 /// The arm a fire mode needs (A12.3): the one holding the guard it breaks, or for `ckpt-ddl` the
 /// integer it moves. `Any` is G1, which every arm set checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,33 +409,34 @@ impl Fire {
         })
     }
 
-    /// What this mode must fire, and what the pre-registration allows beside it, by guard id
-    /// (A20.1). Exhaustive, with no `_` arm, so a new mode must declare both. The FIRECHECK line
-    /// prints them, and the verdict script cross-checks them against its own table.
-    fn expects(self) -> (&'static [&'static str], &'static [&'static str]) {
+    /// What this mode must fire, and what the pre-registration allows beside it, by guard id AND
+    /// where the verdict script grades it (A20.1, A22.4). Exhaustive, with no `_` arm, so a new mode
+    /// must declare both. The FIRECHECK line prints them, and the script cross-checks them against
+    /// its own table.
+    fn expects(self) -> (&'static [(&'static str, At)], &'static [(&'static str, At)]) {
         match self {
             Fire::None => (&[], &[]),
-            Fire::WrongPage => (&["G2"], &[]),
-            Fire::CensusOff => (&["G3"], &[]),
-            Fire::ControlCatalog => (&["G4"], &[]),
-            Fire::ControlCold => (&["G5"], &["G7"]),
-            Fire::WrongHeight => (&["G6"], &[]),
-            Fire::ControlDrift => (&["G7"], &[]),
-            Fire::WrongArenas => (&["H2"], &[]),
-            Fire::WrongLive => (&["H3"], &[]),
-            Fire::MergeQuarantined => (&["M1"], &["M5", "G1"]),
-            Fire::WrongStart => (&["M2"], &[]),
-            Fire::WrongVisits => (&["M3"], &[]),
-            Fire::WrongDelta => (&["M4"], &[]),
-            Fire::WrongLiveMerge => (&["M5"], &[]),
-            Fire::WrongCkptFlag => (&["M6"], &[]),
-            Fire::ExtraBranch => (&["G1"], &[]),
-            Fire::ChildLocked => (&["H1"], &["ARM3"]),
-            Fire::ExtraExtent => (&["H2"], &[]),
-            Fire::OrphanExtent => (&["H4"], &[]),
-            Fire::NoClusterTime => (&["H5"], &[]),
-            Fire::PinnedCheckpoint => (&["M6"], &[]),
-            Fire::StaleMarker => (&["H6"], &["ARM3"]),
+            Fire::WrongPage => (&[("G2", At::Any)], &[]),
+            Fire::CensusOff => (&[("G3", At::Any)], &[]),
+            Fire::ControlCatalog => (&[("G4", At::Any)], &[]),
+            Fire::ControlCold => (&[("G5", At::Last)], &[("G7", At::Any)]),
+            Fire::WrongHeight => (&[("G6", At::Any)], &[]),
+            Fire::ControlDrift => (&[("G7", At::Any)], &[]),
+            Fire::WrongArenas => (&[("H2", At::Any)], &[]),
+            Fire::WrongLive => (&[("H3", At::Any)], &[]),
+            Fire::MergeQuarantined => (&[("M1", At::Any)], &[("M5", At::Any), ("G1", At::AfterFirst)]),
+            Fire::WrongStart => (&[("M2", At::Any)], &[]),
+            Fire::WrongVisits => (&[("M3", At::Any)], &[]),
+            Fire::WrongDelta => (&[("M4", At::Any)], &[]),
+            Fire::WrongLiveMerge => (&[("M5", At::Any)], &[]),
+            Fire::WrongCkptFlag => (&[("M6", At::Any)], &[]),
+            Fire::ExtraBranch => (&[("G1", At::Every)], &[]),
+            Fire::ChildLocked => (&[("H1", At::Any)], &[("ARM3", At::Any)]),
+            Fire::ExtraExtent => (&[("H2", At::Every)], &[]),
+            Fire::OrphanExtent => (&[("H4", At::Every)], &[]),
+            Fire::NoClusterTime => (&[("H5", At::Last)], &[]),
+            Fire::PinnedCheckpoint => (&[("M6", At::AxisTwo)], &[]),
+            Fire::StaleMarker => (&[("H6", At::First)], &[("ARM3", At::Any)]),
             // A JUDGE fire: no guard; its own FIRECHECK line names what may print (A20.3).
             Fire::CkptDdl => (&[], &[]),
         }
@@ -2318,6 +2331,8 @@ fn main() {
             &merge_rows,
             &ckpt_points,
             fire,
+            &checkpoints,
+            &merge_targets,
             &mut failures,
             &mut ns_void,
         );
@@ -2335,6 +2350,25 @@ fn main() {
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// One expected id with where it is graded, as the FIRECHECK line prints it (A22.4).
+fn at_text(id: &str, at: At, checkpoints: &[usize], merge_targets: &[usize]) -> String {
+    let ns = |v: &[usize]| v.iter().map(|n| format!("N={n}")).collect::<Vec<_>>().join(", ");
+    let place = match at {
+        At::Any => return id.to_string(),
+        At::First => ns(&checkpoints[..checkpoints.len().min(1)]),
+        At::Last => ns(checkpoints.last().map(std::slice::from_ref).unwrap_or(&[])),
+        At::Every => ns(checkpoints),
+        At::AfterFirst => ns(checkpoints.get(1..).unwrap_or(&[])),
+        At::AxisTwo => merge_targets.iter().map(|m| format!("axis ii M={m}")).collect::<Vec<_>>().join(", "),
+    };
+    format!("{id} at {place}")
+}
+
+/// A FIRECHECK list of expected ids, joined with "and" (the places carry commas).
+fn expect_list(v: &[(&str, At)], checkpoints: &[usize], merge_targets: &[usize]) -> String {
+    v.iter().map(|&(id, at)| at_text(id, at, checkpoints, merge_targets)).collect::<Vec<_>>().join(" and ")
 }
 
 /// G7's measure of the box (PREREG A15.1, A16.3): arm 1's control ns, max over min across N, per
@@ -2381,6 +2415,8 @@ fn read_vs_n_summary(
     merge_rows: &[MergeRow],
     ckpt_points: &[CkptPoint],
     fire: Fire,
+    checkpoints: &[usize],
+    merge_targets: &[usize],
     failures: &mut Vec<String>,
     ns_void: &mut Vec<String>,
 ) {
@@ -2717,13 +2753,14 @@ fn read_vs_n_summary(
              (A20.2); any other = a finding."
         );
     } else if fire != Fire::None {
-        // A20.1: what must fire and what is allowed beside it, by id, from `Fire::expects`.
+        // A20.1, A22.4: what must fire and what is allowed beside it, by id and where it is graded.
         let (must, may) = fire.expects();
         println!(
-            "FIRECHECK {fire:?}: must appear below: {}; allowed extras (PREREG): {}; any other is a finding \
-             (A20.1).",
-            must.join(", "),
-            if may.is_empty() { "none".to_string() } else { may.join(", ") }
+            "FIRECHECK {fire:?}: must appear below: {}; allowed extras (PREREG): {}; any other is a finding. \
+             The verdict script also grades shape rules this line does not print (A17.2's H6 shape, H2's +1, \
+             H4's freed = 1, (f2)'s CKPT lines) (A20.1, A22.4).",
+            expect_list(must, checkpoints, merge_targets),
+            if may.is_empty() { "none".to_string() } else { expect_list(may, checkpoints, merge_targets) }
         );
     }
     if failures.is_empty() && ns_void.is_empty() {
