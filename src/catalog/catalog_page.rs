@@ -385,6 +385,39 @@ impl CatalogPage {
     
 }
 
+/// Refuse an entry the catalog page format cannot hold, **by asking the encoder itself** (D249).
+///
+/// For a caller that has to know BEFORE it changes anything whether an entry will persist. `ALTER`
+/// decides everything in `Catalog::plan_alters` and only then rewrites the heap, and a refusal that
+/// first arrives at `persist`, after the rewrite, can neither be undone (the rows are already in the
+/// new shape) nor left in memory (every later `persist` would re-serialize it and refuse too).
+///
+/// **It is not a second length check.** It runs `serialize`, the single authority the header above
+/// describes, so a change to any guard in there changes this answer with it, and nothing here can
+/// mask a mutant of one. It asks the two questions `Catalog::persist` itself asks:
+///
+/// - **Does the entry fit an empty page?** `persist` places entries with `has_space`, and an entry
+///   no page can hold is never placed: `persist` links a fresh page per turn until allocation
+///   refuses. Asked first, and asked only here, because `serialize` has no bounds check and would
+///   panic on such an entry.
+/// - **Does it serialize?** Every length prefix is checked there.
+pub(crate) fn refuse_unless_encodable(entry: &TableEntry) -> Result<(), FerroError> {
+    let mut page = CatalogPage::new(0);
+    if !page.has_space(entry) {
+        return Err(FerroError::Constraint(format!(
+            "the catalog entry of table {} would be {} bytes, more than one {}-byte catalog page \
+             holds; refused before anything was written",
+            elide(&entry.name),
+            HEADER_SIZE + entry.length(),
+            PAGE_SIZE
+        )));
+    }
+    // Pushed rather than `add_entry`ed: `add_entry` asks `has_space` again, and a second copy of the
+    // question above would let a mutant of it survive.
+    page.entries.push(entry.clone());
+    page.serialize().map(|_| ())
+}
+
 impl TableEntry {
     pub fn length(&self)  -> usize{
         let mut length = 12;

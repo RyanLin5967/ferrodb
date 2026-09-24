@@ -68,6 +68,7 @@ use std::sync::atomic::Ordering;
 
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::catalog::catalog_page::{TableEntry, refuse_unless_encodable};
 use crate::catalog::column::{DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::catalog::stats::{ColumnStats, TableStats};
@@ -563,6 +564,21 @@ impl Catalog {
         }
         let new_schema = shapes.last().unwrap().clone();
 
+        // **The entry `finish` will persist, asked of the encoder now, while nothing is written**
+        // (D249). `resulting_schema` checks a new column name for existence and duplicates only, and
+        // the catalog encoder refuses a name longer than its one-byte length prefix. Asked at
+        // `finish`, that refusal came after `rewrite_heap` had converted every row, and `finish`
+        // installs the new schema in memory before its `persist`: the refused name stayed in the
+        // catalog map and every later `persist` in the process refused on it. An undo there would
+        // have been worse, leaving rows in the new shape under the old schema (I19). This is the
+        // entry exactly as `apply_plan` and `finish` will install it: the new shape, and every
+        // index renamed through the same function they use. The primary root `finish` also writes
+        // is a fixed-width field, so it cannot change the answer.
+        let mut installed = entry.clone();
+        installed.schema = new_schema.clone();
+        rename_indexed_columns(&mut installed, actions);
+        refuse_unless_encodable(&installed)?;
+
         // The statistics are carried across the alteration by [`carried_stats`], and they are
         // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
         // `finish` runs only after the heap has been converted, so a conversion that fails inside
@@ -656,36 +672,9 @@ impl Catalog {
         //
         // Before `finish`, which is the `persist` both halves of the install ride on: two persists
         // would be two chances to store one half of an alteration.
-        let renames: Vec<(&String, &String)> = actions
-            .iter()
-            .filter_map(|a| match a {
-                AlterAction::RenameColumn { from, to } => Some((from, to)),
-                _ => None,
-            })
-            .collect();
-        if !renames.is_empty() {
+        if actions.iter().any(|a| matches!(a, AlterAction::RenameColumn { .. })) {
             let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
-            for (from, to) in renames {
-                // **Both lists, and the second one is not decoration.** A `TableEntry` keeps
-                // ordinary indexes and full-text indexes in separate vectors, and BOTH record
-                // their column by name. `planner::plan` resolves each of them with
-                // `position(|c| c.name == info.column_name).ok_or(KeyNotFound)` — the full-text one
-                // at `plan.rs:110` exactly as the ordinary one at `:102` — so missing either leaves
-                // an index that is not stale but unfindable, and every write against the table
-                // stops working. The pre-refactor rename arm walked only `indexes`; a full-text
-                // index over a renamed column has been broken since `CREATE FULLTEXT INDEX`
-                // existed, through the plain `ALTER TABLE` path as much as through a merge.
-                for ind in entry.indexes.iter_mut() {
-                    if &ind.column_name == from {
-                        ind.column_name = to.clone();
-                    }
-                }
-                for ind in entry.fulltext_indexes.iter_mut() {
-                    if &ind.column_name == from {
-                        ind.column_name = to.clone();
-                    }
-                }
-            }
+            rename_indexed_columns(entry, &actions);
         }
 
         let new_schema = shapes
@@ -729,6 +718,37 @@ impl Catalog {
         let shape = shape_of(&entry.schema);
         self.persist()?;
         Ok(shape)
+    }
+}
+
+/// Rename every index and full-text index column that `actions` renames, in the chain's own order.
+///
+/// One definition with two callers, and the second is why it is a function (D249):
+/// [`Catalog::apply_plan`] installs the renames, and [`Catalog::plan_alters`] builds the entry
+/// `finish` will persist so the encoder can be asked about it before the rewrite. Two copies of this
+/// loop could let the entry that was checked differ from the entry that is written.
+fn rename_indexed_columns(entry: &mut TableEntry, actions: &[AlterAction]) {
+    for action in actions {
+        let AlterAction::RenameColumn { from, to } = action else { continue };
+        // **Both lists, and the second one is not decoration.** A `TableEntry` keeps ordinary
+        // indexes and full-text indexes in separate vectors, and BOTH record their column by name.
+        // `planner::plan` resolves each of them with
+        // `position(|c| c.name == info.column_name).ok_or(KeyNotFound)` — the full-text one at
+        // `plan.rs:110` exactly as the ordinary one at `:102` — so missing either leaves an index
+        // that is not stale but unfindable, and every write against the table stops working. The
+        // pre-refactor rename arm walked only `indexes`; a full-text index over a renamed column had
+        // been broken since `CREATE FULLTEXT INDEX` existed, through the plain `ALTER TABLE` path as
+        // much as through a merge.
+        for ind in entry.indexes.iter_mut() {
+            if &ind.column_name == from {
+                ind.column_name = to.clone();
+            }
+        }
+        for ind in entry.fulltext_indexes.iter_mut() {
+            if &ind.column_name == from {
+                ind.column_name = to.clone();
+            }
+        }
     }
 }
 
