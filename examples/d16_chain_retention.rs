@@ -43,10 +43,13 @@
 //! `progress` line first, so a run stopped by `timeout` names the cell and phase it stopped in.
 //!
 //! **Fire-checks inject inside the engine, not here.** `bench/d16_chain/firecheck.py` applies one
-//! source mutant at a time to `src/` (the pin, a reap's drain, the fast path's free, the net
-//! counter, the copy, the candidate loop, the drain's disarm), rebuilds, and checks each cell's
-//! verdict against PREREG amendment 1's table. This file has no fault switch of its own. A forced
-//! result at the call site would test nothing inside the path being measured.
+//! source mutant at a time to `src/`, rebuilds, and checks every cell's verdict, every `compare`
+//! line, the slot line, the build flag and the exit code against PREREG A1.6 and A2.3-A2.4. This
+//! file has no fault switch of its own. A forced result at the call site would test nothing inside
+//! the path being measured.
+//!
+//! Each half of a two-part guard has its own id (G1/G1b, G2/G2b, G3/G3b, G4/G4b; PREREG A2.2), so a
+//! fire-check can say which half fired.
 //!
 //! Exit 0: every guard held and every prediction matched. Exit 1: the guards held but a prediction
 //! did not (that is a result, printed as MISMATCH). Exit 2: NOT A RESULT. A dirty or unknown build
@@ -326,7 +329,7 @@ fn check_census(c: &Census, when: &str, fails: &mut Vec<String>) {
     }
     if c.counter_reserved != c.enum_reserved {
         fails.push(format!(
-            "G2 {when}: reserved_page_count says {}, the live extents' sizes sum to {}",
+            "G2b {when}: reserved_page_count says {}, the live extents' sizes sum to {}",
             c.counter_reserved, c.enum_reserved
         ));
     }
@@ -481,8 +484,8 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
     };
     match rig.catalog.get(survivor) {
         Ok(r) if r.depth == want_depth => {}
-        Ok(r) => fails.push(format!("G1: survivor {survivor} has depth {}, not {want_depth}", r.depth)),
-        Err(e) => fails.push(format!("G1: survivor {survivor} unreadable before sweep 1: {e:?}")),
+        Ok(r) => fails.push(format!("G1b: survivor {survivor} has depth {}, not {want_depth}", r.depth)),
+        Err(e) => fails.push(format!("G1b: survivor {survivor} unreadable before sweep 1: {e:?}")),
     }
     if built.bad_cows != 0 {
         fails.push(format!(
@@ -519,8 +522,8 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
     // ---- G4: the survivor lives and the doomed are gone ----------------------------------------
     match rig.catalog.get(survivor) {
         Ok(r) if r.state == BranchState::Live => {}
-        Ok(r) => fails.push(format!("G4: survivor {survivor} reads {:?} after sweep 1", r.state)),
-        Err(e) => fails.push(format!("G4: survivor {survivor} unreadable after sweep 1: {e:?}")),
+        Ok(r) => fails.push(format!("G4b: survivor {survivor} reads {:?} after sweep 1", r.state)),
+        Err(e) => fails.push(format!("G4b: survivor {survivor} unreadable after sweep 1: {e:?}")),
     }
     let not_reaped = built
         .doomed
@@ -537,6 +540,7 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
         .reaper
         .drain_pending()
         .map_err(|e| format!("drain_pending probe after sweep 1: {e:?}"))?;
+    check_deferred(&rig.reaper, "after the sweep-1 probe", &mut fails);
 
     // ---- sweep 2, control (a): the survivor goes too -------------------------------------------
     progress(tag, "sweep2");
@@ -564,7 +568,7 @@ fn run_cell(arm: Arm, depth: usize, p: usize, persist: bool, tag: &str) -> Resul
 
     let refused = rig.reaper.refused_reaps();
     if refused != 0 {
-        fails.push(format!("G3: the reaper refused {refused} reaps"));
+        fails.push(format!("G3b: the reaper refused {refused} reaps"));
     }
 
     // ---- the id-slot probe (A1.4), after every census ------------------------------------------
