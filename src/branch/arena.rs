@@ -4911,6 +4911,94 @@ mod tests {
         });
     }
 
+    /// **D183 — a `put_pending` whose record fails must leave the log reading DIRTY.**
+    ///
+    /// Review axis 2b, fixed at `4b1ab2d` and pinned by nothing until this test: the re-verify's
+    /// mutant M9 (the bump on this arm removed) passed the whole lib target on both `4b1ab2d` and
+    /// the merged tree (`bench/d183_reverify.txt`).
+    ///
+    /// The arm used to be safe by accident — `take_pending` bumped unconditionally, so every caller
+    /// arrived here already dirty. The conditional bump removed that: a `put_pending` with no
+    /// preceding take (or after an EMPTY one) extends the log and bumps nothing, so if its append
+    /// fails, the counters still say the durable log is level with memory. The next persist then
+    /// APPENDS behind a file that does not list the entry, and a crash before the next compaction
+    /// loses it — `drain_pending` never revisits an entry the file does not hold.
+    ///
+    /// The append is made to fail by turning the armed file into a DIRECTORY for the one call, which
+    /// fails the same way on every platform and needs no permission bits. Two assertions, and both
+    /// are needed: the persist after the failure must be a REWRITE (the mechanism), and `image +
+    /// tail` must restore byte-identical to a full image of live memory (the durable state). The
+    /// second was fire-checked on its own, with the first removed.
+    #[test]
+    fn a_put_pending_whose_record_fails_leaves_the_log_dirty() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-putfail-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-putfail-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_dir(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        // The image is now current and the log level: the only thing that could carry the entry
+        // below to the file afterwards is a record, or a rewrite the counters force.
+        h.store.checkpoint(&armed).unwrap();
+        let (r0, a0) = h.store.persist_counters();
+
+        let saved = std::fs::read(&armed).unwrap();
+        std::fs::remove_file(&armed).unwrap();
+        std::fs::create_dir(&armed).unwrap();
+        let entry = PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner: b.branch_id,
+        };
+        let put = h.store.put_pending(vec![entry]);
+        std::fs::remove_dir(&armed).unwrap();
+        std::fs::write(&armed, &saved).unwrap();
+        assert!(put.is_err(), "fixture: the append did not fail, so the failure arm never ran");
+        assert_eq!(
+            h.store.persist_counters(),
+            (r0, a0),
+            "fixture: the failed put_pending still persisted something"
+        );
+        assert_eq!(h.store.pending_len(), 1, "fixture: put_pending did not keep the entry in memory");
+
+        // Any persist at all: a claim, which carries no pending log.
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(spare.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "the persist after a failed put_pending APPENDED ({} rewrites, {} appends) behind a \
+             file that does not list the entry it left in memory",
+            r1 - r0,
+            a1 - a0
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the durable pending-free log is short the entry a failed put_pending left in memory: \
+             a crash now loses it"
+        );
+
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
     /// ⭐ **A recycled page handed out again must reach the durable map, or a live extent is freed.**
     ///
     /// `extent_is_empty` is `recycled >= next_free`. A durable recycled list that still names a

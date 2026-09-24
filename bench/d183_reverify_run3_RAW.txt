@@ -1,0 +1,20 @@
+# D183 re-verify run 3 — RAW, unedited. Driven by the lead from ~/wt/logs/lead-lanes-0924/d183_run3.sh
+# lock owner: 49922 d183-run3 2026-09-24T01:01:49Z
+2026-09-24T01:01:49Z head=904b8d0152a7dc64d7dc6e6ef17f946f6553a376 blob=39deee8371ed53f9e5a9af0fd33d776358b7c2f5
+M10: applied
+2026-09-24T01:01:49Z M10 applied: pre=39deee8371ed53f9e5a9af0fd33d776358b7c2f5 post=7fc329ce06fa5806539988110cb52cfad3bc116f
+2026-09-24T01:03:34Z M10 rc=101 compiled=1 result=[test result: FAILED. 1678 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 101.01s] failures=[    branch::arena::tests::reusing_a_recycled_page_reaches_the_durable_map ]
+m9 test inserted
+P8 test fn occurrences: 1
+2026-09-24T01:03:34Z P8 inserted: blob=4f66daac1beab365dba164970ef9180e189a35c5
+2026-09-24T01:03:39Z p8 lib --list: 1682 tests, 0 benchmarks
+2026-09-24T01:05:18Z p8_clean rc=0 compiled=1 result=[test result: ok. 1680 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.66s] failures=[]
+2026-09-24T01:05:23Z p8 single rc=0 [test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1681 filtered out; finished in 0.07s]
+M9: applied
+2026-09-24T01:05:23Z M9 applied: pre=4f66daac1beab365dba164970ef9180e189a35c5 post=4c9c411e7ec40af36518cbbfe8810816ac89e4f5
+2026-09-24T01:07:03Z M9 rc=101 compiled=1 result=[test result: FAILED. 1679 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 95.32s] failures=[    branch::arena::tests::a_put_pending_whose_record_fails_leaves_the_log_dirty ]
+M9 panic: APPENDED (0 rewrites, 1 appends) behind a file that does not list the entry it left in memory
+M9b: applied
+2026-09-24T01:07:03Z M9b applied: pre=4f66daac1beab365dba164970ef9180e189a35c5 post=8cab08783bf87b3c9ad99285088b3ccd2b049832
+2026-09-24T01:08:37Z M9b rc=101 compiled=1 result=[test result: FAILED. 1679 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 90.56s] failures=[    branch::arena::tests::a_put_pending_whose_record_fails_leaves_the_log_dirty ]
+M9b panic: short the entry a failed put_pending left in memory: a crash now loses it
