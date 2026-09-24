@@ -240,3 +240,88 @@ The `inbox_bytes ≥ MAX_FRAME_BYTES` floor. It would refuse the existing
 `207d362` made exactly that edit (fixture → `MAX_FRAME_BYTES`, 1 MiB payloads, 16 frames written from a
 thread, the bound assertion → `<= MAX_FRAME_BYTES`). It is a test edit, and the lead has filed it as
 Ryan's decision.
+
+---
+
+## Amendment 4 — the fresh review of `dd9d1e1`, written BEFORE its fixes (nothing built)
+
+Source: `artie-research frontier/d207_review.md` @ `1b37542`, verdict SOUND-WITH-CAVEATS. The lead
+verified F1 and F2 and ruled as follows. Remove the quadratic at its source, then remove the per-frame
+budget: removed rather than guarded, because it no longer protects anything and it causes the stall.
+Changes to my own unlanded tests go through this amendment.
+
+### Every step that decoding one configuration costs, READ at `dd9d1e1`
+
+M is the member count and L the learner count, each ≤ `MAX_CONFIG_NODES`.
+
+| step | where | cost |
+|---|---|---|
+| the two id lists, strictly ascending | `decode_node_list` | O(M + L) |
+| voter/learner disjointness | `first_common`, a two-pointer merge | O(M + L) |
+| `Config::new`: collect, `sort`, `dedup` | `config.rs:54-58` | O(M log M) |
+| `with_learners`: collect, `sort`, `dedup` | `config.rs:62-64` | O(L log L) |
+| **`with_learners`: `l.retain(\|n\| !self.members.contains(n))`** | **`config.rs:67`** | **O(L × M), the only quadratic** |
+| the canonical comparison back against the wire | `decode_config` | O(M + L) |
+
+The rest of a frame's decode is linear in its bytes: the entry loop, `take_bytes`, and `decode_catalog`,
+whose `RecKind::deserialize` has one loop, over the columns. `transport.rs` has no other `contains`, `find` or
+`position` in code (READ: `grep`). `members` is always sorted and deduplicated, because its field is private
+and every constructor goes through `Config::new` or is empty (READ `config.rs:28-125`). So the fix is a
+`binary_search` per learner. That makes a configuration O((M + L) log(M + L)), and a frame linear in its
+bytes up to that log.
+
+Claims this falsifies, to be rewritten in the fix:
+
+- `transport.rs:784`, the per-config refusal: "the comparisons a configuration costs are quadratic in its
+  two list lengths";
+- `:137`, the doc for `MAX_CONFIG_NODES`: "the quadratic term is about a million comparisons".
+
+`:795` is the budget's own message, and it goes with the budget.
+
+### Run R3 — RED at **`01bd8ae`** (the tree at `dd9d1e1` plus one test)
+
+**Q** = `a_leaders_full_catch_up_append_of_membership_entries_is_delivered`. The module has **60** tests on
+macOS there (59 elsewhere). Predicted: **59 passed, 1 failed**. Q panics at `a.send` with "…refused to its
+sender: a configuration holds 1024 nodes, but only 0 of this frame's 4096-node budget is left…". The
+encoder's budget runs out after two configurations of 1024 + 1024 ids, so the third is refused.
+
+### Test changes, registered here before they are made
+
+- **Remove D, E, H and I.** They assert the budget, which is removed. D and E are still run and
+  still fail as registered in Run R at `6ceb719`, where they exist.
+- **C** (review F5): pin `FRAME_LEN = 7_340_111` and `FIT = 9` as literals. The encoder's length becomes
+  a premise that is asserted, not the source of the expected values. C's three dependent assertions
+  are otherwise unchanged.
+- **W** (review F4): `poll_interval` goes from 5 ms to 200 ms, and "deterministic" is rewritten.
+  - On the fixed tree W stays deterministic.
+  - On the red tree, and under M18, the red needs `shutdown`'s locked set-and-notify, a few µs, to land
+    before the sender's dial next checks the stop flag. That moment is spread over a whole poll, so the
+    chance of a missed red is about µs / 200 ms (INFERRED), down from about µs / 5 ms. M18's kill stays
+    probabilistic, and it is recorded as such.
+- **New post-fix test X**, `removing_voters_from_a_learner_list_is_a_binary_search_per_learner`. It
+  drives the new `config::retain_absent` with an `Ord` type that counts comparisons: 1024 items against
+  512 sorted references (the evens).
+  - Correctness: the odd 512 remain.
+  - Cost: **≤ 1024 x 11 + 512 = 11,776** comparisons. That is one `binary_search` of at most 10 per item,
+    plus at most 511 for the ascending `debug_assert`.
+  - A per-item scan would cost about 512 x 256.5 + 512 x 512 = **393,472** (INFERRED arithmetic).
+
+### Correction to line 27 (review F6)
+
+The itemisation reads "21 envelope". The envelope is **16** bytes: `from` 4, `to` 4, `term` 8. With 16,
+the parts add up to 7,340,111. The total and everything computed from it (88,081,332; 66,060,999;
+`fit` 9) were already right.
+
+### Fix, then Run G3 at the tip
+
+The fix:
+
+- `config::retain_absent` does a `binary_search` per item, and `with_learners` calls it.
+- `MAX_FRAME_CONFIG_NODES`, its const assert and the budget threaded through both halves of the codec are
+  removed; those functions go back to their `9aa6968` signatures.
+- The doc and the two refusal messages for `MAX_CONFIG_NODES` are rewritten to what is left.
+- The failed `try_clone` in `accept_loop` is counted in `refused_conns` (review F3).
+
+Predicted at the tip: **57 tests on macOS (56 elsewhere): 60 − D − E − H − I + X. All pass.** Q delivers
+the Append unchanged. Per-target: **2591** on macOS = 2579 (INFERRED, the lead's number) + A, B, C, F, G, J,
+K, L, P, W, Q and X.
