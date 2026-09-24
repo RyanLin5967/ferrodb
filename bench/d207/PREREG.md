@@ -725,3 +725,6 @@ pass `git apply --check`. Test counts are unchanged: transport 58, replicate 60,
    - They cannot all be made true by counting, because TCP gives no delivery receipt.
 
 **Predictions are unchanged** from amendments 8 and 9. `749d399` touches doc comments only; no test reads them.
+
+*Erratum to amendment 10, appended:* item 2 says "§3 names the options". It should say that the lane report
+(`lane_d207_transport.md` §6, "D73 observations") names the options for O-1.
