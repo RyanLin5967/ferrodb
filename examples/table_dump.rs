@@ -36,6 +36,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::execution::executor::{run, Outcome};
@@ -94,7 +95,16 @@ fn main() {
             eprintln!("table_dump: open {db}: {e}");
             std::process::exit(1);
         });
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let dm = Arc::new(DiskManager::new(file).unwrap());
+    // **D239.** The arena region is reserved before recovery, as in `src/cli/cli.rs`. This tool
+    // never attaches the arena store at all, so without this no region is ever registered, and a
+    // page recovery allocates (a directory repair) could be one of the arena's.
+    let arena_path = format!("{db}.arena");
+    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path)).unwrap_or_else(|e| {
+        eprintln!("table_dump: reserve the arena region: {e}");
+        std::process::exit(1);
+    });
+    let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
