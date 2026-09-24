@@ -354,3 +354,84 @@ Changes to the expectations (INFERRED):
 - GREEN: `d222_index_root_after_backfill` **5/5**. That is its own lane's expectation, green here because this branch carries its fix.
 - Per-target suite: **2630 run, passed=2629, failed=1**. That is 2611 (quoted from #16 §14), plus this branch's 14, plus D222's 5.
 - Nothing else changes. No D208/D214/D215/F4 test, mutant or red phase touches the D222 test file.
+
+---
+
+## Amendment 7 (appended before any run; nothing above is edited): review 2's follow-ups
+
+Review 2 (`frontier/d208_review2.md` @ artie-research `7806e77`, of `f612ba8..17c9a37`) found nothing that blocks. Its A1 (a count-based split can produce an unserialisable half) is ledger row D225, owned by lane `d225-byte-split`, not this branch. The lead assigned four follow-ups. Nothing has been built or run. Every expectation is INFERRED.
+
+| sha | what |
+|---|---|
+| `bd2e29b` | **RED**: T11a, T11b and T12. They compile against `3a1b57e` |
+| `1c3f8c0` | **RED**: T13. T12's build is factored into `build_split_table`, with no behaviour change. The source is still `bd2e29b`'s |
+| `5528b6e` | the fixes (C4) and the docs (C3, Q3) |
+| this commit | this amendment. `src/` and `tests/` are identical to `5528b6e` |
+
+### 1. One source of truth, carried through (C4)
+- `Catalog::live_root(table, index, recorded)` returns the cell's value, and the record only for a tree with no cell.
+- `drop_table` frees the primary and every index from it.
+- `rebuild_indexes` frees each old tree from it. It first catches the index records up with `catch_up_index_records`, and reads the primary's live root before borrowing the entry mutably. The one production caller (`open_recovered`) had cell == record anyway, so this matters only to a live caller.
+- `Catalog::catch_up_index_records(table)` copies every B-tree and full-text record from its cell. ALTER's `finish` calls it before its one persist, which is the rule D214 follows for the primary. Neither helper writes a cell.
+
+New tests, in `root_cell_is_per_index`:
+- **T11a** `an_alter_catches_up_a_lagging_btree_record_from_its_cell` and **T11b** `an_alter_catches_up_a_lagging_fulltext_record_from_its_cell`:
+  - they grow the index until its root really splits;
+  - they set its in-memory record back to the pre-split page (the ONE simulated step);
+  - they run `ALTER RENAME` on an unindexed column;
+  - they assert the cell is the same `Arc`, is untouched, and that record == cell.
+- **T12** `a_drop_after_lagging_records_frees_every_live_tree`. D222's high-water instrument, reused:
+  - 600 rows split the primary, the B-tree and the posting tree, each asserted;
+  - every record is lagged;
+  - DROP-and-rebuild twice, and the third copy must reuse the second's pages;
+  - a no-lag control arm.
+- **T13** `a_rebuild_after_lagging_records_frees_every_live_tree`. Two fresh databases get identical statements; one has lagged records; each runs `rebuild_indexes`; the highest allocated page must match.
+
+### RED
+- At `bd2e29b`: `--test root_cell_is_per_index` gives **16 run, 3 FAILED**.
+  - T11a and T11b fail at "the ALTER wrote the lagging … record as it was": `finish` caught up the primary only.
+  - T12 fails at its second arm: `drop_table` frees the stale leaves.
+- At `1c3f8c0`: **17 run, 4 FAILED**, the same three plus T13 at "freed the stale leaves … and leaked the live trees".
+- Falsifiers:
+  - any "premise failed" line (a root that never split, a record that never caught up);
+  - T12's control arm failing (then something other than the lag leaks);
+  - T11 or T12 passing here.
+
+### GREEN at `5528b6e` (or this commit)
+- `root_cell_is_per_index` **17/17**, `catalog::alter::tests` **2/2**, `d222_index_root_after_backfill` **5/5**.
+- Everything else as in amendments 5 and 6. The D53 files are untouched.
+
+### Per-target suite
+- **2634 run, passed=2633, failed=1** (D197's premise test). That is 2611 (quoted from #16 §14), plus this branch's 18 (T2–T13, F4a–c, U1, U2), plus D222's 5.
+
+### New mutants (base `5528b6e`, target `--test root_cell_is_per_index`)
+
+| mutant | edit | expected FAILED |
+|---|---|---|
+| K23 | `drop_table` frees the primary from its record | T12 |
+| K24 | `drop_table` frees the B-tree indexes from their records | T12 |
+| K25 | `drop_table` frees the full-text indexes from their records | T12 |
+| K26 | `finish` does not call `catch_up_index_records` | T11a, T11b |
+| K27 | `catch_up_index_records` skips the B-tree list | T11a, T13 |
+| K28 | `catch_up_index_records` skips the full-text list | T11b, T13 |
+| K29 | `rebuild_indexes` frees the old primary from its record | T13 |
+| K30 | `rebuild_indexes` does not catch the index records up first | T13 |
+
+- T11–T13 are expected to pass under K5–K7, K9–K22 and K15/K18a–c (none touches the frees or the index records' catch-up).
+- Under the key-collapsing mutants K1–K4 and K8, T12 and T13 are **undetermined**: their fixture puts both index kinds on one column, so the cells collide, and a drop could free one tree twice. No kill is claimed for them.
+
+### 2. Corrections
+- **C1: K18b's "equivalent mutant" (amendment 5) holds for FIXED-WIDTH primary keys only.** The claim rested on "a same-size replace cannot split", which rests on "no leaf is ever left persisted full".
+  - Leaves split by COUNT (`mid = len / 2`), while fullness is by BYTES.
+  - With variable-width keys (a VARCHAR or DECIMAL primary key), a half can be left exactly full, and a same-size replace into it then splits (review 2; D225 shows the count split's other failure).
+  - For INTEGER, BIGINT and TIMESTAMP keys the halves are always under the threshold, and the claim stands.
+  - The principled D214 is correct either way, because a split through `open_shared` lands in the cell. K18b's expected verdict stays "survives". Its equivalence is now claimed only for fixed-width primary keys, and no test here uses a variable-width one.
+- **C5: two of the three F4 tests pin a state no current path reaches.** In amendment 4's naming:
+  - **F4c** (`a_create_table_never_inherits…`) is reachable: a DROP TABLE whose persist failed, then CREATE TABLE.
+  - **F4a** (`a_create_index_…`) and **F4b** (`a_create_fulltext_index_…`) are NOT reachable. No `DROP INDEX` exists, and the only route to a dead index key is that same failed DROP TABLE, after which the CREATE TABLE's sync retires the dead table's index keys before any CREATE INDEX can run.
+  - F4a and F4b pin defensive behaviour. Their shared doc said the state is "the way that DROP leaves it", which is true only of F4c.
+  - Review 2 and the lead's brief call the two unreachable ones "F4b and F4c", naming the table test first. They are the same two tests.
+
+### 3. Docs (READ at `5528b6e`)
+- **C3:** PrimaryWrite's doc (`src/wal/txn.rs`) now names D208's two extra map writers, and says why neither can reach the `(t, None)` cell a PrimaryWrite holds. `rename_root_cells` moves index keys only. `install_fresh_cell` replaces `(t, None)` only in CREATE TABLE, for a name absent from the catalog, under `ddl_checkpointed`.
+- **Q3:** `AlterPlan.primary_cell`'s doc records that `apply_plan` does not check the table's identity (the same `Arc`, the same `dir_root`), and that this is unreachable today because both callers plan and apply with only reads between.
