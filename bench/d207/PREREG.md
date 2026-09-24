@@ -842,3 +842,91 @@ This lane does not bump REPL_VERSION: that is decision 10's test edit, and the d
 | **M38 `checkpoint_writes_legacy`** | a checkpoint always writes version 1 | V3 |
 | **M39 `always_raise`** | every log is born at version 2 | V2 |
 | **M40 `counters_not_wired`** | `Node::transport_counters` reports `unaddressable` 0 | NC |
+
+---
+
+## Amendment 12 — the D223 review's fixes, tests and mutants, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `3083397` | red tests V1–V4 and U, as amendment 11 registered them |
+| `dd6304a` | amendment 11 |
+| `85df0da` | F2: format version 2, raised before the first frame over 8,384,576; `MAX_FRAME` a literal; the switch extracted from `discard_prefix` |
+| `bce1f60` | F3: `TransportCounters` and `Node::transport_counters()`. F4: `node.rs`'s loss comment narrowed |
+| `aaaadb4` | F3: post-fix test NC |
+| `a8fdd80` | F5: `tel/log.rs` keeps `MAX_FRAME_BYTES − 4096`, no longer derived from the consensus disk bound |
+| `31541c7` | F5, follow-on: two docs D223 made stale (`snapshot.rs`'s `MAX_SIDECAR_BYTES` derivation, `membership.rs`'s "appends every command"). Comments only |
+| `36e0a81` | F7: `Node::propose`'s doc names admission refusals as well as `NotLeader`. Comment only |
+| `38efedb` | mutants M35–M40; all 35 regenerated from `36e0a81` |
+
+Beyond amendment 11's plan, the code also does these things:
+
+- `RoundLog`'s `Debug` prints the version.
+- `Header::decode`'s refusal now names both versions this build reads. The one test that reads that message
+  (`tests_log.rs:750-756`) writes `VERSION + 1` and matches only "format version". With `VERSION = 2` that is 3, which
+  is still refused.
+- `TransportCounters`'s `Debug` includes `refused_after_stop`, which the transport's own `Debug` had left out.
+- **The version is monotonic across truncation too.** A suffix truncation that removes the only large frame leaves
+  the log at version 2. An older build then refuses a log it could have read. That is conservative, and no test
+  depends on it.
+
+**Why a downgrade refuses rather than falls back** (READ at `9aa6968`):
+
+- `open` decodes BOTH headers with `headers[i] = Header::decode(&buf)?;` (`:413`). So a version-2 header in either
+  file refuses the open. It does not demote to the other file.
+- The switch retires the superseded file with `set_len(0)` (`:850`). So a completed raise leaves no version-1 file
+  holding the large frame.
+
+**No TEL test pins the append limit:** `git grep -nE "8_?384_?512|8_?388_?608|MAX_FRAME_BYTES" -- src/tel/ tests/`
+returns only `tel/log.rs`'s own lines 494, 501 and 507. So F5 moves no test. TEL's modules are added to the collateral
+runs because the constant's expression changed.
+
+### Corrections to the record (append-only; the lines above stand as written)
+
+- **Amendment 11's G6 node row is wrong.** It says "13 + NC = 14" and "READ: 13 `#[test]` in `tests_node.rs` at
+  `1b8d290`".
+  - The count is **12** at `1b8d290` and **13** at `36e0a81`. Instrument:
+    `git show <sha>:src/consensus/tests_node.rs | grep -cE '^\s*#\[test\]'`. The file has no `#[cfg` and no
+    `#[ignore]`.
+  - Per-target 2604 is unaffected, because it was computed from the added tests.
+    `git diff 1b8d290 36e0a81 | grep -cE '^\+\s*#\[test\]'` returns 6, and the same count with `-` returns 0. Then
+    2598 + 6 = 2604.
+  - The 2598 is Run G5's prediction at `010d3c4`, never measured. `010d3c4..1b8d290` adds and removes no
+    `#[test]` (same instrument).
+- **F8: Run R5 (amendment 8) and Run R6 (amendment 11) read as measurements. Both are predictions**; nothing on this
+  branch has been compiled or run. Read them as:
+  - "Predicted: T3 panics with `TooLarge { bytes: 8388539, limit: 8384512 }`";
+  - "Predicted: the log module, 51 passed and 3 failed".
+
+### Run G6 — GREEN at the tip (predicted)
+
+| module | tests | predicted |
+|---|---|---|
+| log | 54 | all pass |
+| node, `consensus::node::tests_node::` | 13 (12 + NC) | all pass |
+| transport | 58 (57 off macOS) | all pass, unchanged |
+| replicate | 60 | all pass, unchanged |
+
+**Per-target: 2604** on macOS (predicted).
+
+### Commands per mutant
+
+| mutants | command | predicted to fail |
+|---|---|---|
+| M35 | the log module, `timeout 1800 cargo test --no-fail-fast --lib consensus::log::tests_log::` | U only. The signed-maximum test stores a disk frame of 8,388,539, and M35's bound is exactly 8,388,539, so that test survives it |
+| M36 | the log module | V1, V3, V4 |
+| M37 | the log module | V4 only, at crash points between the large frame's write and the switch's retirement |
+| M38 | the log module | V3 |
+| M39 | the log module | V2 |
+| M40 | the node module, `timeout 1800 cargo test --no-fail-fast --lib consensus::node::tests_node::` | NC |
+
+The M35 arithmetic (INFERRED, `log.rs:1130`): a disk frame is `4 + 8 + 8 + payload + 4`, and U's payload is
+`WalBatch`'s 13-byte header plus 8,388,563 − 29 bytes. Together that is 8,388,571 > 8,388,539, so M35 refuses U.
+
+**How M37 fails** (INFERRED): its raise copies the large frame into the spare, which is fine once the switch
+completes. But under `WriteThrough` the frame is durable under the version-1 header from `write_batch` until the
+switch retires that file, and V4's sweep crashes inside that window.
+
+All 35 patches pass `git apply --check` against `38efedb`'s tree. M1–M34 keep their edits, and only hunk context
+moved: each patch's `^[-+]` lines were compared with its copy at `36e0a81`, and eight patches were regenerated with
+identical edits.
