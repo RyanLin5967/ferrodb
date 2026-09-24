@@ -1,20 +1,24 @@
-//! D244 review 3, R3-F3 — **both production exits run the branch catalog's publish.** This checks
+//! D244 review 3, R3-F3 — **the CLI's clean exit runs the branch catalog's publish.** This checks
 //! WORDING, not an outcome, and says so here.
 //!
 //! `tests/d244_clean_exit_publishes_the_root.rs` runs `cli::exit_sequence` and shows that the
-//! publish in it is load-bearing (mutants MC and MD). What no test can run is the binaries' own
-//! exits: `run_cli` reads a REPL from stdin, `examples/pgserver.rs` serves a socket, and neither can
-//! be handed a storage that fails a read of page 1. So two edits would pass every outcome test:
-//! - ME: `run_cli` goes back to checkpointing inline instead of calling `exit_sequence`;
-//! - MF: pgserver drops its `publish_root_durably()` call.
+//! publish in it is load-bearing (mutants MC and MD). What no test can run is the binary's own
+//! exit: `run_cli` reads a REPL from stdin and cannot be handed a storage that fails a read of page
+//! 1. So one edit would pass every outcome test:
+//! - ME: `run_cli` goes back to checkpointing inline instead of calling `exit_sequence`.
 //!
-//! This test reads the two files, with `//` comments stripped, and fails on either.
+//! This test reads `src/cli/cli.rs`, with `//` comments stripped, and fails on it.
+//!
+//! pgserver is not checked here: its code after `serve(..).unwrap()` is unreachable, because
+//! `serve` returns only `Err` (D244 review 2, R2-2). A check on it would guard dead code. The
+//! server is covered by `durable()`'s own publish instead (`d244_publish_root.rs`, A3).
 //!
 //! # Blind spots
 //!
-//! It matches text. A call under another name (an alias, a wrapper), a call in dead code, or a
-//! string holding the pattern would all satisfy it. It is the same kind of guard as
-//! `d53_private_root_allowlist.rs`, for the same reason: the outcome is not reachable from a test.
+//! It matches text. A call under another name (an alias, a wrapper), a call in dead code, a string
+//! holding the pattern, or a pattern inside a `/* */` comment (only `//` is stripped) would all
+//! satisfy it. It is the same kind of guard as `d53_private_root_allowlist.rs`, for the same reason:
+//! the outcome is not reachable from a test.
 
 /// `path` under the crate root, with every `//` comment removed.
 fn code_only(path: &str) -> String {
@@ -64,16 +68,4 @@ fn run_cli_ends_through_exit_sequence_which_publishes_before_the_arena_checkpoin
         .find("store.checkpoint(")
         .unwrap_or_else(|| panic!("`exit_sequence` must checkpoint the arena"));
     assert!(publish < arena, "`exit_sequence` must publish the branch catalog's root before the arena checkpoint");
-}
-
-#[test]
-fn pgserver_publishes_the_branch_root_before_its_arena_checkpoint() {
-    let pg = code_only("examples/pgserver.rs");
-    let publish = pg
-        .find("publish_root_durably()")
-        .unwrap_or_else(|| panic!("pgserver's exit must publish the branch catalog's root (MF)"));
-    let arena = pg
-        .rfind("store.checkpoint(")
-        .unwrap_or_else(|| panic!("pgserver must checkpoint its arena at exit"));
-    assert!(publish < arena, "pgserver must publish the branch catalog's root before its arena checkpoint (MF)");
 }
