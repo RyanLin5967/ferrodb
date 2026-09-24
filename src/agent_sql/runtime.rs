@@ -80,7 +80,7 @@ use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRe
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceFlush, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::tel::frame::TxnFrame;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -5018,7 +5018,16 @@ impl AgentRuntime {
         // repair at all. Closing them needs the heap rewrite logged, which is a larger change than
         // this row. What IS closed, below, is the change feed — it never carries half of a
         // multi-table merge.
-        let prov = Arc::clone(self.provenance());
+        //
+        // **D219 — every provenance record this merge writes is made durable by ONE sync.** The
+        // rewrite below re-stamps the rows it moves and the publish loop stamps every version it
+        // writes, both through `prov`, which is the guard's stamper: applied to the index at once
+        // with every guard, and written later. `record_applied`'s row authorship is the merge's one
+        // durable write and carries all of them ahead of its own records; `provenance.flush()`
+        // after it covers a merge with no row to attribute, and the guard's `Drop` covers every
+        // early return, so nothing this merge stamped outlives the statement unwritten.
+        let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
+        let prov = Arc::clone(provenance.stamper());
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
         for (i, report) in schema_reports.iter().enumerate() {
             if report.to_apply.is_empty() {
@@ -5210,7 +5219,7 @@ impl AgentRuntime {
         for w in ready {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
-            let author = Some((Arc::clone(self.provenance()), snapshot.prov));
+            let author = Some((Arc::clone(&prov), snapshot.prov));
             if let Err(e) = w.apply_in(ctx, publish_txn, author) {
                 ctx.txn.abort(publish_txn)?;
                 return Err(e);
@@ -5228,6 +5237,9 @@ impl AgentRuntime {
             &images,
             reserved,
         )?;
+        // Durable before the merge is acknowledged. A no-op, with no sync, whenever
+        // `record_applied` had a row to attribute: its write already carried every pending stamp.
+        provenance.flush()?;
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -5448,6 +5460,9 @@ impl AgentRuntime {
         // records, their order and their bytes are unchanged; only the number of syncs they share
         // went from δ to 1. This is still the write that makes `who_wrote_row` durable, and it
         // still completes before this function returns, so before `merge` acknowledges anything.
+        // It is also the MERGE's ONE sync: every physical stamp the rewrite and the publish loop
+        // left pending (`ProvenanceFlush` in `publish_evaluation_as`) is written ahead of these
+        // records in the same append.
         //
         // It stays under `state` deliberately. The sync could be awaited after releasing `state`
         // (stage under the lock, wait outside it, as `begin_session_as_staged` does for a fork),

@@ -145,7 +145,11 @@ pub struct DurableProvenanceStore {
     mem: MemProvenanceStore,
     /// Serialises appends, and is held across `mem`'s mutation so the file and the index cannot
     /// disagree about which runs exist. Lock order is file -> mem, everywhere, without exception.
-    file: Mutex<File>,
+    ///
+    /// It also guards the PENDING records (D219): records already in `mem` whose frames have not
+    /// been written yet. One lock over both is what keeps file order equal to index order — see
+    /// [`Appender`].
+    file: Mutex<Appender>,
     path: PathBuf,
     recovery: RecoveryReport,
     /// Set when an append failed after the in-memory index had already been changed.
@@ -204,7 +208,7 @@ impl DurableProvenanceStore {
 
         Ok(DurableProvenanceStore {
             mem,
-            file: Mutex::new(file),
+            file: Mutex::new(Appender { file, pending: Vec::new() }),
             path,
             recovery,
             poisoned: AtomicBool::new(false),
@@ -461,45 +465,65 @@ impl DurableProvenanceStore {
     /// **Synchronous on every call, deliberately.** The whole claim of this module is that a stamp
     /// survives the process that made it; a buffered write that has not reached the disk survives
     /// a clean exit and nothing else, and the difference is invisible until the crash that matters.
-    /// The cost is one fsync per append — per interned run, per stamped version, per forget, and
-    /// per BATCH of row authorship (D219) — which is the price of the guarantee rather than an
-    /// oversight.
-    fn append_locked(&self, file: &File, body: &[u8]) -> Result<(), FerroError> {
-        self.append_all_locked(file, &[body])
+    /// The cost is one fsync per append — per interned run, per stamped version, per forget, per
+    /// BATCH of row authorship, and per flush of pending stamps (D219) — which is the price of the
+    /// guarantee rather than an oversight.
+    ///
+    /// `issued_by` is the counter of the write path that issued the sync; see [`SyncCounters`].
+    fn append_locked(
+        &self,
+        out: &mut Appender,
+        body: &[u8],
+        issued_by: &AtomicU64,
+    ) -> Result<(), FerroError> {
+        self.append_all_locked(out, &[body], issued_by)
     }
 
-    /// Append every body as its own framed record, with ONE write and ONE fsync for all of them.
+    /// Append every PENDING record and then every body, each as its own framed record, with ONE
+    /// write and ONE fsync for all of them.
     ///
     /// This is `branch/group_commit.rs`'s rule with a single writer: every record of the group is
     /// written first and the sync is issued after the LAST of them, so the sync covers them all.
     /// A sync issued before the last write would acknowledge a record a crash can still lose, which
     /// is the one ordering that module calls its whole correctness argument.
     ///
+    /// **Pending records go FIRST, whatever this append is for.** They reached the index before
+    /// anything this call carries, so writing them first is what keeps file order equal to index
+    /// order — and replay is in file order, so a pending stamp overtaken by a later one for the same
+    /// slot would reopen as the earlier author.
+    ///
     /// Each frame is byte-for-byte the frame a one-body call writes, and they are laid down in
     /// order, so replay, the torn-tail heal and the format are untouched: a torn batch is a torn
-    /// tail like any other, and the reader keeps the intact prefix of it.
-    fn append_all_locked(&self, file: &File, bodies: &[&[u8]]) -> Result<(), FerroError> {
+    /// tail like any other, and the reader keeps the intact prefix of it. Nothing to write is not a
+    /// write: no sync, and nothing counted.
+    fn append_all_locked(
+        &self,
+        out: &mut Appender,
+        bodies: &[&[u8]],
+        issued_by: &AtomicU64,
+    ) -> Result<(), FerroError> {
         // One-shot, and it disarms itself, so a test can fail exactly the append it means to.
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::SeqCst) {
             return Err(FerroError::Provenance("injected provenance append failure".into()));
         }
-        // Resolved BEFORE the write, so a body this file's reader could not decode is refused
-        // rather than appended: replay stops the whole open on an unknown tag. One append is one
-        // sync counted under one kind, so every body of it must carry that kind.
-        let tag = bodies.first().and_then(|b| b.first()).copied();
-        let counter = self.syncs.for_tag(tag)?;
-        if bodies.iter().any(|b| b.first().copied() != tag) {
-            return Err(FerroError::Provenance(
-                "refusing to append provenance records of different kinds under one sync".into(),
-            ));
+        let all: Vec<&[u8]> =
+            out.pending.iter().map(Vec::as_slice).chain(bodies.iter().copied()).collect();
+        if all.is_empty() {
+            return Ok(());
         }
-        let end = file
+        // Checked BEFORE the write, so a body this file's reader could not decode is refused rather
+        // than appended: replay stops the whole open on an unknown tag.
+        for body in &all {
+            known_tag(body)?;
+        }
+        let end = out
+            .file
             .metadata()
             .map_err(|e| FerroError::Provenance(e.to_string()))?
             .len();
-        let mut frames = Vec::with_capacity(bodies.iter().map(|b| 4 + b.len() + 4).sum());
-        for body in bodies {
+        let mut frames = Vec::with_capacity(all.iter().map(|b| 4 + b.len() + 4).sum());
+        for body in &all {
             let start = frames.len();
             let total = (4 + body.len() + 4) as u32;
             frames.extend_from_slice(&total.to_be_bytes());
@@ -507,12 +531,16 @@ impl DurableProvenanceStore {
             let crc = crc32(&frames[start..]);
             frames.extend_from_slice(&crc.to_be_bytes());
         }
-        pwrite_all(file, &frames, end)
+        pwrite_all(&out.file, &frames, end)
             .map_err(|e| FerroError::Provenance(format!("append to {}: {e}", self.path.display())))?;
-        file.sync_data()
+        out.file
+            .sync_data()
             .map_err(|e| FerroError::Provenance(e.to_string()))?;
-        // Counted only once the sync has RETURNED OK: a failed sync made nothing durable.
-        counter.fetch_add(1, Ordering::Relaxed);
+        // Cleared only once the sync has RETURNED OK, and counted only then: a failed sync made
+        // nothing durable. A failure leaves the store poisoned by the caller, so nothing can append
+        // after the records it lost.
+        out.pending.clear();
+        issued_by.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -590,8 +618,36 @@ enum Frame {
     ForgetTable(u32),
 }
 
-/// One counter per record kind, keyed by the frame's own tag byte so the kind is read from the
-/// bytes being made durable rather than restated at each call site.
+/// The file, and the records the index already holds whose frames have not been written to it.
+///
+/// Behind ONE mutex, and that is the ordering argument rather than tidiness: a record is applied to
+/// the index and queued here under this lock, and every append writes the queue before anything it
+/// was called for, so no record can reach the file ahead of one that reached the index first.
+#[derive(Debug)]
+struct Appender {
+    file: File,
+    /// Bodies `stamp_pending` applied to the index and has not written. In index order.
+    pending: Vec<Vec<u8>>,
+}
+
+/// Refuse a body whose tag this file's reader cannot decode: replay would stop the whole file there.
+fn known_tag(body: &[u8]) -> Result<(), FerroError> {
+    match body.first() {
+        Some(&TAG_RUN) | Some(&TAG_STAMP) | Some(&TAG_ROW_AUTHOR) | Some(&TAG_FORGET_TABLE) => Ok(()),
+        other => Err(FerroError::Provenance(format!(
+            "refusing to append a provenance record with tag {other:?}: replay would stop the whole \
+             file at it"
+        ))),
+    }
+}
+
+/// One counter per WRITE PATH, bumped once per sync that path issued.
+///
+/// Booked by the issuing call rather than by the frames a sync carried, so every sync is counted
+/// exactly once and the fields sum to the syncs issued. The distinction matters since D219: a sync
+/// carries every pending record along with its own, so a MERGE's physical stamps ride in the one
+/// sync its row authorship issues and are booked under `row_authors` — or, for a merge with no row
+/// to attribute, in the flush, booked under `stamps`.
 #[derive(Debug, Default)]
 struct SyncCounters {
     runs: AtomicU64,
@@ -601,18 +657,6 @@ struct SyncCounters {
 }
 
 impl SyncCounters {
-    fn for_tag(&self, tag: Option<u8>) -> Result<&AtomicU64, FerroError> {
-        match tag {
-            Some(TAG_RUN) => Ok(&self.runs),
-            Some(TAG_STAMP) => Ok(&self.stamps),
-            Some(TAG_ROW_AUTHOR) => Ok(&self.row_authors),
-            Some(TAG_FORGET_TABLE) => Ok(&self.forgets),
-            other => Err(FerroError::Provenance(format!(
-                "refusing to append a provenance record with tag {other:?}: replay would stop the \
-                 whole file at it"
-            ))),
-        }
-    }
 
     fn snapshot(&self) -> SyncCounts {
         SyncCounts {
@@ -630,7 +674,7 @@ impl ProvenanceStore for DurableProvenanceStore {
         // so two threads cannot both observe "this run is new" and both write it, and no stamp can
         // slip between a run being interned and its record reaching the file. Lock order is
         // file -> mem, everywhere.
-        let file = self.file.lock().unwrap();
+        let mut file = self.file.lock().unwrap();
         // Checked UNDER the lock, and that is the fix for a race rather than tidiness. Checked
         // before taking it, a writer that had already passed the check could be sitting on
         // `file.lock()` while another thread's append failed and poisoned the store; it would then
@@ -679,7 +723,7 @@ impl ProvenanceStore for DurableProvenanceStore {
         body.push(TAG_RUN);
         body.extend_from_slice(&id.0.to_be_bytes());
         body.extend_from_slice(&tail);
-        if let Err(e) = self.append_locked(&file, &body) {
+        if let Err(e) = self.append_locked(&mut file, &body, &self.syncs.runs) {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(e);
         }
@@ -703,18 +747,48 @@ impl ProvenanceStore for DurableProvenanceStore {
     }
 
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
-        let file = self.file.lock().unwrap();
+        let mut file = self.file.lock().unwrap();
         // Under the lock; see `intern` for the race that checking it first opened.
         self.refuse_if_poisoned()?;
         // In memory first: it holds the guards (an uninterned id, `ProvId::NONE`, a page dictionary
         // at its cap), and a refused stamp must not reach the file.
         self.mem.stamp(rid, id)?;
-        let mut body = Vec::with_capacity(11);
-        body.push(TAG_STAMP);
-        body.extend_from_slice(&rid.page_id.to_be_bytes());
-        body.extend_from_slice(&rid.slot_num.to_be_bytes());
-        body.extend_from_slice(&id.0.to_be_bytes());
-        if let Err(e) = self.append_locked(&file, &body) {
+        if let Err(e) = self.append_locked(&mut file, &stamp_body(rid, id), &self.syncs.stamps) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// **D219: a physical stamp applied to the index NOW and written LATER, with the next sync.**
+    ///
+    /// Everything `stamp` refuses is refused here, at the same moment — the guards live in `mem` and
+    /// run before anything is queued — so a MERGE whose publish loop hits a full page dictionary
+    /// still aborts its publish transaction, as it did when each stamp synced. Only the frame waits:
+    /// it joins `pending`, and the next append of any kind writes it ahead of its own records.
+    ///
+    /// Until then the index knows a stamp the file does not, which is exactly the state the poison
+    /// flag refuses to let an append FAILURE leave behind. Here it is transient by construction: the
+    /// caller holds a `ProvenanceFlush` that writes it on every exit, and `Drop` writes whatever a
+    /// caller left behind.
+    fn stamp_pending(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
+        let mut file = self.file.lock().unwrap();
+        self.refuse_if_poisoned()?;
+        self.mem.stamp(rid, id)?;
+        file.pending.push(stamp_body(rid, id));
+        Ok(())
+    }
+
+    /// Write and sync every pending record: one append, one sync, booked under `stamps` because
+    /// pending records are physical stamps. Nothing pending is not a write — no sync, and no
+    /// refusal even from a poisoned store.
+    fn flush(&self) -> Result<(), FerroError> {
+        let mut file = self.file.lock().unwrap();
+        if file.pending.is_empty() {
+            return Ok(());
+        }
+        self.refuse_if_poisoned()?;
+        if let Err(e) = self.append_all_locked(&mut file, &[], &self.syncs.stamps) {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(e);
         }
@@ -754,7 +828,7 @@ impl ProvenanceStore for DurableProvenanceStore {
             // Nothing to record is not a write: not refused by a poisoned store, and no sync.
             return Ok(());
         }
-        let file = self.file.lock().unwrap();
+        let mut file = self.file.lock().unwrap();
         self.refuse_if_poisoned()?;
         // In memory first, so a refused attribution (an id this store never interned) does not
         // reach the file and make the next `open` refuse the whole thing. `mem.stamp_rows` refuses
@@ -772,7 +846,7 @@ impl ProvenanceStore for DurableProvenanceStore {
             })
             .collect();
         let bodies: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
-        if let Err(e) = self.append_all_locked(&file, &bodies) {
+        if let Err(e) = self.append_all_locked(&mut file, &bodies, &self.syncs.row_authors) {
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(e);
         }
@@ -788,13 +862,13 @@ impl ProvenanceStore for DurableProvenanceStore {
     }
 
     fn forget_table(&self, table: u32) -> Result<(), FerroError> {
-        let file = self.file.lock().unwrap();
+        let mut file = self.file.lock().unwrap();
         self.refuse_if_poisoned()?;
         self.mem.forget_table(table)?;
         let mut body = Vec::with_capacity(5);
         body.push(TAG_FORGET_TABLE);
         body.extend_from_slice(&table.to_be_bytes());
-        if let Err(e) = self.append_locked(&file, &body) {
+        if let Err(e) = self.append_locked(&mut file, &body, &self.syncs.forgets) {
             // **The in-memory forget has already happened and cannot be undone**, so this store
             // now knows LESS than its file — the mirror image of the poison case `intern` and
             // `stamp` guard, and poisoned for the same reason. Reopening would replay the
@@ -808,6 +882,30 @@ impl ProvenanceStore for DurableProvenanceStore {
     fn sync_counts(&self) -> SyncCounts {
         self.syncs.snapshot()
     }
+}
+
+impl Drop for DurableProvenanceStore {
+    /// The last chance for a pending record on a clean shutdown. A `ProvenanceFlush` is meant to
+    /// have written it long before; one that did not left the index holding a stamp the file lacks,
+    /// and dropping it silently would lose attribution the process had already reported. A failure
+    /// here cannot be returned, and there is no later write for the poison flag to protect.
+    fn drop(&mut self) {
+        // A lock poisoned by a panicking writer is not flushed through: `flush` would panic on it,
+        // and a panic inside a drop that runs during unwinding aborts the process.
+        if !self.file.is_poisoned() {
+            let _ = self.flush();
+        }
+    }
+}
+
+/// One physical `Stamp` record's body: tag, page, slot, run. The same bytes on both paths.
+fn stamp_body(rid: RecordId, id: ProvId) -> Vec<u8> {
+    let mut body = Vec::with_capacity(11);
+    body.push(TAG_STAMP);
+    body.extend_from_slice(&rid.page_id.to_be_bytes());
+    body.extend_from_slice(&rid.slot_num.to_be_bytes());
+    body.extend_from_slice(&id.0.to_be_bytes());
+    body
 }
 
 #[cfg(test)]
@@ -1363,6 +1461,30 @@ mod tests {
         assert_eq!(s.row_author(1, 1).unwrap(), id, "a record from before the failure was lost");
         assert_eq!(s.row_author(1, 2).unwrap(), ProvId::NONE, "part of a failed batch landed");
         assert_eq!(s.row_author(1, 3).unwrap(), ProvId::NONE, "part of a failed batch landed");
+    }
+
+    /// **A store dropped with pending stamps writes them.** The flush guard is meant to have done
+    /// it already; this is the clean-shutdown backstop for a caller that did not, so a stamp the
+    /// index reported is not silently missing from the next process.
+    #[test]
+    fn a_store_dropped_with_pending_stamps_writes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let id = {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let id = s.intern(&run("restock", "run-1")).unwrap();
+            s.stamp_pending(rid(4, 0), id).unwrap();
+            s.stamp_pending(rid(4, 1), id).unwrap();
+            assert_eq!(
+                DurableProvenanceStore::open(&path).unwrap().recovery().stamps,
+                0,
+                "a pending stamp reached the file before anything wrote it"
+            );
+            id
+        };
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert_eq!(s.recovery().stamps, 2, "dropping the store lost its pending stamps");
+        assert_eq!(s.attribute(rid(4, 1)).unwrap(), id);
     }
 
     /// A batch naming a run this store never interned attributes none of its rows, writes nothing,

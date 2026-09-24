@@ -280,6 +280,16 @@ impl ProvenanceStore for MemProvenanceStore {
         inner.pages.entry(rid.page_id).or_default().stamp(rid.slot_num, id)
     }
 
+    /// Nothing to defer: this store has no file, so a pending stamp is an ordinary one.
+    fn stamp_pending(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
+        self.stamp(rid, id)
+    }
+
+    /// Nothing is ever pending here.
+    fn flush(&self) -> Result<(), FerroError> {
+        Ok(())
+    }
+
     /// A batch of one. There is ONE implementation of the row-attribution guards, in `stamp_rows`,
     /// so the single and batched paths cannot drift apart.
     fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {

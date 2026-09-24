@@ -14,6 +14,7 @@
 //! row-inflation figure for an unstated ~40-byte row, and was measured nowhere.
 
 pub mod capture;
+pub mod deferred;
 pub mod durable;
 pub mod readset;
 pub mod revert;
@@ -31,6 +32,7 @@ pub use readset::{
 pub use revert::{
     DependencyEdge, DependencyGraph, DependencyGraphBuilder, RevertMode, RevertPlan,
 };
+pub use deferred::ProvenanceFlush;
 pub use durable::DurableProvenanceStore;
 pub use sha256::{prompt_digest, sha256 as sha256_of, to_hex, Sha256};
 pub use store::{MemProvenanceStore, PageProvDict, MAX_PAGE_DICT_ENTRIES, PROV_SLOT_BYTES};
@@ -169,6 +171,23 @@ pub trait ProvenanceStore: Send + Sync {
     /// Stamp a version with its author. Called on the write path, once per version, one `u32`.
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
 
+    /// Stamp a version with its author in the index NOW — with every guard `stamp` applies, so a
+    /// refusal still happens at the write that caused it — and leave its durable record PENDING:
+    /// written only by `flush`, or ahead of whatever the store's next durable write carries.
+    ///
+    /// **D219.** A MERGE stamps every version it publishes, and `stamp` syncs once per call, so a
+    /// merge of δ versions paid δ fsyncs on its publish loop before its row authorship paid one
+    /// more. Its stamps come here instead, and the MERGE's single sync carries them.
+    ///
+    /// A caller that stamps through this must make the records durable before it acknowledges
+    /// anything. [`ProvenanceFlush`] is the guard that makes that hold on every exit — early
+    /// returns and panics included — and it is the only intended way in.
+    fn stamp_pending(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
+
+    /// Make every pending record durable: ONE append and ONE sync for all of them. Nothing pending
+    /// is not a write: no sync, and no refusal even from a store that is refusing writes.
+    fn flush(&self) -> Result<(), FerroError>;
+
     /// Every page that carries attribution, as `(page_id, distinct runs in its dictionary)`.
     ///
     /// The per-page dictionary refuses past [`MAX_PAGE_DICT_ENTRIES`], so *how close a workload
@@ -255,26 +274,33 @@ pub trait ProvenanceStore: Send + Sync {
 ///
 /// Split rather than totalled for the reason [`durable::RecoveryReport`] is: a total hides one
 /// write path behind another. D219 is the case that needed it. A `MERGE` against the durable store
-/// pays syncs on two paths — the executor's physical `stamp`, once per published VERSION, and
-/// `record_applied`'s logical row authorship, under `AgentRuntime`'s `state` lock — and D219
-/// changed only the second, from one sync per applied OP (`stamp_row` in a loop) to one per merge
-/// (`stamp_rows`). One number could not say which of the two moved.
+/// used to pay syncs on two paths — the executor's physical `stamp`, once per published VERSION,
+/// and `record_applied`'s logical row authorship, once per applied OP under `AgentRuntime`'s
+/// `state` lock — and one number could not say which of the two moved.
+///
+/// **Each sync is booked once, under the write path that ISSUED it**, so the fields sum to the
+/// syncs issued and `total()` is that count. Since D219 a sync also carries every PENDING record
+/// (`stamp_pending`) ahead of its own, so a MERGE's physical stamps ride in the one sync its row
+/// authorship issues and are booked under `row_authors`; a merge with no row to attribute (a
+/// schema-only merge whose rewrite re-stamped moved rows) makes them durable with `flush`, booked
+/// under `stamps`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncCounts {
     /// Syncs that made a newly interned run durable. A repeat intern is a lookup and syncs nothing.
     pub runs: u64,
-    /// Syncs that made a physical `(page, slot)` stamp durable.
+    /// Syncs issued by `stamp`, and by `flush` of pending physical stamps.
     pub stamps: u64,
-    /// Syncs that made logical `(table, row)` authorship durable: one per `stamp_row` call, and
-    /// one per `stamp_rows` batch however many rows it carries.
+    /// Syncs issued by logical `(table, row)` authorship: one per `stamp_row` call, and one per
+    /// `stamp_rows` batch however many rows it carries — plus whatever physical stamps were
+    /// pending when it was issued.
     pub row_authors: u64,
     /// Syncs that made a `DROP TABLE`'s forget durable.
     pub forgets: u64,
 }
 
 impl SyncCounts {
-    /// Every sync, whatever it carried. For reporting only: a question about one write path is
-    /// answered by that path's field, never by this.
+    /// Every sync issued, whatever it carried: each is booked under exactly one field. D219's exit
+    /// — one sync per MERGE, physical and logical together — is stated in this number.
     pub fn total(&self) -> u64 {
         self.runs + self.stamps + self.row_authors + self.forgets
     }
