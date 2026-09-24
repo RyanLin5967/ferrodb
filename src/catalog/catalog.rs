@@ -474,6 +474,12 @@ impl Catalog {
             Ok(()) => Ok(()),
             Err(e) => {
                 undo(self);
+                // D230 review 7, F-D: write the restored records back. The refused persist may have
+                // rewritten some catalog pages in the pool before it failed, and it left a persist
+                // owed (F2), which keeps every later log until some persist succeeds. This one
+                // usually does, since the entry that could not be written is gone; if it fails too,
+                // the debt stays set and the log stays kept, which is the safe direction.
+                let _ = self.persist();
                 Err(e)
             }
         }

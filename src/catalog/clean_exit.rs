@@ -26,7 +26,10 @@ use crate::wal::txn::TxnManager;
 /// a statement that wrote heap records, so such a log is not empty unless a checkpoint has run since.
 ///
 /// Blind spot, stated: if a checkpoint HAS truncated the log since the root moved and nothing has
-/// been written after it, the next open does not rebuild, and this error is the only signal.
+/// been written after it, the next open does not rebuild, and this error is the only signal. On a
+/// catalog opened through `open_recovered` that cannot happen after a FAILED persist: the persist
+/// debt keeps every checkpoint from truncating until a persist succeeds (D230 review 3, F2). It
+/// remains for a catalog built without the debt.
 pub fn checkpoint_for_exit(catalog: &Catalog, txn: &TxnManager) -> Result<(), FerroError> {
     if let Err(e) = catalog.persist() {
         let flushed = match txn.wal.flush() {

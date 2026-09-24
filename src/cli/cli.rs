@@ -218,7 +218,10 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 ///    (`catalog::clean_exit::checkpoint_for_exit`). A `sync_roots` whose persist failed this session
 ///    left the catalog page behind the trees, and a checkpoint alone would flush that page and
 ///    truncate the log, so the next open would not rebuild and would read it. On failure the log is
-///    kept for the next open to rebuild from, and the error names the roots.
+///    kept for the next open to rebuild from, and the error names the roots. (On this tree the
+///    catalog `open_recovered` returns also carries the persist debt, so no checkpoint truncates
+///    after a failed persist until one succeeds: D230 review 3, F2. This step then writes the
+///    records the debt is waiting for.)
 /// 2. Persist where the arena starts and what it has allocated. Without this the next open finds no
 ///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
 ///
