@@ -1829,3 +1829,172 @@ fn the_largest_entry_an_unsigned_frame_carries_is_delivered_and_stored() {
     let back = open_on(&restarted).unwrap();
     assert_eq!(back.entry(1).unwrap(), e);
 }
+
+// ---------------------------------------------------------------------------------------------
+// D207 review 4, C1 — the raise pinned beyond a one-entry batch at floor 0: a mixed batch, the
+// exact boundary, a checkpointed floor, and this build's own reopen through every crash.
+// ---------------------------------------------------------------------------------------------
+
+/// A `WalBatch` entry whose DISK frame is exactly `disk` bytes: 24 of frame and 13 of command
+/// around the batch's bytes (`encode_frame`, `encode_command`). Each test that uses it also checks
+/// the stored length from the image, so a change to that arithmetic fails loudly rather than
+/// shifting the fixture.
+fn of_disk_size(term: Term, round: Round, disk: usize) -> Entry {
+    Entry { term, round, command: Command::WalBatch { start_lsn: 0, bytes: vec![1u8; disk - 37] } }
+}
+
+/// The frame lengths in the live file of a durable image.
+fn live_frame_lens(images: &BTreeMap<String, Vec<u8>>) -> Vec<usize> {
+    frames_in(&images[live_file(images)]).into_iter().map(|(_, len)| len).collect()
+}
+
+#[test]
+fn a_mixed_batch_raises_the_version_whichever_entry_is_large() {
+    // `Persist` appends a whole `Append`'s entries at once, and one `Append` can carry a small entry
+    // beside one just over the old bound. The raise must look at every frame in the batch, not at
+    // one of them. The large entry is a disk frame one byte over the old read bound.
+    let large = PRE_D223_READ_BOUND + 1;
+    for (order, batch) in [
+        ("[small, large]", vec![entry(1, 3), of_disk_size(1, 4, large)]),
+        ("[large, small]", vec![of_disk_size(1, 3, large), entry(1, 4)]),
+    ] {
+        let fabric = SimFabric::clean(Durability::WriteThrough);
+        let mut log = open_on(&fabric).unwrap();
+        fill(&mut log, 1, 1..=2);
+        log.append(&batch).unwrap();
+        log.sync().unwrap();
+        drop(log);
+        let images = fabric.durable_image();
+        assert!(
+            live_frame_lens(&images).contains(&large),
+            "{order}: the fixture never stored a {large}-byte frame, so this tests nothing"
+        );
+        assert!(
+            !accepted_by_a_pre_d223_build(&images[live_file(&images)]),
+            "{order}: a batch holding a frame over the old read bound was written under a header an \
+             older build accepts; that build would trim it and every round after it"
+        );
+        assert_no_frame_an_older_build_would_trim(&images, order);
+    }
+}
+
+#[test]
+fn the_version_is_raised_exactly_above_the_pre_d223_read_bound() {
+    // An older build reads a frame of exactly its read bound (its scan breaks on `total >`), so that
+    // frame needs no mark, and one byte more does. Both sides of the line, so the constant can move
+    // in neither direction: up, and an older build trims; down, and a downgradable log is marked.
+    for (disk, raised) in [(PRE_D223_READ_BOUND, false), (PRE_D223_READ_BOUND + 1, true)] {
+        let fabric = SimFabric::clean(Durability::WriteThrough);
+        let mut log = open_on(&fabric).unwrap();
+        fill(&mut log, 1, 1..=2);
+        log.append(&[of_disk_size(1, 3, disk)]).unwrap();
+        log.sync().unwrap();
+        drop(log);
+        let images = fabric.durable_image();
+        assert!(
+            live_frame_lens(&images).contains(&disk),
+            "the fixture never stored a {disk}-byte frame, so this tests nothing"
+        );
+        assert_eq!(
+            !accepted_by_a_pre_d223_build(&images[live_file(&images)]),
+            raised,
+            "a {disk}-byte frame against the old read bound of {PRE_D223_READ_BOUND}: the version \
+             should {} been raised",
+            if raised { "have" } else { "not have" }
+        );
+        assert_no_frame_an_older_build_would_trim(&images, &format!("a {disk}-byte frame"));
+    }
+}
+
+#[test]
+fn a_version_raise_on_a_checkpointed_log_keeps_the_floor_and_every_round() {
+    // The raise is a switch with the floor unchanged, so the header it writes must carry the floor's
+    // own term. Every other raise in these tests is at floor 0 with one term, where a wrong floor
+    // term cannot show. Here the floor is 2@1 and the rounds above it are 3@1 and 4@2: a header
+    // claiming floor term 2 would make the next open's scan stop at round 3, whose term is lower,
+    // and trim it and everything after it.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=3);
+    fill(&mut log, 2, 4..=4);
+    log.discard_prefix(2, 1).unwrap();
+    assert_eq!((log.snapshot_round(), log.snapshot_term()), (2, 1), "the fixture's floor");
+    log.append(&[over_the_old_bound(2, 5)]).unwrap();
+    log.sync().unwrap();
+    drop(log);
+
+    let images = fabric.durable_image();
+    assert!(
+        !accepted_by_a_pre_d223_build(&images[live_file(&images)]),
+        "the raise on a checkpointed log did not mark it"
+    );
+    let restarted = fabric.restart();
+    let back = open_on(&restarted).unwrap();
+    assert_eq!(
+        (back.snapshot_round(), back.snapshot_term()),
+        (2, 1),
+        "the raise rewrote the floor or its term"
+    );
+    assert_eq!(back.last_round(), 5, "rounds were lost across the raise and a reopen");
+    assert_eq!(back.entry(3).unwrap(), entry(1, 3));
+    assert_eq!(back.entry(4).unwrap(), entry(2, 4));
+    assert_eq!(back.entry(5).unwrap(), over_the_old_bound(2, 5));
+}
+
+#[test]
+fn no_crash_during_a_version_raise_loses_a_round_this_build_reads() {
+    // The other half of the sweep in
+    // `no_crash_can_leave_a_large_frame_under_a_header_an_older_build_accepts`. That one checks what
+    // an OLDER build would see. This one reopens with THIS build at every crash point and requires
+    // every round that was durable before the append: the raise moves the whole log to the other
+    // file, and a raise that could lose rounds 1-3 would pass the older build's check whenever the
+    // damage also made the header unreadable.
+    let mut ran = 0usize;
+    for durability in [Durability::WriteThrough, Durability::SyncOnly] {
+        let fabric = SimFabric::clean(durability);
+        let mut log = open_on(&fabric).unwrap();
+        fill(&mut log, 1, 1..=3);
+        drop(log);
+        let base = fabric.restart().durable_image();
+
+        let census = SimFabric::from_images(base.clone(), None, durability);
+        let mut l = open_on(&census).unwrap();
+        let mark = census.op_count();
+        l.append(&[over_the_old_bound(1, 4)]).unwrap();
+        l.sync().unwrap();
+        drop(l);
+        let points: Vec<u64> = census.faultable_ops().into_iter().filter(|i| *i >= mark).collect();
+        assert!(points.len() >= 2, "a large append under {durability:?} made {} faultable operations", points.len());
+
+        for at in points {
+            for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
+                let plan = FaultPlan::at_shaped(at, 0xD207, shape);
+                let f = SimFabric::from_images(base.clone(), Some(plan), durability);
+                let mut broken = open_on(&f).unwrap();
+                let _ = broken
+                    .append(&[over_the_old_bound(1, 4)])
+                    .and_then(|()| broken.sync().map(|_| ()));
+                let where_ = format!("{durability:?} op {at} {shape:?}");
+                assert!(f.fired().is_some(), "{where_}: no fault fired, so this point tested nothing");
+                drop(broken);
+
+                let restarted = f.restart();
+                let after = match open_on(&restarted) {
+                    Ok(a) => a,
+                    Err(e) => panic!("{where_}: a crash during the raise left a log this build will not open: {e}"),
+                };
+                assert_eq!(after.snapshot_round(), 0, "{where_}: the floor moved");
+                let last = after.last_round();
+                assert!(last == 3 || last == 4, "{where_}: the log ends at round {last}, not 3 or 4");
+                for r in 1..=3 {
+                    assert_eq!(after.entry(r).unwrap(), entry(1, r), "{where_}: lost or changed round {r}");
+                }
+                if last == 4 {
+                    assert_eq!(after.entry(4).unwrap(), over_the_old_bound(1, 4), "{where_}: round 4 changed");
+                }
+                ran += 1;
+            }
+        }
+    }
+    assert!(ran >= 12, "the sweep ran {ran} points across both models, which is not a sweep");
+}
