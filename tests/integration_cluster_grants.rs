@@ -930,3 +930,27 @@ fn the_reaper_trait_is_the_path_under_test() {
     let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(Arc::clone(&s.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&s.store)));
     assert!(reaper.reap_expired(LeaseDeadline::now_millis()).unwrap().is_empty());
 }
+
+/// **D206 — ported from `31364b3` (branch `F4-clusterstate`, 2026-08-28), which was never merged.**
+/// The assertions are that commit's, unchanged; only this header is new. Red against `9aa6968`,
+/// where `LeaseDeadline::try_from_now` is a plain `saturating_add`.
+#[test]
+fn an_over_long_lease_cannot_forge_the_never_expires_sentinel() {
+    // `TRUNK_LEASE` is `LeaseDeadline(u64::MAX)` and means never expires — reaping skips it. A
+    // plain `saturating_add` turns a huge `lease_millis`, or a cluster tick far in the future, into
+    // a branch indistinguishable from trunk: nothing errors, the branch just stays for ever, and
+    // exit criterion 8 fails with no symptom.
+    let _scope = ClusterScope::joined(N1);
+    cluster::apply_lease_tick(1_000).unwrap();
+
+    let d = LeaseDeadline::try_from_now(u64::MAX).unwrap();
+    assert_ne!(d.0, u64::MAX, "an over-long lease forged the trunk sentinel");
+    assert_eq!(d.0, u64::MAX - 1);
+    // And it is still a real deadline: something can expire it.
+    assert!(d.is_expired_at(u64::MAX), "the clamped deadline is unreachable, so it never expires");
+
+    // The same through the whole reaper path, against an absurd tick rather than an absurd lease.
+    cluster::apply_lease_tick(u64::MAX).unwrap();
+    let d2 = LeaseDeadline::try_from_now(60_000).unwrap();
+    assert_ne!(d2.0, u64::MAX, "an absurd tick forged the trunk sentinel");
+}

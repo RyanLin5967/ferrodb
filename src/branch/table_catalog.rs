@@ -3213,6 +3213,54 @@ mod f1_lease_grace {
         );
     }
 
+    /// **D206, in the virtual clock's own arithmetic.** `u64::MAX` is `TRUNK_LEASE`, "never
+    /// expires", and the reaper skips it; a computation that saturates onto it makes a branch
+    /// indistinguishable from trunk and un-reapable, with no symptom. `31364b3` closed that for
+    /// `from_now`; the offset adds two more computations — `v + D` on the way out and `D +=
+    /// downtime` at a resume — and each must stop one short of the sentinel too.
+    ///
+    /// An explicit `LeaseDeadline(u64::MAX)` is a different thing — the caller's own "never", which
+    /// trunk and a dozen benches use — and it must survive the translation unchanged, in both
+    /// directions, rather than be turned into a real deadline by a restart.
+    #[test]
+    fn a_shifted_deadline_never_forges_the_never_expires_sentinel() {
+        let path = sidecar("sentinel");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        // The latest deadline any computation may produce, and a caller's explicit "never".
+        let latest = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap().branch_id;
+        let never = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+        let small = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap(); // D = 3000
+
+        assert_eq!(
+            lease(&c, latest),
+            u64::MAX - 1,
+            "the downtime shift saturated a real deadline onto the never-expires sentinel"
+        );
+        assert!(LeaseDeadline(lease(&c, latest)).is_expired_at(u64::MAX), "still a real deadline");
+        assert_eq!(lease(&c, never), u64::MAX, "a caller's explicit never was lost to the shift");
+        assert_eq!(lease(&c, BranchId::TRUNK), u64::MAX, "trunk lost its sentinel");
+
+        // Written AFTER the offset exists, both kinds survive the inward half as well.
+        let late = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 1)).unwrap();
+        assert_eq!(late.lease_deadline.0, u64::MAX - 1, "fork's return forged the sentinel");
+        assert_eq!(lease(&c, late.branch_id), u64::MAX - 1);
+        c.renew_lease(small, LeaseDeadline(u64::MAX)).unwrap();
+        assert_eq!(lease(&c, small), u64::MAX, "an explicit never written after a restart was lost");
+
+        // An absurd downtime saturates the OFFSET one short of the sentinel as well, so even the
+        // smallest real deadline cannot be pushed onto it.
+        c.record_lease_alive(0).unwrap();
+        c.resume_leases(u64::MAX).unwrap();
+        assert_eq!(c.alive_state().unwrap().map(|(_, d)| d), Some(u64::MAX - 1), "offset");
+        assert_eq!(lease(&c, late.branch_id), u64::MAX - 1, "a huge offset forged the sentinel");
+        let expired = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap().branch_id;
+        assert_ne!(lease(&c, expired), u64::MAX, "a huge offset forged the sentinel");
+        assert_eq!(lease(&c, never), u64::MAX);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
         let path = sidecar("enforced");

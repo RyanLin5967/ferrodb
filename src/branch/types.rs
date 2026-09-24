@@ -442,6 +442,17 @@ mod tests {
         assert!(d.is_expired_at(1001));
     }
 
+    /// D206 on a standalone node. `tests/integration_cluster_grants.rs` carries `31364b3`'s own
+    /// test for the cluster path (`try_from_now` under an applied tick); this is the same rule for
+    /// `from_now`, which every production fork reaches. Red against `9aa6968`.
+    #[test]
+    fn an_over_long_lease_from_now_does_not_forge_the_never_expires_sentinel() {
+        let d = LeaseDeadline::from_now(u64::MAX);
+        assert_ne!(d.0, u64::MAX, "an over-long lease forged the trunk sentinel");
+        assert_eq!(d.0, u64::MAX - 1);
+        assert!(d.is_expired_at(u64::MAX), "the clamped deadline must still be reachable");
+    }
+
     #[test]
     fn branch_state_roundtrips() {
         for s in [BranchState::Live, BranchState::Reaping, BranchState::Reaped] {
