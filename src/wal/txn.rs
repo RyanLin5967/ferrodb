@@ -1062,7 +1062,7 @@ impl TxnManager {
     {
         let frame_i = self.bp.fetch_page(page_id)?;
         let mut frame = self.bp.frame_write(frame_i);
-        let undone = Page::deserialize(frame.data).and_then(|mut page| {
+        let undone = Page::deserialize_at(page_id, frame.data).and_then(|mut page| {
             undo(&mut page)?;
             page.serialize()?;
             Ok(page)

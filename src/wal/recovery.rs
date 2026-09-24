@@ -134,7 +134,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
         let frame_i = bp.fetch_page(*page_id)?;
         let frame = bp.frames[frame_i].read().unwrap();
-        let page = Page::deserialize(frame.data)?;
+        let page = Page::deserialize_at(*page_id, frame.data)?;
         drop(frame);
         bp.unpin_page(*page_id, false);
         let free = page.get_free_space_end() - page.get_free_space_start();
@@ -210,7 +210,7 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
     let mut page = if stored_id != page_id {
         Page::empty(page_id)
     } else {    
-        Page::deserialize(frame.data)?
+        Page::deserialize_at(page_id, frame.data)?
     };
 
     if page.lsn >= lsn {

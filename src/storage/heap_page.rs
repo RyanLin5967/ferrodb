@@ -95,24 +95,107 @@ impl Page {
         Ok(buffer)
     }
 
+    /// [`Page::deserialize_at`], naming the page id the page's own header records. A caller that
+    /// knows which page it read calls `deserialize_at` with it instead: an all-zero page's header
+    /// records page 0.
     pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
-        let page_type = u8::from_be_bytes(bytes[0..1].try_into().unwrap());
+        let stored = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        Self::deserialize_at(stored, bytes)
+    }
+
+    /// **D256: parse page `page_id`, refusing a header that cannot describe a heap page.**
+    ///
+    /// This sliced `bytes[HEADER_SIZE..free_space_start]` and `bytes[free_space_end..]` with no
+    /// check. So a page whose bytes never reached disk, all zero, PANICKED (`bytes[23..0]`), and
+    /// did so at every open: `rebuild_indexes` scans every primary heap. Other headers parsed, and
+    /// then `read` or `restore_at` indexed past the page, `insert` underflowed, or `read` returned
+    /// another slot's bytes.
+    ///
+    /// Each check holds for every page [`Page::serialize`] writes, by construction: it writes the
+    /// slot count and `free_space_start` from one `slot_arr.len()`, `free_space_end` as
+    /// [`Page::get_free_space_end`], and every heap page starts as [`Page::empty`].
+    /// `tests::d256::every_page_the_writer_produces_is_one_the_reader_accepts` is the falsifier.
+    /// A refusal is [`FerroError::Corruption`], as `CatalogPage::deserialize` refuses a page that is
+    /// neither of its formats, and for the same reason it refuses an all-zero one: accepting it
+    /// "would let a genuinely corrupt page through".
+    ///
+    /// No caller reads a refused page as empty. `wal::recovery::redo_one` does rebuild from empty
+    /// a page whose header records ANOTHER page id, which a zero page does, before calling this:
+    /// a page allocated after the last checkpoint and never flushed is zero on disk, and the log
+    /// holds every change made to it.
+    ///
+    /// **Not checked, stated:** the `checksum` field, which nothing computes
+    /// (`tests/sim_durability.rs::a_torn_table_page_is_served_as_a_row_that_was_never_written`);
+    /// the tuple bytes; overlapping slots, on which no method with a caller indexes out of bounds
+    /// (`compact`, which could, has none); and whether the header's page id is `page_id`, which is
+    /// only named here.
+    pub fn deserialize_at(page_id: u32, bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
+        Self::parse(&bytes).map_err(|why| {
+            let stored = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+            let header = if stored == page_id { String::new() } else { format!(" (its header names page {stored})") };
+            FerroError::Corruption(format!("heap page {page_id} cannot be read{header}: {why}"))
+        })
+    }
+
+    /// The checks of [`Page::deserialize_at`], ordered so every index stays in bounds: the slot
+    /// array is sliced only once it is known to end inside the page. The error says why.
+    fn parse(bytes: &[u8; PAGE_SIZE]) -> Result<Self, String> {
+        if bytes.iter().all(|b| *b == 0) {
+            return Err("every byte is zero: nothing was written here, or the write never reached disk".into());
+        }
+        let page_type = bytes[0];
         let page_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-        let free_space_start = u16::from_be_bytes(bytes[7..9].try_into().unwrap());
-        let free_space_end = u16::from_be_bytes(bytes[9..11].try_into().unwrap());
+        let num_slots = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+        let free_space_start = u16::from_be_bytes(bytes[7..9].try_into().unwrap()) as usize;
+        let free_space_end = u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize;
         let lsn = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
         let checksum = u32::from_be_bytes(bytes[19..23].try_into().unwrap());
 
-        let raw_slot_arr = &bytes[HEADER_SIZE..free_space_start as usize];
-        let mut slot_arr = Vec::new();
-        for slice in raw_slot_arr.chunks(SLOT_ENTRY_SIZE) {
-            let offset = u16::from_be_bytes(slice[0..2].try_into().unwrap());
-            let length = u16::from_be_bytes(slice[2..4].try_into().unwrap());
-            slot_arr.push(SlotEntry::new(offset, length))
+        if page_type != HEAP_PAGE_TYPE {
+            return Err(format!("its page type is {page_type}, and a heap page's is {HEAP_PAGE_TYPE}"));
         }
-        
-        let tuples = bytes[free_space_end as usize..PAGE_SIZE].to_vec();
-        Ok (Page { page_type, page_id, lsn, checksum, slot_arr, tuples })
+        // This also puts the slot array's end at or past the header, and on a slot boundary.
+        let slots_end = HEADER_SIZE + num_slots * SLOT_ENTRY_SIZE;
+        if free_space_start != slots_end {
+            return Err(format!(
+                "its header counts {num_slots} slot(s), which end at byte {slots_end}, but says free space \
+                 starts at byte {free_space_start}"
+            ));
+        }
+        if free_space_start > free_space_end {
+            return Err(format!(
+                "its free space would run backwards, from byte {free_space_start} to byte {free_space_end}"
+            ));
+        }
+        if free_space_end > PAGE_SIZE {
+            return Err(format!("its free space ends at byte {free_space_end}, past the {PAGE_SIZE}-byte page"));
+        }
+
+        let mut slot_arr = Vec::with_capacity(num_slots);
+        let mut lowest = PAGE_SIZE;
+        for (i, raw) in bytes[HEADER_SIZE..free_space_start].chunks_exact(SLOT_ENTRY_SIZE).enumerate() {
+            let slot = SlotEntry::new(u16::from_be_bytes([raw[0], raw[1]]), u16::from_be_bytes([raw[2], raw[3]]));
+            // A live or retired slot's bytes must lie inside the page; the check below puts their
+            // start at or past the tuple region.
+            if !slot.is_free() {
+                let (start, end) = (slot.offset as usize, slot.offset as usize + slot.span());
+                if end > PAGE_SIZE {
+                    return Err(format!("slot {i} holds bytes {start}..{end}, past the {PAGE_SIZE}-byte page"));
+                }
+                lowest = lowest.min(start);
+            }
+            slot_arr.push(slot);
+        }
+        // `read` and `update` locate a tuple from the lowest occupied offset, and `insert` and
+        // `restore_at` from where `tuples` begins, which is this field. They must be one number.
+        if free_space_end != lowest {
+            return Err(format!(
+                "its free space ends at byte {free_space_end}, but its slots' tuples begin at byte {lowest}"
+            ));
+        }
+
+        let tuples = bytes[free_space_end..PAGE_SIZE].to_vec();
+        Ok(Page { page_type, page_id, lsn, checksum, slot_arr, tuples })
     }
 
     // finds space in page, writes tuple bytes, add slot entry

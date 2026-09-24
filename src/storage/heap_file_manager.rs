@@ -34,7 +34,7 @@ impl HeapFileManager {
     pub fn read(&self, record_id: RecordId) -> Result<Tuple, FerroError>{
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
-        let page = Page::deserialize(frame.data)?;
+        let page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let tuple = page.read(record_id.slot_num as usize)?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(record_id.page_id, false);
@@ -154,7 +154,7 @@ impl HeapFileManager {
     fn insert_into(&self, page_id: u32, tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(page_id, frame.data)?;
         let tuple_bytes = tuple.data.clone();
         let slot_num = page.insert(tuple)?;
         if let Some(txn) = &self.txn {
@@ -172,7 +172,7 @@ impl HeapFileManager {
     pub fn update(&self, record_id: RecordId, new_tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         let new_bytes = new_tuple.data.clone();
         let clone = Tuple::new(new_tuple.data.clone());
@@ -239,7 +239,7 @@ impl HeapFileManager {
 
                 let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
                 let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-                let mut page = Page::deserialize(frame.data)?;
+                let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
                 self.take_off_page(&mut page, record_id, &old_bytes)?;
                 frame.data = page.serialize()?;
                 drop(frame);
@@ -268,7 +268,7 @@ impl HeapFileManager {
     pub fn delete(&self, record_id: RecordId) -> Result<(), FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         self.take_off_page(&mut page, record_id, &old_bytes)?;
         frame.data = page.serialize()?;
