@@ -1103,3 +1103,51 @@ fn commit_rewrite(
     // inventing a rule for it.
     Ok(primary.root_page_id.load(Ordering::Relaxed))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::column::Column;
+    use crate::storage::disk_manager::DiskManager;
+
+    /// **D214 — `finish` points the primary index's SHARED cell at the root it records.**
+    ///
+    /// ⚠ **A UNIT test**, driving the private `finish` with a root that has moved. No `ALTER`
+    /// fixture is known to move the primary root, and none is expected to. `commit_rewrite` only
+    /// `upsert`s a key the tree already holds (its `search` guard), with a fixed-size `RecordId`,
+    /// and `BPlusTreeManager::try_write_without_split` documents that a same-size replacement
+    /// cannot reach a split (READ). The three shapes `commit_rewrite`'s own comment lists never
+    /// moved it. So this pins `finish`'s contract rather than a reachable SQL schedule: whatever
+    /// root the rewrite hands back, the record and the cell every statement descends from (D53)
+    /// must agree afterwards, and the cell must still be the same `Arc`.
+    ///
+    /// FAILS before D214's fix (INFERRED) at the cell == record assertion: `finish` wrote the
+    /// record only, and the cell kept naming the pre-ALTER tree.
+    #[test]
+    fn finish_points_the_primary_cell_at_the_root_it_records() {
+        let file = tempfile::tempfile().unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let schema = Schema::new(vec![Column { name: "id".into(), data_type: DataType::Integer, nullable: false }]);
+        catalog.create_table("t".into(), schema.clone()).unwrap();
+        let cell = catalog.root_cell("t", None).expect("CREATE TABLE seeds the primary cell");
+        let before = catalog.get_table("t").unwrap().primary_index_root;
+        assert_eq!(cell.load(Ordering::SeqCst), before, "premise failed: the cell and the record disagree before the ALTER");
+        // A real second tree, so the moved root is a page that holds a tree root.
+        let moved = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap().root_page_id.load(Ordering::SeqCst);
+        assert_ne!(moved, before, "premise failed: the moved root is the old one, so nothing here can fail");
+
+        catalog.finish("t", schema, moved, None).unwrap();
+
+        assert_eq!(catalog.get_table("t").unwrap().primary_index_root, moved, "premise failed: finish did not record the new root");
+        assert_eq!(
+            cell.load(Ordering::SeqCst),
+            moved,
+            "finish recorded the new primary root and left the shared cell on the pre-ALTER tree"
+        );
+        assert!(
+            Arc::ptr_eq(&cell, &catalog.root_cell("t", None).unwrap()),
+            "finish REPLACED the primary cell, so a statement holding the old one keeps a private root (D53)"
+        );
+    }
+}
