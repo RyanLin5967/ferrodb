@@ -3,18 +3,19 @@
 
 Usage: python3 bench/d216/mutants.py <tip-sha> [--target-dir DIR] [--only M26,...] [--skip M26,...]
 
-At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor`:
-those five mutate code only `d252-caught-up-pin` has, under a test target (the lib) both tips have.
+At `d216-clean-restart`, run with `--skip M29_history_covers_to_the_bound,M30_refusal_passes_its_rows,M31_only_the_refused_commit_is_held,M32_refusal_clamps_to_the_last_row,M33_gap_fill_covers_to_the_cursor,M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal`:
+those eight mutate code only the child branches have, under a test target (the lib) every tip has.
+At `d252-caught-up-pin`, run with `--skip M35_window_never_grows,M36_window_has_no_cap,M37_window_grows_over_a_refusal`
+(D276 code, only on `d276-oversized-transaction`). At `d276-oversized-transaction`, run the full set.
 
 A mutant whose `--test` target the tip does not have is reported NOT-AT-TIP and left out of
 everything, CONTROL included: at `d216-clean-restart` that is M26-M28, and nothing else. A pattern
 that matches anything but once, where the targets exist, is a PATTERN-MISMATCH, never an absence.
 Mutants left out by `--only` or `--skip` are listed in the summary as SKIPPED.
 
-`--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. On
-`d252-caught-up-pin` the full set runs with no flag since the lead's ruling on the lane's §12.4 ⚖
-(the two D216 gate negative controls plant their own buffered record), whose commit made a full
-CONTROL clean there.
+`--only` runs the named mutants and nothing else, and its CONTROL covers only their targets. Since the
+lead's ruling on the lane's §12.4 ⚖ (the two D216 gate negative controls plant their own buffered
+record), a full CONTROL is clean on `d252-caught-up-pin` and its children.
 
 For each mutant: restore the tree, apply one exact replacement (refused unless the pattern matches
 exactly once), run the named cargo test targets, and record KILLED when every expected test is
@@ -211,6 +212,21 @@ MUTANTS = [
      "        if let crate::wal::log::Truncation::Kept { newest_pin: oldest_pin, .. } = self.wal.truncate(0)? {\n",
      [("--test", "integration_cluster_snapshot", "an_install_under_a_wal_pin_is_refused_and_names_the_pin")],
      ["an_install_under_a_wal_pin_is_refused_and_names_the_pin"], "KILL"),
+    # D276: a transaction larger than max_bytes. No growth; no cap (grows to the frontier); growth
+    # over a refusal.
+    ("M35_window_never_grows", "src/replication/stream.rs",
+     "        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
+     "        if false && next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
+     [STREAM], [S + "a_transaction_larger_than_max_bytes_is_delivered_whole",
+                S + "a_transaction_beyond_the_window_cap_is_refused_by_name"], "KILL"),
+    ("M36_window_has_no_cap", "src/replication/stream.rs",
+     "            let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);\n",
+     "            let cap = u64::MAX;\n",
+     [STREAM], [S + "a_transaction_beyond_the_window_cap_is_refused_by_name"], "KILL"),
+    ("M37_window_grows_over_a_refusal", "src/replication/stream.rs",
+     "        if next == cursor && decoded.open_from.is_some() && refused_commit.is_none() && to < frontier {\n",
+     "        if next == cursor && decoded.open_from.is_some() && to < frontier {\n",
+     [STREAM], [S + "a_refusal_inside_an_oversized_transaction_is_reported_not_grown_past"], "KILL"),
     ("M33_gap_fill_covers_to_the_cursor", "src/replication/logical.rs",
      "                history.covered_through = scanned_to;\n",
      "                history.covered_through = from_lsn;\n                let _ = scanned_to;\n",
