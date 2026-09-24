@@ -1693,4 +1693,37 @@ use super::*;
         let t = txn.begin().unwrap();
         assert_ne!(t, 0, "a transaction was given id 0, which recovery never undoes and every log reader takes for a declaration");
     }
+    /// **D234 with D227: an open over an EMPTY log still declares every table before anything can
+    /// pin the log.**
+    ///
+    /// A log written before D227 can be empty while the database has tables: a clean close by a
+    /// process that ran no DDL re-declared nothing. `open_recovered` retains the tables (D227) but
+    /// took no checkpoint over an empty log. Since D234, a checkpoint that a pin keeps from
+    /// truncating re-declares nothing, so tables retained and never written could stay out of the
+    /// log for as long as a change stream lags. The open therefore checkpoints whenever it has a
+    /// declaration to make, and at an open nothing holds a pin yet.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39`, and at `e2611bf`, at the
+    /// declaration assertion (the open takes no checkpoint, and the log stays empty).
+    #[test]
+    fn an_open_over_an_empty_log_still_declares_every_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.db");
+        d216_cleanly_closed(&db);
+        {
+            // What a clean close before D227 left: tables in the catalog, and an empty log.
+            let wal = WalManager::new(PathBuf::from(format!("{}.wal", db.display()))).unwrap();
+            let _ = wal.truncate(wal.header_txn_id).unwrap();
+            let (base, end) = d216_bounds(&wal);
+            assert_eq!(base, end, "premise failed: the log was not emptied");
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        let log = d216_log(&o.wal);
+        assert!(
+            log.iter().any(|(_, txn, kind)| *txn == 0 && matches!(kind, RecKind::Ddl { table, .. } if table == "t")),
+            "an open over an empty log left table t undeclared: {log:?}"
+        );
+    }
 }
