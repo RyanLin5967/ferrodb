@@ -7,8 +7,8 @@
 //!
 //! * `undo_txn` finds one transaction's ops with `state.applied.iter().filter(|a| a.txn == txn)`.
 //!   `State::applied` is never pruned and gains one entry per cell any `MERGE` published, so this
-//!   is O(|applied|) per reverted transaction — D86's defect, on the one reader D86's index said it
-//!   did not serve.
+//!   is O(|applied|) per reverted transaction — D86's defect, on one of the two readers D86's index
+//!   said it did not serve.
 //! * `dependency_graph_of(&state.captures)` clones every retained capture and hands them to
 //!   `DependencyGraphBuilder::build`, which joins every write against every read with nested
 //!   loops. `captures` keeps every PUBLISHED transaction for the life of the process, so for N

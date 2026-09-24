@@ -1464,6 +1464,19 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
             // If it ever gains a field of its own, or a second writer, that reasoning lapses and
             // this decision has to be made again.
             "applied_by_cell",
+            // **Wall #18 — DECIDED on D86's three grounds, each re-checked for this field.**
+            //
+            // `applied_by_txn` is an INDEX into `applied`: `txn -> positions in that Vec`, read
+            // only by `undo_txn`. It is NOT a second funnel:
+            //   * it holds no information `applied` does not already hold — every entry is a
+            //     position whose op already carries that `txn`;
+            //   * it is keyed by TRANSACTION id, not by branch, so it holds no per-branch state for
+            //     an envelope to govern;
+            //   * its only writer is `State::push_applied`, the same single door as
+            //     `applied_by_cell` and `applied`, reached only from `record_applied` on the
+            //     publish path — no statement writes it.
+            // If it gains a second writer, that reasoning lapses and this has to be decided again.
+            "applied_by_txn",
             "merges", "quarantine_reasons", "escrow", "versions", "captures",
             // `runs` and `row_author` were REMOVED by E79c (`ee01420`), and a removal gets the
             // same determination an addition does — the difference is which way it can be wrong.

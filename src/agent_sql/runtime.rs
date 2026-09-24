@@ -869,11 +869,27 @@ struct State {
     /// comparison a shared box cannot fake. Merge k cost O(k x delta); merging N branches was
     /// O(N^2).
     ///
-    /// ⚠ The Vec STAYS. Two other readers need it and neither is served by this key: the `txn`
-    /// filter in `REVERT` (`:4159`) and `highest_applied_seq` (`:3538`). This is an index beside
-    /// the log, not a replacement for it — which also means the two must be pushed together, and
-    /// `push_applied` is the only place that does either.
+    /// ⚠ The Vec STAYS. Other readers need it and are not served by this key: `highest_applied_seq`
+    /// walks it whole once per merge, and so do `diff`'s `concurrent` test, `pickable_ops` and the
+    /// cherry-pick projection. `REVERT`'s per-txn lookup was on that list too; since wall #18 it has
+    /// its own index, `applied_by_txn` below. This is an index beside the log, not a replacement
+    /// for it — which also means they must be pushed together, and `push_applied` is the only place
+    /// that does any of it.
     applied_by_cell: std::collections::HashMap<(u32, u64, u32), Vec<u32>>,
+    /// **Wall #18.** `txn` -> positions in `applied`, so `REVERT` stops rescanning the whole log
+    /// for every transaction it undoes.
+    ///
+    /// `undo_txn` asked a KEYED question — `a.txn == txn` — of a Vec that is never pruned, once per
+    /// reverted transaction, under the lock every statement takes: O(every op any merge ever
+    /// published) to find the handful one merge did. It is D86's defect on one of the two readers
+    /// D86's index said it did not serve, and it gets D86's answer: an index beside the log,
+    /// pushed by the same door. This is the materialised form of ARIES's per-transaction `PrevLSN` chain —
+    /// a rollback walks its own transaction's records, never the log.
+    ///
+    /// Each list is increasing, because `push_applied` appends, so a transaction's positions come
+    /// back in log order — the order the scan it replaces produced — and `undo_txn`'s stable sort
+    /// sees the same input it always did.
+    applied_by_txn: std::collections::HashMap<u64, Vec<u32>>,
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id SLOT.
     ///
@@ -938,20 +954,29 @@ struct State {
 }
 
 impl State {
-    /// **D86.** The one place that appends to `applied`, so the log and its index cannot drift.
+    /// **D86.** The one place that appends to `applied`, so the log and its indexes cannot drift.
     ///
     /// A second source of truth rots when someone adds a write and does not know about the index.
     /// Making the append the only operation removes the ordering to get wrong — the same reason
-    /// `CatalogState::install` exists for the live-branch counter.
+    /// `CatalogState::install` exists for the live-branch counter. Wall #18's `applied_by_txn` is
+    /// pushed here for the same reason, and for EVERY op: a whole-row create or delete has no
+    /// cell, but it is still one of its transaction's ops and `REVERT` still has to undo it.
     fn push_applied(&mut self, op: AppliedOp) {
+        let at = self.applied.len() as u32;
         if let Some(col) = op.col {
-            let at = self.applied.len() as u32;
             self.applied_by_cell
                 .entry((op.tbl.0, op.row.0, col.0))
                 .or_default()
                 .push(at);
         }
+        self.applied_by_txn.entry(op.txn.0).or_default().push(at);
         self.applied.push(op);
+    }
+
+    /// Positions in `applied` of one transaction's published ops, in log order. Empty for a
+    /// transaction that published nothing — a cascade can name a live task that never merged.
+    fn applied_of_txn(&self, txn: TxnId) -> &[u32] {
+        self.applied_by_txn.get(&txn.0).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Positions in `applied` for one cell, newest last. Empty when the cell has never been
@@ -5879,13 +5904,18 @@ impl AgentRuntime {
     fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
         let ops: Vec<AppliedOp> = {
             let state = self.state.lock().unwrap();
+            // **Wall #18: ask the index, do not rescan the log.** This was
+            // `state.applied.iter().filter(|a| a.txn == txn)`: every op any merge ever published,
+            // once per reverted transaction, under the lock every statement takes. The positions
+            // come back in log order, which is the order that filter produced, so the stable sort
+            // below hands back the same undo order it always did, ties included.
             let mut examined = 0u64;
             let mut v: Vec<AppliedOp> = state
-                .applied
+                .applied_of_txn(txn)
                 .iter()
-                .filter(|a| {
+                .filter_map(|&i| {
                     examined += 1;
-                    a.txn == txn
+                    state.applied.get(i as usize)
                 })
                 .cloned()
                 .collect();
@@ -6352,8 +6382,10 @@ fn blind_writes_of(
 /// could falsify it.
 ///
 /// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
-/// final element is not necessarily the largest. One pass per merge, the same order of cost
-/// `undo_txn` already pays per revert over the same vector.
+/// final element is not necessarily the largest. That makes it one pass over the whole vector per
+/// merge, so each merge pays for every op published before it. (This used to add "the same order of cost `undo_txn` already pays
+/// per revert over the same vector"; wall #18 indexed `undo_txn`'s lookup by txn, so that
+/// comparison no longer holds and this is the merge path's own whole-log walk.)
 fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
     applied.iter().map(|a| a.seq).max()
 }
