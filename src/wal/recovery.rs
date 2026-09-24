@@ -414,7 +414,6 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     // pages and wrote over live branch data. See `ArenaPageStore::reserve_persisted_floor`.
     let mut arena_path = db_path.as_os_str().to_os_string();
     arena_path.push(".arena");
-    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push(".wal");
@@ -424,6 +423,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     timings.files = t.elapsed();
     let t = Instant::now();
     let recovered = recover(&txn)?;
+    // MUTANT (fire-check only, never land): reserved after recovery, before the rebuild.
+    ArenaPageStore::reserve_persisted_floor(&bp.disk_manager, Path::new(&arena_path))?;
     timings.recover = t.elapsed();
     let t = Instant::now();
     let mut catalog = if existed {
