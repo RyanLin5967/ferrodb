@@ -334,7 +334,13 @@ pub struct BootTimings {
     /// `Catalog::open`, or `Catalog::create` for a new file.
     pub catalog: Duration,
     /// [`rebuild_indexes`], the checkpoint after it and the stale-index marker's removal. Zero when
-    /// recovery replayed nothing and no marker was left, which is every open after a clean shutdown.
+    /// recovery replayed nothing and no marker was left.
+    ///
+    /// ⚠ **That is NOT every open after a clean shutdown (D216, lead-verified 2026-09-24).** A clean
+    /// close's `TxnManager::checkpoint` truncates the log and then re-appends every retained DDL and
+    /// run declaration, so the next open finds records, recovers, and rebuilds every index — after
+    /// any process that ran DDL or merged an attributed agent session. This field is how READ-VS-N
+    /// measures that cost before D216's fix and its absence after.
     pub rebuild: Duration,
 }
 
