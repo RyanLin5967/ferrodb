@@ -1,14 +1,20 @@
 #!/bin/bash
 # D65 run 2 — one lock hold across build + smoke + run. Lane d65-reopen.
 set -u
-LOCK=/tmp/ferrodb-suite.lock; ME=""; SAMP=""
+LOCK=/tmp/ferrodb-suite.lock; ME=""; SAMP=""; CHILD=""
 W=/Users/idide/wt/ferrodb-d65-reopen-curve
 L=/Users/idide/wt/logs/d65-reopen
 OUT=${D65_OUT:-$W/bench/d65_reopen_curve_1e6_run2.txt}
 PIDF=$L/run.pid
 rel(){ [ -n "$ME" ] && [ "$(cat $LOCK/owner 2>/dev/null)" = "$ME" ] && rm -rf "$LOCK"; }
-cleanup(){ [ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null; rel; [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ] && { rm -rf "$L/tmp"; rm -f "$PIDF"; }; echo "$(date -u +%FT%TZ) released (pid $$)" >> "$L/status"; }
+cleanup(){ [ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null; [ -n "$CHILD" ] && { kill "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null; }; rel; [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ] && { rm -rf "$L/tmp"; rm -f "$PIDF"; }; echo "$(date -u +%FT%TZ) released (pid $$)" >> "$L/status"; }
 trap cleanup EXIT
+# Long children run in the background and are WAITED on: bash defers a trapped signal until a FOREGROUND
+# child exits, so a TERM to this script's pid (the one run.pid names) used to leave the curve running,
+# lock held, until it finished (fire-checked: all 7 rows printed after the TERM). `wait` is interrupted
+# by a trapped signal at once; cleanup then TERMs the child (GNU timeout forwards it to the binary) and
+# waits for it to die BEFORE releasing the lock (Amendment 2).
+run_child(){ "$@" & CHILD=$!; wait "$CHILD"; local r=$?; CHILD=""; return "$r"; }
 for s in TERM INT HUP; do trap "echo \"\$(date -u +%FT%TZ) got SIG$s (ppid \$PPID)\" >> \"\$L/status\"; exit 143" $s; done
 
 # >>> single-instance guard (added after two copies of this lane each launched this script) >>>
@@ -31,6 +37,11 @@ if ! claim; then
 fi
 has_run(){ grep -q '^\[HERE\]' "$OUT" 2>/dev/null; }
 has_run && { rm -f "$PIDF"; refuse "$OUT already holds a run header; one run, one path - set D65_OUT" 10; }
+#  (3) NO INHERITED LOAD LOG (Amendment 2): $L/load.txt is appended to (>>), never truncated, so the
+#      samples of a run killed before it appended them would be printed in the NEXT artifact as that
+#      run's own. A completed run removes the file after appending it, so if it exists here a cut
+#      run's samples are unbanked: commit them with that run's raw artifact, remove the file, relaunch.
+[ -e "$L/load.txt" ] && { rm -f "$PIDF"; refuse "$L/load.txt exists: a cut run's load samples are unbanked" 11; }
 # <<< single-instance guard <<<
 echo "$(date -u +%FT%TZ) waiting for lock (pid $$)" >> "$L/status"
 until mkdir "$LOCK" 2>/dev/null; do o=$(awk '{print $1}' "$LOCK/owner" 2>/dev/null)
@@ -42,13 +53,13 @@ cd "$W" || exit 3
 ( while :; do echo "$(date -u +%T) $(uptime | sed 's/.*averages*: *//')" >> "$L/load.txt"; sleep 30; done ) & SAMP=$!
 
 echo "$(date -u +%FT%TZ) build start, HEAD $(git rev-parse --short HEAD), dirty=[$(git status --short | tr '\n' ' ')]" >> "$L/status"
-timeout 1500 cargo build --release --example branch_curve_writes > "$L/build.log" 2>&1; brc=$?
+run_child timeout 1500 cargo build --release --example branch_curve_writes > "$L/build.log" 2>&1; brc=$?
 echo "$(date -u +%FT%TZ) build rc=$brc" >> "$L/status"
 [ $brc -ne 0 ] && exit 4
 BIN=$W/target/release/examples/branch_curve_writes
 mkdir -p "$L/tmp"; export TMPDIR="$L/tmp/"
 
-timeout 300 "$BIN" 1000,2000 8 1 > "$L/smoke.txt" 2>&1; src=$?
+run_child timeout 300 "$BIN" 1000,2000 8 1 > "$L/smoke.txt" 2>&1; src=$?
 echo "$(date -u +%FT%TZ) smoke rc=$src" >> "$L/status"
 [ $src -ne 0 ] && exit 5
 grep -q "reload ctl" "$L/smoke.txt" || { echo "smoke: binary lacks the amended control column" >> "$L/status"; exit 6; }
@@ -69,11 +80,14 @@ has_run && refuse "$OUT gained a run header while this launch waited" 10
   echo
 } >> "$OUT"
 echo "$(date -u +%FT%TZ) curve start" >> "$L/status"
-timeout 5400 "$BIN" 1000,10000,100000,250000,500000,750000,1000000 8 8 >> "$OUT" 2>&1; rc=$?
+# 10800 s, not 5400 (Amendment 2): at the cut run's ~161 f/s, 10^6 cumulative forks need ~6200 s.
+run_child timeout 10800 "$BIN" 1000,10000,100000,250000,500000,750000,1000000 8 8 >> "$OUT" 2>&1; rc=$?
 {
   echo "# rc=$rc"
   echo "free after: $(df -h "$L" | awk 'NR==2{print $4}')   load after: $(uptime | sed 's/.*averages*: *//')   at $(date -u +%FT%TZ)"
 } >> "$OUT"
-{ echo; echo "=== LOAD LOG (uptime every 30 s, whole lock hold incl. build) ==="; cat "$L/load.txt"; } >> "$OUT"
+# Stop the sampler BEFORE removing its file, or its next tick recreates it and guard (3) refuses a clean relaunch.
+kill "$SAMP" 2>/dev/null; wait "$SAMP" 2>/dev/null; SAMP=""
+{ echo; echo "=== LOAD LOG (uptime every 30 s, whole lock hold incl. build) ==="; cat "$L/load.txt"; } >> "$OUT" && rm -f "$L/load.txt"
 echo "$(date -u +%FT%TZ) curve rc=$rc" >> "$L/status"
 exit 0

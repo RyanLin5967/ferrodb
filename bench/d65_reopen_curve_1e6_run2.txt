@@ -137,3 +137,46 @@ A9. [review 10, CONFIRMED] Nothing committed wrote the load log. The run script 
 Rule 4 (4096 / 334 / pages live = N), rule 2 (run 1 reproduction ±50%) and rule 6 (stops are the
 result, no limit raised, FREE_FLOOR untouched) stand unchanged.
 ====================================================================================================
+
+=== AMENDMENT 2 — appended 2026-09-24T00:28Z, AFTER the cut run and BEFORE the relaunch's first number ===
+The text above is unchanged. This amendment supersedes it where it says so, and nowhere else.
+Context: the first attempt at this run (pid 19453, script 3b74b32) was SIGTERMed at 2026-09-23T23:03:08Z by
+the LEAD (Ryan paused everything), mid-segment 250000 -> 500000. Its output is banked RAW, off this path so
+the run script's has_run guard cannot see its [HERE] header, in bench/d65_reopen_curve_1e6_run2_CUT_RAW.txt
+and bench/d65_reopen_curve_1e6_run2_CUT_RAW_load.txt (commit 87ebc0f). It is NOT A COUNT: its rows are never
+pooled with the relaunch's, and no verdict in this file is computed from them.
+DISCLOSURE: its four rows (N = 1k, 10k, 100k, 250k; every column) were SEEN by the lead and by this lane
+before this amendment was written. Nothing below depends on any reopen value.
+
+B1. [lead's Amendment L1, artie-research frontier/lane_d65_reopen.md; CONFIRMED] CURVE TIMEOUT 5400 -> 10800 s.
+    Instrument: the cut run's forks/sec column, which is PER SEGMENT (examples/branch_curve_writes.rs times
+    only the segment's forks: `seg` over `t0.elapsed()`): 173.6, 164.0, 163.6, 160.9 => 1543 s of fork time
+    to N = 250000. The remaining 750000 forks at 160.9 f/s need ~4660 s: ~6200 s in total > 5400, so 5400
+    truncates the curve below 10^6 (L1 predicted a last row of 750000). 10800 s fires only if the mean rate
+    over the last 750000 forks falls below ~82 f/s, half the rate observed.
+    This is the ONLY change to what is measured or how it is judged. Checkpoints, threads, the 8 GB budget,
+    FREE_FLOOR, every column, every control and every verdict rule (1-6, A1-A9) stand unchanged. The bound
+    was derived from forks/sec alone.
+B2. IF 10800 s STILL FIRES (`# rc=124`), that is a STOP under rule 6: the stopping N is the result, and
+    nothing is extrapolated to 10^6. L1's sentence "a catalog-flat / arena-linear verdict over 1k->750k ... is
+    the claim this run can support" conflicts with A5 for the ARENA: A5 needs 5 points at N >= 10^5, and a
+    stop at 750000 leaves 4, so the arena column is INCONCLUSIVE by rule. A5 stands (it was registered first).
+    CATALOG: A5's rules are applied over the printed points (R = last printed / first; inc counted over the
+    printed steps; WALL still needs inc >= 4), and the result is quoted "to <last N>", never "to 10^6".
+B3. Run-script hygiene. No measured value, column or rule is touched. Fire-checked on a sandbox copy
+    (scratch lock, worktree and log dir; stub binary; `cargo build` replaced by `true`). The real suite lock
+    was never touched.
+    - GUARD (3), before the lock wait: refuse (rc 11) if ~/wt/logs/d65-reopen/load.txt exists. The sampler
+      appends and never truncates, so the cut run's 84 samples (22:21:27Z..23:02:59Z) would have been printed
+      in the relaunch's LOAD LOG as its own. They were banked above and the file removed. A completed run now
+      stops the sampler, appends the file, then removes it.
+      Fire-check: leftover file -> rc 11, no lock taken; clean -> rc 0; relaunch after a completed run -> not
+      refused; relaunch after a TERM-cut run -> rc 11.
+    - PROMPT STOP: build, smoke and curve now run under `run_child` (background + `wait`). Before this change,
+      bash deferred a TERM sent to the script pid (the pid run.pid names) until the foreground child exited.
+      Fire-checked on the old script: all 7 stub rows printed after the TERM, lock held throughout, no rc
+      line. Now: the script exits 0 s after the TERM, the child is dead before the lock is released, and no
+      row is written after the TERM.
+    The relaunch's "[HERE] ... binary built from" line will name the commit carrying this amendment, not
+    3b74b32. 3b74b32..that commit touches only bench/; the harness source is byte-identical.
+====================================================================================================
