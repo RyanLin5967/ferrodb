@@ -52,9 +52,8 @@ impl Modify for Delete {
     /// nothing to record. It is here so that stays true by construction if DELETE ever writes an
     /// index, instead of depending on whoever adds that write remembering D230.
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
-        let written = self.write_rows();
+        let count = self.write_rows()?; // D230 MUTANT M5
         let synced = sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog);
-        let count = written?;
         synced?;
         // D69 — record that this table changed, on the SAME path as the write that
         // changed it. The merge staleness check reads this counter instead of
