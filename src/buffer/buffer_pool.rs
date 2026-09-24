@@ -1440,15 +1440,12 @@ impl BufferPoolManager {
     }
 
     /// Write-ahead logging for one page about to be written back: the log records its contents
-    /// depend on must be durable first. A page that carries its own LSN (a heap page) waits for the
-    /// log through the record at that LSN.
+    /// depend on must be durable first. What a page depends on is decided by [`log_dependency`],
+    /// from the page itself.
     ///
-    /// **D216: a page with no LSN waits for the log up to [`Frame::wal_mark`].** Index pages are not
-    /// logged, and their LSN field is always 0 (nothing in `storage::index` sets it); `page_lsn_of`
-    /// reads none from a catalog or directory page either. (It does read one from an arena page
-    /// whose first byte, the high byte of its birth epoch, is 0: bytes 11..19 of a copy-on-write
-    /// header, which are not an LSN. That predates D216, and arena pages are not the trees
-    /// `rebuild_indexes` rebuilds.) This gate used to skip all of these. But an
+    /// **D216: a table page with no LSN of its own waits for the log up to [`Frame::wal_mark`].**
+    /// Index pages are not logged, and their LSN field is always 0 (nothing in `storage::index`
+    /// sets it); a catalog or directory page has none. This gate used to skip all of them. But an
     /// index leaf's contents still depend on logged changes: it holds the key of every row inserted
     /// under it, and each such row's `HeapInsert` is appended BEFORE the leaf changes (heap first, in
     /// `execution::insert` and `execution::update`). So an eviction could write a leaf holding an
@@ -1470,22 +1467,58 @@ impl BufferPoolManager {
     /// (`an_index_page_whose_records_are_durable_does_not_flush_the_log`). What is left costs what
     /// the heap page already costs: a flush when the page holds a change whose records are not yet
     /// durable. Unmeasured.
+    ///
+    /// **D247: an arena page waits for nothing.** The CLI and pgserver build `ArenaPageStore` over
+    /// this same pool. The classifier this replaced read any page whose first byte is 0 as a heap
+    /// page, and an arena page begins with its birth epoch as a big-endian u64, so its bytes 11..19
+    /// (arena id, checksum, type, flags) became an "LSN" of about 2^24 to 2^56, and the first dirty
+    /// arena write-back after any commit paid a log write and an fsync
+    /// (`tests/d247_arena_page_write_back_flushes_no_log.rs`). A branch page is not logged.
     fn wal_gate(&self, frame: &Frame) -> Result<(), FerroError> {
-        if let Some(wal) = self.wal.get() {
-            match page_lsn_of(&frame.data) {
-                0 => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,
-                plsn => wal.flush_up_to(plsn)?,
-            }
+        let Some(wal) = self.wal.get() else {
+            return Ok(());
+        };
+        match log_dependency(&frame.data, frame.page_id) {
+            LogDependency::UpTo(lsn) => wal.flush_up_to(lsn)?,
+            LogDependency::Through => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,
+            LogDependency::Nothing => {}
         }
         Ok(())
     }
 }
 
-fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
+/// What a page about to be written back depends on in the log. D216, D247.
+#[derive(Debug, PartialEq, Eq)]
+enum LogDependency {
+    /// A heap page carrying the LSN of the last record applied to it.
+    UpTo(u64),
+    /// A page with no LSN of its own that may still reflect logged changes (an index, directory or
+    /// catalog page, or a heap page no logged change has touched), or a page this cannot classify.
+    /// It waits for the log up to its [`Frame::wal_mark`].
+    Through,
+    /// A copy-on-write arena page, recognised by its own checksum. Branch pages are not logged.
+    Nothing,
+}
+
+/// Classify `data`, the bytes of page `page_id`, POSITIVELY. A page that fits no class waits for
+/// the log (`Through`), because waiting when it was not needed costs a flush, and not waiting when
+/// it was needed breaks write-ahead logging.
+///
+/// - A table page names itself: heap, directory, B+tree and catalog headers all carry the page id
+///   in bytes 1..5 after a type byte of 0 to 5. `recovery::redo_one` makes the same check before it
+///   trusts a heap page. Without it the classifier took an arena page for a heap page (D247).
+/// - An arena page carries a crc32 of itself (`cow::page_header`), which a table page does not.
+///   It is checked only for a page that is not a table page naming itself.
+fn log_dependency(data: &[u8; PAGE_SIZE], page_id: Option<u32>) -> LogDependency {
+    let names_itself = page_id.is_some_and(|id| data[1..5] == id.to_be_bytes());
     match data[0] {
-        0 => u64::from_be_bytes(data[11..19].try_into().unwrap()),
-        2 | 3 => u64::from_be_bytes(data[5..13].try_into().unwrap()),
-        _ => 0,
+        0 if names_itself => match u64::from_be_bytes(data[11..19].try_into().unwrap()) {
+            0 => LogDependency::Through,
+            lsn => LogDependency::UpTo(lsn),
+        },
+        1..=5 if names_itself => LogDependency::Through,
+        _ if crate::cow::page_header::verify_checksum(data) => LogDependency::Nothing,
+        _ => LogDependency::Through,
     }
 }
 
