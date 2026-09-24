@@ -26,7 +26,7 @@ ONEFLUSH=b875ab3 # ONE flush after all the rewrites (eff03e8) + the two-table re
 ALTERRED=789d1da # catalog::alter tests 1-2 on 6f22427's code (flush before finish, unconditional)
 POISONRED=33e3d67 # catalog::alter test 3 on 77bddcb's code (stamps still written inside the rewrite loop)
 A1RED=e60c5be    # PREREG A1's red: test 3 expects the poisoned-store ALTER refused (on f513a37's code)
-FIX=50e175b      # the whole fix, + PREREG A1: plan_alters probes check_writable
+FIX=49c852f      # the whole fix (src as at 50e175b, PREREG A1's probe) + PREREG A2's tests and texts
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -134,9 +134,11 @@ mutant M17_pending_ignores_the_poison provenance::durable::tests::a_poisoned_sto
 mutant M18_flush_checks_poison_first provenance::durable::tests::an_empty_flush_is_not_a_write_even_on_a_poisoned_store
 mutant M19_rewrite_does_not_stamp INTEGRATION catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 mutant M20_flush_even_if_nothing_moved catalog::alter::tests::an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store
-mutant M21_stamps_before_finish catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
+# M21: test 2 kills it (Err before finish: 2 columns); test 3 no longer can, the probe refuses first (PREREG A2 F6).
+mutant M21_stamps_before_finish catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered catalog::alter::tests::a_store_poisoned_between_plan_and_apply_leaves_the_table_consistently_altered
 mutant M22_flush_error_swallowed catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
-mutant M23_stamp_refusal_swallowed catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered
+# M23: killed only by the store poisoned between plan and apply (PREREG A2 F1); test 3's is refused by the probe.
+mutant M23_stamp_refusal_swallowed catalog::alter::tests::a_store_poisoned_between_plan_and_apply_leaves_the_table_consistently_altered
 mutant M24_rewrite_stamps_eagerly catalog::alter::tests::a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync
 mutant M25_stamp_the_old_rid catalog::alter::tests::a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync
 mutant M26_more_than_one_moved_row catalog::alter::tests::a_rewrite_that_moves_one_attributed_row_still_stamps_it
