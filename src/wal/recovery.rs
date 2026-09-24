@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key}, index_page::{entry_over_bound, entry_too_large, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -241,6 +241,73 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
     Ok(())
 }
 
+/// **D225 — before any tree is freed, refuse by name a heap row whose index entry the rebuilt
+/// trees would refuse.**
+///
+/// Every write path refuses an entry over `MAX_ENTRY_BYTES`, so this build cannot commit such a
+/// row, but a build before D225 could: its count split admitted any entry that happened to fit.
+/// "Every write path" includes an ALTER that widens an indexed column, whose rewrite writes no
+/// index entry at all and would otherwise leave the heap holding values the rebuild widens: its
+/// `prepare_rewrite` asks the bound of every widened secondary entry first (review 6 H1; before
+/// that, this premise was false).
+/// The rebuild below frees each old tree before refilling a fresh one, table by table, and the
+/// catalog is persisted only at the end. A refusal part-way would leave the in-memory catalog
+/// naming new trees, the persisted one naming freed pages, and the next open freeing them again.
+/// So every row of every table is asked first, for every entry the rebuild will make, and a
+/// refusal leaves the database exactly as recovery found it. The cost is a second heap scan, at
+/// recovery only.
+///
+/// The database then does not open in this build until the table is repaired with a build that
+/// can still open it, `index_page::RECOVERY_REMEDY`. Deleting the row is not a repair: a deleted
+/// tuple is never purged, and this check reads every tuple the heap holds, as the rebuild does.
+/// That is deliberate: the alternative is admitting an entry for which a leaf split is not
+/// guaranteed to exist.
+fn refuse_rows_no_rebuilt_tree_admits(catalog: &Catalog, bp: &Arc<BufferPoolManager>, names: &[String]) -> Result<(), FerroError> {
+    for name in names {
+        let entry = catalog.tables.get(name).expect("name came from this map");
+        let column = |col_name: &str| {
+            entry.schema.columns.iter().position(|c| c.name == col_name).ok_or(FerroError::KeyNotFound)
+        };
+        let secondary = entry.indexes.iter().map(|i| column(&i.column_name)).collect::<Result<Vec<_>, _>>()?;
+        let fulltext = entry.fulltext_indexes.iter().map(|i| column(&i.column_name)).collect::<Result<Vec<_>, _>>()?;
+        let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+        for r in hfm.scan() {
+            let (_, tuple) = r?;
+            let vals = tuple.deserialize(&entry.schema)?;
+            let refuse = |what: &str, len: usize| {
+                let pk: String = format!("{:?}", vals[0]).chars().take(60).collect();
+                FerroError::Constraint(format!(
+                    "cannot rebuild the indexes of '{name}' after recovery: the row with primary key \
+                     {pk} makes {what} that no rebuilt tree admits: {}. A build before D225 could \
+                     store it. Nothing has been freed or rewritten. {RECOVERY_REMEDY} Then reopen.",
+                    entry_too_large(len)
+                ))
+            };
+            if let Some(len) = entry_over_bound(&vals[0], &RecordId::new(0, 0)) {
+                return Err(refuse("its primary entry", len));
+            }
+            for &col in &secondary {
+                if let Some(len) = entry_over_bound(&(vals[col].clone(), vals[0].clone()), &()) {
+                    return Err(refuse(&format!("its entry in the index on '{}'", entry.schema.columns[col].name), len));
+                }
+            }
+            for &col in &fulltext {
+                if let Some(text) = indexed_text(&vals[col])? {
+                    for token in distinct_tokens(text) {
+                        if let Some(len) = entry_over_bound(&posting_key(&token, &vals[0]), &()) {
+                            return Err(refuse(
+                                &format!("a posting in the full-text index on '{}'", entry.schema.columns[col].name),
+                                len,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Result<(), FerroError> {
     // **By table name, not by `HashMap` order.** This loop frees every index tree and builds a fresh
     // one, so the order decides which page ids the new trees get and therefore every byte written
@@ -252,6 +319,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // Every tree this rebuilds, with its fresh root: the shared cells are repointed from this at
     // the end (D205), once the `&mut` borrow of each entry has ended.
     let mut rebuilt: Vec<(String, Option<String>, u32)> = Vec::new();
+    refuse_rows_no_rebuilt_tree_admits(catalog, bp, &names)?;
     for name in names {
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());

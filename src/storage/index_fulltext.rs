@@ -27,13 +27,18 @@ pub type PostingTree = BPlusTreeManager<(Value, Value), ()>;
 /// Longest token this index stores, in bytes. A longer run of alphanumerics is **not indexed** and
 /// therefore cannot be found; every other token in the same value still is.
 ///
-/// This is a structural limit, not a style choice. A leaf's payload budget is
-/// `PAGE_SIZE - LEAF_HEADER_SIZE` = 4069 bytes, and `BPlusTreeLeafPage::split` cannot split a leaf
-/// holding one entry: `mid = 1/2 = 0`, so `split_off(0)` moves the lone entry to the new leaf,
-/// leaves the original empty, and serializing the still-oversized leaf panics. `VARCHAR(60000)` is
-/// a legal column type here and one 60000-byte run of letters is one token, so without a cap an
-/// ordinary `INSERT` could panic inside the B+tree rather than fail. 255 bytes is far below the
-/// structural limit and far above any word.
+/// This is a structural limit, not a style choice. `VARCHAR(60000)` is a legal column type here
+/// and one 60000-byte run of letters is one token. When this cap was written, a posting over a
+/// page made `BPlusTreeLeafPage::split` leave an empty leaf and panic in `serialize`. Since D225
+/// every tree refuses an entry over `index_page::MAX_ENTRY_BYTES` (2034 bytes, key and value as
+/// stored) by name, so an uncapped token would fail its whole `INSERT` rather than panic. The cap
+/// keeps an over-long word from doing even that.
+///
+/// A posting is `(token, pk)`: 3 + 255 = 258 bytes of token at most, so a posting always fits
+/// under the entry bound when the primary key takes at most 2034 - 258 = 1776 bytes as stored.
+/// With a longer `VARCHAR` primary key, a long token can still push a posting over the bound, and
+/// that `INSERT` is refused by name (`execution::insert` asks before writing anything). 255 bytes
+/// is far above any word.
 pub const MAX_TOKEN_BYTES: usize = 255;
 
 /// Split `text` into the tokens this index recognises, in order of appearance.

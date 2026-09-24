@@ -31,6 +31,170 @@ pub const BPLUS_INTERNAL_TYPE: u8 = 2;
 pub const BPLUS_LEAF_TYPE: u8 = 3;
 const INTERNAL_HEADER_SIZE: usize = 19;
 const LEAF_HEADER_SIZE: usize = 27;
+
+/// **The largest entry, key plus value as stored, that any B+tree in this engine admits: 2034
+/// bytes.** D225.
+///
+/// [`admit_entry`] refuses anything larger, by name, before a tree latches or writes, because
+/// above this size a leaf split is not guaranteed to exist. For the trees in this engine that is:
+///
+/// - a primary index, `Value -> RecordId` (6 bytes): a key of at most 2028 bytes, so a `VARCHAR`
+///   primary key of at most 2025 bytes of text (1 tag + 2 length + the text);
+/// - a secondary index, `(value, pk) -> ()`: the value and the primary key together at most 2034;
+///   a `VARCHAR` value under an `INTEGER` key (5 bytes) at most 2026 bytes of text;
+/// - a posting tree, `(token, pk) -> ()`: a token is at most `MAX_TOKEN_BYTES` = 255, so any
+///   primary key of at most 2034 - 258 = 1776 bytes as stored;
+/// - the branch catalog, `Vec<u8> -> Vec<u8>` (4-byte length prefix each): key and value bytes
+///   together at most 2026.
+///
+/// # Why this number: a leaf split always exists up to it, and not one byte past it
+///
+/// Let `B = PAGE_SIZE - LEAF_HEADER_SIZE` = 4069, a leaf's body. `is_full` is `bytes >= B`, so a
+/// leaf that is not full holds `S <= B - 1` bytes. A split is only ever needed when ONE entry of
+/// `c` bytes has just been added to such a leaf — an insert, or a replace after removing the old
+/// entry. If the new entry is first or last, cutting next to it gives halves of `c` and `S` bytes,
+/// both under `B`. Otherwise call the old entries' bytes to its left `L` and to its right `R`, so
+/// `L + R = S`: cutting just before it gives `L` and `c + R`, just after it gives `L + c` and `R`.
+/// Both fail only if `c + R >= B` **and** `L + c >= B`, i.e. `S + 2c >= 2B`, which with
+/// `S <= B - 1` needs `2c >= B + 1`, i.e. `c >= 2035`. So every `c <= B / 2` = 2034 has a cut with
+/// both halves under the threshold, **whatever the widths of the entries already there**, and
+/// [`BPlusTreeLeafPage::split_point`] considers every cut, so it finds one.
+///
+/// The bound is tight. Two 2034-byte entries (4068 bytes, not full) with a 2035-byte entry
+/// between them have no such cut: either half holding the new entry is 4069 bytes, which is full.
+/// `max_entry_bytes_is_tight` pins both sides.
+///
+/// **Internal pages need nothing tighter.** A separator is a leaf key, so at most this many bytes.
+/// An internal node is full at `C = PAGE_SIZE - INTERNAL_HEADER_SIZE` = 4077 bytes of keys and
+/// 4-byte child pointers; it holds at most `C` on disk, and at most `C + k + 4` once a separator of
+/// `k` bytes is added. Take the largest cut whose left half (the keys before the pushed one, and
+/// one more pointer than keys) is under `C`; pushing up the first key leaves a left half of one
+/// pointer, so such a cut exists. If it is the last key, the right half is one pointer. Otherwise
+/// moving one key further would put the left at `C` or more, so the left already holds at least
+/// `C - k' - 4` bytes (`k'` the pushed key) and the right half, everything else, is at most
+/// `(C + k + 4) - C + 4 = k + 8` bytes: under `C` for any `k` a leaf admits. A new root is one
+/// key and two pointers, `k + 8` again.
+///
+/// **What the bound does not cover: data an earlier build wrote.** Its count split admitted any
+/// entry that happened to fit, so a database can hold entries over this bound, and each place
+/// that meets one refuses by name rather than guessing:
+///
+/// - a leaf left at exactly `B` bytes around such an entry, where [`BPlusTreeLeafPage::split_point`]
+///   can find no cut: the insert that needs the split is refused. **This one no executor
+///   pre-check can see**, because it depends on the page, not the row: it can fire inside a
+///   secondary or posting insert AFTER the heap write and the primary upsert. What keeps that from
+///   leaving a primary entry pointing at an undone slot is the abort undoing the primary-index
+///   writes it recorded (D202, `TxnManager::record_primary_write`, on `rollback-index-orphan`).
+///   **D225 therefore lands after D202**; `a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry`
+///   is red without it;
+/// - a heap row whose entry is over the bound, met by the crash-recovery rebuild: refused before
+///   any tree is freed (`wal::recovery`), and the database does not open until the remedy below
+///   has been applied;
+/// - a primary key over the bound, met by an ALTER that rewrites rows or an UPDATE of that row:
+///   refused before the first row is written (`catalog::alter::prepare_rewrite`, the UPDATE
+///   pre-pass), because either may have to re-point the key's entry;
+/// - a branch whose stored capability envelope is over the bound: rewrites of its record that
+///   leave the envelope unchanged go through (`TableBranchCatalog::envelope_write`), so its lease
+///   can be renewed and it can be reaped; a CHANGED envelope over the bound is refused, which
+///   includes `charge_row_writes` and a `restrict_envelope` that leaves it over the bound;
+/// - such a branch cannot be **forked**: the child inherits the envelope at the same encoded size
+///   (`CapabilityEnvelope::inherited` changes only fixed-width counters), so `write_record_new`
+///   refuses it, and on a recycled id `envelope_write` does, unless the reaped occupant's bytes
+///   happen to equal the child's, when the fork succeeds harmlessly;
+/// - a branch-catalog leaf left exactly full around an over-bound entry refuses **mid-record**:
+///   `write_record` removes the branch's old state and deadline keys before it upserts the new
+///   ones, so a no-cut refusal there leaves the branch in neither span. D202's undo does not cover
+///   the branch catalog;
+/// - a `LogBranchCatalog` holding an over-bound envelope **fails to open**: `open` migrates it
+///   through `migrate_from`, whose `write_record` puts the envelope into a fresh tree and is
+///   refused.
+///
+/// **The remedies.** For the rows of a table on a database this build has open, [`OPEN_TABLE_REMEDY`];
+/// for one crash recovery refuses to open, [`RECOVERY_REMEDY`]. There is no other, because a
+/// deleted row can take nothing in place: DELETE stamps the tuple and leaves it, nothing in this
+/// build purges it (there is no VACUUM), and a deleted row can be neither updated nor deleted
+/// again, so it is scanned, and refused, until its table is dropped. DELETE followed by INSERT
+/// therefore CREATES the problem for a key. For the envelope cases the remedy is
+/// `restrict_envelope` to an envelope below the bound, which is admitted; after it, charges and
+/// forks work again. The mid-record and migration cases have none in this build.
+///
+/// **This build writes nothing over the bound itself**, and that includes an ALTER that widens an
+/// indexed column: `catalog::alter::prepare_rewrite` asks the bound of every widened secondary
+/// entry (review 6 H1). **One residual is not a bound failure but its root cause:** a deleted
+/// tuple is never purged, so a deleted row whose value is too long for an index entry refuses
+/// every CREATE INDEX on that column, and every retype of an indexed column it sits in, until the
+/// table is copied and dropped. The refusals name that; they cannot cure it.
+pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
+
+/// What a refusal of an entry over [`MAX_ENTRY_BYTES`] tells the user to do on a database THIS
+/// build has open: the ALTER, UPDATE and CREATE INDEX refusals. D225, reviews 5 and 6.
+///
+/// Every step is one this build can take. SELECT reads the rows, an INSERT under a key and values
+/// that fit is admitted, and `drop_table` frees the trees without asking the bound. It spells out
+/// the two steps this SQL surface lacks (INSERT … SELECT and RENAME TABLE). It never suggests
+/// DELETE followed by INSERT, which leaves the deleted tuple behind for good.
+pub const OPEN_TABLE_REMEDY: &str = "With this build: copy the table's live rows into a new table, \
+    each under a key and values whose index entries fit the bound (there is no INSERT ... SELECT, \
+    so SELECT the rows and INSERT each one), DROP the old table, then CREATE it again under its old \
+    name and copy the rows back (there is no RENAME TABLE). There is no in-place remedy: a deleted \
+    row's tuple is never purged (there is no VACUUM), so it keeps its entries until its table is \
+    dropped, and a primary key cannot be updated.";
+
+/// What the crash-recovery refusal tells the user to do: the same steps, with a build that can
+/// still open the database, because this one refuses to. D225, reviews 5 and 6.
+pub const RECOVERY_REMEDY: &str = "This build cannot open the database until that is repaired. \
+    With a build before D225: copy the table's live rows into a new table, each under a key and \
+    values whose index entries fit the bound, DROP the old table, then CREATE it again under its \
+    old name and copy the rows back. There is no in-place remedy: a deleted row's tuple is never \
+    purged, so it keeps its entries until its table is dropped, and a primary key cannot be \
+    updated.";
+
+/// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry
+/// bound cannot disagree about what an entry costs.
+pub fn serialized_len<T: BTreeSerialize>(t: &T) -> usize {
+    let mut buf = Vec::new();
+    t.serialize(&mut buf);
+    buf.len()
+}
+
+/// The size of an entry that is over [`MAX_ENTRY_BYTES`], or `None` when it is admitted. The
+/// measurement behind [`admit_entry`], for refusals that give their own remedy. D225, review 6.
+pub fn entry_over_bound<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Option<usize> {
+    let len = serialized_len(key) + serialized_len(value);
+    (len > MAX_ENTRY_BYTES).then_some(len)
+}
+
+/// The named part of every entry-bound refusal, and no remedy: the wrappers that carry
+/// [`OPEN_TABLE_REMEDY`] or [`RECOVERY_REMEDY`] must not also say "shorten the indexed value",
+/// which [`admit_entry`]'s own message does. D225, review 6.
+pub fn entry_too_large(len: usize) -> String {
+    format!(
+        "index entry too large: {len} bytes (key and value as stored), over the B+tree entry \
+         limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}"
+    )
+}
+
+/// Refuse an entry larger than [`MAX_ENTRY_BYTES`], naming the limit. D225.
+///
+/// `BPlusTreeManager::insert` and `upsert` call this before they latch or write anything. The DML
+/// paths (`execution::insert`, `execution::update`) call it earlier still, for every entry a row
+/// will add, so a refused row writes nothing at all; `execution::insert` says why that matters.
+///
+/// `Constraint`, not `Unrepresentable`: no length field is too narrow here, and a page could hold
+/// the entry. This is a limit the split needs, the same kind as PostgreSQL's "index row size
+/// exceeds maximum". It reaches a client as a statement error (`23000` in `pgwire::sqlstate_of`),
+/// not as an internal one, because the fix is to shorten the value.
+pub fn admit_entry<K: BTreeSerialize, V: BTreeSerialize>(key: &K, value: &V) -> Result<(), FerroError> {
+    if let Some(len) = entry_over_bound(key, value) {
+        return Err(FerroError::Constraint(format!(
+            "index entry too large: {len} bytes (key and value as stored) does not fit under the \
+             B+tree entry limit MAX_ENTRY_BYTES = {MAX_ENTRY_BYTES}, the largest size for which \
+             every leaf split can leave both halves under a {PAGE_SIZE}-byte page; shorten the \
+             indexed value"
+        )));
+    }
+    Ok(())
+}
 // const CHILD_POINTER_SIZE: usize = 4;
 // HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (2)|
 impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
@@ -50,6 +214,17 @@ impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
         let mut buf = Vec::new();
         for k in &self.key_arr {
             k.serialize(&mut buf);
+        }
+        // ⛔ D225: refuse a node that does not fit, rather than panic slicing past the page.
+        if INTERNAL_HEADER_SIZE + buf.len() + 4 * self.child_ptrs.len() > PAGE_SIZE {
+            return Err(FerroError::Internal(format!(
+                "internal page {} holds {} bytes of keys and child pointers, over the {}-byte body \
+                 of a {PAGE_SIZE}-byte page; refused rather than written. A split should have \
+                 prevented this (D225)",
+                self.page_id,
+                buf.len() + 4 * self.child_ptrs.len(),
+                PAGE_SIZE - INTERNAL_HEADER_SIZE
+            )));
         }
         bytes[INTERNAL_HEADER_SIZE..INTERNAL_HEADER_SIZE + buf.len()].copy_from_slice(&buf);
         for (i, child_ptr) in self.child_ptrs.iter().enumerate() {
@@ -109,11 +284,23 @@ impl<K: BTreeSerialize, V: BTreeSerialize> BPlusTreeLeafPage<K, V> {
         for k in &self.key_arr {
             k.serialize(&mut buf);
         }
-        bytes[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + buf.len()].copy_from_slice(&buf);
         let mut buff = Vec::new();
         for v in &self.vals {
             v.serialize(&mut buff);
         }
+        // ⛔ D225: refuse a leaf that does not fit, rather than panic slicing past the page. This
+        // copy was the panic `d208_review2` A1 reached from ordinary SQL.
+        if LEAF_HEADER_SIZE + buf.len() + buff.len() > PAGE_SIZE {
+            return Err(FerroError::Internal(format!(
+                "leaf page {} holds {} bytes of entries, over the {}-byte body of a \
+                 {PAGE_SIZE}-byte page; refused rather than written. A split should have \
+                 prevented this (D225)",
+                self.page_id,
+                buf.len() + buff.len(),
+                PAGE_SIZE - LEAF_HEADER_SIZE
+            )));
+        }
+        bytes[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + buf.len()].copy_from_slice(&buf);
         bytes[LEAF_HEADER_SIZE + buf.len()..LEAF_HEADER_SIZE + buf.len() + buff.len()].copy_from_slice(&buff);
 
         Ok(bytes)
@@ -337,9 +524,62 @@ impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
         self.child_ptrs.insert(index+1, child_ptr);
         self.num_keys += 1;
     }
-    // divide keys/children between current and new node, return middle key to push up, new node
-    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
-        let mid = self.key_arr.len() /2;
+    /// Where to split this node: the index of the key that moves UP. The keys before it stay here
+    /// with their children; the keys after it move to the new node with theirs.
+    ///
+    /// **By bytes — D225**, by the same rule as [`BPlusTreeLeafPage::split_point`]: among the cuts
+    /// that leave both halves under the full threshold, the one that best balances their bytes,
+    /// with ties going to the count midpoint `len / 2`. That is where the count split always cut,
+    /// so a node whose keys are all one width splits exactly where it did before. A half may keep
+    /// no key and one child. The count split produced that too, for a two-key node, and every
+    /// reader handles it (`find_child` on no keys is child 0).
+    ///
+    /// `None` when no cut qualifies. [`MAX_ENTRY_BYTES`] shows that cannot happen to a node that
+    /// has just taken one separator a leaf admits.
+    pub fn split_point(&self) -> Option<usize> {
+        let n = self.key_arr.len();
+        if n == 0 || self.child_ptrs.len() != n + 1 {
+            return None;
+        }
+        let sizes: Vec<usize> = self.key_arr.iter().map(serialized_len).collect();
+        let total: usize = sizes.iter().sum();
+        let under = |bytes: usize| INTERNAL_HEADER_SIZE + bytes < PAGE_SIZE;
+        let count_mid = n / 2;
+        // ((byte imbalance, distance from the count midpoint), cut), smallest first.
+        let mut best: Option<((usize, usize), usize)> = None;
+        let mut before = 0; // bytes of the keys left of the pushed one
+        for m in 0..n {
+            let left = before + 4 * (m + 1);
+            let right = (total - before - sizes[m]) + 4 * (n - m);
+            before += sizes[m];
+            if !under(left) || !under(right) {
+                continue;
+            }
+            let rank = (left.abs_diff(right), m.abs_diff(count_mid));
+            if best.is_none_or(|(b, _)| rank < b) {
+                best = Some((rank, m));
+            }
+        }
+        best.map(|(_, m)| m)
+    }
+
+    /// Push key `mid` up and move the keys after it, with their children, to a new node at
+    /// `new_page_id`. Returns the pushed key and the new node.
+    ///
+    /// ⛔ **The D225 guard: refuses, and leaves this node exactly as it was, if either half is at
+    /// or over the full threshold.** [`Self::split_point`] never picks such a cut, so this fires
+    /// only if the choice and the page encoding ever disagree about what a key costs, or a caller
+    /// passes some other cut. Before D225 the answer to that was a panic in `serialize`.
+    pub fn split_at(&mut self, mid: usize, new_page_id: u32) -> Result<(K, Self), FerroError> {
+        let n = self.key_arr.len();
+        if mid >= n || self.child_ptrs.len() != n + 1 {
+            return Err(FerroError::Internal(format!(
+                "internal page {}: cannot push up key {mid} of {n} (it has {} children)",
+                self.page_id,
+                self.child_ptrs.len()
+            )));
+        }
+        let num_keys_before = self.num_keys;
         let mid_key = self.key_arr.remove(mid);
 
         let mut new_node = Self {
@@ -353,7 +593,36 @@ impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
         };
         new_node.num_keys = new_node.key_arr.len() as u16;
         self.num_keys = mid as u16;
-        (mid_key, new_node)
+        if self.is_full() || new_node.is_full() {
+            let refusal = FerroError::Internal(format!(
+                "splitting internal page {} at key {mid} of {n} would leave a half at or over the \
+                 {PAGE_SIZE}-byte page ({} and {} bytes of keys and pointers); refused, and the \
+                 node is left unsplit (D225)",
+                self.page_id,
+                self.payload_len(),
+                new_node.payload_len()
+            ));
+            self.key_arr.push(mid_key);
+            self.key_arr.append(&mut new_node.key_arr);
+            self.child_ptrs.append(&mut new_node.child_ptrs);
+            self.num_keys = num_keys_before;
+            return Err(refusal);
+        }
+        Ok((mid_key, new_node))
+    }
+
+    /// The byte split, unwrapped, for the unit tests that pin its shape. **Test-only on purpose:**
+    /// a production caller has to handle a refusal, and `BPlusTreeManager` does, through
+    /// [`Self::split_point`] and [`Self::split_at`].
+    #[cfg(test)]
+    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
+        let mid = self.split_point().expect("no cut leaves both halves under the page");
+        self.split_at(mid, new_page_id).expect("the D225 guard refused split_point's own cut")
+    }
+
+    /// Bytes of keys and child pointers, the part of the page `is_full` measures.
+    pub fn payload_len(&self) -> usize {
+        self.key_arr.iter().map(serialized_len).sum::<usize>() + 4 * self.child_ptrs.len()
     }
     // does adding one more entry exceed capacity? triggers splits
     pub fn is_full(&self) -> bool { 
@@ -436,9 +705,70 @@ impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTree
         return Ok(Some(&self.vals[index]));
     }
 
-    // divide entries between this leaf and a new leaf, copy the middle key up (stays in leaf), fix sibling pointers
-    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
-        let mid = self.key_arr.len() /2;
+    /// Where to split this leaf: the index of the first entry that moves to the new right leaf.
+    ///
+    /// **By bytes, not by count — D225.** The count split cut at `len / 2`, which is safe only
+    /// when every entry has the same width. With variable-width keys the wide entries sort
+    /// together, one half could hold all of them and be larger than a page, and `serialize`
+    /// panicked copying it (`d208_review2` A1: a `VARCHAR` index, 32 ordinary INSERTs). This is
+    /// PostgreSQL's `_bt_findsplitloc` in its plain form: among the cuts that leave BOTH halves
+    /// non-empty and under the full threshold, take the one that best balances their bytes. Ties
+    /// go to the cut nearest `len / 2`, so a leaf whose entries are all one width (every INTEGER,
+    /// BIGINT or TIMESTAMP key) splits exactly where the count split did.
+    ///
+    /// `None` when no cut qualifies. [`MAX_ENTRY_BYTES`] proves that cannot happen after one
+    /// admitted entry lands in a leaf that was not full; the caller refuses by name if it does.
+    pub fn split_point(&self) -> Option<usize> {
+        let n = self.key_arr.len();
+        if self.vals.len() != n {
+            return None;
+        }
+        let sizes: Vec<usize> = self
+            .key_arr
+            .iter()
+            .zip(&self.vals)
+            .map(|(k, v)| serialized_len(k) + serialized_len(v))
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let under = |bytes: usize| LEAF_HEADER_SIZE + bytes < PAGE_SIZE;
+        let count_mid = n / 2;
+        // ((byte imbalance, distance from the count midpoint), cut), smallest first.
+        let mut best: Option<((usize, usize), usize)> = None;
+        let mut left = 0;
+        for m in 1..n {
+            left += sizes[m - 1];
+            let right = total - left;
+            if !under(left) || !under(right) {
+                continue;
+            }
+            let rank = (left.abs_diff(right), m.abs_diff(count_mid));
+            if best.is_none_or(|(b, _)| rank < b) {
+                best = Some((rank, m));
+            }
+        }
+        best.map(|(_, m)| m)
+    }
+
+    /// Move the entries from `mid` on to a new leaf at `new_page_id`, copy the first of them up as
+    /// the separator (it also stays in the leaf), and link the new leaf in after this one. Returns
+    /// the separator and the new leaf.
+    ///
+    /// The old right neighbour's `prev` still names this leaf; it is another page, so repointing it
+    /// is the caller's job (`BPlusTreeManager` does it under that page's latch).
+    ///
+    /// ⛔ **The D225 guard: refuses, and leaves this leaf exactly as it was, if either half is at or
+    /// over the full threshold.** [`Self::split_point`] never picks such a cut, so this fires only
+    /// if the choice and the page encoding ever disagree about what an entry costs, or a caller
+    /// passes some other cut. Before D225 the answer to that was a panic in `serialize`.
+    pub fn split_at(&mut self, mid: usize, new_page_id: u32) -> Result<(K, Self), FerroError> {
+        let n = self.key_arr.len();
+        if mid == 0 || mid >= n || self.vals.len() != n {
+            return Err(FerroError::Internal(format!(
+                "leaf page {}: cannot split before entry {mid} of {n}; both halves must keep an entry",
+                self.page_id
+            )));
+        }
+        let (next_before, num_keys_before) = (self.next, self.num_keys);
         let mid_key = self.key_arr[mid].clone();
 
         let mut new_node = Self {
@@ -455,8 +785,36 @@ impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTree
         self.next = Some(new_node.page_id); // self now points to new node
         new_node.num_keys = new_node.key_arr.len() as u16;
         self.num_keys = self.key_arr.len() as u16;
-        // ALSO NEED TO UPDATE OLD SIBLING POINTER POINTING TO new_node INSTEAD OF SELF
-        (mid_key, new_node)
+        if self.is_full() || new_node.is_full() {
+            let refusal = FerroError::Internal(format!(
+                "splitting leaf page {} before entry {mid} of {n} would leave a half at or over \
+                 the {PAGE_SIZE}-byte page ({} and {} bytes of entries); refused, and the leaf is \
+                 left unsplit (D225)",
+                self.page_id,
+                self.payload_len(),
+                new_node.payload_len()
+            ));
+            self.key_arr.append(&mut new_node.key_arr);
+            self.vals.append(&mut new_node.vals);
+            self.next = next_before;
+            self.num_keys = num_keys_before;
+            return Err(refusal);
+        }
+        Ok((mid_key, new_node))
+    }
+
+    /// The byte split, unwrapped, for the unit tests that pin its shape. **Test-only on purpose:**
+    /// a production caller has to handle a refusal, and `BPlusTreeManager` does, through
+    /// [`Self::split_point`] and [`Self::split_at`].
+    #[cfg(test)]
+    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
+        let mid = self.split_point().expect("no cut leaves both halves under the page");
+        self.split_at(mid, new_page_id).expect("the D225 guard refused split_point's own cut")
+    }
+
+    /// Bytes of keys and values, the part of the page `is_full` measures.
+    pub fn payload_len(&self) -> usize {
+        self.key_arr.iter().map(serialized_len).sum::<usize>() + self.vals.iter().map(serialized_len).sum::<usize>()
     }
 
     pub fn upper_bound(&self, key: &K) -> usize {
@@ -641,5 +999,324 @@ mod tests {
         assert_eq!(leaf.key_arr[0], (Value::Varchar("ottawa".into()), Value::Integer(5)));
         assert_eq!(leaf.key_arr[1], (Value::Varchar("toronto".into()), Value::Integer(1)));
         assert_eq!(leaf.key_arr[2], (Value::Varchar("toronto".into()), Value::Integer(2)));
+    }
+
+    /// Bytes one key occupies on a page, measured with the page encoding itself.
+    fn d225_bytes(k: &(Value, Value)) -> usize {
+        let mut buf = Vec::new();
+        k.serialize(&mut buf);
+        buf.len()
+    }
+
+    /// **D225 — a leaf splits by BYTES, so both halves of a mixed-width leaf fit.**
+    ///
+    /// The leaf is `d208_review2` A1's, built in memory: 16 `('a', pk)` entries of 9 bytes, then 16
+    /// `('b' x 247, pk)` of 255 (`Varchar` is 1 tag + 2 length + the bytes, `Integer` 1 + 4, `()`
+    /// nothing). 4224 bytes against a 4069-byte body, so it is full and must split. The count split
+    /// cut at `mid = 16` and put all sixteen wide entries, 4080 bytes, in the right half: over the
+    /// body, so `serialize` panicked slicing past the page. Red at `9aa6968` on the right half's
+    /// `is_full` assertion, before any serialize runs.
+    ///
+    /// The balanced cut is 24, by arithmetic rather than by asking the subject: 16·9 + 8·255 = 2184
+    /// left and 8·255 = 2040 right, 144 apart; 23 gives 1929 / 2295 (366 apart) and 25 gives
+    /// 2439 / 1785. Pinning it separates a byte split from "count, unless that overflows", which
+    /// would cut at 17.
+    #[test]
+    fn a_mixed_width_leaf_splits_into_two_halves_that_fit() {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+        for pk in 1..=16 {
+            leaf.insert_entry((Value::Varchar("a".into()), Value::Integer(pk)), ());
+        }
+        for pk in 17..=32 {
+            leaf.insert_entry((Value::Varchar("b".repeat(247)), Value::Integer(pk)), ());
+        }
+        // Premise: the leaf holds the mixed widths the reproducer's arithmetic assumes, narrow first.
+        assert_eq!(leaf.key_arr.len(), 32);
+        assert!(leaf.key_arr[..16].iter().all(|k| d225_bytes(k) == 9), "premise: 16 narrow 9-byte entries first");
+        assert!(leaf.key_arr[16..].iter().all(|k| d225_bytes(k) == 255), "premise: 16 wide 255-byte entries after");
+        assert!(leaf.is_full(), "premise: 4224 bytes is over the 4069-byte body, so this leaf must split");
+
+        let (separator, right) = leaf.split(2);
+        assert!(!leaf.is_full(), "the left half is at or over the page: {} entries", leaf.key_arr.len());
+        assert!(!right.is_full(), "the right half is at or over the page: {} entries", right.key_arr.len());
+        assert_eq!(leaf.key_arr.len(), 24, "not the byte-balanced cut (16·9 + 8·255 | 8·255)");
+        assert_eq!(right.key_arr.len(), 8);
+        assert_eq!((leaf.num_keys, right.num_keys), (24, 8));
+        assert_eq!((leaf.vals.len(), right.vals.len()), (24, 8));
+        assert_eq!(right.key_arr[0], separator, "the separator is the right half's first key");
+        assert!(leaf.key_arr.last() < right.key_arr.first(), "the halves are out of key order");
+        assert_eq!(leaf.next, Some(2), "the left half must publish the new page as its next");
+        leaf.serialize().expect("the left half serializes");
+        right.serialize().expect("the right half serializes");
+    }
+
+    /// **D225 — the same defect one level up, in an INTERNAL split.**
+    ///
+    /// 32 separators: 17 narrow `('a', pk)` of 9 bytes, then 15 wide `('b' x 260, pk)` of 268. Keys
+    /// 17·9 + 15·268 = 4173 plus 33 child pointers (132) = 4305 bytes against a 4077-byte body, so
+    /// it is full. The count split pushes key 16 (the last narrow one) up and keeps 15 wide keys
+    /// and 16 pointers on the right: 4020 + 64 = 4084 bytes, over the body, so `serialize` would
+    /// slice past the page. A tree reaches this state: before the 32nd separator arrived the node
+    /// held 4305 - 268 - 4 = 4033 bytes, under the threshold. Red at `9aa6968` on the right half's
+    /// `is_full`.
+    ///
+    /// The balanced cut pushes key 24 up: left 17·9 + 7·268 + 25·4 = 2129, right 7·268 + 8·4 =
+    /// 1908, 221 apart; pushing 23 gives 1857 / 2180 (323 apart) and 25 gives 2401 / 1636.
+    #[test]
+    fn a_mixed_width_internal_node_splits_into_two_halves_that_fit() {
+        let mut node = BPlusTreeInternalPage::<(Value, Value)>::new(1);
+        for pk in 1..=17 {
+            node.key_arr.push((Value::Varchar("a".into()), Value::Integer(pk)));
+        }
+        for pk in 18..=32 {
+            node.key_arr.push((Value::Varchar("b".repeat(260)), Value::Integer(pk)));
+        }
+        node.child_ptrs = (100..133).collect();
+        node.num_keys = 32;
+        assert!(node.key_arr[..17].iter().all(|k| d225_bytes(k) == 9), "premise: 17 narrow 9-byte keys first");
+        assert!(node.key_arr[17..].iter().all(|k| d225_bytes(k) == 268), "premise: 15 wide 268-byte keys after");
+        assert_eq!(node.child_ptrs.len(), 33, "premise: one more child than keys");
+        assert!(node.is_full(), "premise: 4305 bytes is over the 4077-byte body, so this node must split");
+
+        let all_keys = node.key_arr.clone();
+        let (up, right) = node.split(2);
+        assert!(!node.is_full(), "the left half is at or over the page: {} keys", node.key_arr.len());
+        assert!(!right.is_full(), "the right half is at or over the page: {} keys", right.key_arr.len());
+        assert_eq!(up, all_keys[24], "not the byte-balanced cut (push key 24)");
+        assert_eq!((node.key_arr.len(), right.key_arr.len()), (24, 7));
+        assert_eq!((node.num_keys, right.num_keys), (24, 7));
+        assert_eq!(node.child_ptrs.len(), node.key_arr.len() + 1);
+        assert_eq!(right.child_ptrs.len(), right.key_arr.len() + 1);
+        // Every key exactly once, in order, with the pushed one between the halves; every pointer
+        // exactly once, in order.
+        let mut keys = node.key_arr.clone();
+        keys.push(up.clone());
+        keys.extend(right.key_arr.iter().cloned());
+        assert_eq!(keys, all_keys);
+        let mut ptrs = node.child_ptrs.clone();
+        ptrs.extend(&right.child_ptrs);
+        assert_eq!(ptrs, (100..133).collect::<Vec<u32>>());
+        node.serialize().expect("the left half serializes");
+        right.serialize().expect("the right half serializes");
+    }
+
+    /// The reproducer's leaf: 16 narrow 9-byte entries, then 16 wide 255-byte ones (4224 bytes).
+    fn d225_mixed_leaf() -> BPlusTreeLeafPage<(Value, Value), ()> {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+        for pk in 1..=16 {
+            leaf.insert_entry((Value::Varchar("a".into()), Value::Integer(pk)), ());
+        }
+        for pk in 17..=32 {
+            leaf.insert_entry((Value::Varchar("b".repeat(247)), Value::Integer(pk)), ());
+        }
+        leaf
+    }
+
+    /// The internal reproducer: 17 narrow 9-byte keys, 15 wide 268-byte ones, 33 children.
+    fn d225_mixed_node() -> BPlusTreeInternalPage<(Value, Value)> {
+        let mut node = BPlusTreeInternalPage::<(Value, Value)>::new(1);
+        for pk in 1..=17 {
+            node.key_arr.push((Value::Varchar("a".into()), Value::Integer(pk)));
+        }
+        for pk in 18..=32 {
+            node.key_arr.push((Value::Varchar("b".repeat(260)), Value::Integer(pk)));
+        }
+        node.child_ptrs = (100..133).collect();
+        node.num_keys = 32;
+        node
+    }
+
+    /// **D225 — `MAX_ENTRY_BYTES` is exactly the largest entry a split always admits.**
+    ///
+    /// Both sides of the bound, from the proof in its doc. Two 2034-byte entries hold 4068 bytes,
+    /// one under the 4069-byte body, so the leaf is not full. A new entry between them has a cut at
+    /// 2034 bytes, and none at 2035, because either half holding it is then 4069 bytes, which is
+    /// full. A `(Varchar, Integer)` key with a `()` value is `len + 8` bytes for `len` characters.
+    #[test]
+    fn max_entry_bytes_is_tight() {
+        assert_eq!(MAX_ENTRY_BYTES, 2034, "(4096 - 27) / 2");
+        let entry = |c: &str, len: usize| (Value::Varchar(c.repeat(len)), Value::Integer(1));
+        for (middle, cut_exists) in [(2026usize, true), (2027, false)] {
+            let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+            leaf.insert_entry(entry("a", 2026), ());
+            leaf.insert_entry(entry("c", 2026), ());
+            assert!(!leaf.is_full(), "premise: 2 x 2034 = 4068 bytes is under the body");
+            leaf.insert_entry(entry("b", middle), ());
+            assert_eq!(d225_bytes(&leaf.key_arr[1]), middle + 8, "premise: the new entry sits in the middle");
+            assert!(leaf.is_full(), "premise: the third entry makes the leaf full");
+            match leaf.split_point() {
+                Some(mid) => {
+                    assert!(cut_exists, "a {}-byte entry found cut {mid}: the bound is not tight", middle + 8);
+                    let (_, right) = leaf.split_at(mid, 2).expect("split_point's own cut");
+                    assert!(!leaf.is_full() && !right.is_full());
+                }
+                None => assert!(!cut_exists, "a {}-byte entry, within the bound, found no cut", middle + 8),
+            }
+        }
+    }
+
+    /// **D225 — the proof, exercised: once one admitted entry lands in a leaf that was not full,
+    /// a cut exists and `split_at` accepts it.**
+    ///
+    /// 20000 leaves from a fixed LCG. Each is filled with entries of 12 to 2034 bytes up to a
+    /// random total between 2034 and 4068, so it is not full, and then takes one more entry of up
+    /// to `MAX_ENTRY_BYTES` at a random position: first, last or between. Every leaf that is then
+    /// full must have a cut, and both halves must come out under the threshold. The floor on how
+    /// many split is there so a fixture that stopped splitting fails rather than passes.
+    #[test]
+    fn every_admitted_entry_leaves_a_cut() {
+        let mut state: u64 = 0xd225;
+        let mut next = move |bound: u64| -> u64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        // A 4-byte key is 8 bytes as stored and a value 4 + its length, so an entry is 12 + len.
+        let widths = (MAX_ENTRY_BYTES - 12 + 1) as u64;
+        let mut splits = 0;
+        for trial in 0..20_000 {
+            let mut leaf = BPlusTreeLeafPage::<Vec<u8>, Vec<u8>>::new(1);
+            let target = 2034 + next(2035) as usize;
+            let (mut total, mut last_key) = (0usize, 0u32);
+            loop {
+                let size = 12 + next(widths) as usize;
+                if total + size > target {
+                    break;
+                }
+                last_key += 2; // even keys, so an odd one can go anywhere between them
+                leaf.insert_entry(last_key.to_be_bytes().to_vec(), vec![0u8; size - 12]);
+                total += size;
+            }
+            assert!(!leaf.is_full(), "premise: trial {trial} built a full leaf");
+            let size = 12 + next(widths) as usize;
+            let at = 2 * next(last_key as u64 / 2 + 1) as u32 + 1;
+            leaf.insert_entry(at.to_be_bytes().to_vec(), vec![0u8; size - 12]);
+            if !leaf.is_full() {
+                continue;
+            }
+            splits += 1;
+            let mid = leaf.split_point().unwrap_or_else(|| {
+                panic!(
+                    "trial {trial}: {} bytes in {} entries after a {size}-byte insert has no cut",
+                    leaf.payload_len(),
+                    leaf.key_arr.len()
+                )
+            });
+            let (_, right) = leaf.split_at(mid, 2).unwrap_or_else(|e| panic!("trial {trial}: {e}"));
+            assert!(!leaf.is_full() && !right.is_full(), "trial {trial}: a half is at or over the page");
+        }
+        assert!(splits > 1_000, "only {splits} of 20000 trials needed a split; the fixture tests nothing");
+    }
+
+    /// **D225 — a page whose entries all have one width splits exactly where the count split did.**
+    ///
+    /// This is what leaves every INTEGER-, BIGINT- and TIMESTAMP-keyed tree, and every test that
+    /// measured one, unchanged. For one width the best-balanced cut ties at most two ways, and the
+    /// tie goes to `len / 2`. Every size a tree reaches: up to 370 11-byte leaf entries (369 is the
+    /// most a leaf holds without being full) and up to 453 5-byte internal keys (452 likewise).
+    #[test]
+    fn a_fixed_width_page_splits_where_the_count_split_did() {
+        for n in 2..=370usize {
+            let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(1);
+            for i in 0..n {
+                leaf.insert_entry(Value::Integer(i as i32), RecordId::new(i as u32, 0));
+            }
+            assert_eq!(leaf.split_point(), Some(n / 2), "a leaf of {n} fixed-width entries");
+        }
+        for n in 1..=453usize {
+            let mut node = BPlusTreeInternalPage::<Value>::new(1);
+            node.key_arr = (0..n).map(|i| Value::Integer(i as i32)).collect();
+            node.child_ptrs = (0..=n as u32).collect();
+            node.num_keys = n as u16;
+            assert_eq!(node.split_point(), Some(n / 2), "an internal node of {n} fixed-width keys");
+        }
+    }
+
+    /// **D225's guard, forced to fire: a cut that leaves a half full is refused, and the page is
+    /// left exactly as it was.** The cut is the count split's own, on both reproducer pages.
+    #[test]
+    fn split_at_refuses_a_cut_that_leaves_a_half_full_and_restores_the_page() {
+        let mut leaf = d225_mixed_leaf();
+        let before = (leaf.key_arr.clone(), leaf.vals.clone(), leaf.next, leaf.num_keys);
+        let e = leaf.split_at(16, 2).expect_err("the count cut leaves 4080 bytes on the right");
+        assert!(e.to_string().contains("would leave a half at or over"), "not the D225 guard: {e}");
+        assert_eq!((leaf.key_arr.clone(), leaf.vals.clone(), leaf.next, leaf.num_keys), before, "the refusal changed the leaf");
+        assert_eq!(leaf.split_point(), Some(24), "the restored leaf must still split at its byte cut");
+        leaf.split_at(24, 2).expect("the byte cut is accepted");
+
+        let mut node = d225_mixed_node();
+        let before = (node.key_arr.clone(), node.child_ptrs.clone(), node.num_keys);
+        let e = node.split_at(16, 2).expect_err("the count cut leaves 4084 bytes on the right");
+        assert!(e.to_string().contains("would leave a half at or over"), "not the D225 guard: {e}");
+        assert_eq!((node.key_arr.clone(), node.child_ptrs.clone(), node.num_keys), before, "the refusal changed the node");
+        assert_eq!(node.split_point(), Some(24), "the restored node must still split at its byte cut");
+        node.split_at(24, 2).expect("the byte cut is accepted");
+
+        // A cut outside the page is refused rather than indexing past it.
+        assert!(d225_mixed_leaf().split_at(0, 2).is_err(), "a cut leaving the left half empty");
+        assert!(d225_mixed_leaf().split_at(32, 2).is_err(), "a cut past the last entry");
+        assert!(d225_mixed_node().split_at(32, 2).is_err(), "pushing up a key that does not exist");
+    }
+
+    /// **`serialize` refuses a page over its body instead of panicking**: the last line of D225's
+    /// defence, and the panic `d208_review2` A1 reached. The boundary is exact: a body of exactly
+    /// the page serializes (an earlier build could leave one, full but legal), one byte more is
+    /// refused.
+    #[test]
+    fn serialize_refuses_an_oversized_page_rather_than_panicking() {
+        let wide = |pk: i32, len: usize| (Value::Varchar("b".repeat(len)), Value::Integer(pk));
+        // Leaf body 4069: 15 x 255 + one of 244 (3 + 236 + 5) fits exactly; 245 is one over.
+        for (last_len, fits) in [(236usize, true), (237, false)] {
+            let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(7);
+            for pk in 0..15 {
+                leaf.insert_entry(wide(pk, 247), ());
+            }
+            leaf.insert_entry(wide(99, last_len), ());
+            let body = 15 * 255 + last_len + 8;
+            match leaf.serialize() {
+                Ok(_) => assert!(fits, "a {body}-byte leaf body serialized past the page"),
+                Err(e) => {
+                    assert!(!fits, "a {body}-byte leaf body, which fits, was refused: {e}");
+                    assert!(e.to_string().contains(&format!("leaf page 7 holds {body} bytes")), "{e}");
+                }
+            }
+        }
+        // Internal body 4077: 14 x 268 + one of 261 (3 + 253 + 5) + 16 pointers fits exactly.
+        for (last_len, fits) in [(253usize, true), (254, false)] {
+            let mut node = BPlusTreeInternalPage::<(Value, Value)>::new(7);
+            for pk in 0..14 {
+                node.key_arr.push(wide(pk, 260));
+            }
+            node.key_arr.push(wide(99, last_len));
+            node.child_ptrs = (1..=16).collect();
+            node.num_keys = 15;
+            let body = 14 * 268 + last_len + 8 + 16 * 4;
+            match node.serialize() {
+                Ok(_) => assert!(fits, "a {body}-byte internal body serialized past the page"),
+                Err(e) => {
+                    assert!(!fits, "a {body}-byte internal body, which fits, was refused: {e}");
+                    assert!(e.to_string().contains(&format!("internal page 7 holds {body} bytes")), "{e}");
+                }
+            }
+        }
+    }
+
+    /// **The entry bound, at the byte, on both halves of an entry.** A secondary key under `()`,
+    /// and a primary key under its 6-byte `RecordId`: the value counts.
+    #[test]
+    fn admit_entry_refuses_one_byte_over_the_bound_by_name() {
+        let at = (Value::Varchar("x".repeat(2026)), Value::Integer(1));
+        let over = (Value::Varchar("x".repeat(2027)), Value::Integer(1));
+        assert_eq!((d225_bytes(&at), d225_bytes(&over)), (2034, 2035), "premise: 3 + len + 5");
+        admit_entry(&at, &()).expect("an entry exactly at the bound is admitted");
+        let e = admit_entry(&over, &()).expect_err("one byte over is refused");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("index entry too large: 2035 bytes") && msg.contains("MAX_ENTRY_BYTES = 2034"),
+            "not the named refusal: {msg}"
+        );
+        assert!(matches!(e, FerroError::Constraint(_)), "a statement error, not an internal one: {e:?}");
+
+        admit_entry(&Value::Varchar("x".repeat(2025)), &RecordId::new(1, 1)).expect("3 + 2025 + 6 = 2034");
+        admit_entry(&Value::Varchar("x".repeat(2026)), &RecordId::new(1, 1)).expect_err("3 + 2026 + 6 = 2035");
     }
 }

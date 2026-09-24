@@ -12,7 +12,8 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
-use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_fulltext::{distinct_tokens, indexed_text, post_tokens, posting_key};
+use crate::storage::index_page::{admit_entry, entry_over_bound, entry_too_large, OPEN_TABLE_REMEDY};
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -49,7 +50,12 @@ impl Modify for Update {
         // vacated and the new one being claimed - and this executor does neither. Refusing is the
         // correct trade. Refusing without saying what to do instead is not, especially now that
         // there IS something to do: as of E63 a deleted key can be used again, so DELETE-then-INSERT
-        // is a real remedy rather than advice that would have failed.
+        // works rather than being advice that would have failed.
+        //
+        // **With one caveat (D225, review 6):** the deleted tuple is never purged. Every entry an
+        // index over its values would need, including a CREATE INDEX added later, is still asked of
+        // it, so a row whose value is too long for an index entry leaves a tuple that refuses that
+        // index for good. The remedy then is the table copy, `index_page::OPEN_TABLE_REMEDY`.
         if let Some((col, _)) = self.assignments.iter().find(|(col, _)| *col == 0) {
             return Err(FerroError::Constraint(format!(
                 "column '{}' of '{}' is the primary key and cannot be updated: moving a key means \
@@ -69,15 +75,24 @@ impl Modify for Update {
             };
             res.push((rid, values));
         }
-        let mut count = 0;
+        // **D225 — every row's new values, and the entry bound over every index entry they will
+        // add, BEFORE the first row is written.**
+        //
+        // Each tree refuses an entry over `MAX_ENTRY_BYTES` by name, but it would refuse after the
+        // heap update, and an abort undoes only the heap: a row the heap moved would keep a primary
+        // entry pointing at a deleted slot (`execution::insert` gives the same argument). Asking
+        // per row inside the write loop is not enough either, because a later row's refusal lands
+        // after the earlier rows are written. So all of them are asked first, here, for exactly
+        // the entries the loop below may add: the primary re-point, a changed secondary value,
+        // and the tokens of changed text. The assignments are evaluated here too, still once per row, and the NOT
+        // NULL check moves with them: it reads only the new values, and inside the loop it had
+        // the same late-refusal shape.
+        let mut planned = Vec::with_capacity(res.len());
         for (rid, old_values) in res {
-            let head_h = self.heap.read(rid)?.version_header()?;
-            check_write_conflict(&self.view, &head_h)?;
             let mut new_values = old_values.clone();
             for (col_idx, expr) in &self.assignments {
                 new_values[*col_idx] = evaluate(expr, &old_values)?;
             }
-            
             for (i, col) in self.schema.columns.iter().enumerate() {
                 if !col.nullable && matches!(new_values[i], Value::Null) {
                     return Err(FerroError::Constraint(format!(
@@ -86,6 +101,43 @@ impl Modify for Update {
                     )))
                 }
             }
+            let pk = &old_values[0];
+            // The primary re-point, `upsert(pk, new_rid)`, happens only if the heap moves the row,
+            // which is not known until it is written, so it is asked for every row. This build
+            // cannot write a key over the bound; an earlier build could. The refusal names the one
+            // remedy that works for a key (review 5): a primary key cannot be UPDATEd, and DELETE
+            // then INSERT would leave the deleted tuple under the key for good.
+            if let Some(len) = entry_over_bound(pk, &RecordId::new(0, 0)) {
+                let shown: String = format!("{pk:?}").chars().take(60).collect();
+                return Err(FerroError::Constraint(format!(
+                    "this UPDATE would re-point the primary-index entry of the row whose key is \
+                     {shown}: {}. A build before D225 could store such a key; this one cannot \
+                     re-point it. Nothing has been written. {OPEN_TABLE_REMEDY}",
+                    entry_too_large(len)
+                )));
+            }
+            for handle in &self.secondary_indexes {
+                let new_v = &new_values[handle.col_index];
+                if &old_values[handle.col_index] != new_v {
+                    admit_entry(&(new_v.clone(), pk.clone()), &())?;
+                }
+            }
+            for ft in &self.fulltext_indexes {
+                let new_text = indexed_text(&new_values[ft.col_index])?;
+                if indexed_text(&old_values[ft.col_index])? != new_text {
+                    if let Some(text) = new_text {
+                        for token in distinct_tokens(text) {
+                            admit_entry(&posting_key(&token, pk), &())?;
+                        }
+                    }
+                }
+            }
+            planned.push((rid, old_values, new_values));
+        }
+        let mut count = 0;
+        for (rid, old_values, new_values) in planned {
+            let head_h = self.heap.read(rid)?.version_header()?;
+            check_write_conflict(&self.view, &head_h)?;
             let pk = old_values[0].clone();
             let mut old_ver = self.heap.read(rid)?;
             old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());

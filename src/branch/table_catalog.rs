@@ -37,6 +37,7 @@ use crate::branch::BranchCatalog;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::error::FerroError;
 use crate::storage::index::BPlusTreeManager;
+use crate::storage::index_page::admit_entry;
 
 /// Header payload: `next_id` then `epoch`, both big-endian.
 const HEADER_BYTES: usize = 16;
@@ -593,6 +594,7 @@ impl TableBranchCatalog {
              span, so they would be silently dropped. Use write_record.",
             rec.arenas.len()
         );
+        Self::admit_envelope(rec)?;
         self.tree.insert(keys::record(rec.branch_id.id), rec.serialize_core())?;
         self.tree.insert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
         if Self::in_deadline_index(rec.state, rec.branch_id) {
@@ -602,6 +604,58 @@ impl TableBranchCatalog {
             self.tree.insert(keys::envelope(rec.branch_id.id), e.serialize())?;
         }
         Ok(())
+    }
+
+    /// **D225 — refuse an envelope too large for a B+tree entry before any of `rec` is written.**
+    ///
+    /// The envelope is the one variable-length value in this tree, and the record writers put it
+    /// LAST. The tree refuses an entry over `MAX_ENTRY_BYTES` by name, but that refusal would land
+    /// after the record, state and deadline keys were already written, leaving a record whose
+    /// envelope never arrived. About 150 column capabilities is enough to reach it. So
+    /// `write_record_new`, which always writes the envelope, asks the bound first; `write_record`
+    /// asks it through [`Self::envelope_write`], only for an envelope it will write.
+    fn admit_envelope(rec: &BranchRecord) -> Result<(), FerroError> {
+        match &rec.envelope {
+            Some(e) => admit_entry(&keys::envelope(rec.branch_id.id), &e.serialize()),
+            None => Ok(()),
+        }
+    }
+
+    /// Decide what `write_record` does to `rec`'s envelope key, BEFORE any of `rec` is written.
+    /// D225.
+    ///
+    /// **An envelope identical to the stored one is left alone, and only an envelope this call
+    /// writes is held to the entry bound.** `set_root`, `renew_lease`, `set_state` and `reparent`
+    /// hydrate the record, envelope included, and hand it straight back unchanged. Re-writing it
+    /// through the bound meant a branch whose envelope an earlier build stored over the bound
+    /// could never renew its lease and never be moved to `Reaped`: an unreapable branch, from a
+    /// rewrite that changes nothing about the envelope. A CHANGED envelope over the bound is still
+    /// refused, and that includes `charge_row_writes` and `restrict_envelope`, which write through
+    /// `upsert` directly.
+    ///
+    /// The comparison is of the stored bytes against this record's encoding. A hydrated envelope
+    /// handed back re-encodes to exactly what was read **when the stored bytes are this encoder's
+    /// own output**. They need not be: `CapabilityEnvelope::deserialize` normalises. `allow` sorts
+    /// and deduplicates tables, `TableCapability::new` sorts and deduplicates columns, a tag-0
+    /// floor's payload is discarded, and trailing bytes are not checked. So a non-canonical stored
+    /// envelope reads as CHANGED, is admitted, and is refused if it is over the bound. That fails
+    /// closed, but this relief does not reach it. Byte equality is still the right test: anything
+    /// weaker (a length, a field subset) would let a genuinely changed envelope pass unwritten.
+    /// Callers hold `logical`, and every writer of the envelope key does too.
+    fn envelope_write(&self, rec: &BranchRecord) -> Result<EnvelopeWrite, FerroError> {
+        let key = keys::envelope(rec.branch_id.id);
+        Ok(match &rec.envelope {
+            None => EnvelopeWrite::Remove,
+            Some(e) => {
+                let bytes = e.serialize();
+                if self.tree.search(&key)?.as_deref() == Some(bytes.as_slice()) {
+                    EnvelopeWrite::Unchanged
+                } else {
+                    admit_entry(&key, &bytes)?;
+                    EnvelopeWrite::Put(bytes)
+                }
+            }
+        })
     }
 
     /// `rec` must be WHOLE -- its arena span is rewritten to match it. `old` is deliberately a
@@ -625,6 +679,7 @@ impl TableBranchCatalog {
         rec: &BranchRecord,
         old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
+        let envelope = self.envelope_write(rec)?;
         if let Some(prev) = old {
             self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
             if Self::in_deadline_index(prev.state(), prev.branch_id()) {
@@ -639,9 +694,10 @@ impl TableBranchCatalog {
         if Self::in_deadline_index(rec.state, rec.branch_id) {
             self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
         }
-        match &rec.envelope {
-            Some(e) => self.upsert(keys::envelope(rec.branch_id.id), e.serialize())?,
-            None => {
+        match envelope {
+            EnvelopeWrite::Unchanged => {}
+            EnvelopeWrite::Put(bytes) => self.upsert(keys::envelope(rec.branch_id.id), bytes)?,
+            EnvelopeWrite::Remove => {
                 self.remove_if_present(&keys::envelope(rec.branch_id.id))?;
             }
         }
@@ -1754,6 +1810,177 @@ mod d10_guard {
 }
 
 #[cfg(test)]
+mod d225_envelope_bound {
+    //! D225: the envelope is the one variable-length value in the branch catalog's tree, so it is
+    //! the one that can exceed `MAX_ENTRY_BYTES`, and it is written last. `admit_envelope` asks
+    //! the bound before the record's first key. Without it, the record and state keys land and
+    //! the envelope is refused after them.
+    use super::*;
+    use crate::branch::record::{ColumnCapability, Verb};
+    use crate::storage::index_page::BPlusTreePage;
+
+    fn fresh_catalog() -> (TableBranchCatalog, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d225-{}-{:?}",
+            std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("e.branchcat");
+        let _ = std::fs::remove_file(&path);
+        (TableBranchCatalog::open_sidecar(&path, 1).expect("open"), path)
+    }
+
+    /// An envelope granting `columns` open columns on one table: 21 + 8 + 13 per column bytes.
+    fn envelope_of(columns: u32) -> CapabilityEnvelope {
+        envelope_with_budget(columns, 10)
+    }
+
+    /// The same shape with a different row-write budget: a fixed-width field, so the same length.
+    fn envelope_with_budget(columns: u32, max_row_writes: u64) -> CapabilityEnvelope {
+        CapabilityEnvelope::new(Verb::ALL, max_row_writes).allow(1, (0..columns).map(ColumnCapability::open).collect())
+    }
+
+    /// 153 open columns numbered from 1 instead of 0: the same count, so the same length and the
+    /// same 21-byte header as `envelope_of(153)`, but different column ids.
+    fn envelope_shifted_153() -> CapabilityEnvelope {
+        CapabilityEnvelope::new(Verb::ALL, 10).allow(1, (1..=153).map(ColumnCapability::open).collect())
+    }
+
+    /// **An envelope too large for a B+tree entry refuses the whole record, before any key of it
+    /// is written.** 153 columns is 21 + 8 + 153·13 = 2018 bytes of envelope. Under the 9-byte
+    /// envelope key the entry is 4 + 9 + 4 + 2018 = 2035 bytes, one over the bound; 152 columns
+    /// is 2022, under it. Expected sizes are this arithmetic.
+    #[test]
+    fn an_envelope_over_the_entry_bound_refuses_the_whole_record() {
+        let (cat, _p) = fresh_catalog();
+        let trunk = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
+        assert_eq!(envelope_of(153).serialize().len(), 2018, "premise: the envelope's size");
+
+        let mut over = trunk.clone();
+        over.branch_id = BranchId::new(4242, 0);
+        over.envelope = Some(envelope_of(153));
+        let e = cat.write_record_new(&over).expect_err("a 2035-byte envelope entry must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert!(cat.core(4242).expect("read").is_none(), "the record key was written before the refusal");
+        assert_eq!(cat.tree.search(&keys::envelope(4242)).expect("search"), None);
+
+        // Negative control: one column fewer lands whole.
+        let mut under = trunk.clone();
+        under.branch_id = BranchId::new(4243, 0);
+        under.envelope = Some(envelope_of(152));
+        cat.write_record_new(&under).expect("a 2022-byte envelope entry is under the bound");
+        assert!(cat.core(4243).expect("read").is_some(), "the record under the bound was not written");
+        assert_eq!(
+            cat.tree.search(&keys::envelope(4243)).expect("search"),
+            Some(envelope_of(152).serialize()),
+            "the envelope under the bound was not written"
+        );
+    }
+
+    /// Put `keys::envelope(id) -> bytes` straight into the catalog tree's root leaf, below the tree
+    /// API (which now refuses an entry this size), as a build before D225 could have left it.
+    fn plant_legacy_envelope(cat: &TableBranchCatalog, id: u64, bytes: Vec<u8>) {
+        let root = cat.tree.root_page_id.load(Ordering::Acquire);
+        let mut leaf = match cat.tree.read_node(root).expect("read the root") {
+            BPlusTreePage::Leaf(l) => l,
+            BPlusTreePage::Internal(_) => panic!("premise failed: a two-branch catalog's tree is one leaf"),
+        };
+        let key = keys::envelope(id);
+        let _ = leaf.remove_entry(&key);
+        leaf.insert_entry(key, bytes);
+        assert!(!leaf.is_full(), "premise failed: the planted leaf must be under the threshold, as a leaf an earlier build wrote");
+        let image = leaf.serialize().expect("the planted leaf fits its page");
+        let bp = &cat.tree.buffer_pool;
+        let frame_i = bp.fetch_page(root).expect("fetch the root");
+        let mut frame = bp.frame_write(frame_i);
+        frame.data = image;
+        drop(frame);
+        bp.unpin_page(root, true);
+    }
+
+    /// **D225 F1d — a branch whose envelope an earlier build stored over the bound can still renew
+    /// its lease and be reaped; a CHANGED over-bound envelope is still refused.**
+    ///
+    /// The envelope is 153 open columns, a 2035-byte entry under its key (the arithmetic is on the
+    /// test above), planted in the tree's page directly because every write path now refuses it.
+    /// `renew_lease` and the reaper's two `set_state` transitions hydrate the record and hand the
+    /// envelope back unchanged, so they must not re-admit it: before this, each was refused, and
+    /// the branch could never be retired. A changed envelope (154 columns: 21 + 8 + 154·13 = 2031
+    /// bytes, a 2048-byte entry) handed to `write_record` is refused before any key is written, so
+    /// the lease that call carries is not stored. Red at `72e1620` on `renew_lease`.
+    #[test]
+    fn a_legacy_over_bound_envelope_still_renews_and_reaps_and_a_changed_one_is_refused() {
+        let (cat, _p) = fresh_catalog();
+        let child = cat.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).expect("fork");
+        let id = child.branch_id.id;
+        let legacy = envelope_of(153).serialize();
+        plant_legacy_envelope(&cat, id, legacy.clone());
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "premise: the legacy envelope is stored");
+        assert!(admit_entry(&keys::envelope(id), &legacy).is_err(), "premise: the planted entry is over the bound");
+
+        cat.renew_lease(child.branch_id, LeaseDeadline(1_000_000))
+            .expect("renew_lease must not re-admit an envelope it leaves unchanged");
+        assert_eq!(cat.core(id).unwrap().unwrap().lease_deadline(), LeaseDeadline(1_000_000));
+
+        let old = cat.core(id).unwrap().unwrap();
+        let mut changed = cat.get_raw(id).unwrap();
+        changed.envelope = Some(envelope_of(154));
+        changed.lease_deadline = LeaseDeadline(7);
+        let e = cat.write_record(&changed, Some(&old)).expect_err("a changed over-bound envelope must be refused");
+        assert!(e.to_string().contains("index entry too large: 2048 bytes"), "not the named refusal: {e}");
+        assert_eq!(
+            cat.core(id).unwrap().unwrap().lease_deadline(),
+            LeaseDeadline(1_000_000),
+            "the refused write stored its record before refusing the envelope"
+        );
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused write changed the envelope");
+
+        // M26b (review 5): a change of the SAME length is still a change. Only the budget differs
+        // here. The production shape this guards is `fork_staged`'s recycled-id path (review 6
+        // F4): the stored bytes there are the REAPED occupant's envelope and the child's are
+        // `parent.inherited()`, so they can differ in their counters, or in their tables at the
+        // same length (M26c below).
+        let same_length = envelope_with_budget(153, 11).serialize();
+        assert_eq!(same_length.len(), legacy.len(), "premise: the same encoded length");
+        assert_ne!(same_length, legacy, "premise: different bytes");
+        let mut rebudgeted = cat.get_raw(id).unwrap();
+        rebudgeted.envelope = Some(envelope_with_budget(153, 11));
+        rebudgeted.lease_deadline = LeaseDeadline(8);
+        let e = cat.write_record(&rebudgeted, Some(&old)).expect_err("a same-length changed over-bound envelope must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(
+            cat.core(id).unwrap().unwrap().lease_deadline(),
+            LeaseDeadline(1_000_000),
+            "the refused same-length write stored its record"
+        );
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused same-length write changed the envelope");
+
+        // M26c (review 6): the same length AND the same 21-byte header (verbs, budget, row-writes,
+        // table count), with different column ids. A comparison of length plus header would call
+        // this unchanged and leave the stored grants in place.
+        let shifted = envelope_shifted_153().serialize();
+        assert_eq!(shifted.len(), legacy.len(), "premise: the same encoded length");
+        assert_eq!(shifted[..21], legacy[..21], "premise: the same 21-byte header");
+        assert_ne!(shifted, legacy, "premise: different bytes");
+        let mut regranted = cat.get_raw(id).unwrap();
+        regranted.envelope = Some(envelope_shifted_153());
+        regranted.lease_deadline = LeaseDeadline(9);
+        let e = cat
+            .write_record(&regranted, Some(&old))
+            .expect_err("a same-length, same-header changed over-bound envelope must be refused");
+        assert!(e.to_string().contains("index entry too large: 2035 bytes"), "not the named refusal: {e}");
+        assert_eq!(
+            cat.core(id).unwrap().unwrap().lease_deadline(),
+            LeaseDeadline(1_000_000),
+            "the refused same-header write stored its record"
+        );
+        assert_eq!(cat.tree.search(&keys::envelope(id)).unwrap(), Some(legacy.clone()), "the refused same-header write changed the envelope");
+
+        cat.set_state(child.branch_id, BranchState::Live, BranchState::Reaping).expect("Live -> Reaping");
+        cat.set_state(child.branch_id, BranchState::Reaping, BranchState::Reaped).expect("Reaping -> Reaped");
+        assert_eq!(cat.core(id).unwrap().unwrap().state(), BranchState::Reaped, "the branch was not retired");
+    }
+}
+
+#[cfg(test)]
 mod serial_section_profile {
     //! Where does the ~0.22 ms a fork holds `logical` actually go? (S8 / D8)
     //!
@@ -2734,5 +2961,15 @@ enum ChildLiveness {
     // rather than a value, because it is not a fact about the child: it is equally the signature
     // of a record being rewritten right now (`dangling_child` has the mechanism). Keeping the
     // variant unconstructed would only invite the next reader to resolve into it again.
+}
+
+/// What [`TableBranchCatalog::write_record`] does to a record's envelope key. D225.
+enum EnvelopeWrite {
+    /// The stored envelope is already this one, byte for byte: nothing is written or asked.
+    Unchanged,
+    /// Write these bytes, which the entry bound has already admitted.
+    Put(Vec<u8>),
+    /// The record carries no envelope: remove any stored one.
+    Remove,
 }
 
