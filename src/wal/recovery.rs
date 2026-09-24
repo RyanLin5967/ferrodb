@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{agent_sql::runtime::AgentRuntime, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{agent_sql::runtime::{table_id, AgentRuntime}, buffer::buffer_pool::BufferPoolManager, provenance::{DurableProvenanceStore, ProvenanceStore}, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -420,37 +420,86 @@ pub struct OpenedDatabase {
     /// what keeps an unread field from failing the build.
     #[cfg(test)]
     completed_drops: Vec<String>,
-    /// Every table a `DropTable` record in the retained log names and this open's catalog does not:
-    /// the tables whose provenance [`OpenedDatabase::attach_runtime`] forgets (D250 review 2's R2-4).
-    /// It contains `completed_drops`. PRIVATE for the same reason.
+    /// Every table a `DropTable` record in the retained log names and this open's catalog does not
+    /// (D250 review 2's R2-4). It contains `completed_drops`. `open_recovered` forgot them in the
+    /// database's provenance file; [`OpenedDatabase::attach_runtime`] forgets them in an in-memory
+    /// store. PRIVATE for the same reason.
     dropped_tables: Vec<String>,
+    /// The database's provenance file, when this open opened it to forget `dropped_tables` in it
+    /// (D250 review 3's A). Handed to the runtime by [`OpenedDatabase::attach_runtime`], so the file
+    /// has one owner per process.
+    provenance: Option<Arc<DurableProvenanceStore>>,
+    /// Where that file lives: [`provenance_path`] of the database.
+    provenance_path: PathBuf,
+}
+
+/// Where a database's durable provenance store lives: beside it, `<db>.provenance`. One spelling, for
+/// `open_recovered`'s forget and [`OpenedDatabase::attach_runtime`] (D250 review 3's A); the CLI
+/// spelled it itself before.
+pub fn provenance_path(db_path: &Path) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(".provenance");
+    PathBuf::from(path)
+}
+
+/// DROPs whose table's authors `open_recovered` could not forget in the provenance file, since
+/// process start (D250 review 3's A). The store poisons itself on such a failure, so every later
+/// provenance call refuses; this counts and the open prints it.
+pub static PROVENANCE_FORGET_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`PROVENANCE_FORGET_FAILURES`].
+pub fn provenance_forget_failures() -> u64 {
+    PROVENANCE_FORGET_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Where an attached runtime keeps its row authors (D250 review 3's A).
+pub enum ProvenanceBacking {
+    /// The database's provenance file (the CLI): the store `open_recovered` opened, which it has
+    /// already made forget every dropped table, or the file opened here when it had nothing to forget.
+    Durable,
+    /// The runtime's own in-memory store (pgserver). The dropped tables are forgotten in it, which is
+    /// a stated no-op in production: a new process's in-memory store starts empty.
+    InMemory,
 }
 
 impl OpenedDatabase {
     /// **The one door an agent runtime comes through onto an opened database** (D250 review 1's F7,
-    /// the lead's ruling, the same "one function both call" rule as D204). It forgets the provenance
-    /// of every table the retained log records as dropped and the catalog does not name, as the
-    /// executor does after a DROP (B9, `AgentRuntime::forget_table`), so a table later created under
-    /// the name does not inherit the dropped one's authors. The list is private to this module, so an
-    /// entry point cannot run the forget itself and cannot leave it out; `tests/open_path_allowlist.rs`
-    /// checks that both production entry points build their runtime through here. It lives in the WAL
-    /// module because a door in `agent_sql::runtime` would need the list `pub(crate)`, which the CLI
-    /// could read.
+    /// the lead's ruling, the same "one function both call" rule as D204). A table the retained log
+    /// records as dropped, and the catalog does not name, must not keep its authors, or a table later
+    /// created under the name inherits them (B9, `AgentRuntime::forget_table`).
     ///
-    /// **Idempotent, and repeated at every open until it has run** (D250 review 2's R2-4): not only the
-    /// DROPs this open completed, but every one the log still records. A crash after an open made its
-    /// completion durable and before a runtime was attached is caught by the next open, because
-    /// [`open_recovered`] re-declares such a DROP after a checkpoint that truncated past it. The same
-    /// record catches a crash between the executor's DROP and its own forget: `ddl_unit` re-declares
-    /// the DROP after its truncation. pgserver's forget is a no-op, because its provenance store is in
-    /// memory.
+    /// - [`ProvenanceBacking::Durable`] installs the database's provenance file.
+    ///   [`open_recovered`] forgot the dropped tables in it BEFORE its checkpoint truncated their
+    ///   records (D250 review 3's A), so nothing is left to do here but hand it over. The file is
+    ///   opened once per process: the open's store, or opened here when the open had nothing to
+    ///   forget.
+    /// - [`ProvenanceBacking::InMemory`] keeps the runtime's own store and forgets the dropped tables
+    ///   in it, which is a stated no-op in production (pgserver's store starts empty).
     ///
-    /// `&self` and no drain: every runtime attached to one open forgets the same tables.
-    pub fn attach_runtime(&self, runtime: AgentRuntime) -> Arc<AgentRuntime> {
-        for table in &self.dropped_tables {
-            runtime.forget_table(table);
-        }
-        Arc::new(runtime)
+    /// The lists are private to this module, so an entry point cannot run the forget itself and cannot
+    /// leave it out; `tests/open_path_allowlist.rs` checks that both production entry points build
+    /// their runtime through here, with their backing, and that nothing else names
+    /// `with_durable_provenance`. **Not type-forced, stated:** `AgentRuntime`'s constructors are
+    /// public and used across the test suite, so a runtime can still be built without this door.
+    ///
+    /// `&self` and no drain: every runtime attached to one open is attached the same way.
+    pub fn attach_runtime(&self, runtime: AgentRuntime, backing: ProvenanceBacking) -> Result<Arc<AgentRuntime>, FerroError> {
+        let runtime = match backing {
+            ProvenanceBacking::Durable => {
+                let store = match &self.provenance {
+                    Some(store) => store.clone(),
+                    None => Arc::new(DurableProvenanceStore::open(&self.provenance_path)?),
+                };
+                runtime.with_provenance_store(store)
+            }
+            ProvenanceBacking::InMemory => {
+                for table in &self.dropped_tables {
+                    runtime.forget_table(table);
+                }
+                runtime
+            }
+        };
+        Ok(Arc::new(runtime))
     }
 }
 
@@ -498,8 +547,9 @@ type LoggedDrop = (String, u32, u32, u64);
 /// Left alone, as a NEW table re-created at the same root:
 /// - one with any DDL record other than a `DropTable` at the root after the DROP: its `CreateTable`,
 ///   or an `AlterColumn` that answered `Ok` (D250 review 2's R2-2). CREATE INDEX logs no DDL record,
-///   so a CREATE INDEX on a table re-created as below, under a pin that keeps the old DROP, is not
-///   seen: stated;
+///   so a CREATE INDEX on a table re-created as below is not seen while something keeps the old DROP
+///   in the log: a pin, or a release still owed (its checkpoint then answers `KeptForOwed` without
+///   truncating; D250 review 3's B). Stated;
 /// - one with any heap record (or CLR) on its heap or time-travel root after the DROP (D250 review
 ///   1's F2). A CREATE whose checkpoint wrote the catalog and then failed to sync logs no
 ///   `CreateTable`, but every row committed into it leaves such a record. An EMPTY table re-created
@@ -622,6 +672,45 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
              any of its pages the DROP had not freed yet are leaked"
         );
     }
+    // **D250 review 3's A (the lead's decision): the provenance forget runs HERE, before the
+    // checkpoint below truncates the log.** Every table the retained log records as dropped and the
+    // catalog now does not name (a table re-created under the name is named, and its provenance is
+    // its own) is forgotten in the database's provenance file, when there is one. The completion
+    // above becomes durable only at that checkpoint, so a crash before it repeats this open whole,
+    // and the forget is idempotent: nothing is re-declared, and no later open is left to finish it.
+    // `dd939ab` re-declared each such `DropTable` after the checkpoint instead, and `recover` counts
+    // any non-empty log as recovered, so every open of a process that never truncated after its open
+    // (pgserver always, a killed CLI) rebuilt every index. The same record covers a crash between
+    // the executor's DROP and its own forget (B9): `ddl_unit` re-appends the DROP after its
+    // truncation, for the change feed, and the next open finds it. The store is handed to the
+    // runtime through `attach_runtime`, so the file is opened once per process.
+    let mut dropped_tables: Vec<String> = logged_drops
+        .into_iter()
+        .filter(|(table, ..)| catalog.get_table(table).is_none())
+        .map(|(table, ..)| table)
+        .collect();
+    dropped_tables.sort_unstable();
+    dropped_tables.dedup();
+    let provenance_path = provenance_path(db_path);
+    let provenance = if dropped_tables.is_empty() || !provenance_path.exists() {
+        None
+    } else {
+        let store = Arc::new(DurableProvenanceStore::open(&provenance_path)?);
+        for table in &dropped_tables {
+            if let Err(e) = store.forget_table(table_id(table).0) {
+                use std::io::Write;
+                PROVENANCE_FORGET_FAILURES.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: the DROP of `{table}` is in the log, but its authors could not be forgotten in {} ({e}); \
+                     the provenance store now refuses every call, and a table created under the name would \
+                     inherit them",
+                    provenance_path.display()
+                );
+            }
+        }
+        Some(store)
+    };
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
     // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
@@ -656,30 +745,6 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             }
         }
     }
-    // D250 review 2's R2-4 (the lead's decision): every table the log records as dropped and the
-    // catalog now does not name has its provenance forgotten by `attach_runtime`, at this open and at
-    // every later one until a runtime has been attached. A table re-created under the name is named
-    // by the catalog, and its provenance is its own. The checkpoint above may have truncated those
-    // records away BEFORE any runtime is attached, and a crash then would lose the forget for good;
-    // so each is declared again, as `ddl_unit` does after a DROP's truncation, and stays until the
-    // running process's next truncating checkpoint, which comes after the door. Cost, stated: a
-    // crash-residue log that holds only such a record makes the next open replay and rebuild every
-    // index (D216's term); a clean CLI exit truncates it.
-    let dropped: Vec<LoggedDrop> = logged_drops.into_iter().filter(|(table, ..)| catalog.get_table(table).is_none()).collect();
-    for (table, dir_root, time_travel_root, at) in &dropped {
-        if wal.base_lsn.load(Ordering::SeqCst) > *at {
-            txn.declare_drop_again(&crate::wal::txn::DdlRecord {
-                op: DdlOp::DropTable,
-                table: table.clone(),
-                dir_root: *dir_root,
-                time_travel_root: *time_travel_root,
-                columns: Vec::new(),
-            })?;
-        }
-    }
-    let mut dropped_tables: Vec<String> = dropped.into_iter().map(|(table, ..)| table).collect();
-    dropped_tables.sort_unstable();
-    dropped_tables.dedup();
     Ok(OpenedDatabase {
         bp,
         wal,
@@ -689,6 +754,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         #[cfg(test)]
         completed_drops,
         dropped_tables,
+        provenance,
+        provenance_path,
     })
 }
 
@@ -1944,7 +2011,8 @@ use super::*;
                 "premise failed: row 1 of `{table}` was not attributed before the runtime was attached"
             );
         }
-        let runtime = o.attach_runtime(runtime);
+        // `InMemory` and `.unwrap()`: the door's signature since lane §3.15. The assertions are unchanged.
+        let runtime = o.attach_runtime(runtime, ProvenanceBacking::InMemory).unwrap();
         assert_eq!(
             runtime.provenance().row_author(table_id("t").0, 1).unwrap(),
             ProvId::NONE,

@@ -229,6 +229,26 @@ pub fn txn_end_failures() -> u64 {
     TXN_END_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Poisons the log if dropped while `armed`: `ddl_unit` arms it once a DROP's record is durable and
+/// disarms it when the DROP's mutation returns, so only an unwind through the mutation poisons (D250
+/// review 3's Q4).
+struct PoisonOnUnwind<'a> {
+    wal: &'a WalManager,
+    table: &'a str,
+    armed: bool,
+}
+
+impl Drop for PoisonOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.wal.poison(&format!(
+                "the DROP of `{}` panicked after its record was durable; the next open completes it",
+                self.table
+            ));
+        }
+    }
+}
+
 /// Mismatch lines written from a STORED observation, since process start (review 7's F4): a
 /// mismatch whose first quarantine write failed, recorded later by a retry that could not read the
 /// page. Its release stays owed, so it is not in [`RELEASE_MISMATCHES`], which counts a mismatch when
@@ -298,6 +318,7 @@ pub fn failure_counters_line() -> Option<String> {
         ("release mismatches", release_mismatches()),
         ("mismatches recorded from a stored observation", stored_mismatch_lines()),
         ("commits whose TxnEnd could not be written", txn_end_failures()),
+        ("dropped tables whose authors could not be forgotten", crate::wal::recovery::provenance_forget_failures()),
         ("directory update failures", directory_update_failures()),
         ("deferred checkpoints", deferred_checkpoints()),
         ("drops that kept the log", kept_log_drops()),
@@ -1581,15 +1602,6 @@ impl TxnManager {
             .map(|r| r.columns.clone())
     }
 
-    /// Declare a completed DROP again, durably, after a checkpoint truncated past its record: the
-    /// open's half of the rule `ddl_unit` follows after a DROP's truncation (D250 review 2's R2-4,
-    /// `wal::recovery::open_recovered`). Not retained in the schema: the running process's next
-    /// truncating checkpoint drops it, after the provenance forget it exists for has run.
-    pub(crate) fn declare_drop_again(&self, r: &DdlRecord) -> Result<(), FerroError> {
-        self.append_ddl(r)?;
-        self.wal.flush()
-    }
-
     fn append_ddl(&self, r: &DdlRecord) -> Result<(), FerroError> {
         self.wal.append(
             0,
@@ -1753,7 +1765,16 @@ impl TxnManager {
             ));
             return Err(e);
         }
-        let out = match f() {
+        // **D250 review 3's Q4: a PANIC in `f` poisons the log too.** It is the same state as `f`'s
+        // `Err`: the record is durable, the next open completes the DROP, and nothing may write the
+        // table meanwhile. Until this, a panic was fail-stop only because `f` runs inside `att`'s
+        // critical section and the unwind poisoned that `Mutex`, a property of lock placement that
+        // nothing pinned.
+        let mut unwinding = PoisonOnUnwind { wal: &*self.wal, table: &record.table, armed: true };
+        let returned = f();
+        unwinding.armed = false;
+        drop(unwinding);
+        let out = match returned {
             Ok(out) => out,
             Err(e) => {
                 self.wal.poison(&format!(

@@ -1443,11 +1443,18 @@ impl AgentRuntime {
     /// path applies it, and the three constructors keep their signatures and their many call sites.
     /// A runtime built without it still works — it is simply in-memory, which is what a test wants.
     pub fn with_durable_provenance(
-        mut self,
+        self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, FerroError> {
-        self.prov_store = Arc::new(crate::provenance::DurableProvenanceStore::open(path)?);
-        Ok(self)
+        Ok(self.with_provenance_store(Arc::new(crate::provenance::DurableProvenanceStore::open(path)?)))
+    }
+
+    /// Install a provenance store someone else opened: `wal::recovery::OpenedDatabase::attach_runtime`
+    /// hands over the database's provenance file, which the open has already made forget every
+    /// dropped table (D250 review 3's A), so the file has one owner per process.
+    pub(crate) fn with_provenance_store(mut self, store: Arc<dyn ProvenanceStore>) -> Self {
+        self.prov_store = store;
+        self
     }
 
     pub fn provenance(&self) -> &Arc<dyn ProvenanceStore> {
