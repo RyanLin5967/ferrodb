@@ -161,3 +161,18 @@ A Python PORT of its rule was RUN over committed trees; this is evidence about t
 - at `b5793ca`: no offenders.
 
 If adopted, the allowlist target gains 1 test (its planted fire-check). That test is not in the prediction above.
+
+---
+
+## Amendment 3 (appended before any run): correction to amendment 2's mutant sentence
+
+Amendment 2 says "T9 is expected to pass under each of [K1 to K14]". **That is wrong for K2 and
+K8.** I found this by re-deriving each mutant against T9's fixture, which has a full-text index and
+no B-tree index on `body`:
+
+- **K2** (the lookup maps FullText to Secondary). `sync_root_cells` still seeds `(t, FullText(body))` under its true key, but every `root_cell(.., FullText(..))` lookup now asks for `Secondary(body)`, which does not exist. SEARCH therefore falls back to the snapshot's stale record: **T9 FAILS**.
+- **K8** (`sync_root_cells` seeds the full-text index under Secondary). No `FullText(body)` cell ever exists, so SEARCH falls back to the record: **T9 FAILS**.
+- **K1** (the whole shared key restored) is NOT a kill for T9. The one full-text index then seeds `Secondary(body)`, and both the insert handle and SEARCH resolve to that same shared cell. T9 passes, as amendment 2 says.
+- K3 to K7 and K9 to K14 leave T9 passing, as amendment 2 says. K3 and K7 were re-checked specifically: under each, the full-text cell still ends at the current root (K3 through `update_fulltext_root`'s store into the true key; K7 through the handle's own split into the shared cell).
+
+Corrected expected kills: K2 fails T1 T2 T3 T5 T6 T7 T8 **T9**. K8 fails T2 T5 T6 T7 T8 **T9**. K16 and K17 fail T9. K15 fails U1.
