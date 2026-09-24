@@ -24,20 +24,23 @@
 //! anywhere earlier is a fixture that did not build what it says.
 
 use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::reaper::TwoTierReaper;
-use ferrodb::branch::record::BranchRecord;
+use ferrodb::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use ferrodb::branch::table_catalog::TableBranchCatalog;
-use ferrodb::branch::types::{BranchId, BranchState, Epoch, LeaseDeadline};
+use ferrodb::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::DiskManager;
 
 struct Fixture {
     concrete: Arc<TableBranchCatalog>,
     catalog: Arc<dyn BranchCatalog>,
+    store: Arc<ArenaPageStore>,
     reaper: TwoTierReaper,
     _dir: tempfile::TempDir,
 }
@@ -52,8 +55,8 @@ fn fixture() -> Fixture {
     let catalog: Arc<dyn BranchCatalog> = concrete.clone();
     let base = pool.disk_manager.high_water().unwrap();
     let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), base).unwrap());
-    let reaper = TwoTierReaper::new(Arc::clone(&catalog), store);
-    Fixture { concrete, catalog, reaper, _dir: dir }
+    let reaper = TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store));
+    Fixture { concrete, catalog, store, reaper, _dir: dir }
 }
 
 /// Fork `n` branches off trunk and return, sorted, the ids of those that reused a slot.
@@ -145,8 +148,17 @@ fn the_open_sweep_gives_back_leaked_slots_and_nothing_else() {
     let free = c.fork(t, LeaseDeadline(u64::MAX)).unwrap();
     f.reaper.reap(free.branch_id).unwrap();
 
+    let keys_before = f.concrete.candidate_keys_scanned();
     let resumed = f.reaper.resume_interrupted_reaps().unwrap();
     assert!(resumed.is_empty(), "fixture: nothing was left Reaping, so nothing may be resumed");
+    // F3 (review audit): the POSITIVE control for the grid test's `== 0`. L, Q and Z are keyed;
+    // X, Y and P lost their keys at their pinned flips; F was released. So the candidate query
+    // reads exactly 3 keys, which also proves the instrument counts (lane §8.7).
+    assert_eq!(
+        f.concrete.candidate_keys_scanned() - keys_before,
+        3,
+        "the open sweep's candidate query did not read exactly the three keyed slots L, Q and Z"
+    );
 
     // IDEMPOTENT, and on a catalog with nothing to give back it WRITES NOTHING: a second open
     // issues no fsync at all. (Only `P` is left unreleased, and it is pinned.)
@@ -264,4 +276,225 @@ fn a_healthy_open_reads_no_released_and_no_pinned_slot() {
              slots; none of them can be released now, so every key read is the wall this removes"
         );
     }
+}
+
+/// A catalog that fails ONE operation on purpose, so a cascade is left in the state a crash or an
+/// I/O error leaves it in. Everything else is delegated untouched.
+struct Faulty {
+    inner: Arc<dyn BranchCatalog>,
+    /// Fail the Nth `detach_child` (1-based); 0 = never.
+    fail_detach_at: u64,
+    detaches: AtomicU64,
+    /// Fail the next `get_raw` of this id, once; `u64::MAX` = never.
+    fail_get_raw_of: AtomicU64,
+}
+
+fn injected(what: &str) -> FerroError {
+    BranchError::Corrupt(format!("injected failure: {what}")).into()
+}
+
+impl BranchCatalog for Faulty {
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        if self
+            .fail_get_raw_of
+            .compare_exchange(id, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(injected("get_raw"));
+        }
+        self.inner.get_raw(id)
+    }
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        let n = self.detaches.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_detach_at {
+            return Err(injected("detach_child"));
+        }
+        self.inner.detach_child(parent_id, fork_epoch)
+    }
+    fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
+        self.inner.get(branch)
+    }
+    fn next_epoch(&self) -> Epoch {
+        self.inner.next_epoch()
+    }
+    fn current_epoch(&self) -> Epoch {
+        self.inner.current_epoch()
+    }
+    fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+        self.inner.fork(parent, lease)
+    }
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(branch, parent, fork_epoch, root)
+    }
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(branch, envelope)
+    }
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        self.inner.set_state(branch, expect, to)
+    }
+    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
+        self.inner.set_root(branch, root)
+    }
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        self.inner.expired_before(now_millis)
+    }
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        self.inner.in_state(state)
+    }
+    fn scan(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        self.inner.scan()
+    }
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        self.inner.max_live_child(parent_id)
+    }
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        self.inner.live_child_in_epoch_range(parent_id, lo, hi)
+    }
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        self.inner.has_live_children(parent_id)
+    }
+    fn live_count(&self) -> usize {
+        self.inner.live_count()
+    }
+    fn release_id(&self, id: u64) {
+        self.inner.release_id(id)
+    }
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        child_id: u64,
+    ) -> Result<(), FerroError> {
+        self.inner.attach_child(parent_id, fork_epoch, child_id)
+    }
+    fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
+        self.inner.renew_lease(branch, lease)
+    }
+    fn charge_row_writes(&self, branch: BranchId, rows: u64) -> Result<(), FerroError> {
+        self.inner.charge_row_writes(branch, rows)
+    }
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(branch, arena)
+    }
+}
+
+fn faulty_over(f: &Fixture, fail_detach_at: u64) -> Arc<Faulty> {
+    Arc::new(Faulty {
+        inner: Arc::clone(&f.catalog),
+        fail_detach_at,
+        detaches: AtomicU64::new(0),
+        fail_get_raw_of: AtomicU64::new(u64::MAX),
+    })
+}
+
+fn reaper_through(f: &Fixture, faulty: &Arc<Faulty>) -> TwoTierReaper {
+    TwoTierReaper::new(Arc::clone(faulty) as Arc<dyn BranchCatalog>, Arc::clone(&f.store))
+}
+
+/// T → Q → P → L, with P then Q reaped (both pinned by L) through a reaper over `faulty`, which
+/// has not fired yet: a pinned reap stops before any detach. Returns (Q, P, L).
+fn pinned_pair_over(f: &Fixture, faulty: &Arc<Faulty>) -> (BranchId, BranchId, BranchId) {
+    let c = &*f.catalog;
+    let q = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let p = c.fork(q, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let l = c.fork(p, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let through = reaper_through(f, faulty);
+    through.reap(p).unwrap();
+    through.reap(q).unwrap();
+    assert_eq!(faulty.detaches.load(Ordering::SeqCst), 0, "fixture: a pinned reap detached something");
+    (q, p, l)
+}
+
+/// The ids among `forks` (already made) plus `more` further forks off trunk that reused a slot.
+fn recycled_among(c: &dyn BranchCatalog, forks: Vec<BranchId>, more: usize) -> Vec<u64> {
+    let mut all = forks;
+    for _ in 0..more {
+        all.push(c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id);
+    }
+    let mut out: Vec<u64> = all.into_iter().filter(|b| b.generation != 0).map(|b| b.id).collect();
+    out.sort_unstable();
+    out
+}
+
+/// **F1 (review audit), schedule 1: a cascade that fails part-way, then a fork that recycles a slot
+/// the cascade had already released, then the open sweep.** The failure stands in for a crash at
+/// the same point. At `23d8e97` the cascade released P before its third detach failed, the fork
+/// recycles P, the sweep's re-walk from L stops at the recycled P, and Q is stranded: `Reaped`,
+/// unreleased, with no key. PRE-REGISTERED (lane §8.7): `{L, P}` at `23d8e97`, which fails here,
+/// and `{L, P, Q}` after the fix.
+#[test]
+fn a_cascade_that_fails_part_way_strands_no_ancestor() {
+    let f = fixture();
+    let faulty = faulty_over(&f, 3);
+    let (q, p, l) = pinned_pair_over(&f, &faulty);
+    assert!(
+        reaper_through(&f, &faulty).reap(l).is_err(),
+        "fixture: the third detach was meant to fail the leaf's reap"
+    );
+
+    // A fork before any sweep: whatever the failed cascade already released can be recycled now.
+    let first = f.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap().branch_id;
+    let fresh = TwoTierReaper::new(Arc::clone(&f.catalog), Arc::clone(&f.store));
+    assert!(fresh.resume_interrupted_reaps().unwrap().is_empty());
+
+    let mut want = vec![q.id, p.id, l.id];
+    want.sort_unstable();
+    assert_eq!(
+        recycled_among(&*f.catalog, vec![first], 3),
+        want,
+        "F1: a slot the failed cascade had released was recycled, the sweep's walk stopped there, \
+         and an ancestor above it was stranded with no key"
+    );
+}
+
+/// **F1 (review audit), schedule 2: a cascade that cannot read a parent.** At `23d8e97` a `get_raw`
+/// error was taken as "the parent is not Reaped", the cascade returned `Ok`, and the reap released
+/// the originator. That removed the only key while P and Q were still unreleased.
+/// PRE-REGISTERED (lane §8.7): `{L}` at `23d8e97`, which fails here, and `{L, P, Q}` after the fix.
+#[test]
+fn a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator() {
+    let f = fixture();
+    let faulty = faulty_over(&f, 0);
+    let (q, p, l) = pinned_pair_over(&f, &faulty);
+    // Armed only now: P's own reap read P's record, and that read must not be the one that fails.
+    faulty.fail_get_raw_of.store(p.id, Ordering::SeqCst);
+    eprintln!("F1 schedule 2: reap(L) -> {:?}", reaper_through(&f, &faulty).reap(l).map(|_| ()));
+    assert_eq!(
+        faulty.fail_get_raw_of.load(Ordering::SeqCst),
+        u64::MAX,
+        "fixture: the injected get_raw never fired"
+    );
+
+    let fresh = TwoTierReaper::new(Arc::clone(&f.catalog), Arc::clone(&f.store));
+    assert!(fresh.resume_interrupted_reaps().unwrap().is_empty());
+    let mut want = vec![q.id, p.id, l.id];
+    want.sort_unstable();
+    assert_eq!(
+        recycled_among(&*f.catalog, Vec::new(), 3),
+        want,
+        "F1: a parent read that failed mid-cascade let the reap release the originator and remove \
+         the only key, stranding every reaped ancestor above it"
+    );
 }

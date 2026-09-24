@@ -190,12 +190,14 @@ fn a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth() {
     // `2987369`. D200 (`206af08`) made `release_id` ask once per released ancestor, so the count
     // became 2D+1 from that commit on, and the bound failed there. This lane's pre-registration
     // missed that until the audit re-derivation. The §8.6 change adds one question per Reaped
-    // flip: 2D+2 at the tip (34 at D=16, 130 at D=64). The bound is now the linear window [D, 4D].
-    // A walk down the chain would be ~D²/2, 2048 at D=64, so the window still refuses the defect
-    // this control exists to catch.
+    // flip: 2D+2 at the tip (34 at D=16, 130 at D=64). `04f7b38` made the bound the window
+    // [D, 4D]. ⚠ F2 (review audit): that admitted a cascade stopping anywhere in the upper half of
+    // the chain, which the post-condition cannot see. The count is derivable exactly, so it is now
+    // asserted EXACTLY: 2D+2 (lane §8.7). A stop at level m costs 2(D−m)+2 and fails it; a walk
+    // down the chain (~D²/2) fails it too.
     for a in [&small, &large] {
         assert!(
-            a.cascade >= a.depth && a.cascade <= 4 * a.depth,
+            a.cascade == 2 * a.depth + 2,
             "CONTROL moved: cascade={} at D={} (expected 2D+2 at the branch tip, linear in D) — the \
              fixture or the pre-registered model is wrong; the class assertions below mean nothing \
              until it holds",
