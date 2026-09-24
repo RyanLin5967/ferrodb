@@ -508,25 +508,31 @@ pub fn run_agent_stmt_staged(
             Ok(Outcome::Agent(AgentOutput::Diff(runtime.diff(&mut ctx, branch)?)))
         }
         BoundAgentStmt::Merge { branch } => {
-            let report = runtime.merge(&mut ctx, branch)?;
+            let merged = runtime.merge(&mut ctx, branch);
+            // **The binding follows the runtime's state, not the result (D194 Amendment 13, A).**
             // A conflicting merge publishes nothing and leaves the branch alive, so the agent can
-            // fix the violated predicate and merge again.
-            if report.applied_to_target && current == Some(branch) {
+            // fix the violated predicate and merge again. A published merge seals it, and that
+            // includes one that then failed to record its authors and returned `Err`: the branch is
+            // gone either way, and a connection left bound to it could do nothing but reconnect.
+            if current == Some(branch) && !runtime.has_live_workspace(branch) {
                 session.agent = None;
             }
-            Ok(Outcome::Agent(AgentOutput::Merge(report)))
+            Ok(Outcome::Agent(AgentOutput::Merge(merged?)))
         }
         BoundAgentStmt::Abandon { branch } => {
-            runtime.abandon(branch)?;
+            let abandoned = runtime.abandon(branch);
             let name = session
                 .agent
                 .as_ref()
                 .filter(|a| a.branch == branch)
                 .map(|a| a.branch_name.clone())
                 .unwrap_or_else(|| branch.to_string());
-            if current == Some(branch) {
+            // As for MERGE: a branch that is no longer live, whether this ABANDON sealed it or
+            // something else did first, leaves the connection unbound.
+            if current == Some(branch) && !runtime.has_live_workspace(branch) {
                 session.agent = None;
             }
+            abandoned?;
             Ok(Outcome::Agent(AgentOutput::Abandoned { branch: name }))
         }
         BoundAgentStmt::Rebase { branch } => {

@@ -678,11 +678,18 @@ impl ProvenanceStore for DurableProvenanceStore {
         Ok(())
     }
 
+    // **A poisoned store answers no authorship question (D194 Amendment 13, D).** The append that
+    // poisoned it may have been exactly the stamp that moved a row to its new author, and every
+    // stamp after it was refused. So what memory holds for those rows is their PREVIOUS author, a
+    // confident wrong answer. The physical `attribute` / `who_wrote(rid)` reads keep answering:
+    // they are keyed by the version slot, which a refused stamp never moved.
     fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+        self.refuse_if_poisoned()?;
         self.mem.row_author(table, row)
     }
 
     fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        self.refuse_if_poisoned()?;
         self.mem.attributed_rows(table)
     }
 

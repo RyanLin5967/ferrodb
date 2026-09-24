@@ -961,7 +961,11 @@ pub struct DiffCost {
 ///
 /// The bound is independent of merges: per row, the newest entry, plus one entry per distinct live
 /// pin value that reads an older version, plus garbage kept below half the row (see `garbage`).
-/// Entries still waiting in `pending` are over that, and are freed as it drains.
+/// Entries still waiting in `pending` are over that. ⚠ The queue is NOT guaranteed to drain (review
+/// 6, E). When the lowest live pin departs, its interval `(0, p]` swallows the queue's partly swept
+/// front, and re-tests entries a higher pin still reads. Under oldest-first turnover that can
+/// starve the entries behind them. Amendment 13 registers the replacement, which queues each
+/// departure's own entries by their highest live reader.
 ///
 /// All four fields are derived from `workspaces` and `version_history`, and they change only
 /// through `State`'s own methods. None holds per-branch state that a statement can write.
@@ -2503,6 +2507,24 @@ impl AgentRuntime {
             }
         }
         (pinned, distinct.len(), ids)
+    }
+
+    /// Whether this runtime still holds a live workspace for `branch`: it has been forked and not
+    /// yet merged, abandoned or reaped. A SQL session unbinds its branch on exactly this answer
+    /// after a MERGE or an ABANDON, whatever that statement returned (Amendment 13, A).
+    pub fn has_live_workspace(&self, branch: BranchId) -> bool {
+        self.state.lock().unwrap().workspaces.contains_key(&branch)
+    }
+
+    /// The merge id this runtime recorded for a merge FROM `branch`, if any. A record exists
+    /// exactly when that merge's publish committed and its versions were recorded, whatever
+    /// failed after that.
+    ///
+    /// It scans every merge ever recorded (`merges` is not pruned). It is for an error path, the
+    /// cluster's publish-failure message (Amendment 13, C), and no statement path calls it.
+    pub fn published_merge_of(&self, branch: BranchId) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state.merges.iter().find(|(_, m)| m.branch == branch).map(|(id, _)| id.clone())
     }
 
     /// **D194 cost review (Amendment 10): what `version_history` holds.** Returns
@@ -6405,12 +6427,23 @@ impl AgentRuntime {
         // affordable. See the field docs on `AgentRuntime::attested` for why fork and commit get
         // no such commitment.
         self.attest_merge(into, self.branches.next_epoch(), &images);
-        self.seal(from, true)?;
-        if let Err(e) = authorship {
-            return Err(FerroError::Merge(format!(
-                "merge {merge_id} was published and sealed, but recording who wrote its rows \
-                 failed: {e}"
-            )));
+        // Both results are reported (Amendment 13, B): a seal that also fails must not hide that
+        // authorship is incomplete.
+        match (authorship, self.seal(from, true)) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(sealing)) => return Err(sealing),
+            (Err(stamping), Ok(())) => {
+                return Err(FerroError::Merge(format!(
+                    "merge {merge_id} was published and sealed, but recording who wrote its rows \
+                     failed: {stamping}"
+                )))
+            }
+            (Err(stamping), Err(sealing)) => {
+                return Err(FerroError::Merge(format!(
+                    "merge {merge_id} was published, but recording who wrote its rows failed \
+                     ({stamping}), and sealing its branch then failed too ({sealing})"
+                )))
+            }
         }
 
         Ok(MergeReport {
@@ -6672,10 +6705,33 @@ impl AgentRuntime {
         // Authorship of each published row, kept past `seal` AND past the process (exit criterion
         // 9). This is the write that makes `who_wrote_row` durable. Last, so that a failure here
         // leaves authorship incomplete and nothing else.
+        //
+        // **Best-effort, and never stale (Amendment 13, D).** Stopping at the first failure left
+        // every later row naming its PREVIOUS author: a version this merge replaced. So a row whose
+        // stamp fails is cleared to "nobody on record", and the loop goes on. A row that can be
+        // neither stamped nor cleared is named in the error. A durable store that refuses both is
+        // poisoned, and a poisoned store refuses to say who wrote any row (`durable.rs`).
+        let mut first_failure: Option<FerroError> = None;
+        let mut unstamped: Vec<(u32, u64)> = Vec::new();
+        let mut uncleared: Vec<(u32, u64)> = Vec::new();
         for (tbl, row) in stamps {
-            self.prov_store.stamp_row(tbl, row, snapshot.prov)?;
+            if let Err(e) = self.prov_store.stamp_row(tbl, row, snapshot.prov) {
+                unstamped.push((tbl, row));
+                if self.prov_store.stamp_row(tbl, row, ProvId::NONE).is_err() {
+                    uncleared.push((tbl, row));
+                }
+                if first_failure.is_none() {
+                    first_failure = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_failure {
+            None => Ok(()),
+            Some(e) => Err(FerroError::Provenance(format!(
+                "{e}; rows left unattributed (table, row): {unstamped:?}; of those, rows whose \
+                 previous author could not be cleared: {uncleared:?}"
+            ))),
+        }
     }
 
     // ---- ABANDON ---------------------------------------------------------------------------
