@@ -352,10 +352,25 @@ fn the_idle_probe_meters_are_readable_from_a_running_node() {
         n.net.idle_redials()
     );
 
-    // Both counters only rise, and the premise was read first, so the snapshot must show both.
-    let c = n.transport_counters();
-    assert!(c.idle_probes >= 1, "the node's snapshot hides the transport's idle probes: {c:?}");
-    assert!(c.idle_redials >= 1, "the node's snapshot hides the transport's idle redials: {c:?}");
+    // EQUAL, not merely nonzero: the snapshot must be the transport's own meters. A snapshot taken
+    // between two identical direct readings has nothing to race with, because the meters only rise.
+    let mut compared = false;
+    for _ in 0..100 {
+        let before = (n.net.idle_probes(), n.net.idle_redials());
+        let c = n.transport_counters();
+        let after = (n.net.idle_probes(), n.net.idle_redials());
+        if before == after {
+            assert_eq!(
+                (c.idle_probes, c.idle_redials),
+                before,
+                "the node's snapshot is not the transport's own probe meters: {c:?}"
+            );
+            compared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(compared, "the transport's probe meters never held still for one snapshot");
     drop(peer);
     n.shutdown();
 }
