@@ -1,0 +1,9 @@
+VOID -- do not quote any result in this directory, pass or fail.
+
+This lockrun acquisition held the suite lock 2026-09-24T22:11:22Z .. 22:19:26Z (lockrun.log). At 22:17:01Z a
+fire-check of lockrun.sh (with a TEST lock) ran `cargo clean -p ferrodb` on the REAL shared lane target
+/Users/idide/wt/ferrodb-lane-target.noindex and deleted ~14 GiB of ferrodb artifacts (team-lead, 2026-09-24).
+A binary could have been deleted or rebuilt under this run, so the lead's rule voids every result of the
+acquisition. neighbours.txt ended in "No such file or directory (os error 2)", consistent with a deleted
+binary. lib_branch.txt and mine.txt finished at ~22:13, before the wipe; they are void by the same rule.
+Kept, not deleted, per the lead. Re-run in a new acquisition: bench/wall21/green/.
