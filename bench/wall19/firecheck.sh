@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
 # lease-reap attestation, and must turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
-# section 9.4 (supersedes 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
+# section 10.4 (supersedes 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
 # Blind spots, stated: it runs three selections per mutant (the attest lib module, the three D199
