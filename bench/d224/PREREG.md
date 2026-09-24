@@ -673,3 +673,31 @@ run):
 | node | 14 | K strengthened, no test added |
 | log | 58 | |
 | replicate | 60 | |
+
+---
+
+## Amendment 9 — review 3's changes recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `c77ab7b` | amendment 8 |
+| `535d388` | "at least two frames" and the conditional re-campaign, in `transport.rs`, **comments only** |
+| `d1392da` | test L (additions); T's timing comment rewritten (comment only) |
+| `649f732` | K's fixture reworked to unequal meters, as amendment 8 registered |
+| `a508498` | N11 and N12; N10's generator comment corrected; N1–N12 regenerated from `649f732` |
+
+- **No code line in `transport.rs` changed since `c797187`**, and none since `bf1fd63`. Instrument: the
+  comment-filtered `^[-+]` diff of `transport.rs` leaves 0 lines.
+- **Removed test lines since `c797187`:**
+  - two comment lines of T's in `tests_transport.rs`;
+  - in `tests_node.rs`, K's old comments and its old premise, which only required both meters ≥ 1. The new premise
+    requires `redials ≥ 1` and `probes > redials`, which is stronger, and the equality is unchanged.
+- **Counts at `a508498`:** transport **64** on macOS, node 14, log 58, replicate 60. The whole-repo instrument
+  (`[[:space:]]` form) gives `+36 −0` against `9aa6968`.
+- **Per-target (predicted):** **2615 on macOS** (2579 measured + 36). 2614 on Linux x86_64 and aarch64. 2613
+  elsewhere.
+- **Mutants:** all twelve patches pass `git apply --check` against `a508498`'s tree. N1–N10 keep their edits; only
+  hunk context moved, and N6, N9 and N10 were the only patches rewritten. Kill sets are amendment 8's table.
+- **Commands:**
+  - N1–N6, N9 and N10 on the transport module;
+  - N7, N8, N11 and N12 on `consensus::node::tests_node::`.
