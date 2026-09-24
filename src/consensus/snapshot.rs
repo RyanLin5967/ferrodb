@@ -1301,6 +1301,10 @@ pub struct PageStoreSnapshots {
     paths: StorePaths,
     /// Scratch for `backup::take`, which writes a directory.
     scratch: PathBuf,
+    /// The transaction manager over [`Self::wal`], when one is wired (review 7's F6). An install then
+    /// forgets its release state together with the quarantine (`TxnManager::start_new_incarnation`).
+    /// None in production today.
+    txn: Option<Arc<crate::wal::txn::TxnManager>>,
 }
 
 /// The three files a snapshot install replaces, plus the page file it restores into.
@@ -1329,7 +1333,21 @@ impl PageStoreSnapshots {
             catalog_page_id,
             paths,
             scratch: scratch.into(),
+            txn: None,
         }
+    }
+
+    /// Wire the transaction manager over this store's log, so an install forgets the replaced
+    /// database's release state with its quarantine (review 7's F6). A manager over another log is
+    /// refused: its state would be cleared by an install that replaced a different database.
+    pub fn with_txn(mut self, txn: Arc<crate::wal::txn::TxnManager>) -> Result<Self, FerroError> {
+        if !Arc::ptr_eq(&txn.wal, &self.wal) {
+            return Err(FerroError::Wal(
+                "the transaction manager handed to the snapshot store is over a different log".into(),
+            ));
+        }
+        self.txn = Some(txn);
+        Ok(self)
     }
 
     /// The branch catalog as its own file format: `u32 length | BranchRecord::serialize()`.
@@ -1525,12 +1543,17 @@ impl SnapshotStore for PageStoreSnapshots {
         // mismatch of the installed one look already recorded. Before the truncation, so a failure
         // leaves the install unfinished (its marker stays) rather than the old file current.
         // Its DROP intent goes with it (D229 review 2's F11): it names the replaced database's pages, and
-        // the next open would free them under the installed one. One fresh-database transition.
-        crate::wal::txn::start_fresh_database(&self.wal.path).map_err(|e| {
-            FerroError::Wal(format!(
-                "the install could not move the replaced database's release quarantine and drop intent aside ({e})"
-            ))
-        })?;
+        // the next open would free them under the installed one. Review 7's F6: with a transaction manager
+        // wired, its owed releases and unrecorded mismatches describe the replaced database too, and go
+        // with the quarantine. Either way one fresh-database transition.
+        match &self.txn {
+            Some(txn) => txn.start_new_incarnation()?,
+            None => crate::wal::txn::start_fresh_database(&self.wal.path).map_err(|e| {
+                FerroError::Wal(format!(
+                    "the install could not move the replaced database's release quarantine and drop intent aside ({e})"
+                ))
+            })?,
+        }
         let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         self.wal.truncate(0)?;
         let after = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
