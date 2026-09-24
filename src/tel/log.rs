@@ -634,7 +634,10 @@ fn take_u32_len(
     Ok(n)
 }
 
-fn put_value(out: &mut Vec<u8>, v: &Value) -> Result<(), FerroError> {
+/// `pub(crate)` — with `take_value`, `put_op`/`take_op` and the branch and optional-value pairs —
+/// because D212's durable REVERT history (`agent_sql::revert_store`) encodes the same `Value`s and
+/// `Op`s. One exhaustive codec rather than a second copy that could disagree about a variant.
+pub(crate) fn put_value(out: &mut Vec<u8>, v: &Value) -> Result<(), FerroError> {
     match v {
         Value::Integer(i) => {
             out.push(V_INTEGER);
@@ -675,7 +678,7 @@ fn put_value(out: &mut Vec<u8>, v: &Value) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn take_value(body: &[u8], at: &mut usize) -> Result<Value, FerroError> {
+pub(crate) fn take_value(body: &[u8], at: &mut usize) -> Result<Value, FerroError> {
     Ok(match take_u8(body, at)? {
         V_INTEGER => Value::Integer(take_u32(body, at)? as i32),
         V_VARCHAR => Value::Varchar(take_str(body, at)?),
@@ -705,7 +708,7 @@ fn take_value(body: &[u8], at: &mut usize) -> Result<Value, FerroError> {
     })
 }
 
-fn put_opt_value(out: &mut Vec<u8>, v: &Option<Value>) -> Result<(), FerroError> {
+pub(crate) fn put_opt_value(out: &mut Vec<u8>, v: &Option<Value>) -> Result<(), FerroError> {
     match v {
         None => out.push(0),
         Some(v) => {
@@ -716,7 +719,7 @@ fn put_opt_value(out: &mut Vec<u8>, v: &Option<Value>) -> Result<(), FerroError>
     Ok(())
 }
 
-fn take_opt_value(body: &[u8], at: &mut usize) -> Result<Option<Value>, FerroError> {
+pub(crate) fn take_opt_value(body: &[u8], at: &mut usize) -> Result<Option<Value>, FerroError> {
     match take_u8(body, at)? {
         0 => Ok(None),
         1 => Ok(Some(take_value(body, at)?)),
@@ -729,13 +732,13 @@ fn take_opt_value(body: &[u8], at: &mut usize) -> Result<Option<Value>, FerroErr
 
 // ---- ids --------------------------------------------------------------------------------------
 
-fn put_branch(out: &mut Vec<u8>, b: BranchId) {
+pub(crate) fn put_branch(out: &mut Vec<u8>, b: BranchId) {
     // `id` then `generation`, the layout `provenance::durable` already writes for a `BranchId`.
     out.extend_from_slice(&b.id.to_be_bytes());
     out.extend_from_slice(&b.generation.to_be_bytes());
 }
 
-fn take_branch(body: &[u8], at: &mut usize) -> Result<BranchId, FerroError> {
+pub(crate) fn take_branch(body: &[u8], at: &mut usize) -> Result<BranchId, FerroError> {
     let id = take_u64(body, at)?;
     let generation = take_u32(body, at)?;
     Ok(BranchId::new(id, generation))
@@ -797,7 +800,7 @@ fn take_delta(body: &[u8], at: &mut usize) -> Result<Delta, FerroError> {
 /// The smallest an `Op` can be: `tbl(4) | row(8) | col-absent(1) | kind(1) | witness-absent(1)`.
 const OP_MIN: usize = 15;
 
-fn put_op(out: &mut Vec<u8>, op: &Op) -> Result<(), FerroError> {
+pub(crate) fn put_op(out: &mut Vec<u8>, op: &Op) -> Result<(), FerroError> {
     out.extend_from_slice(&op.tbl.0.to_be_bytes());
     out.extend_from_slice(&op.row.0.to_be_bytes());
     match op.col {
@@ -849,7 +852,7 @@ fn put_op(out: &mut Vec<u8>, op: &Op) -> Result<(), FerroError> {
     put_opt_value(out, &op.witness)
 }
 
-fn take_op(body: &[u8], at: &mut usize) -> Result<Op, FerroError> {
+pub(crate) fn take_op(body: &[u8], at: &mut usize) -> Result<Op, FerroError> {
     let tbl = TableId(take_u32(body, at)?);
     let row = RowId(take_u64(body, at)?);
     let col = match take_u8(body, at)? {

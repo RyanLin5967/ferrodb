@@ -113,6 +113,18 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // also admit one that aborted, since `abort` writes `TxnEnd` too — and the store skips any
     // `hseq` it already holds, so a record the store has is never taken twice. The next
     // checkpoint (the CLI takes one right after this) writes them.
+    let carries_history = records.iter().any(|r| matches!(r.kind, RecKind::RevertHistory { .. }));
+    if carries_history && txn.history_store().is_none() {
+        // Opening without the store and then checkpointing would truncate the only copy of every
+        // committed history record the store does not hold yet. Refused here, at the one moment
+        // the whole log is read anyway.
+        return Err(FerroError::Wal(
+            "this log carries REVERT history (D212 (a')) but no history store is attached; attach \
+             `<db>.history` (HistoryStore::open_for_database) to the TxnManager before recover, or \
+             a checkpoint would discard history the store does not hold"
+                .into(),
+        ));
+    }
     if let Some(store) = txn.history_store() {
         let committed: HashSet<u64> = records
             .iter()

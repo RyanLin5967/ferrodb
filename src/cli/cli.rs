@@ -62,6 +62,10 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    // D212 (a'): REVERT's history store, attached BEFORE recover: the open's catch-up queues the
+    // committed history the store lacks, and the checkpoint below writes it there before it
+    // truncates the log that holds its only other copy.
+    txn.attach_history_store(crate::wal::history::HistoryStore::open_for_database(db_path)?)?;
     let recovered = recover(&txn)?;
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?

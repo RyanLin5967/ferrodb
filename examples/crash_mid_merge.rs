@@ -57,6 +57,9 @@ fn main() {
     let wal = Arc::new(WalManager::new(format!("{path}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    // D212 (a'): REVERT's history store, before recover, as the CLI does.
+    txn.attach_history_store(ferrodb::wal::history::HistoryStore::open_for_database(&path).unwrap())
+        .unwrap();
 
     // Same opening sequence the CLI uses, so recovery is the real one.
     let recovered = recover(&txn).unwrap();

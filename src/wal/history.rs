@@ -58,6 +58,24 @@ use crate::wal::log::{crc32, take_u32, take_u64, take_u8};
 /// How many publishes back a REVERT reaches when `FERRODB_REVERT_RETENTION_MERGES` is not set.
 pub const DEFAULT_RETENTION_MERGES: u64 = 1024;
 
+/// **The window `W`: how many publishes back a REVERT reaches.**
+/// `FERRODB_REVERT_RETENTION_MERGES`, or [`DEFAULT_RETENTION_MERGES`] when unset. A value that is set
+/// and is not a positive integer is REFUSED rather than defaulted: a typo would otherwise shrink or
+/// grow what REVERT can reach, silently. Read by the entry point that opens the store, once.
+pub fn retention_from_env() -> Result<u64, FerroError> {
+    match std::env::var("FERRODB_REVERT_RETENTION_MERGES") {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RETENTION_MERGES),
+        Err(e) => Err(FerroError::Internal(format!("FERRODB_REVERT_RETENTION_MERGES: {e}"))),
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(FerroError::Internal(format!(
+                "FERRODB_REVERT_RETENTION_MERGES={v:?} is not a positive number of merges; \
+                 refusing to open with a REVERT window nobody chose"
+            ))),
+        },
+    }
+}
+
 const MAGIC: u32 = 0x4652_4831; // "FRH1"
 const IMAGE_VERSION: u8 = 1;
 /// `MAGIC | VERSION | count`.
@@ -135,6 +153,12 @@ impl HistoryStore {
     /// `<db>.history`, the file an entry point opens for the database at `db_path`.
     pub fn path_for_database(db_path: &str) -> PathBuf {
         format!("{db_path}.history").into()
+    }
+
+    /// **What an entry point calls, before `recover`:** `<db>.history` with the window from
+    /// `FERRODB_REVERT_RETENTION_MERGES`.
+    pub fn open_for_database(db_path: &str) -> Result<Arc<HistoryStore>, FerroError> {
+        HistoryStore::open(HistoryStore::path_for_database(db_path), retention_from_env()?)
     }
 
     /// Open the store at `path`, reading it whole if it exists.

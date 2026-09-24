@@ -36,8 +36,7 @@ pub mod mem_catalog;
 pub mod merge_engine;
 pub mod paged_rows;
 pub mod persistent_map;
-/// D212 — what `REVERT MERGE` reads, kept in the database's own heap tables so it commits with the
-/// merge it describes and survives a restart.
+/// D212 (a') — what a REVERT history record means: the bodies `wal::history` stores opaquely.
 pub(crate) mod revert_store;
 pub mod runtime;
 pub mod session;
