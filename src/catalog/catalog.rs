@@ -358,7 +358,10 @@ impl Catalog {
     fn attach_or_discard(&mut self, built: BuiltIndex) -> Result<(), FerroError> {
         match self.attach_index(&built) {
             Ok(()) => Ok(()),
-            Err(e) => Err(self.discard_after(e, built)),
+            Err(e) => {
+                drop(built); // D271 MUTANT MC: a failed attach keeps the tree it built
+                Err(e)
+            }
         }
     }
 
