@@ -37,6 +37,12 @@
 //! (3, 1, 1). If the CONTROL fails on either build, the fixture or this model is wrong — stop and
 //! re-derive; do not read the class assertions.
 //!
+//! ⚠ **The "after the fix" column is the count at `2987369`, not at the branch tip.** Later commits
+//! on this branch add liveness questions of their own. From `206af08`, `release_id` asks once per
+//! released ancestor. From `b7e8d4e`, the `Reaped` flip asks once, and `detach_child` asks once
+//! under a Reaped parent. At the tip, REAP is 4·(D−1) = 60 / 252 (still flat, 4 per reap), DRAIN
+//! and WRITE PATH are unchanged, and the CONTROL is 3D+1 = 49 / 193 (lane report §8.6).
+//!
 //! The assertions are on the SLOPE (per-unit cost at D=64 against D=16), not on the exact cells,
 //! so a constant this model missed cannot fail them; the exact cells are printed for the record.
 
