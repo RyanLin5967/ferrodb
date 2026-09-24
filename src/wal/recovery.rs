@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{agent_sql::runtime::AgentRuntime, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::{DdlOp, RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -414,10 +414,28 @@ pub struct OpenedDatabase {
     pub catalog: Catalog,
     /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
     pub recovered: bool,
-    /// The tables whose DROP the log records and this open completed (D250). A caller that keeps
-    /// per-table state outside the catalog forgets it for each, as the executor does after a DROP:
-    /// the CLI and pgserver call `AgentRuntime::forget_table` (B9, D250 review 1's F7).
-    pub completed_drops: Vec<String>,
+    /// The tables whose DROP the log records and this open completed (D250). PRIVATE, so no entry
+    /// point can name it: [`OpenedDatabase::attach_runtime`] is its only consumer (lane §3.7).
+    completed_drops: Vec<String>,
+}
+
+impl OpenedDatabase {
+    /// **The one door an agent runtime comes through onto an opened database** (D250 review 1's F7,
+    /// the lead's ruling, the same "one function both call" rule as D204). It forgets the provenance
+    /// of every table whose DROP this open completed, as the executor does after a DROP (B9,
+    /// `AgentRuntime::forget_table`), so a table later created under the name does not inherit the
+    /// dropped one's authors. The list is private to this module, so an entry point cannot run the
+    /// forget itself and cannot leave it out; `tests/open_path_allowlist.rs` checks that both
+    /// production entry points build their runtime through here. It lives in the WAL module because
+    /// a door in `agent_sql::runtime` would need the list `pub(crate)`, which the CLI could read.
+    ///
+    /// `&self` and no drain: every runtime attached to one open forgets the same tables.
+    pub fn attach_runtime(&self, runtime: AgentRuntime) -> Arc<AgentRuntime> {
+        for table in &self.completed_drops {
+            runtime.forget_table(table);
+        }
+        Arc::new(runtime)
+    }
 }
 
 /// The heap a record writes, as its directory root: a `Heap*` record's own, or the one a CLR redoes.
@@ -1434,8 +1452,8 @@ use super::*;
             o.catalog.get_table("t").is_none(),
             "the next open did not complete the logged DROP: recovery skipped the table's records and left it in the catalog"
         );
-        // Lane §3.5 (review 1's F7): the open names the DROP it completed, so the entry points forget
-        // the table's provenance as the executor's DROP does.
+        // Lane §3.5 (review 1's F7): the open names the DROP it completed, so `attach_runtime` forgets
+        // the table's provenance as the executor's DROP does (lane §3.7, test 11).
         assert_eq!(o.completed_drops, vec!["t".to_string()], "the open did not report the DROP it completed");
     }
 
@@ -1700,5 +1718,73 @@ use super::*;
             }
         }
         panic!("`allocate` handed out more pages below the high-water mark {high} than there are");
+    }
+
+    /// **D250 review 1's F7, the lead's door (lane §3.7 test 11): a runtime attached to an open that
+    /// completed a DROP forgets that table's provenance, and no other table's.** The executor's DROP
+    /// forgets a table's row authors (B9); a DROP the next open completed never reached the executor,
+    /// so `OpenedDatabase::attach_runtime` forgets them for every runtime built on the open. Red only
+    /// under ATTm: it needs the door.
+    #[test]
+    fn a_runtime_attached_to_an_open_that_completed_a_drop_forgets_that_tables_provenance_and_no_other() {
+        use crate::{agent_sql::runtime::table_id, branch::types::BranchId, provenance::{ProvId, RunEntity}};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("half_drop_provenance.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in [
+                "CREATE TABLE keep (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO keep VALUES (1, 10);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                "INSERT INTO t VALUES (1, 10);",
+            ] {
+                run_sql(sql, &mut o.catalog, &o.bp, &o.txn).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            let record = {
+                let e = o.catalog.get_table("t").expect("t");
+                crate::wal::txn::DdlRecord {
+                    op: DdlOp::DropTable,
+                    table: "t".into(),
+                    dir_root: e.first_directory_page_id,
+                    time_travel_root: e.time_travel_root,
+                    columns: Vec::new(),
+                }
+            };
+            let err = o
+                .txn
+                .drop_checkpointed(record, || Err::<(), _>(FerroError::Internal("injected: the drop failed before it freed anything".into())))
+                .expect_err("premise failed: the DROP succeeded although its mutation failed");
+            assert!(err.to_string().contains("injected"), "premise failed: the DROP failed, but not in its mutation: {err}");
+            // The crash: every handle goes, with the DROP's record durable and the catalog unchanged.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).expect("the open after a half-done DROP failed");
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "premise failed: the open did not complete the logged DROP of `t`");
+        assert!(o.catalog.get_table("keep").is_some(), "premise failed: `keep` did not survive the open");
+
+        let runtime = AgentRuntime::new();
+        let run = RunEntity::new(ProvId::NONE, "agent", "run-1", "model", "v1", [7u8; 32], 1_700_000_000_000, BranchId::new(1, 0));
+        let author = runtime.provenance().intern(&run).unwrap();
+        for table in ["t", "keep"] {
+            runtime.provenance().stamp_row(table_id(table).0, 1, author).unwrap();
+            assert_eq!(
+                runtime.provenance().row_author(table_id(table).0, 1).unwrap(),
+                author,
+                "premise failed: row 1 of `{table}` was not attributed before the runtime was attached"
+            );
+        }
+        let runtime = o.attach_runtime(runtime);
+        assert_eq!(
+            runtime.provenance().row_author(table_id("t").0, 1).unwrap(),
+            ProvId::NONE,
+            "a runtime attached to the open still names an author for `t`, whose DROP the open completed: a \
+             table created under the name later would inherit the dropped one's authors"
+        );
+        assert_eq!(
+            runtime.provenance().row_author(table_id("keep").0, 1).unwrap(),
+            author,
+            "attaching the runtime forgot the authors of `keep`, which was never dropped"
+        );
     }
 }

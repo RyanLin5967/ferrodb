@@ -53,8 +53,8 @@ fn main() {
     // drifting again. Before the arena below, for the reason given there: the rebuild allocates pages.
     // A PANIC on failure, not `process::exit`, for the reason given at the lease scan below: this
     // runs after the lock, and exiting would strand `<db>.lock`.
-    let OpenedDatabase { bp, txn, catalog, completed_drops, .. } =
-        open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| panic!("pgserver: {e}"));
+    // Kept whole until the runtime exists: the runtime joins it through `attach_runtime` below.
+    let opened = open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| panic!("pgserver: {e}"));
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
     // Readiness, not a guess: the test reads this line rather than sleeping.
@@ -78,11 +78,11 @@ fn main() {
     );
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
+        ArenaPageStore::reopen_from_checkpoint(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
             .expect("reattach to the arena")
     } else {
-        let base = bp.disk_manager.high_water().expect("high water") + 32_736;
-        ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
+        let base = opened.bp.disk_manager.high_water().expect("high water") + 32_736;
+        ArenaPageStore::new(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
     });
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
@@ -93,7 +93,10 @@ fn main() {
         store.clone(),
     ));
 
-    let runtime = Arc::new(
+    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
+    // table whose DROP the open completed, as the executor's DROP does (B9). `tests/open_path_allowlist.rs`
+    // holds both entry points to it.
+    let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
@@ -115,11 +118,7 @@ fn main() {
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
 
-    // D250 review 1's F7: a DROP the open completed forgets the table's provenance, as the
-    // executor's DROP does (B9).
-    for table in &completed_drops {
-        runtime.forget_table(table);
-    }
+    let OpenedDatabase { bp, txn, catalog, .. } = opened;
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));

@@ -56,7 +56,8 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
     // function every binary opens through. This sequence used to be written out here, and
     // `examples/pgserver.rs` had its own copy that omitted the rebuild.
-    let OpenedDatabase { bp, txn, catalog, completed_drops, .. } = open_recovered(Path::new(db_path), &_lock)?;
+    // Kept whole until the runtime exists: the runtime joins it through `attach_runtime` below.
+    let opened = open_recovered(Path::new(db_path), &_lock)?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`
@@ -83,7 +84,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // `reopen_from_checkpoint` refuses rather than guessing a base.
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone(), Path::new(&arena_path))?
+        ArenaPageStore::reopen_from_checkpoint(opened.bp.clone(), branches.clone(), Path::new(&arena_path))?
     } else {
         // The arena owns `[base, inf)` and the ordinary allocator is confined to `[0, base)`, so
         // `base` is a hard ceiling on how far ordinary tables can grow. The first version of this
@@ -95,8 +96,8 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // a database created just now and one that already has pages: an existing database gets its
         // arena above what it has already allocated, still with room to grow. Costs nothing up
         // front - bitmap pages are chained on demand, so a distant floor is only a bound check.
-        let base = bp.disk_manager.high_water()?.saturating_add(arena_headroom());
-        ArenaPageStore::new(bp.clone(), branches.clone(), base)?
+        let base = opened.bp.disk_manager.high_water()?.saturating_add(arena_headroom());
+        ArenaPageStore::new(opened.bp.clone(), branches.clone(), base)?
     });
     // Persist the free-space map whenever the arena claims a new extent, not only at exit. The
     // exit checkpoint below is still worth taking - it captures the final partial extent - but it
@@ -125,7 +126,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // should make no decision. Built once and shared by both arms, which open the same file.
     let effects = DurableEffectLog::default_for_database(db_path)?;
 
-    let runtime = Arc::new(
+    // Through the opened database's one door (D250 review 1's F7): it forgets the provenance of every
+    // table whose DROP the open completed, as the executor's DROP does (B9), or a table re-created
+    // under the name would inherit its authorship. `tests/open_path_allowlist.rs` holds both entry
+    // points to it.
+    let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
@@ -145,11 +150,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
-    // D250 review 1's F7: a DROP the open completed forgets the table's provenance, as the
-    // executor's DROP does (B9), or a table re-created under the name would inherit its authorship.
-    for table in &completed_drops {
-        runtime.forget_table(table);
-    }
+    let OpenedDatabase { bp, txn, catalog, .. } = opened;
     let mut session = Session::with_runtime(runtime.clone());
 
     // The catalog moves behind a mutex, and is locked for exactly one statement.
