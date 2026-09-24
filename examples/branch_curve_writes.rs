@@ -367,7 +367,7 @@ impl Fire {
         }
     }
 
-    /// The arm whose guard this mode breaks; `None` for no fire. Exhaustive, with no `_` arm, so a
+    /// The arm this mode needs; `None` for no fire. Exhaustive, with no `_` arm, so a
     /// new mode does not compile until it names its arm (A12.3).
     fn needs(self) -> Option<NeedsArm> {
         Some(match self {
@@ -415,7 +415,7 @@ impl Fire {
         };
         if !on {
             return Some(format!(
-                "CURVE_FIRECHECK={:?} is refused: its guard is in the {need:?} arm, which \
+                "CURVE_FIRECHECK={:?} is refused: it needs the {need:?} arm, which \
                  CURVE_ARMS does not run, so it could only pass unseen (PREREG A12.3)",
                 self
             ));
@@ -839,6 +839,24 @@ impl RestartRow {
     }
 }
 
+/// The 1-minute load average ×100 (PREREG A14.2), or `u64::MAX` when the box will not say.
+/// `/proc/loadavg` where it exists, else `sysctl -n vm.loadavg` (`{ 1.23 1.45 1.67 }`), the reader
+/// `examples/d97_attestation.rs` uses. The first number in either is the 1-minute average.
+fn load_1min_centi() -> u64 {
+    let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
+        std::process::Command::new("sysctl")
+            .args(["-n", "vm.loadavg"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    });
+    text.as_deref()
+        .and_then(|t| t.split_whitespace().find_map(|w| w.parse::<f64>().ok()))
+        .map(|l| (l * 100.0).round() as u64)
+        .unwrap_or(u64::MAX)
+}
+
 /// The stale-index marker `open_recovered` honours, beside `{db}.wal`: the engine's own path helper.
 fn stale_marker(db_path: &str) -> std::path::PathBuf {
     ferrodb::wal::txn::stale_indexes_marker(Path::new(&format!("{db_path}.wal")))
@@ -856,6 +874,8 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let _cluster = (fire == Fire::NoClusterTime).then(|| ClusterScope::joined(NodeId(1)));
     // H6 (A12.2): read BEFORE the open, which removes the marker once it has rebuilt for it.
     let stale = stale_marker(db_path).exists();
+    // A14.2's load flag: the box's load around this one open, read outside every timer.
+    let load_start = load_1min_centi();
     let interval = scan_interval_from_env().expect("lease scan interval");
     let c0 = this_thread();
     let db = open_database(db_path, interval).expect("open the database");
@@ -874,6 +894,7 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
     let recovered = db.recovered;
     let (_, closed) = db.close();
     closed.expect("close the database cleanly");
+    let load_end = load_1min_centi();
     let us = |d: Duration| d.as_micros() as u64;
     println!(
         "RESTART_RESULT recovered={} stale={} total_us={} lock_us={} files_us={} recover_us={} sql_catalog_us={} \
@@ -881,7 +902,7 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
          provenance_us={} lease_start_us={} \
          open_visits={} freed={} first_pass_done={} first_pass_us={} visits_total={} \
          descents_total={} live={} c_desc={} c_att={} c_opt={} c_omiss={} c_lat={} c_fetch={} \
-         c_fault={} c_hop={}",
+         c_fault={} c_hop={} load_start_centi={} load_end_centi={}",
         recovered as u64,
         stale as u64,
         us(t.total),
@@ -911,6 +932,8 @@ fn open_only_child(db_path: &str, fire: Fire) -> ! {
         c.fetches,
         c.faults,
         c.scan_leaves,
+        load_start,
+        load_end,
     );
     std::process::exit(0);
 }
@@ -1470,13 +1493,14 @@ fn main() {
 
     let dir = std::env::temp_dir().join(format!("ferrodb-wcurve-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // A13.2: the (f0) refusal checks assert this line is ABSENT. The directory itself cannot say,
-    // because `RemoveOnDrop` below deletes it on unwind too. stderr, so no stdout table moves.
-    eprintln!("RUN DIR {}", dir.display());
     // Declared first so it drops LAST, after every handle below. A panic anywhere in this run
     // (every `expect` here is one) used to skip the old trailing `remove_dir_all` and leave a
     // multi-GB database in the temp dir of a disk this harness is guarding with FREE_FLOOR.
     let _cleanup = RemoveOnDrop(dir.clone());
+    // A13.2: the (f0) refusal checks assert this line is ABSENT. The directory itself cannot say,
+    // because `RemoveOnDrop` deletes it on unwind too. stderr, so no stdout table moves. After
+    // `_cleanup` is armed (A14.5), so a failed write cannot leak the directory.
+    eprintln!("RUN DIR {}", dir.display());
     // READ-VS-N: guard failures, and failures that void only the ns columns. Printed at the end,
     // and either one makes the run exit 2.
     let mut failures: Vec<String> = Vec::new();
@@ -1610,8 +1634,10 @@ fn main() {
              restart child is a fresh process running the same open at the production interval."
         );
         println!(
-            "  checkpoint interval: FERRODB_CHECKPOINT_INTERVAL={} (A13.7: each CKPT line's `period` reads against it)",
-            std::env::var("FERRODB_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "unset, so the engine default".into())
+            "  checkpoint interval: {} commits, the engine's value in force (A14.3; FERRODB_CHECKPOINT_INTERVAL={}). \
+             Each CKPT line's `period` reads against it (A13.7).",
+            ferrodb::wal::txn::checkpoint_interval(),
+            std::env::var("FERRODB_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "unset".into())
         );
         println!(
             "  workload: trunk row {ROW} = BigInt({TRUNK_VALUE}); each branch forks from trunk and \
@@ -2089,18 +2115,33 @@ fn main() {
         // A13.1's judge fire: one retained `Ddl` record, created before any merge. Its own
         // checkpoint (`ddl_checkpointed`) truncates first and resets the commit counter, and the
         // record is logged after it, so the log past its base is that record alone.
+        //
+        // A14.1: the injection is the record's RETENTION in `schema_log`, which is what every later
+        // checkpoint re-appends; that is asserted. Whether the base moved is printed, not asserted:
+        // after `reopen_for_merges` the log is empty past its base (D227), so the DDL's truncation
+        // stores the base it already had.
         if fire == Fire::CkptDdl {
             let mut plain = Session::with_runtime(Arc::clone(&open.runtime));
             let base0 = open.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
             exec_sql(open, &mut plain, CKPT_DDL_SQL).expect("ckpt-ddl fire: create the table");
             let base1 = open.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
             let past = open.txn.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst) - base1;
+            let dir_root: u32 = open
+                .catalog
+                .lock()
+                .get_table("ckpt_ddl")
+                .map(|t| t.first_directory_page_id)
+                .expect("ckpt-ddl fire: the table exists after CREATE TABLE");
+            let retained = open.txn.retained_shape(dir_root).is_some();
             assert!(
-                base1 != base0 && past > 0,
-                "ckpt-ddl fire did not inject: base moved={}, {past} bytes past the base",
-                base1 != base0
+                retained && past > 0,
+                "ckpt-ddl fire did not inject: retained={retained}, {past} bytes past the base"
             );
-            println!("  CKPT-DDL base_moved=1 bytes_past_base={past}");
+            println!(
+                "  CKPT-DDL base_moved={} retained={} bytes_past_base={past}",
+                (base1 != base0) as u8,
+                retained as u8
+            );
         }
         let live_before = hd.cat_concrete.live_count().map(|n| n as u64).unwrap_or(u64::MAX);
         let mut m_done = 0usize;
@@ -2293,7 +2334,8 @@ fn read_vs_n_summary(
             );
             println!(
                 "  axis ({axis}): `slope` spans the previous row to this one ({}); `typ ns ± SE` is the mean \
-                 and sd/sqrt(n) over the block's applied merges that did not checkpoint. Reported, not judged (A13.3).",
+                 and sd/sqrt(n) over the block's applied merges that did not checkpoint: a WITHIN-block error over \
+                 consecutive merges, not a noise floor for comparing rows (A14.4). Reported, not judged (A13.3).",
                 rows.iter().map(|r| (if axis == "i" { r.n } else { r.m }).to_string()).collect::<Vec<_>>().join(" -> ")
             );
             if axis == "ii" {
@@ -2367,7 +2409,20 @@ fn read_vs_n_summary(
         // merge-OFF control, since after D216 a merge-on log still holds re-appended declarations.
         // `recover`, `rebuild` and `m rows` size it. A9.1: warmth is `child net` (total less recover
         // and rebuild, which only the child pays before D216) against `parent total`.
-        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows  recovered  child net ms");
+        // A14.2: the load flag (D65's L2). Every reading in the run, start and end, sets the median
+        // (the upper one for an even count, as every median here); a row is flagged when its larger
+        // reading exceeds 1.5 × that median. A flag, never a guard: the slopes it qualifies are
+        // reported, not judged.
+        let mut loads: Vec<u64> = restart_rows
+            .iter()
+            .filter(|r| !r.child.is_empty())
+            .flat_map(|r| [r.get("load_start_centi"), r.get("load_end_centi")])
+            .filter(|&l| l != u64::MAX)
+            .collect();
+        loads.sort_unstable();
+        let load_median = loads.get(loads.len() / 2).copied();
+        let centi = |l: u64| if l == u64::MAX { format!("{:>6}", "-") } else { format!("{:>6.2}", l as f64 / 100.0) };
+        println!("         N   total ms   slope   lease_start ms   slope   arena ms   us/visit   1st-pass ms   parent total ms   parent lease ms   recover ms   rebuild ms    wal B   m rows  recovered  child net ms   load0   load1   L2");
         let mut prev: Option<(usize, f64, f64)> = None;
         for r in restart_rows.iter().filter(|r| !r.child.is_empty()) {
             let total = r.get("total_us") as f64 / 1000.0;
@@ -2379,8 +2434,15 @@ fn read_vs_n_summary(
                 ),
                 None => (format!("{:>7}", "-"), format!("{:>7}", "-")),
             };
+            let (l0, l1) = (r.get("load_start_centi"), r.get("load_end_centi"));
+            let hi = [l0, l1].into_iter().filter(|&l| l != u64::MAX).max();
+            let l2 = match (hi, load_median) {
+                (Some(h), Some(m)) => if (h as f64) > 1.5 * (m as f64) { "1" } else { "0" },
+                _ => "-",
+            };
+            let (load0, load1) = (centi(l0), centi(l1));
             println!(
-                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3} {:>12.3} {:>12.3} {:>8} {:>8} {:>10} {:>13.3}",
+                "  {:>8} {:>10.3} {st} {:>16.3} {sl} {:>10.3} {:>10.3} {:>13.3} {:>17.3} {:>17.3} {:>12.3} {:>12.3} {:>8} {:>8} {:>10} {:>13.3}  {load0}  {load1} {l2:>4}",
                 r.n,
                 total,
                 lease,
@@ -2398,6 +2460,12 @@ fn read_vs_n_summary(
             );
             prev = Some((r.n, total, lease));
         }
+        println!(
+            "  arm 3: load0/load1 = the child's 1-min load at its start and end; L2 = 1 when the row's larger \
+             reading exceeds 1.5 x the run's median reading ({}). The time slopes and R5's magnitude are REPORTED \
+             (A14.2); O(N) is judged on R1-R3's integers.",
+            load_median.map(|m| format!("{:.2}", m as f64 / 100.0)).unwrap_or_else(|| "-".into())
+        );
         let measured = restart_rows.iter().filter(|r| !r.child.is_empty()).count();
         if measured < 2 {
             failures.push(format!("arm 3: {measured} restart(s) measured; one point is not a curve"));
