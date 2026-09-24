@@ -59,6 +59,14 @@ fn main() {
         .open(&db)
         .expect("open db");
     let dm = Arc::new(DiskManager::new(file).unwrap());
+    // **D239.** The arena region is reserved BEFORE recovery, for the reason `src/cli/cli.rs`
+    // gives: until it is, every arena page reads as free to the allocator, and recovery's own
+    // allocations (a heap directory repair here) could be handed one. See
+    // `ArenaPageStore::reserve_persisted_floor`. Panics like every other post-lock failure in
+    // this file, so the `DbLock` is dropped on the way out.
+    let arena_path = format!("{db}.arena");
+    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))
+        .expect("reserve the arena region before recovery");
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
@@ -86,7 +94,6 @@ fn main() {
     // sit above what the catalog has already allocated, or the ordinary allocator and the arena hand
     // out the same page. The floor is persisted in the checkpoint, so a reopen reattaches to the
     // region it left rather than inventing a new one on top of live pages.
-    let arena_path = format!("{db}.arena");
     let branches = Arc::new(
         TableBranchCatalog::default_for_database(&db, 1).expect("branch catalog"),
     );

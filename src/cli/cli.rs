@@ -58,6 +58,13 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let existed = Path::new(db_path).exists();
     let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
     let dm = Arc::new(DiskManager::new(file)?);
+    // **D239 — the arena region is reserved BEFORE recovery, not after it.** The store below
+    // registers it again when it reattaches, but that is after `recover`, the index rebuild and
+    // its checkpoint, and until a region is registered every arena page reads as free to the
+    // allocator. A rebuild that outgrew the table region was handed arena pages and wrote over
+    // live branch data. See `ArenaPageStore::reserve_persisted_floor`.
+    let arena_path = format!("{db_path}.arena");
+    ArenaPageStore::reserve_persisted_floor(&dm, Path::new(&arena_path))?;
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
@@ -82,7 +89,6 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // so an agent session's writes lived in a `BTreeMap` and the copy-on-write branch engine -
     // zero-copy fork, lease reaping, shadow paging - was reachable only from tests. The engine was
     // real and the binary did not use it.
-    let arena_path = format!("{db_path}.arena");
     // `default_for_database` rather than a path spelled out here, for the same reason
     // `DurableEffectLog::default_for_database` is used below: the naming convention and the choice
     // of implementation belong beside the format, and an entry point wiring a runtime should make
