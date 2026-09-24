@@ -442,7 +442,8 @@ impl Handles {
     }
 }
 
-/// Wait for the lease thread's first pass to reach its end — the second full sweep, PREREG R3.
+/// Wait for the lease thread's first pass to reach its end. Before D209 that pass was the second
+/// full sweep (PREREG R3); on a tree with D209 its sweep is skipped and it adds no visits.
 /// `None` if it did not within `bound`.
 fn wait_first_pass(db: &OpenDatabase, bound: Duration) -> Option<Duration> {
     let t = Instant::now();

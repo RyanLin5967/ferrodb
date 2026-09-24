@@ -310,8 +310,9 @@ pub struct LeaseStats {
     ///
     /// `scans` cannot say that: it is counted before the orphan sweep runs, and a pass that
     /// refused or failed early reaches neither. READ-VS-N's restart arm waits on this to know the
-    /// lease thread's first pass — a second full sweep, see `TwoTierReaper::open_sweep_visits` —
-    /// has finished, rather than guessing from elapsed time. Observing only.
+    /// lease thread's first pass has finished, rather than guessing from elapsed time: until D209
+    /// that pass repeated the open's full sweep, see `TwoTierReaper::open_sweep_visits`. Observing
+    /// only.
     pub finished: u64,
 }
 
@@ -405,6 +406,28 @@ impl LeaseThread {
         interval: Duration,
     ) -> Result<LeaseThread, FerroError> {
         let resumed = with_lock(&*lock, || reaper.resume_interrupted_reaps())?;
+        // **D209 — the open's orphan sweep is a collection, so the cadence counts from it.**
+        //
+        // `resume_interrupted_reaps` ends in the full O(live arenas) sweep and stamps nothing. The
+        // thread spawned below runs its first pass at once, and that pass ends in
+        // `collect_orphans_if_due`, which still read ORPHAN_SWEEP_NEVER, so every open swept every
+        // live arena twice, back to back.
+        //
+        // Read AFTER the sweep. `scan_once` reads its `now` before the sweep it stamps, so that two
+        // ticks racing cannot both pay; nothing can race here, because the thread that could does
+        // not exist yet. A reading from before the sweep is short by the sweep's whole length,
+        // which read-vs-n's PREREG R5 puts at 10-90 s for 10^6 arenas (inferred, unmeasured). Once
+        // that reaches ORPHAN_SWEEP_INTERVAL_MS the first pass sweeps again, and the fix is gone
+        // at exactly the scale it is for.
+        //
+        // The clock is `scan_once`'s, so the interval is measured in one unit. A node that cannot
+        // read it (a cluster member with no applied tick) stamps nothing and keeps the old
+        // behaviour: its first scan that knows the time sweeps again. That is the safe direction.
+        // An interval has to start at a reading of the clock it is measured in, and the only cost
+        // is the repeat this row removes everywhere else.
+        if let Ok(now) = LeaseDeadline::try_now_millis() {
+            reaper.orphan_sweep_finished_at(now);
+        }
         if !resumed.is_empty() {
             // The reaper reclaimed pages without any client asking, so the runtime still holds
             // those branches' workspaces; nothing else will ever tell it.

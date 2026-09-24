@@ -1187,7 +1187,8 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
 /// orphan sweep, and then spawns the thread, whose first pass runs at once and ends in
 /// `collect_orphans_if_due`. The open's sweep stamped nothing, so that gate still read
 /// `ORPHAN_SWEEP_NEVER` and the same sweep ran again straight after it: every open paid for its
-/// orphan sweep twice, and at 10^6 branches one sweep is tens of seconds (read-vs-n PREREG R5).
+/// orphan sweep twice. read-vs-n's PREREG R5 puts one sweep at 10-90 s for 10^6 branches
+/// (inferred, unmeasured).
 ///
 /// Observed only through counters that exist without the fix — `sweep_visits`,
 /// `open_sweep_visits` and `LeaseStats::finished` — so this compiles against the unfixed tree and
@@ -1232,5 +1233,104 @@ fn d209_an_open_sweeps_the_live_arenas_once_not_twice() {
          visited {at_open}: the open's full orphan sweep did not stamp the cadence, so \
          `collect_orphans_if_due` read ORPHAN_SWEEP_NEVER and repeated the whole O(live arenas) \
          sweep (D209)"
+    );
+}
+
+/// A lock that stands off before it runs the body, then records the lease clock just before the
+/// body starts. For `start`, the body is `resume_interrupted_reaps`, whose last step is the open's
+/// orphan sweep.
+struct StandOffGate {
+    statement: Mutex<()>,
+    stand_off: Duration,
+    /// The lease clock at the FIRST entry. Later entries would be the scan's reaps; the tests that
+    /// use this gate expire nothing, so there are none, and only the first is kept regardless.
+    entered: Mutex<Option<u64>>,
+}
+
+impl RuntimeLock for StandOffGate {
+    fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+        std::thread::sleep(self.stand_off);
+        let mut entered = self.entered.lock().unwrap();
+        if entered.is_none() {
+            *entered = Some(LeaseDeadline::now_millis());
+        }
+        drop(entered);
+        body();
+    }
+}
+
+/// **D209, the other half: where the stamp may land.** The red test above cannot tell the right
+/// stamp from two wrong ones that also silence the first pass, and each wrong one costs something
+/// the counters there never see:
+///
+/// * **A stamp read before the resume.** That is the order `scan_once` uses for its own `now`, so
+///   it is the likely wrong one. It is short of the open's sweep by the sweep's whole length, and
+///   once that length reaches `ORPHAN_SWEEP_INTERVAL_MS` the first pass sweeps again: D209 back,
+///   but only at a scale no unit test runs. This gate stands off for `STAND_OFF` before it runs
+///   the resume, so such a stamp lands at least that far before `entered`.
+/// * **A stamp in the future, or from another clock.** It shuts the cadence for longer than one
+///   interval, and the residue of an in-process error path waits on it for that long.
+///
+/// So the stamp is bracketed. It must be at or after `entered`, the lease clock read inside the
+/// lock just before the resume ran. It must be at or before `after`, read once the first pass has
+/// finished. A due-check one millisecond short of an interval from `entered` must NOT sweep; one a
+/// full interval after `after` MUST, and must visit every live arena again.
+///
+/// Blind spot, stated: a stamp read inside the resume but before its sweep also lands after
+/// `entered`, and on a sweep this small no test can separate it from one read after the sweep.
+/// `start` reads the clock after `with_lock` returns; this pins everything short of that.
+#[test]
+fn d209_the_open_stamp_holds_the_cadence_one_interval_from_the_sweep_and_no_longer() {
+    use crate::branch::reaper::ORPHAN_SWEEP_INTERVAL_MS;
+    const STAND_OFF: Duration = Duration::from_millis(50);
+
+    let f = fixture();
+    for _ in 0..3 {
+        branch_with_pages(&f, FAR_FUTURE, 2);
+    }
+    let gate = Arc::new(StandOffGate {
+        statement: Mutex::new(()),
+        stand_off: STAND_OFF,
+        entered: Mutex::new(None),
+    });
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&gate) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the lease thread's first pass to finish", || lease.stats().finished >= 1);
+    let stats = lease.stop();
+    let after = LeaseDeadline::now_millis();
+    let entered =
+        (*gate.entered.lock().unwrap()).expect("start never took the lock for the resume");
+    assert_eq!(stats.reaped, 0, "fixture: nothing had expired, so no reap may add visits");
+
+    let at_open = f.reaper.open_sweep_visits();
+    assert!(
+        at_open >= 3,
+        "the open swept {at_open} arenas over three live branches with pages, so the sweep below \
+         has nothing to be counted against"
+    );
+
+    let held = f.reaper.sweep_visits();
+    f.reaper.collect_orphans_if_due(entered + ORPHAN_SWEEP_INTERVAL_MS - 1).unwrap();
+    assert_eq!(
+        f.reaper.sweep_visits(),
+        held,
+        "a due-check one millisecond short of an interval after the open took its lock swept \
+         anyway: the stamp predates the open's sweep (read before the resume, at least \
+         {STAND_OFF:?} early here), or is missing. At 10^6 arenas that is the second sweep again."
+    );
+
+    f.reaper.collect_orphans_if_due(after + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+    assert_eq!(
+        f.reaper.sweep_visits() - held,
+        at_open,
+        "a full interval after the open, the cadence did not sweep every live arena: the stamp is \
+         later than the open or on another clock, so the gate stays shut past its interval and \
+         the residue of an in-process error path waits on it"
     );
 }

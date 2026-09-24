@@ -42,10 +42,16 @@ use crate::error::FerroError;
 /// of an in-process error path — a drain that released pages and then failed before its narrowed
 /// sweep could free the emptied extent. Sixty seconds is twice the lease thread's own scan
 /// interval, which is the shortest cadence that is not "every tick".
-const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
+pub(crate) const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
 
-/// Sentinel for "the orphan collector has never run on this reaper", so the first background tick
-/// always collects rather than waiting out an interval measured from the epoch.
+/// Sentinel for "no orphan collection this reaper knows the time of", so the first due-check
+/// collects rather than waiting out an interval measured from the epoch.
+///
+/// **D209.** It used to be what every open left behind: the open's full sweep stamped nothing,
+/// so the lease thread's first pass swept every live arena again straight after it.
+/// `LeaseThread::start` now replaces it with the time that sweep finished
+/// ([`TwoTierReaper::orphan_sweep_finished_at`]), so in production it survives an open only on a
+/// node that cannot read the lease clock yet.
 const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
 
 /// What one branch's turn in a lease sweep actually did.
@@ -165,9 +171,11 @@ impl TwoTierReaper {
     ///
     /// **READ-VS-N, arm 3.** `sweep_visits` alone cannot answer "what did the OPEN pay": the lease
     /// thread that `LeaseThread::start` spawns runs its first pass immediately, and that pass ends
-    /// in `collect_orphans_if_due`, whose gate is still at `ORPHAN_SWEEP_NEVER` because the open
-    /// sweep calls [`Self::collect_orphaned_extents`] directly and stamps nothing. So a second full
-    /// sweep begins while the caller of `start` is reading the counter. This one is taken inside
+    /// in `collect_orphans_if_due`. Until D209 that gate was still at `ORPHAN_SWEEP_NEVER`, because
+    /// the open sweep calls [`Self::collect_orphaned_extents`] directly, so a second full sweep
+    /// began while the caller of `start` was reading the counter. `start` now stamps the gate
+    /// ([`Self::orphan_sweep_finished_at`]), and the first pass adds nothing to `sweep_visits`
+    /// unless the node could not read the lease clock at open. This one is taken inside
     /// [`Self::resume_interrupted_reaps`], before that thread exists, so nothing else can be
     /// sweeping. Observing only: nothing reads it to decide anything.
     pub fn open_sweep_visits(&self) -> u64 {
@@ -426,8 +434,32 @@ impl TwoTierReaper {
         Ok(freed)
     }
 
+    /// **D209.** Record that a complete [`Self::collect_orphaned_extents`] pass finished at
+    /// `now_millis`, so [`Self::collect_orphans_if_due`] waits a full interval from it.
+    ///
+    /// For the open's sweep, which [`Self::resume_interrupted_reaps`] runs directly and which is
+    /// the complete answer to a crash. Unstamped, it left the cadence at [`ORPHAN_SWEEP_NEVER`] and
+    /// the lease thread's first pass repeated the whole O(live arenas) sweep straight after it.
+    ///
+    /// Two conditions on `now_millis`, both the caller's to meet:
+    ///
+    /// * **The clock the cadence runs on.** `LeaseThread::start` passes
+    ///   `LeaseDeadline::try_now_millis`, the function `scan_once` hands `collect_orphans_if_due`.
+    ///   A reading from any other clock gates the next collection on a comparison between two
+    ///   units.
+    /// * **Taken after the sweep.** A reading from before it is short by the sweep's whole length.
+    ///   read-vs-n's PREREG R5 puts that at 10-90 s for 10^6 arenas (inferred, unmeasured), so it
+    ///   can reach the interval, which would bring the second sweep back at exactly the scale this
+    ///   exists for.
+    pub(crate) fn orphan_sweep_finished_at(&self, now_millis: u64) {
+        self.last_orphan_sweep_ms.store(now_millis, Ordering::SeqCst);
+    }
+
     /// Run [`Self::collect_orphaned_extents`] if at least [`ORPHAN_SWEEP_INTERVAL_MS`] of cluster
     /// time has passed since it last ran, and never more often than that.
+    ///
+    /// "Last ran" includes the open's sweep, which `LeaseThread::start` stamps (D209), so the first
+    /// due-check after an open waits a full interval instead of repeating it.
     ///
     /// `now_millis` is the cluster's time as the lease thread read it, not a local clock — the
     /// same reading `reap_expired` is deciding expiry on, so the cadence cannot disagree with the
