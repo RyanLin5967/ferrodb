@@ -1796,6 +1796,26 @@ impl TxnManager {
         pending.len()
     }
 
+    /// Discard the owed releases on the heaps whose directories start at `roots`, which a DROP has
+    /// just unlinked: its pages are freed after its checkpoint (D229), so there is nothing left for
+    /// them to release. `release_retry` must be held.
+    fn discard_releases_on(&self, roots: &[u32]) {
+        use std::io::Write;
+        let discarded = {
+            let mut pending = self.pending_releases.lock().unwrap();
+            let before = pending.len();
+            pending.retain(|(_, r)| !roots.contains(&r.dir_root));
+            before - pending.len()
+        };
+        if discarded > 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ferrodb: DROP discarded {discarded} release(s) owed on the dropped table: its pages are freed, \
+                 so nothing is left to release"
+            );
+        }
+    }
+
     /// The checkpoint after a DDL that frees no page and mutates first: CREATE INDEX and CREATE
     /// FULLTEXT INDEX (review 3's caveat 1 and decision 1).
     ///
