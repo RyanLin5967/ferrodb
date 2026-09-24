@@ -945,7 +945,6 @@ impl BranchCatalog for TableBranchCatalog {
         // concurrent forkers share one disk round-trip instead of queueing for private ones. See
         // `group_commit` for why the ticket is taken last.
         let (child, seq) = self.mutate(|| {
-
             // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
             // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
             // its envelope hands the child `None` - which is the UNGOVERNED default. The child of a
@@ -999,9 +998,9 @@ impl BranchCatalog for TableBranchCatalog {
                 self.write_record_new(&child)?;
             }
             // The child's entry in its parent's live set. A child that exists but is not listed in its
-        // parent is a GC correctness hole, which is why both happen under one logical lock.
-        // The VALUE is the child's branch id, so a reader can resolve the child and check
-        // whether it is still live. See `live_child_at` for why the entry is only a hint.
+            // parent is a GC correctness hole, which is why both happen under one logical lock.
+            // The VALUE is the child's branch id, so a reader can resolve the child and check
+            // whether it is still live. See `live_child_at` for why the entry is only a hint.
             self.tree
                 .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
             self.write_header()?;
@@ -1112,6 +1111,14 @@ impl BranchCatalog for TableBranchCatalog {
             if expect == to {
                 // Nothing to write, and it keeps a second `set_state(.., Reaped)` from bumping the
                 // generation twice.
+                //
+                // D244 review F6: the no-op still goes through `mutate`'s publish, so a publish an
+                // earlier mutation failed is retried here. If the retry fails too, this call returns
+                // that error, where before D244 it could not fail once past the checks above. Kept
+                // on purpose: the header write it reports is still owed, and swallowing it would
+                // hide a catalog the next open refuses. It is reached when a caller passes the state
+                // the branch already has, e.g. `seal`'s reaper-less fallback passing `record.state`
+                // with `to = Reaped` (`agent_sql/runtime.rs`).
                 return Ok(false);
             }
             let old = core.clone();
