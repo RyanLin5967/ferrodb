@@ -585,10 +585,12 @@ fn sync_dir_of(path: &std::path::Path) -> std::io::Result<()> {
 ///   that clock, so the next first start credits `now − mark` — a subtraction across two processes'
 ///   lease clocks, exactly as a real mark is credited, which is what makes it right however far the
 ///   writer's clock lagged the wall (a host that slept).
-/// - `accrued`: the downtime already owed when that writer opened the catalog, so the writer's own
-///   run, between its open and its last commit, is credited as neither.
+/// - `accrued`: the downtime already owed when that writer opened the catalog, fixed at that open,
+///   so the writer's own run, between its open and its last commit, is credited to the NEXT process
+///   as neither.
 ///
-/// A mark supersedes it: once `[0x08]` exists this key is never written or read again.
+/// A mark supersedes it: once `[0x08]` is on disk this key is never READ again. A commit racing the
+/// mark's own `durable` may still write one, which the next open ignores (review 5, Q4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SoftMark {
     mark: u64,
@@ -633,16 +635,24 @@ impl SoftMark {
 /// | `m` = `file` | `W`: an OS mtime |
 /// | `now` | this process's lease clock, `L_new` |
 ///
-/// **At an unresumed writer's open, lease terms only** — [`Self::owed_at_open`]:
-/// `accrued + max(L_w(open) − s.mark, L_w(open) − m)`. **At the resume** —
+/// **At an unresumed writer's open, lease-scale terms** — [`Self::owed_at_open`]:
+/// `accrued + max(L_w(open) − s.mark, L_w(open) − m)`, where `L_w(open) − m` reads the mtime as the
+/// lease reading of a writer whose lease clock was the wall clock (R2). **At the resume** —
 /// [`Self::resume_credit`]: `accrued + max(now − s.mark, W(now) − m, now − m)`, the wall half
-/// being the lead's review-3 rule.
+/// being the lead's review-3 rule. Three subtractions are lease − mtime (`owed_at_open`'s file
+/// half, `resume_credit`'s lease half, the migration's `accrued`), each one clock only under R2.
 ///
-/// The relations the bound relies on (PREREG amendment 12):
-/// - **R1** `L_p = W − lag_p` with `lag_p ≥ 0`, non-decreasing within `p` unless the wall clock
-///   steps back after `p` anchored (the reason the file term also takes the lease half, `now − m`).
-/// - **R2** a pre-D198 writer, and a legacy log's, has `lag = 0`: its lease clock IS the wall
-///   clock.
+/// The relations the bound relies on (PREREG amendments 12 and 13):
+/// - **R1** `L_p = W − lag_p` (a definition). `lag_p ≥ 0` and grows with host sleep, but it is
+///   NOT monotone: on macOS `Instant` is the raw uptime clock and drifts against the
+///   NTP-disciplined wall either way, and a backward wall step moves it too (the reason the file
+///   term also takes the lease half, `now − m`). R1 is used only for `m ≥ s.mark`; where it fails,
+///   the file half exceeds the soft half: over only.
+/// - **R2** a writer whose lease clock was the wall clock — every pre-D198 build, so every
+///   `.branches` log a pre-D198 build wrote — has `lag = 0`. **Not** a `.branches` log a D198 build
+///   wrote (`LogBranchCatalog::open`, the embedder path; it writes no soft mark): the migration's
+///   credit is then short by that writer's lag at its last append, never below 0 (review 5, C1b; a
+///   stated residual — the log catalog has no restart grace at all).
 /// - **R3** `m ≤ W(last moment its writer was alive)`, and every soft mark is written in a commit,
 ///   so the file is never older, on `W`, than its last soft mark.
 /// - **R4** `s.mark ≤ L_w(last moment w was alive)`.
@@ -651,10 +661,18 @@ impl SoftMark {
 /// (R4), over by `w`'s idle tail only; a lease of a pre-D198 writer is credited at least
 /// `L_new(now) − m`, its owed (R2, R3). With a soft mark present, `L − m ≤ L − s.mark` (R3, R1),
 /// so at an open the maximum IS the soft term: no lag counted twice. The one wall term, at the
-/// resume, over-credits by the resumer's own lag. Every route over-credits without bound; none
-/// under-credits below the policy's 0 (PREREG amendment 12's table).
+/// resume, over-credits by the resumer's own lag.
 ///
-/// An ACCRUAL, not a frozen stamp: nothing here credits an unresumed writer's own run.
+/// **Under the policy's owed, never below 0** (stated residuals): a `.branches` log a D198 build
+/// wrote (R2 above); a torn first commit, which loses the pre-writer outage AND up to the torn
+/// writer's own lag, the file half being `L − m` with `m` stamped by the wall while its lease clock
+/// lagged (review 5, C1d); and an open on a cluster member followed by `leave()`, which records
+/// `first_start_owed = 0`, so the pre-open outage is dropped (review 5, C1e). **Over it, without
+/// bound**: every route in PREREG amendment 13's table.
+///
+/// An ACCRUAL, not a frozen stamp: nothing here credits an unresumed writer's own run to the NEXT
+/// process. A writer that later resumes ITSELF credits its own run since its open: its resume uses
+/// the evidence it took at that open (review 5, C4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FirstStartEvidence {
     /// The last unresumed D198 writer's soft mark, if any.
@@ -664,12 +682,14 @@ struct FirstStartEvidence {
 }
 
 impl FirstStartEvidence {
-    /// **What an unresumed writer owes at its open, on ITS lease clock `lease_now`** — lease terms
-    /// only (review 4, C1). A wall term here would add the writer's own lag to a quantity the next
-    /// start reads on the same lagging clock again. Clamped by D206's rule.
+    /// **What an unresumed writer owes at its open, on ITS lease clock `lease_now`** — lease-scale
+    /// terms: the soft mark is a lease reading, and the mtime is read as the lease reading of a
+    /// writer whose lease clock was the wall clock (R2) (review 4 C1, review 5 C1a). A wall term
+    /// here would add the writer's own lag to a quantity the next start reads on the same lagging
+    /// clock again. Clamped by D206's rule.
     fn owed_at_open(&self, lease_now: u64) -> u64 {
         let since_soft = self.soft.map_or(0, |s| lease_now.saturating_sub(s.mark));
-        let since_file = self.file.map_or(0, |m| lease_now.saturating_sub(m.millis()));
+        let since_file = self.file.map_or(0, |m| m.lease_scale_age_millis(lease_now));
         LeaseDeadline::saturating_deadline(self.accrued(), since_soft.max(since_file))
     }
 
@@ -679,7 +699,7 @@ impl FirstStartEvidence {
     fn resume_credit(&self, now: u64) -> u64 {
         let since_soft = self.soft.map_or(0, |s| now.saturating_sub(s.mark));
         let since_file =
-            self.file.map_or(0, |m| m.wall_age_millis().max(now.saturating_sub(m.millis())));
+            self.file.map_or(0, |m| m.wall_age_millis().max(m.lease_scale_age_millis(now)));
         LeaseDeadline::saturating_deadline(self.accrued(), since_soft.max(since_file))
     }
 
@@ -993,14 +1013,16 @@ impl TableBranchCatalog {
                 // own commits soft-marked the new catalog with nothing accrued; not on a cluster
                 // member, for `record_soft_mark`'s reason.
                 //
-                // `accrued` is on THIS process's lease clock, `L_mig − m`, never the wall age
-                // (review 4, C1): the next start adds `now − mark` on the same clock, and a wall
-                // term here would count this process's lag twice. Exact for the source's writer,
-                // whose lease clock was the wall clock (R2 in `FirstStartEvidence`).
+                // `accrued` is lease-scale, `L_mig − m`, never the wall age (review 4, C1): the
+                // next start adds `now − mark` on the same clock, and a wall term here would count
+                // this process's lag twice. `m` is read as the lease reading of a writer whose
+                // lease clock was the wall clock (R2 in `FirstStartEvidence`): exact for a log a
+                // pre-D198 build wrote, short by the writer's lag for one a D198 build wrote
+                // (review 5, C1b; a stated residual).
                 let lease_now = crate::cluster::standalone_lease_millis();
                 if let (Some(m), Some(now)) = (source_mtime, lease_now) {
                     if cat.holds_a_live_lease()? {
-                        let accrued = now.saturating_sub(m.millis());
+                        let accrued = m.lease_scale_age_millis(now);
                         cat.upsert(keys::first_start(), SoftMark { mark: now, accrued }.encode())?;
                         cat.publish_root()?;
                     }
@@ -1012,12 +1034,16 @@ impl TableBranchCatalog {
                 cat.pool.flush_all()?;
                 cat.pool.disk_manager.sync()?;
             }
+            // Each rename is made durable before the next (review 5, C5): one sync after both would
+            // not order them, and a filesystem that kept the retirement without the publish would
+            // leave neither file, so the next open would create a fresh, empty catalog.
             std::fs::rename(&tmp_path, &cat_path)
                 .map_err(|e| FerroError::Io(format!("publish {cat_path}: {e}")))?;
+            sync_dir_of(Path::new(&cat_path))
+                .map_err(|e| FerroError::Io(format!("sync the directory of {cat_path}: {e}")))?;
             // Only now is the log redundant.
             std::fs::rename(&legacy_path, &retired_path)
                 .map_err(|e| FerroError::Io(format!("retire {legacy_path}: {e}")))?;
-            // Both renames survive a power cut only once the directory holding them is synced.
             sync_dir_of(Path::new(&cat_path))
                 .map_err(|e| FerroError::Io(format!("sync the directory of {cat_path}: {e}")))?;
             return Self::open_sidecar_at(
@@ -1828,7 +1854,7 @@ impl TableBranchCatalog {
     /// (`first_start`), or `None` if it took none. See [`FirstStartEvidence`].
     fn first_start_credit(&self, now_millis: u64) -> Option<FirstStartCredit> {
         self.first_start.map(|e| FirstStartCredit {
-            file_mtime: e.file,
+            file_mtime: e.file.map(FileWallStamp::millis),
             writer_mark: e.soft.map(|s| s.mark),
             recorded_millis: e.soft.map_or(0, |s| s.accrued),
             credited_millis: e.resume_credit(now_millis),

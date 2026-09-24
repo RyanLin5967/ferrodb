@@ -142,9 +142,14 @@ fn main() {
                 if exact { "I holds" } else { "I FAILS" },
             );
         }
+        // The pre-registered statistic (PREREG amendment 13, C6): the median over rounds of the
+        // per-round ratio of medians. Pairing within a round cancels drift between rounds; an even
+        // number of rounds takes the mean of the two middle ratios.
         let mut ratios: Vec<f64> = medians.iter().map(|(u, m)| *u as f64 / *m as f64).collect();
         ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_ratio = ratios[ratios.len() / 2];
+        let mid = ratios.len() / 2;
+        let median_ratio =
+            if ratios.len() % 2 == 0 { (ratios[mid - 1] + ratios[mid]) / 2.0 } else { ratios[mid] };
         let (lo, hi) = if kind == Kind::Staged { (1.00, 1.40) } else { (0.95, 1.10) };
         println!(
             "{kind:?}: median over rounds of (unmarked median / marked median) = \

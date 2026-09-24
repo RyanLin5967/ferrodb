@@ -397,15 +397,20 @@ fn local_wall_millis() -> u64 {
 /// this crate that measures an age against the wall clock (D198 reviews 3 and 4, C1 and C3).
 ///
 /// The FirstStart policy needs the wall-clock age of a catalog's (or a legacy log's) last write. A
-/// function from a stamp to its age would hand out a wall READING to any caller that passes 0 — the
-/// door [`local_wall_millis`]'s privacy closes, reopened by a comment. So the stamp is a type, and
-/// its one constructor reads a FILE: no caller can make a `FileWallStamp` from an integer, and
-/// `wall_age_millis` is the only way it touches the clock. The rule is a type, not a comment.
+/// function from an integer stamp to its age would hand out a wall READING to any caller that
+/// passes 0 — the door [`local_wall_millis`]'s privacy closes, reopened by a comment. So the stamp is
+/// a type whose one constructor reads a FILE, and **no single call returns a wall reading**.
+///
+/// **That is all the type buys** (D198 review 5, C3). Any two independent functions of the stamp
+/// and the wall clock let the wall clock be solved for: `s.millis() + s.wall_age_millis()` IS the
+/// wall reading, for any stamp, and an inline `SystemTime::now()` is always available anyway. So
+/// `millis()` has exactly two named consumers (its doc), the arithmetic goes through
+/// [`Self::lease_scale_age_millis`] and [`Self::wall_age_millis`], and the mutant that rebuilds a
+/// reading from a stamp (M58b) is killed by a TEST, not by this type.
 ///
 /// Why a stamp and not `fn(&Path) -> age`: the evidence is the file's time when the catalog was
 /// OPENED, and its age is needed at the resume, after this process may have written the file
-/// itself. Stated hole: the age of a file whose mtime is the epoch IS a wall reading; obtaining one
-/// means creating such a file, which no path in this crate does.
+/// itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileWallStamp(u64);
 
@@ -418,9 +423,22 @@ impl FileWallStamp {
         u64::try_from(since.as_millis()).ok().map(FileWallStamp)
     }
 
-    /// The stamp, in unix milliseconds on the wall clock. A time in the past, never "now".
+    /// The stamp, in unix milliseconds on the wall clock. **Exactly two consumers, named here**
+    /// (review 5, C3): `TableBranchCatalog::first_start_credit`, which prints it in the startup
+    /// report (`LeaseResume::FirstStartFromFileTime::file_mtime`), and the `#[cfg(test)]`
+    /// `table_catalog::file_mtime_millis`. Arithmetic uses [`Self::lease_scale_age_millis`] or
+    /// [`Self::wall_age_millis`]; a third consumer can rebuild a wall reading with the latter.
     pub(crate) fn millis(self) -> u64 {
         self.0
+    }
+
+    /// `lease_now − stamp`, saturating at 0: the file's age on the LEASE scale. **Correct only under
+    /// R2** (`table_catalog::FirstStartEvidence`): it reads the stamp as the lease reading of a
+    /// writer whose lease clock was the wall clock — every pre-D198 build. For a file last written
+    /// by a D198 process whose lease clock lagged, it is short by that lag (review 5, C1b/C1d; a
+    /// stated residual, never below the pre-policy 0).
+    pub(crate) fn lease_scale_age_millis(self, lease_now: u64) -> u64 {
+        lease_now.saturating_sub(self.0)
     }
 
     /// How long ago, on the wall clock, the file was written: `W(now) − stamp`, saturating at 0 for
