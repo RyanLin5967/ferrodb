@@ -419,3 +419,27 @@ primary heap, so the open panics, and every later one does too.
   - GREEN after the fix.
   - Mutant **M24**: the new `flush_page` removed. Predicted RED on this test.
 - Base and counts follow in the amendment after the code.
+
+**Amendment 13 (after the red test `18c647e`, BEFORE the fix commit).** `18c647e` adds amendment 12's red test,
+`a_page_its_heap_lists_before_its_own_image_reached_the_disk_opens_as_an_empty_page`, as registered. It also adds
+`logged_pages`, which reads the crash image's durable log for heap records by page.
+
+**One D229 test is restated by the fix, fixture only:**
+`the_reset_keeps_a_page_a_directory_lists_whose_bytes_are_zeros` (M2's killer).
+- **Why:** it reached a listed zero page through the route the fix closes. `find_or_make_page` on `u`'s time-travel
+  heap, then only the directory flushed. With the fix, `add_empty_page` has already written the page's empty image, so
+  the test's premise ("page {listed}'s own image reached the disk, so it is not a zero page") would fail at setup.
+- **The change:** the zero image is now planted with `disk_manager.write(listed, zeros)` right after the directory's
+  flush, as a crash under an earlier build left it. The state it checks, the keep-set property and every assertion
+  and premise are unchanged, and M2 is still predicted to be killed by it.
+- **Why no other test is affected** (INFERRED):
+  - The M15 lost-bit test reuses a page that `new_page` + `delete_page` left as zeros. Under `SyncOnly`, both of the
+    reuse's writes are lost at the crash, so its zero premise holds.
+  - D250 test 13's premise reads page LSNs on disk, and an empty image carries LSN 0, as zeros do.
+  - `integration_alter_refusal_safety`'s partial-reservation test counts empty pages by free space, which a written
+    empty page leaves unchanged.
+- **What the fix does not cover:** a database written by an earlier build can already hold a listed zero page. The fix
+  prevents new ones; it repairs none. ferrodb has no deployed databases (proof of concept), so this is stated, not
+  built.
+- The runner gains M24 (the new `flush_page` removed, killed by the red test) and D250's SKIPm, TTm, CLRm and LSNm
+  (amendment 12). Base and counts follow in the next amendment.
