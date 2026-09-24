@@ -1,41 +1,39 @@
 #!/usr/bin/env bash
-# D233 fire-check, amendment 3 (review 2: G1 a control that must be clean and kills by NAME; G3/G4 new
-# mutants; G6/G2/G9 red tests). Pre-registration: artie-research frontier/lane_d233_free_at_empty.md §9.
-# Mutants cover BPlusTreeManager's free-at-empty (index.rs) and fork's FREE_ID reuse
-# (table_catalog.rs). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan
-# work: it runs only when the lead releases the FAN-QUEUE row for D233.
+# D233 fire-check, amendment 6 (review 3: H1 the judge reads only the target files it names; L4
+# --no-fail-fast and a result line per binary; L6 src/ restored on any exit; L9 the control first; H2's
+# TIMEOUT label; M1 Rc registered for U4/U5; --self-test on planted outputs). Pre-registration: artie-research
+# frontier/lane_d233_free_at_empty.md §12 (the arms and killers of §9-§11 otherwise unchanged).
+# Mutants cover BPlusTreeManager's free-at-empty (index.rs) and fork's FREE_ID reuse (table_catalog.rs).
+# Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work: it runs only when the
+# lead releases the FAN-QUEUE row for D233.
 #
-# Arms:
+# Usage: bash bench/d233/firecheck.sh               the run
+#        bash bench/d233/firecheck.sh --self-test   the judge on planted outputs only: no cargo, no git writes
+#
+# Targets: index (--lib storage::index), catalog (--lib branch::table_catalog), collateral (three test
+# binaries, --no-fail-fast), lockorder (--test lock_order_allowlist).
+# Arms, in run order:
+# - control: SUBJECT_SHA, all four targets: every file OK, nothing FAILED, and per target
+#            passed + ignored == the harness's own `-- --list` count, both > 0. Anything else VOIDS the run (exit 2).
 # - base-F3: 0eda6ca's src/ with this tip's index.rs test module spliced in; the index selection
 #            must FAIL exactly Ra, Rb, Rc and G6T (the F3 red run, split per case, review 2 G4).
 # - base-G:  f03e25d's src/ with this tip's index.rs and table_catalog.rs test modules spliced in;
 #            index + catalog must FAIL exactly G6T, G2T, G9a, G9b.
 # - base-L:  2b9d2c0's src/, --test lock_order_allowlist: exactly
 #            every_pool_method_that_locks_opens_a_pool_section FAILS (amendment 5).
-# - control: SUBJECT_SHA, all four selections (index, catalog, collateral, lockorder): zero FAILED lines, a result line and rc=0 in every
-#            file, or the run is VOID (exit 2).
-# - mutants: KILLED-AS-REGISTERED when every required killer FAILED and nothing outside
+# - mutants: KILLED-AS-REGISTERED when every file is OK, every required killer FAILED and nothing outside
 #            required + optional failed; the pre-registered survivors (U8, V4, V5) are
 #            SURVIVED-AS-REGISTERED when nothing outside their optional set failed. Anything else
-#            (MISMATCH, SURVIVED, COMPILE-FAIL) counts against the run.
+#            (MISMATCH, SURVIVED, COMPILE-FAIL, TIMEOUT, INCOMPLETE, RC-*) counts against the run.
 #
 # Blind spots, stated: four selections, not the whole suite. CC (the concurrent arm) is optional
-# wherever it appears, because it sees a mutant only when the scheduler hits the window.
+# wherever it is not required, because it sees a mutant only when the scheduler hits the window. The judge
+# reads cargo's own lines ("test result:", "test <name> ... FAILED") and the rc this script appends.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
 SUBJECT_SHA=f6909db
 OUT=bench/d233/firecheck
-mkdir -p "$OUT"
-
-if ! git diff --quiet "$SUBJECT_SHA" -- src/ tests/; then
-  echo "REFUSED: src/ or tests/ differ from $SUBJECT_SHA; the mutants' text may not apply" >&2
-  exit 2
-fi
-if [ -n "$(git status --porcelain -- src/ tests/)" ]; then
-  echo "REFUSED: uncommitted changes under src/ or tests/" >&2
-  exit 2
-fi
 
 I=src/storage/index.rs
 C=src/branch/table_catalog.rs
@@ -65,12 +63,13 @@ MUTANTS=(
   "W4_malformed_skipped_silently|$C|"'"                stale.push(k);\n                continue;\n"|"                continue;\n"'
 )
 # name|kill or survivor|required killers|optional killers
+# U4 and U5 require Rc (review 3 M1): each breaks the unlink Rc's premise asserts (lane §12).
 KILLERS=(
   "U1_never_unlink|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied|"
   "U2_no_prev_splice|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied|"
   "U3_no_next_splice|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement|unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
-  "U4_parent_keeps_pointer|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf unlinks_racing_refills_and_readers_lose_no_key|a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
-  "U5_wrong_child_removed|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement|a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
+  "U4_parent_keeps_pointer|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf unlinks_racing_refills_and_readers_lose_no_key a_refused_cascade_that_would_empty_the_root_writes_nothing|a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
+  "U5_wrong_child_removed|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_refused_cascade_that_would_empty_the_root_writes_nothing|a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
   "U6_no_cascade|kill|free_at_empty_keeps_the_chain_and_the_parents_in_agreement a_refused_cascade_that_would_empty_the_root_writes_nothing|unlinks_racing_refills_and_readers_lose_no_key a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied"
   "U7_no_refill_recheck|kill|the_unlink_path_keeps_a_leaf_a_writer_refilled|unlinks_racing_refills_and_readers_lose_no_key"
   "U8_no_root_recheck|survivor||unlinks_racing_refills_and_readers_lose_no_key"
@@ -88,55 +87,300 @@ KILLERS=(
   "W3_unreadable_fails_the_fork|kill|a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal|"
   "W4_malformed_skipped_silently|kill|a_malformed_free_id_key_is_counted_and_removed|"
 )
+TARGETS="index catalog collateral lockorder"
 
-run_target() { # $1 = label, $2 = index | catalog | collateral
-  case "$2" in
-    index)      timeout 1800 cargo test --lib storage::index > "$OUT/$1.index.txt" 2>&1 ;;
-    catalog)    timeout 1800 cargo test --lib branch::table_catalog > "$OUT/$1.catalog.txt" 2>&1 ;;
-    collateral) timeout 1800 cargo test --test d58_latch_free_descent --test d126_atomic_upsert --test integration_btree_concurrency > "$OUT/$1.collateral.txt" 2>&1 ;;
-    lockorder)  timeout 1800 cargo test --test lock_order_allowlist > "$OUT/$1.lockorder.txt" 2>&1 ;;
+target_args() { # $1 = target
+  case "$1" in
+    index)      echo "--lib storage::index" ;;
+    catalog)    echo "--lib branch::table_catalog" ;;
+    collateral) echo "--no-fail-fast --test d58_latch_free_descent --test d126_atomic_upsert --test integration_btree_concurrency" ;;
+    lockorder)  echo "--test lock_order_allowlist" ;;
   esac
-  echo "rc=$?" >> "$OUT/$1.$2.txt"
+}
+binaries() { # $1 = target: test binaries it runs, so result lines it must show
+  case "$1" in collateral) echo 3 ;; *) echo 1 ;; esac
 }
 
-failed_names() {
-  cat "$OUT/$1".*.txt 2>/dev/null | sed -nE 's/^test (.+) \.\.\. FAILED$/\1/p' | sed -E 's/.*:://' | sort -u
+# A command runs in the background and the script waits on it, so a TERM or INT reaches the traps at once
+# instead of after the command (bash defers a trap until a foreground child exits, and `timeout` puts
+# cargo in its own process group, out of reach of a signal to this script's group). The trap stops the
+# child before src/ is restored.
+child=""
+waited() { # the command's rc
+  local rc
+  "$@" &
+  child=$!
+  wait "$child"
+  rc=$?
+  child=""
+  return "$rc"
 }
 
-all_ran() {
-  for f in "$OUT/$1".*.txt; do
-    grep -qE '^test result:' "$f" || return 1
+run_target() { # $1 = label, $2 = target
+  local rc
+  # shellcheck disable=SC2046
+  waited timeout 1800 cargo test $(target_args "$2") > "$OUT/$1.$2.txt" 2>&1
+  rc=$?
+  echo "rc=$rc" >> "$OUT/$1.$2.txt"
+}
+
+listed_in() { # $1 = target: what the harness says it will run, at SUBJECT_SHA (the list is kept)
+  # shellcheck disable=SC2046
+  waited timeout 1800 cargo test $(target_args "$1") -- --list > "$OUT/control.$1.list" 2>&1
+  grep -cE ': test$' "$OUT/control.$1.list"
+}
+
+# ---- The judge. It reads ONLY "$OUT/<label>.<target>.txt" for the targets it is given. Any other file in
+# $OUT (a diffstat, a list, the self-test log, a stale output) cannot change a verdict (review 3 H1). ----
+tfile() { printf '%s/%s.%s.txt' "$OUT" "$1" "$2"; }
+
+# One target file's state: OK, or the reason its names cannot be judged.
+tstate() { # $1 label, $2 target
+  local f last rc n nf
+  f=$(tfile "$1" "$2")
+  [ -f "$f" ] || { echo "INCOMPLETE ($2: no output file)"; return; }
+  last=$(tail -n 1 "$f")
+  case "$last" in rc=[0-9]*) rc=${last#rc=} ;; *) echo "INCOMPLETE ($2: no rc line)"; return ;; esac
+  if [ "$rc" = 124 ]; then echo "TIMEOUT ($2)"; return; fi
+  n=$(grep -cE '^test result:' "$f")
+  if [ "$n" -eq 0 ]; then echo "COMPILE-FAIL ($2)"; return; fi
+  if [ "$n" -ne "$(binaries "$2")" ]; then echo "INCOMPLETE ($2: $n result lines)"; return; fi
+  nf=$(grep -cE '^test .+ \.\.\. FAILED$' "$f")
+  case "$rc/$nf" in
+    0/0) ;;
+    101/0) echo "RC-MISMATCH ($2: rc=101 and nothing FAILED)"; return ;;
+    101/*) ;;
+    0/*) echo "RC-MISMATCH ($2: rc=0 with FAILED lines)"; return ;;
+    *) echo "RC-$rc ($2)"; return ;;
+  esac
+  echo OK
+}
+
+arm_state() { # $1 label, then the targets the arm ran: the first state that is not OK, or OK
+  local label=$1 t s
+  shift
+  for t in "$@"; do
+    s=$(tstate "$label" "$t")
+    [ "$s" = OK ] || { echo "$s"; return; }
   done
-  return 0
+  echo OK
 }
 
-all_rc0() {
-  for f in "$OUT/$1".*.txt; do
-    grep -qx 'rc=0' "$f" || return 1
-  done
-  return 0
+failed_names() { # $1 label, then targets: short names of FAILED tests
+  local label=$1 t
+  shift
+  for t in "$@"; do
+    sed -nE 's/^test (.+) \.\.\. FAILED$/\1/p' "$(tfile "$label" "$t")"
+  done | sed -E 's/.*:://' | sort -u
+}
+
+count_in() { # $1 label, $2 target, $3 passed|ignored: summed over the file's result lines
+  grep -E '^test result:' "$(tfile "$1" "$2")" | sed -nE "s/.* ([0-9]+) $3.*/\\1/p" | awk '{ s += $1 } END { print s + 0 }'
 }
 
 words() { printf '%s\n' $1 | sed '/^$/d' | sort -u; }
 
-verdict() { # $1 label, $2 kill|survivor, $3 required, $4 optional
-  if ! all_ran "$1"; then echo "COMPILE-FAIL"; return; fi
-  actual=$(failed_names "$1")
-  extra=$(comm -13 <(words "$3 $4") <(printf '%s\n' "$actual" | sed '/^$/d'))
-  if [ "$2" = survivor ]; then
+verdict() { # $1 label, $2 kill|survivor, $3 required, $4 optional, then the targets the arm ran
+  local label=$1 kind=$2 req=$3 opt=$4 st actual extra missing
+  shift 4
+  st=$(arm_state "$label" "$@")
+  [ "$st" = OK ] || { echo "$st"; return; }
+  actual=$(failed_names "$label" "$@")
+  extra=$(comm -13 <(words "$req $opt") <(printf '%s\n' "$actual" | sed '/^$/d'))
+  if [ "$kind" = survivor ]; then
     if [ -z "$extra" ]; then echo "SURVIVED-AS-REGISTERED ($(echo $actual))"; else echo "MISMATCH (unexpected: $(echo $extra))"; fi
     return
   fi
   if [ -z "$actual" ]; then echo "SURVIVED"; return; fi
-  missing=$(comm -23 <(words "$3") <(printf '%s\n' "$actual"))
-  if [ -z "$missing" ] && [ -z "$extra" ]; then
-    echo "KILLED-AS-REGISTERED ($(echo $actual))"
-  else
-    echo "MISMATCH (missing: $(echo $missing); unexpected: $(echo $extra))"
-  fi
+  missing=$(comm -23 <(words "$req") <(printf '%s\n' "$actual"))
+  if [ -z "$missing" ] && [ -z "$extra" ]; then echo "KILLED-AS-REGISTERED ($(echo $actual))"
+  else echo "MISMATCH (missing: $(echo $missing); unexpected: $(echo $extra))"; fi
+}
+
+control_verdict() { # $1 label, $2 "target=listed ..." (the harness's own -- --list counts)
+  local label=$1 lists=$2 st t l p i
+  # shellcheck disable=SC2086
+  st=$(arm_state "$label" $TARGETS)
+  [ "$st" = OK ] || { echo "VOID ($st)"; return; }
+  # shellcheck disable=SC2086
+  if [ -n "$(failed_names "$label" $TARGETS)" ]; then echo "VOID (a test FAILED)"; return; fi
+  for t in $TARGETS; do
+    # shellcheck disable=SC2086
+    l=$(printf '%s\n' $lists | sed -n "s/^$t=//p")
+    p=$(count_in "$label" "$t" passed)
+    i=$(count_in "$label" "$t" ignored)
+    case "$l" in ''|*[!0-9]*) echo "VOID ($t: no list count)"; return ;; esac
+    if [ "$l" -eq 0 ] || [ "$p" -eq 0 ] || [ $((p + i)) -ne "$l" ]; then
+      echo "VOID ($t: listed $l, passed $p, ignored $i)"; return
+    fi
+  done
+  echo clean
 }
 
 ok_verdict() { case "$1" in KILLED-AS-REGISTERED*|SURVIVED-AS-REGISTERED*) return 0 ;; *) return 1 ;; esac; }
+
+killers_of() { # $1 mutant name: sets kind, req and opt from KILLERS; returns 1 if it has no row
+  local k kname kkind kreq kopt
+  kind=""; req=""; opt=""
+  for k in "${KILLERS[@]}"; do
+    IFS='|' read -r kname kkind kreq kopt <<< "$k"
+    if [ "$kname" = "$1" ]; then kind=$kkind; req=$kreq; opt=$kopt; return 0; fi
+  done
+  return 1
+}
+
+# ---- --self-test: the judge on planted outputs, in a temporary directory. No cargo, no git writes. ----
+plant() { # $1 label, $2 target, $3 rc, then the file's lines
+  local f rc line
+  f=$(tfile "$1" "$2"); rc=$3
+  shift 3
+  { for line in "$@"; do printf '%s\n' "$line"; done; echo "rc=$rc"; } > "$f"
+}
+upto() { # 1..$1, one per line (BSD seq counts down when $1 < 1)
+  local i=1
+  while [ "$i" -le "$1" ]; do echo "$i"; i=$((i + 1)); done
+}
+result_ok() { echo "test result: ok. $1 passed; 0 failed; $2 ignored; 0 measured; 0 filtered out; finished in 0.01s"; }
+ok_file() { # $1 label, $2 target, $3 passed per binary (the collateral target gets three result lines)
+  local b lines=""
+  for b in $(upto "$(binaries "$2")"); do lines="${lines}running $3 tests
+$(result_ok "$3" 0)
+"; done
+  plant "$1" "$2" 0 "${lines%?}"
+}
+fail_file() { # $1 label, $2 target, $3 passed, then the full names of the FAILED tests (one binary's worth)
+  local label=$1 t=$2 p=$3 n body="" b more=""
+  shift 3
+  for n in "$@"; do body="${body}test $n ... FAILED
+"; done
+  for b in $(upto $(($(binaries "$t") - 1))); do more="${more}$(result_ok 5 0)
+"; done
+  plant "$label" "$t" 101 "running tests" "${body%?}" "" "failures:" \
+    "test result: FAILED. $p passed; $# failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" "${more%?}"
+}
+expect() { # $1 case, $2 expected verdict prefix, $3 actual verdict
+  case "$3" in
+    "$2"*) echo "self-test PASS  $1: $3" ;;
+    *) echo "self-test FAIL  $1: expected '$2', got '$3'"; st_bad=$((st_bad + 1)) ;;
+  esac
+}
+all_ok() { # $1 label, then targets to plant clean
+  local label=$1 t
+  shift
+  for t in "$@"; do ok_file "$label" "$t" 4; done
+}
+
+self_test() {
+  local keep=$OUT st_bad=0 tmp lists m name rest t w req1 base_req cc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/d233-selftest.XXXXXX") || { echo "self-test: mktemp failed"; return 1; }
+  OUT=$tmp
+  lists="index=4 catalog=4 collateral=12 lockorder=4"
+
+  all_ok control index catalog collateral lockorder
+  expect "clean control" "clean" "$(control_verdict control "$lists")"
+
+  plant ign catalog 0 "running 6 tests" "$(result_ok 4 2)"
+  all_ok ign index collateral lockorder
+  expect "clean control with 2 ignored" "clean" "$(control_verdict ign "index=4 catalog=6 collateral=12 lockorder=4")"
+
+  all_ok dirty catalog collateral lockorder
+  fail_file dirty index 3 free_at_empty_keeps_the_chain_and_the_parents_in_agreement
+  # The list count is planted equal to the passed count, so the count gate alone would pass this control:
+  # the case proves the FAILED check fires on its own.
+  expect "dirty control" "VOID (a test FAILED)" "$(control_verdict dirty "index=3 catalog=4 collateral=12 lockorder=4")"
+
+  all_ok empty index catalog collateral
+  plant empty lockorder 0 "running 0 tests" "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  expect "control that collected nothing" "VOID" "$(control_verdict empty "index=4 catalog=4 collateral=12 lockorder=0")"
+
+  # U4 with its registered sets, read from the table the run uses.
+  killers_of U4_parent_keeps_pointer || { echo "self-test FAIL  U4 has no KILLERS row"; st_bad=$((st_bad + 1)); }
+  # shellcheck disable=SC2046
+  fail_file U4 index 1 $(printf 'storage::index::tests::%s ' $req)
+  all_ok U4 catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "killed mutant" "KILLED-AS-REGISTERED" "$(verdict U4 "$kind" "$req" "$opt" $TARGETS)"
+
+  # The same outputs, with stray files that share the label. Each holds no result line and an unregistered
+  # FAILED test, so a judge that read them would say COMPILE-FAIL or MISMATCH.
+  for name in "U4.diffstat" "U4.diffstat.txt" "U4.stale.txt"; do
+    printf '%s\n' " src/storage/index.rs | 3 +--" "test stray::not_a_registered_killer ... FAILED" > "$OUT/$name"
+  done
+  # shellcheck disable=SC2086
+  expect "killed mutant, stray files in \$OUT" "KILLED-AS-REGISTERED" "$(verdict U4 "$kind" "$req" "$opt" $TARGETS)"
+
+  req1=${req%% *}
+  for t in $TARGETS; do plant cf "$t" 101 "error[E0308]: mismatched types" "error: could not compile \`ferrodb\` (lib test) due to 1 previous error"; done
+  # shellcheck disable=SC2086
+  expect "compile failure" "COMPILE-FAIL" "$(verdict cf "$kind" "$req" "$opt" $TARGETS)"
+
+  all_ok to catalog collateral lockorder
+  plant to index 124 "running 40 tests" "test storage::index::tests::unlinks_racing_refills_and_readers_lose_no_key has been running for over 60 seconds"
+  # shellcheck disable=SC2086
+  expect "timeout" "TIMEOUT (index)" "$(verdict to "$kind" "$req" "$opt" $TARGETS)"
+
+  all_ok gone index catalog lockorder
+  # shellcheck disable=SC2086
+  expect "a target with no output file" "INCOMPLETE (collateral: no output file)" "$(verdict gone "$kind" "$req" "$opt" $TARGETS)"
+
+  all_ok nfs index catalog lockorder
+  plant nfs collateral 101 "test d58::x ... ok" "$(result_ok 4 0)" "test d126::y ... FAILED" \
+    "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" \
+    "error: test failed, to rerun pass \`--test d126_atomic_upsert\`"
+  # shellcheck disable=SC2086
+  expect "collateral with 2 result lines" "INCOMPLETE (collateral: 2 result lines)" "$(verdict nfs "$kind" "$req" "$opt" $TARGETS)"
+
+  all_ok rcm catalog collateral lockorder
+  plant rcm index 0 "test storage::index::tests::$req1 ... FAILED" "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  # shellcheck disable=SC2086
+  expect "rc=0 with a FAILED line" "RC-MISMATCH" "$(verdict rcm "$kind" "$req" "$opt" $TARGETS)"
+
+  all_ok sv index catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "survivor" "SURVIVED" "$(verdict sv "$kind" "$req" "$opt" $TARGETS)"
+
+  # shellcheck disable=SC2046
+  fail_file mm index 1 $(printf 'storage::index::tests::%s ' $req) storage::index::tests::not_a_registered_killer
+  all_ok mm catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "unexpected failure" "MISMATCH" "$(verdict mm "$kind" "$req" "$opt" $TARGETS)"
+
+  killers_of U8_no_root_recheck || { echo "self-test FAIL  U8 has no KILLERS row"; st_bad=$((st_bad + 1)); }
+  all_ok u8 index catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "registered survivor, nothing FAILED" "SURVIVED-AS-REGISTERED" "$(verdict u8 "$kind" "$req" "$opt" $TARGETS)"
+  cc=${opt%% *}
+  fail_file u8cc index 3 "storage::index::tests::$cc"
+  all_ok u8cc catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "registered survivor, its optional killer FAILED" "SURVIVED-AS-REGISTERED" "$(verdict u8cc "$kind" "$req" "$opt" $TARGETS)"
+  fail_file u8x index 3 "storage::index::tests::$cc" storage::index::tests::not_a_registered_killer
+  all_ok u8x catalog collateral lockorder
+  # shellcheck disable=SC2086
+  expect "registered survivor, an unregistered test FAILED" "MISMATCH" "$(verdict u8x "$kind" "$req" "$opt" $TARGETS)"
+
+  base_req="every_pool_method_that_locks_opens_a_pool_section"
+  fail_file base-L lockorder 3 "$base_req"
+  expect "base arm" "KILLED-AS-REGISTERED" "$(verdict base-L kill "$base_req" "" lockorder)"
+
+  for m in "${MUTANTS[@]}"; do
+    IFS='|' read -r name rest <<< "$m"
+    if ! killers_of "$name"; then
+      echo "self-test FAIL  registration: $name has no KILLERS row"; st_bad=$((st_bad + 1)); continue
+    fi
+    case "$kind" in
+      kill) [ -n "$req" ] || { echo "self-test FAIL  registration: $name has no required killer"; st_bad=$((st_bad + 1)); } ;;
+      survivor) [ -z "$req" ] || { echo "self-test FAIL  registration: survivor $name lists a required killer"; st_bad=$((st_bad + 1)); } ;;
+      *) echo "self-test FAIL  registration: $name has kind '$kind'"; st_bad=$((st_bad + 1)) ;;
+    esac
+  done
+  [ "$st_bad" -eq 0 ] && echo "self-test PASS  registration: every mutant has a row, and every kill a required killer"
+
+  rm -rf "$OUT"
+  OUT=$keep
+  echo "self-test: $st_bad case(s) missed"
+  [ "$st_bad" -eq 0 ]
+}
 
 # Splice SUBJECT_SHA's test module of $1 into the working copy of $1 (which holds an older src/).
 splice_tests() { # $1 = file, $2 = "old-counter" to read the pre-amendment-5 counter
@@ -169,19 +413,63 @@ open(path, "w").write(head + module + tail)
 EOF
 }
 
+if [ "${1:-}" = --self-test ]; then self_test; exit $?; fi
+[ $# -eq 0 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
+
+if ! git diff --quiet "$SUBJECT_SHA" -- src/ tests/; then
+  echo "REFUSED: src/ or tests/ differ from $SUBJECT_SHA; the mutants' text may not apply" >&2
+  exit 2
+fi
+if [ -n "$(git status --porcelain -- src/ tests/)" ]; then
+  echo "REFUSED: uncommitted changes under src/ or tests/" >&2
+  exit 2
+fi
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+if ! self_test > "$OUT/selftest.log" 2>&1; then
+  cat "$OUT/selftest.log" >&2
+  echo "REFUSED: the judge's self-test failed" >&2
+  exit 2
+fi
+
+on_exit() {
+  git checkout "$SUBJECT_SHA" -- src/ 2>/dev/null
+  git diff --quiet "$SUBJECT_SHA" -- src/ tests/ ||
+    echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout $SUBJECT_SHA -- src/" >&2
+}
+on_signal() { # $1 = the exit status
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+  fi
+  exit "$1"
+}
+trap on_exit EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
 bad=0
 restore() {
   git checkout "$SUBJECT_SHA" -- src/
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: src/ not restored after $1" >&2; exit 3; }
 }
 
+echo "== control: $SUBJECT_SHA"
+for t in $TARGETS; do run_target control "$t"; done
+lists=""
+for t in $TARGETS; do lists="$lists $t=$(listed_in "$t")"; done
+v=$(control_verdict control "$lists")
+echo "control: $v (lists:$lists)" | tee "$OUT/summary.txt"
+[ "$v" = clean ] || exit 2
+
 echo "== base-F3: 0eda6ca src/ + this tip's index.rs tests"
 git checkout 0eda6ca -- src/
 splice_tests "$I" || { echo "ABORT: splice failed (base-F3)" >&2; restore base-F3; exit 3; }
 run_target base-F3 index
 restore base-F3
-v=$(verdict base-F3 kill "a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on" "")
-echo "base-F3: $v" | tee "$OUT/summary.txt"
+v=$(verdict base-F3 kill "a_refused_unlink_with_a_broken_prev_link_writes_nothing a_refused_unlink_with_a_broken_next_link_writes_nothing a_refused_cascade_that_would_empty_the_root_writes_nothing a_chain_whose_prev_is_its_next_is_refused_not_waited_on" "" index)
+echo "base-F3: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
 echo "== base-G: f03e25d src/ + this tip's index.rs and table_catalog.rs tests"
@@ -193,7 +481,7 @@ git checkout f03e25d -- src/
 run_target base-G index
 run_target base-G catalog
 restore base-G
-v=$(verdict base-G kill "a_chain_whose_prev_is_its_next_is_refused_not_waited_on fork_never_reuses_a_reaped_slot_that_still_has_a_live_child a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal a_malformed_free_id_key_is_counted_and_removed" "")
+v=$(verdict base-G kill "a_chain_whose_prev_is_its_next_is_refused_not_waited_on fork_never_reuses_a_reaped_slot_that_still_has_a_live_child a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal a_malformed_free_id_key_is_counted_and_removed" "" index catalog)
 echo "base-G: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
@@ -201,25 +489,13 @@ echo "== base-L: src/ at 2b9d2c0 (amendment 5: the page-read counter broke the l
 git checkout 2b9d2c0 -- src/
 run_target base-L lockorder
 restore base-L
-v=$(verdict base-L kill "every_pool_method_that_locks_opens_a_pool_section" "")
+v=$(verdict base-L kill "every_pool_method_that_locks_opens_a_pool_section" "" lockorder)
 echo "base-L: $v" | tee -a "$OUT/summary.txt"
 ok_verdict "$v" || bad=$((bad + 1))
 
-echo "== control: $SUBJECT_SHA"
-for t in index catalog collateral lockorder; do run_target control "$t"; done
-if ! all_ran control || ! all_rc0 control || [ -n "$(failed_names control)" ]; then
-  echo "control: VOID (failed: $(failed_names control | tr '\n' ' '); every file needs a result line and rc=0)" | tee -a "$OUT/summary.txt"
-  exit 2
-fi
-echo "control: clean" | tee -a "$OUT/summary.txt"
-
 for m in "${MUTANTS[@]}"; do
   IFS='|' read -r name FILE old new <<< "$m"
-  kind=""; req=""; opt=""
-  for k in "${KILLERS[@]}"; do
-    IFS='|' read -r kname kkind kreq kopt <<< "$k"
-    if [ "$kname" = "$name" ]; then kind=$kkind; req=$kreq; opt=$kopt; fi
-  done
+  killers_of "$name" || { echo "$name: NO KILLERS ROW" | tee -a "$OUT/summary.txt"; bad=$((bad + 1)); continue; }
   echo "== $name"
   if ! timeout 60 python3 - "$FILE" "$old" "$new" <<'EOF'
 import ast, sys
@@ -235,12 +511,12 @@ EOF
     bad=$((bad + 1))
     continue
   fi
-  # Not *.txt: the judge globs "$OUT/<label>.*.txt" for target outputs (D237 review 2, N2).
   git diff --stat -- "$FILE" > "$OUT/$name.diffstat"
-  for t in index catalog collateral lockorder; do run_target "$name" "$t"; done
+  for t in $TARGETS; do run_target "$name" "$t"; done
   git checkout "$SUBJECT_SHA" -- "$FILE"
   git diff --quiet "$SUBJECT_SHA" -- src/ || { echo "ABORT: restore of $FILE after $name left a difference" >&2; exit 3; }
-  v=$(verdict "$name" "$kind" "$req" "$opt")
+  # shellcheck disable=SC2086
+  v=$(verdict "$name" "$kind" "$req" "$opt" $TARGETS)
   echo "$name: $v" | tee -a "$OUT/summary.txt"
   ok_verdict "$v" || bad=$((bad + 1))
 done
