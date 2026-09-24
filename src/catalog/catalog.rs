@@ -945,6 +945,29 @@ mod tests {
         );
     }
 
+    /// **`table_pages` names both heaps and every tree** (E69's gap, carried into D229: a DROP frees
+    /// what this returns and nothing else, so a structure left out here is a structure leaked). The
+    /// time-travel heap's directory, the primary root and the B-tree index's root are checked by
+    /// id, and the list holds no page twice.
+    #[test]
+    fn table_pages_names_both_heaps_and_every_tree() {
+        let mut catalog = setup_catalog();
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("t", "age").unwrap();
+        let e = catalog.get_table("t").unwrap().clone();
+        let pages = catalog.table_pages("t").unwrap();
+        for (what, page) in [
+            ("heap directory", e.first_directory_page_id),
+            ("time-travel heap directory", e.time_travel_root),
+            ("primary index root", e.primary_index_root),
+            ("B-tree index root", e.indexes[0].root_page_id),
+        ] {
+            assert!(pages.contains(&page), "table_pages leaves out the {what}, page {page}: {pages:?}");
+        }
+        let distinct: std::collections::BTreeSet<u32> = pages.iter().copied().collect();
+        assert_eq!(distinct.len(), pages.len(), "table_pages names a page twice: {pages:?}");
+    }
+
     /// A dropped table must not leave its statistics behind for the next table of the same name.
     ///
     /// E69: `drop_table` removed the entry from `self.tables` and left `self.stats` alone, so a table
