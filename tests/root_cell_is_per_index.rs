@@ -18,6 +18,27 @@
 //!
 //! Secondary lookups survive, because `SecondaryIndexScan` drops an entry whose resolved value
 //! differs from the key. That is why nothing noticed.
+//!
+//! # D208 — the same collision, three more routes (INFERRED, READ-FROM-SOURCE, not run)
+//!
+//! The sentence above holds only in the order the first test uses. Recorded here, not edited out:
+//!
+//! - **Full-text index FIRST.** It seeds the one cell, so the optimizer's secondary scan
+//!   (`optimizer::lower`, `root_cell(&table, Some(&col_name))`) descends the POSTING tree, which
+//!   holds tokens and not whole values: an equality lookup misses every backfilled row. The first
+//!   write makes it durable, because `sync_roots` writes the posting tree's root into the B-tree
+//!   record. Re-checking the value cannot help; the entry is absent, not wrong.
+//! - **A rebuild, in either order.** `rebuild_indexes` stores each fresh root into "its" cell
+//!   (D205's store-in-place). Both trees resolve to the one cell and the posting tree is stored
+//!   last, so after any rebuild the secondary index reads the posting tree.
+//! - **A renamed column (the same defect through another exit).** The cell is keyed by the column
+//!   NAME, and `ALTER ... RENAME COLUMN` renames the records but leaves the cell under the old
+//!   name. An index later built on a new column that takes the old name inherits the renamed
+//!   index's tree through that cell, because `sync_root_cells` never overwrites an existing one.
+//!
+//! The lookups below are only meaningful on an index scan, and below a few hundred rows the
+//! optimizer prefers a filtered sequential scan, which answers correctly whatever the cell names.
+//! So each fixture is `N` rows, `ANALYZE`d, and each asserts its plan before trusting a lookup.
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -29,8 +50,10 @@ use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
+use ferrodb::planner::plan::explain;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
+use ferrodb::wal::recovery::rebuild_indexes;
 use ferrodb::wal::txn::TxnManager;
 
 struct Db {
@@ -82,7 +105,46 @@ impl Db {
         ids.sort();
         ids
     }
+
+    /// The plan the optimizer builds for a SELECT: the same `optimize` that `run` plans with.
+    fn explain(&self, sql: &str) -> String {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+        explain(stmts.remove(0), &self.catalog).unwrap_or_else(|e| panic!("EXPLAIN `{sql}` failed: {e}"))
+    }
+
+    /// Fail unless `sql` is planned as an index scan on column `col` of `t`.
+    fn assert_index_scan(&self, sql: &str, col: usize) {
+        let plan = self.explain(sql);
+        assert!(
+            plan.contains(&format!("Index scan on t (col {col},")),
+            "premise failed: `{sql}` is not planned on the index over column {col}, so its lookup \
+             would read the heap and could not see which tree the index opened. plan:\n{plan}"
+        );
+    }
+
+    /// The durable records' roots for the trees on `column` of `t`: (B-tree, full-text).
+    fn record_roots(&self, column: &str) -> (Option<u32>, Option<u32>) {
+        let e = self.catalog.get_table("t").expect("table t exists");
+        (
+            e.indexes.iter().find(|i| i.column_name == column).map(|i| i.root_page_id),
+            e.fulltext_indexes.iter().find(|i| i.column_name == column).map(|i| i.root_page_id),
+        )
+    }
 }
+
+/// Rows in each index-scan fixture below.
+///
+/// Sized from `optimizer::cost_model` (READ; the EXPLAIN premise in each test is the measurement).
+/// `t (id INTEGER, body VARCHAR(100))` costs 24 + 4 + 100 = 128 bytes a row, 32 to a 4096-byte
+/// page. After `ANALYZE` with every value distinct, an equality scan on the secondary index
+/// estimates 1 row: 2 levels x 4 + 1 leaf + 4 + 4 = 17. The filtered sequential scan costs
+/// pages + 0.02 x rows: 26 at 500 rows, 16 at 300. So the index wins from about 340 rows, and 500
+/// leaves a margin. Do not shrink it: a smaller table switches these tests off, it does not speed
+/// them up.
+const N: i32 = 500;
 
 /// **The full-text index keeps answering for the rows it was built over, after the table is
 /// written again.**
@@ -110,4 +172,121 @@ fn a_fulltext_index_beside_a_secondary_index_on_one_column_keeps_its_own_tree() 
     // Secondary lookups by whole value are expected to survive either way (their scan re-checks
     // the value), so this is a control, not the defect.
     assert_eq!(d.ids("SELECT id FROM t WHERE body = 'alpha beta';"), vec![1], "the secondary lookup broke");
+}
+
+/// **D208, the other order: a B-tree index built BESIDE an existing full-text index answers an
+/// equality lookup for the rows it was built over, before and after the table is written again.**
+///
+/// The full-text index is created first, so it seeds the shared cell, and the secondary scan
+/// descends the posting tree. FAILS today (INFERRED) at the FIRST lookup for `row7 alpha`, before
+/// any write: the posting tree holds `row7` and `alpha`, never the whole value. If that assertion
+/// were removed, the lookups after the write would fail too, and the record assertion at the end
+/// would fail because `sync_roots` wrote the posting tree's root into the B-tree record.
+#[test]
+fn a_btree_index_beside_a_fulltext_index_on_one_column_keeps_its_own_tree() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    for i in 0..N {
+        d.rows(&format!("INSERT INTO t VALUES ({i}, 'row{i} alpha');"));
+    }
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    d.rows("CREATE INDEX ib ON t (body);");
+    d.rows("ANALYZE t;");
+    let lookup = "SELECT id FROM t WHERE body = 'row7 alpha';";
+    d.assert_index_scan(lookup, 1);
+
+    assert_eq!(d.ids(lookup), vec![7], "the B-tree index does not find a row it was built over");
+
+    d.rows(&format!("INSERT INTO t VALUES ({N}, 'late entry');"));
+
+    assert_eq!(d.ids(lookup), vec![7], "one insert later, the B-tree index lost a row it was built over");
+    assert_eq!(
+        d.ids("SELECT id FROM t WHERE body = 'late entry';"),
+        vec![N],
+        "the B-tree index does not find the row just inserted"
+    );
+    // The full-text side is a control in this order: it seeded the cell, so it reads its own tree.
+    assert_eq!(d.ids("SEARCH t (body) FOR 'row7';"), vec![7], "the full-text control broke");
+    assert_eq!(d.ids("SEARCH t (body) FOR 'late';"), vec![N], "the full-text control broke on the new row");
+    // Structural: two trees cannot share a root page, so equal records mean one record names the
+    // other index's tree and that index's own tree is orphaned.
+    let (btree, fulltext) = d.record_roots("body");
+    assert!(btree.is_some() && fulltext.is_some(), "premise failed: an index record is missing");
+    assert_ne!(
+        btree, fulltext,
+        "the B-tree record and the full-text record name the same page, so one of the two trees is orphaned"
+    );
+}
+
+/// **D208 through D205's store-in-place: a rebuild leaves the B-tree index on its own tree.**
+///
+/// The B-tree index is created FIRST here, the order in which the live path leaves B-tree lookups
+/// correct, so the premise lookup before the rebuild passes today and the only thing that changes
+/// is the rebuild. FAILS today (INFERRED) at the lookup right after `rebuild_indexes`: both fresh
+/// roots are stored into the one cell, the posting tree's last.
+#[test]
+fn a_rebuild_leaves_a_btree_index_beside_a_fulltext_index_on_its_own_tree() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    for i in 0..N {
+        d.rows(&format!("INSERT INTO t VALUES ({i}, 'row{i} alpha');"));
+    }
+    d.rows("CREATE INDEX ib ON t (body);");
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    d.rows("ANALYZE t;");
+    let lookup = "SELECT id FROM t WHERE body = 'row7 alpha';";
+    d.assert_index_scan(lookup, 1);
+    assert_eq!(d.ids(lookup), vec![7], "premise failed: the B-tree lookup is wrong before any rebuild");
+
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+
+    assert_eq!(d.ids(lookup), vec![7], "after a rebuild, the B-tree index lost a row");
+    assert_eq!(d.ids("SEARCH t (body) FOR 'row7';"), vec![7], "after a rebuild, the full-text index lost a row");
+
+    d.rows(&format!("INSERT INTO t VALUES ({N}, 'late entry');"));
+
+    assert_eq!(d.ids(lookup), vec![7], "after a rebuild and a write, the B-tree index lost a row");
+    assert_eq!(d.ids("SELECT id FROM t WHERE body = 'late entry';"), vec![N], "the new row is not found by value");
+    assert_eq!(d.ids("SEARCH t (body) FOR 'late';"), vec![N], "the new row is not found by its word");
+    let (btree, fulltext) = d.record_roots("body");
+    assert!(btree.is_some() && fulltext.is_some(), "premise failed: an index record is missing");
+    assert_ne!(btree, fulltext, "after a rebuild and a write, both index records name one tree");
+}
+
+/// **D208, the rename exit: an index built on a column that takes a renamed column's old name
+/// does not inherit the renamed column's tree.**
+///
+/// The rows are inserted AFTER the two ALTERs, so the new column holds values of its own and the
+/// two indexes' trees hold different keys. FAILS today (INFERRED) at the lookup on `a`: the cell
+/// keyed `(t, a)` still names the tree the rename handed to `b`, so the scan finds `b` values only.
+#[test]
+fn an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, a VARCHAR(100));");
+    d.rows("CREATE INDEX ia ON t (a);");
+    d.rows("ALTER TABLE t RENAME COLUMN a TO b;");
+    d.rows("ALTER TABLE t ADD COLUMN a VARCHAR(100);");
+    for i in 0..N {
+        d.rows(&format!("INSERT INTO t VALUES ({i}, 'b{i}', 'a{i}');"));
+    }
+    d.rows("CREATE INDEX ia2 ON t (a);");
+    d.rows("ANALYZE t;");
+    let on_a = "SELECT id FROM t WHERE a = 'a7';";
+    let on_b = "SELECT id FROM t WHERE b = 'b7';";
+    d.assert_index_scan(on_a, 2);
+    d.assert_index_scan(on_b, 1);
+
+    assert_eq!(d.ids(on_a), vec![7], "the index on the new column `a` does not find a row it was built over");
+    assert_eq!(d.ids(on_b), vec![7], "the index that followed the rename to `b` lost a row");
+
+    d.rows(&format!("INSERT INTO t VALUES ({N}, 'b-late', 'a-late');"));
+
+    assert_eq!(d.ids(on_a), vec![7], "one insert later, the index on `a` lost a row");
+    assert_eq!(d.ids(on_b), vec![7], "one insert later, the index on `b` lost a row");
+    assert_eq!(d.ids("SELECT id FROM t WHERE a = 'a-late';"), vec![N], "the new row is not found through `a`");
+    assert_eq!(d.ids("SELECT id FROM t WHERE b = 'b-late';"), vec![N], "the new row is not found through `b`");
+    let (on_a_root, _) = d.record_roots("a");
+    let (on_b_root, _) = d.record_roots("b");
+    assert!(on_a_root.is_some() && on_b_root.is_some(), "premise failed: an index record is missing");
+    assert_ne!(on_a_root, on_b_root, "the indexes on `a` and `b` record one tree between them");
 }
