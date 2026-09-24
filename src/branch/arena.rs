@@ -5145,6 +5145,273 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ---- D183 tail replay: O(records + their own entries), not O(records x pending log) ----------
+
+    /// **D183 tail replay.** An image holding `p0` parked entries, then a tail of `rounds` rounds.
+    /// Each round writes one record of every kind that touches the pending-free log, through the
+    /// real writers:
+    /// * `TAIL_PAGES_PARKED` with one entry: `retire_arenas_by_rule` over a branch with one page
+    ///   and a live child.
+    /// * `TAIL_PENDING_DRAINED` removing one entry: a take, then a put of all but the oldest entry,
+    ///   which is `drain_pending` finding exactly one entry releasable.
+    /// * `TAIL_EXTENT_FREED` of an extent with nothing parked in it: a claim, then `free_arena`.
+    ///
+    /// Claims ride along as `TAIL_ARENA_CLAIMED`. The log stays at `p0` entries throughout, so
+    /// every record replays against a log of the same size.
+    ///
+    /// Returns how many pending entries the tail's records CARRY. It is counted here as they are
+    /// written, never read back from the counter under test.
+    fn parked_image_then_mixed_tail(
+        h: &Harness,
+        armed: &std::path::Path,
+        p0: usize,
+        rounds: usize,
+    ) -> usize {
+        h.store.checkpoint_to(armed.to_path_buf());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..p0 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), p0, "fixture: the image must hold {p0} parked entries");
+        // The image. Every parked entry is in it and the tail starts empty.
+        h.store.checkpoint(armed).unwrap();
+        assert!(
+            ArenaPageStore::tail_kinds(armed).is_empty(),
+            "fixture: the tail did not start empty"
+        );
+        let (r0, _) = h.store.persist_counters();
+
+        let mut carried = 0usize;
+        for _ in 0..rounds {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            let rec = h.catalog.get_raw(b.branch_id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+            carried += 1;
+
+            let taken = h.store.take_pending();
+            assert_eq!(taken.len(), p0 + 1, "fixture: the park did not reach the log");
+            h.store.put_pending(taken[1..].to_vec()).unwrap();
+            carried += 1;
+
+            let c = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let arena = h.store.arena_for(c.branch_id).unwrap();
+            h.store.free_arena(arena).unwrap();
+        }
+        let (r1, _) = h.store.persist_counters();
+        assert_eq!(
+            r1, r0,
+            "fixture: the tail was compacted into a new image, so it no longer holds every record \
+             this fixture wrote"
+        );
+        assert_eq!(h.store.pending_len(), p0, "fixture: each round must add one entry and drop one");
+        carried
+    }
+
+    /// ⭐ **Replay visits each record's OWN entries, plus one pass over the log. It does not visit
+    /// the whole log once per record.**
+    ///
+    /// At `731a7fa` three replay arms walked the entire pending-free log for every record:
+    /// * `TAIL_PAGES_PARKED` built a `HashSet` of it;
+    /// * `TAIL_PENDING_DRAINED` ran `retain` over it, even for a record naming nothing;
+    /// * `TAIL_EXTENT_FREED` ran `retain` over it.
+    ///
+    /// D183 turned full rewrites into these records, so a tail now spans many reaps before
+    /// `compact_threshold` folds it into an image. An open after an unclean exit paid
+    /// O(records x P). A clean CLI exit compacts, so only the crash path paid, and that is the
+    /// path where a fast open matters.
+    ///
+    /// The bound is the fix's claim, stated from the fixture. It allows one pass to index the
+    /// image's log, one visit per entry a record carries, one per record, and one pass to write
+    /// the log back: `2 x (P0 + carried) + records`. A per-record rescan costs about
+    /// `records x P0` instead. With `P0 = 64` and `12` rounds that is 236 allowed against roughly
+    /// 2,300 at `731a7fa` (instrument commit `54c66b9`), so the red and the green are an order of
+    /// magnitude apart rather than a hair.
+    #[test]
+    fn replaying_the_tail_visits_each_records_own_entries_not_the_whole_log() {
+        const P0: usize = 64;
+        const ROUNDS: usize = 12;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-visits-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let carried = parked_image_then_mixed_tail(&h, &armed, P0, ROUNDS);
+
+        // Ask the artifact which records it holds, rather than trusting the writers' routing.
+        let kinds = ArenaPageStore::tail_kinds(&armed);
+        let count = |k: u8| kinds.iter().filter(|&&x| x == k).count();
+        assert_eq!(
+            (
+                count(ArenaPageStore::TAIL_PAGES_PARKED),
+                count(ArenaPageStore::TAIL_PENDING_DRAINED),
+                count(ArenaPageStore::TAIL_EXTENT_FREED),
+            ),
+            (ROUNDS, ROUNDS, ROUNDS),
+            "fixture: the tail does not hold one parked, one drained and one freed record per \
+             round: {kinds:?}"
+        );
+
+        let target = h.fresh_store();
+        let v0 = target.replay_pending_visits();
+        assert!(target.restore(&armed).unwrap());
+        let visits = target.replay_pending_visits() - v0;
+        assert_eq!(target.pending_len(), P0, "the replayed log is not the log the tail describes");
+
+        // Anti-vacuity: every carried entry is visited at least once, so a counter that is not
+        // wired reads below this and cannot pass the bound by reading zero.
+        assert!(
+            visits >= carried as u64,
+            "the counter saw {visits} visits for a tail carrying {carried} entries: it is not wired"
+        );
+        let bound = 2 * (P0 + carried) as u64 + kinds.len() as u64;
+        assert!(
+            visits <= bound,
+            "replay visited {visits} pending-log entries for a tail of {} records carrying \
+             {carried} entries over a {P0}-entry log; allowed {bound}. A per-record scan of the \
+             log visits about {} x {P0}",
+            kinds.len(),
+            kinds.len()
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// The same image and tail through the real writers, restored and compared byte for byte with
+    /// a full image of live memory.
+    ///
+    /// This passes BEFORE the replay index (`731a7fa`) and must still pass after it. That makes it
+    /// the differential for the rewrite: the index has to leave the log in the order, and with
+    /// the entries, that the per-record scans produced.
+    #[test]
+    fn a_mixed_tail_over_a_parked_image_replays_byte_identical_to_a_full_rewrite() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-mixed-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-mixed-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        parked_image_then_mixed_tail(&h, &armed, 16, 6);
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "a parked image plus a tail of parked, drained, claimed and freed records does not \
+             restore to the map a full rewrite holds"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// Every rule the pending-log arms of `apply_tail_record` state, on one hand-built tail, against
+    /// a log derived BY HAND from those rules. The rules:
+    /// * PARKED skips a key already in the log (first wins), a key repeated inside the same record,
+    ///   and an entry naming a freed arena;
+    /// * a key removed and parked again goes to the END;
+    /// * REPLACED keeps duplicates and drops dead arenas;
+    /// * DRAINED removes EVERY entry with a key, and a key that is absent is a no-op;
+    /// * EXTENT_FREED removes every entry of its arena, and later parks into it are skipped.
+    ///
+    /// The real writers never produce most of these shapes, which is exactly why they are built by
+    /// hand: an index that is right only for the shapes the writers happen to produce today is not
+    /// the per-record scan's equal. Passes at `731a7fa`; must pass after the index.
+    #[test]
+    fn replay_of_the_pending_log_keeps_every_rule_the_per_record_scans_had() {
+        let h = Harness::new();
+        let branches: Vec<BranchId> = (0..3)
+            .map(|_| h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id)
+            .collect();
+        let arenas: Vec<ArenaId> =
+            branches.iter().map(|b| h.store.arena_for(*b).unwrap()).collect();
+        let (a1, a2, a3) = (arenas[0], arenas[1], arenas[2]);
+        let owner = branches[0];
+        let dead = ArenaId(u32::MAX - 7);
+        let e = |page: PageId, arena: ArenaId| PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner,
+        };
+        let (x1, x2, x3) = (e(101, a1), e(102, a2), e(103, a1));
+        let (y1, w, v1, v2, u) = (e(201, a3), e(301, a2), e(401, a1), e(402, a2), e(501, a2));
+        // Unarmed store: this seeds memory only, which is what an image load leaves behind.
+        h.store.put_pending(vec![x1, x2, x3]).unwrap();
+
+        let live = h.store.live_page_count().unwrap();
+        let with_entries = |kind: u8, es: &[PendingFree]| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&(es.len() as u32).to_be_bytes());
+            for x in es {
+                ArenaPageStore::encode_pending_entry(&mut p, x);
+            }
+            p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+            ArenaPageStore::encode_tail_record(kind, &p)
+        };
+        let drained = |keys: &[(PageId, ArenaId)]| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for (page, arena) in keys {
+                p.extend_from_slice(&page.to_be_bytes());
+                p.extend_from_slice(&arena.0.to_be_bytes());
+            }
+            p.extend_from_slice(&0u32.to_be_bytes());
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PENDING_DRAINED, &p)
+        };
+        let (a2_start, a2_pages) = {
+            let st = h.store.state.lock().unwrap();
+            let ext = st.extents.get(&a2).expect("fixture: a2 is a live extent");
+            (ext.start_page, ext.page_count)
+        };
+        let freed_a2 = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&a2.0.to_be_bytes());
+            p.extend_from_slice(&a2_start.to_be_bytes());
+            p.extend_from_slice(&a2_pages.to_be_bytes());
+            p.extend_from_slice(&live.to_be_bytes());
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_EXTENT_FREED, &p)
+        };
+        let key = |x: &PendingFree| (x.page_id, x.arena_id);
+
+        let parked = ArenaPageStore::TAIL_PAGES_PARKED;
+        let replaced = ArenaPageStore::TAIL_PENDING_REPLACED;
+        let mut tail = Vec::new();
+        // [x1 x2 x3] -> x2 already there, y1 twice in one record, one dead arena -> [x1 x2 x3 y1]
+        tail.extend(with_entries(parked, &[x2, y1, y1, e(901, dead)]));
+        // x1 goes, an absent key is a no-op -> [x2 x3 y1]
+        tail.extend(drained(&[key(&x1), (999, a3)]));
+        // x1 again goes to the END -> [x2 x3 y1 x1]
+        tail.extend(with_entries(parked, &[x1]));
+        // wholesale: duplicates kept, dead arena dropped -> [x3 x3 w]
+        tail.extend(with_entries(replaced, &[x3, x3, w, e(902, dead)]));
+        // one key, two entries: both go -> [w]
+        tail.extend(drained(&[key(&x3)]));
+        // -> [w v1 v2]
+        tail.extend(with_entries(parked, &[v1, v2]));
+        // a2 freed: w and v2 go, and a2 is dead from here on -> [v1]
+        tail.extend(freed_a2);
+        // a park into the freed arena is skipped; one into a live arena lands -> [v1 x3]
+        tail.extend(with_entries(parked, &[u, x3]));
+
+        let applied = h.store.replay_tail(&tail).unwrap();
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end of the tail");
+        let log = h.store.state.lock().unwrap().pending.clone();
+        assert_eq!(
+            log,
+            vec![v1, x3],
+            "the replayed pending log breaks a rule the per-record scans kept (order, first-wins, \
+             dead-arena skip, duplicate handling)"
+        );
+    }
+
     #[test]
     fn checkpoint_round_trips_through_a_file() {
         let h = Harness::new();
