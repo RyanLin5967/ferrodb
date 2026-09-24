@@ -1,11 +1,11 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1986,7 +1986,7 @@
-         // leader died. A link consensus keeps busy never reaches this gate, so it costs them nothing.
+@@ -1990,7 +1990,7 @@
+         // reads per frame: this one and the refresh after the write.
          if last_used.elapsed() >= probe_gap {
              counters.idle_probes.fetch_add(1, Ordering::SeqCst);
 -            if peer_has_closed(s) {
 +            if false && peer_has_closed(s) {
-                 counters.idle_redials.fetch_add(1, Ordering::SeqCst);
-                 let mut st = ob.state.lock().unwrap();
-                 if let Some(old) = st.live.take() {
+                 // A shutdown closes `st.live`, which shares this socket, so the probe sees its close
+                 // too. Both shutdown paths set `stop` before they close it, so that close is always
+                 // seen here with `stop` set: it is not a redial, and it is not counted as one. The

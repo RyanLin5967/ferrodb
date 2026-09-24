@@ -28,6 +28,11 @@ MUTANTS = [
         "        } else {\n            last_used = Instant::now();\n        }\n",
         "        }\n",
     )]),
+    # PREREG amendment 2 (the D224 review's F4): the code at 7d9567f, which read unread bytes as alive.
+    ("N6_refusal_bytes_read_as_alive", [(
+        "        Ok(_) => true,\n",
+        "        Ok(_) => false,\n",
+    )]),
 ]
 
 
