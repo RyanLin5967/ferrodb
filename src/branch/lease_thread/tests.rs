@@ -1218,3 +1218,20 @@ fn the_shipped_close_errs_when_its_lease_thread_died() {
     let (stats, closed) = db.close();
     assert!(closed.is_err(), "a close whose lease thread died returned Ok: {stats:?}");
 }
+
+/// **D265 (c), the negative control.** A healthy scan thread's `stop()` reads `panicked = false`,
+/// so (a) cannot pass on a field that reads true whatever happened.
+#[test]
+fn a_healthy_scan_thread_does_not_read_as_dead() {
+    let f = fixture();
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("a scan to finish", || lease.stats().finished > 0);
+    let done = lease.stop();
+    assert!(!done.panicked, "a healthy scan thread read as dead: {done:?}");
+}

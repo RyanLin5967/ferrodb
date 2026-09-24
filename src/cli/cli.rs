@@ -127,6 +127,19 @@ impl OpenDatabase {
             // unreachable.
             self.store.checkpoint(Path::new(&self.arena_path))
         });
+        // D265: a lease thread that died leaves a database that stopped reaping for the rest of the
+        // session. The checkpoints above still ran; the close then fails, so `run_cli` exits
+        // non-zero instead of printing "bye bye".
+        let closed = closed.and_then(|()| {
+            if stats.panicked {
+                Err(FerroError::Branch(
+                    "the lease scan thread panicked during this session: no lease was reaped after it died"
+                        .into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
         (stats, closed)
     }
 }
@@ -327,6 +340,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         || stats.refused_scans > 0
         || stats.refused_branches > 0
         || stats.failed > 0
+        || stats.panicked
     {
         println!("ferrodb: lease scan {stats:?}");
     }

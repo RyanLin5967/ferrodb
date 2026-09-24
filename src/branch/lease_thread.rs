@@ -91,7 +91,7 @@
 //! sweep still continues past one — that is what the absorption is FOR — it just no longer
 //! continues *quietly*.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -315,6 +315,11 @@ pub struct LeaseStats {
     /// lease thread's first pass — a second full sweep, see `TwoTierReaper::open_sweep_visits` —
     /// has finished, rather than guessing from elapsed time. Observing only.
     pub finished: u64,
+    /// **D265: the scan thread died by panicking.** Set by a guard in its body as it unwinds
+    /// (`DeathFlag`). Nothing is reaped in this process after it, and `OpenDatabase::close` fails
+    /// on it. Before this field a dead thread's counters read exactly like a healthy thread's, and
+    /// the only sign was one stderr line at shutdown.
+    pub panicked: bool,
 }
 
 #[derive(Default)]
@@ -327,6 +332,7 @@ struct Counters {
     refused_branches: AtomicU64,
     failed: AtomicU64,
     finished: AtomicU64,
+    panicked: AtomicBool,
 }
 
 impl Counters {
@@ -340,6 +346,19 @@ impl Counters {
             refused_branches: self.refused_branches.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
             finished: self.finished.load(Ordering::SeqCst),
+            panicked: self.panicked.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// **D265.** Marks the scan thread dead if it unwinds. A `Drop` guard rather than `catch_unwind`,
+/// so the panic still ends the thread, and `shutdown` still reports it on stderr.
+struct DeathFlag(Arc<Counters>);
+
+impl Drop for DeathFlag {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.panicked.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -426,13 +445,17 @@ impl LeaseThread {
             let halt = Arc::clone(&halt);
             std::thread::Builder::new()
                 .name("ferrodb-lease".into())
-                .spawn(move || loop {
-                    if halt.is_stopping() {
-                        return;
-                    }
-                    scan_once(&reaper, &runtime, &*lock, &counters, &report);
-                    if halt.wait(interval) {
-                        return;
+                .spawn(move || {
+                    // D265: set on unwind, so `stats()` and `stop()` say the thread died.
+                    let _death = DeathFlag(Arc::clone(&counters));
+                    loop {
+                        if halt.is_stopping() {
+                            return;
+                        }
+                        scan_once(&reaper, &runtime, &*lock, &counters, &report);
+                        if halt.wait(interval) {
+                            return;
+                        }
                     }
                 })
                 .map_err(|e| {
@@ -471,7 +494,8 @@ impl LeaseThread {
         self.halt.signal();
         if let Some(h) = self.handle.take() {
             // A panicked scan thread is reported, not propagated: this runs from `Drop` as well,
-            // and panicking there during an unwind aborts the process.
+            // and panicking there during an unwind aborts the process. `stop()`'s caller learns
+            // of it through `LeaseStats::panicked` (D265).
             if h.join().is_err() {
                 report("lease: the scan thread panicked; no further leases will be reaped in this process".to_string());
             }
