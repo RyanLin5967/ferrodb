@@ -1403,7 +1403,8 @@ fn a_stopped_transport_is_distinguishable_from_a_quiet_one() {
 fn a_configuration_naming_more_nodes_than_the_wire_allows_is_refused_before_any_id_is_read() {
     // **This was a remote denial of service.** The disjointness check was
     // `learners.iter().find(|n| members.contains(n))`, and `Vec::contains` is linear, so it was
-    // O(learners × members); `Config::with_learners`'s `retain` is a second O(learners × members).
+    // O(learners × members); `Config::with_learners`'s `retain` was a second O(learners × members),
+    // until D207 made it a binary search per learner (`config::retain_absent`).
     // One 8 MiB frame carries 2,097,152 `u32` node ids, so two lists of ~1M each cost on the order
     // of 10^12 comparisons — one frame from any peer that completed the handshake, one CPU, hours.
     //

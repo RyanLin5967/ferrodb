@@ -64,7 +64,9 @@ impl Config {
         l.dedup();
         // A node cannot be both. If it is a voter, that is the stronger statement and the learner
         // entry is dropped — silently promoting a voter to learner would shrink the quorum.
-        l.retain(|n| !self.members.contains(n));
+        // `members` is sorted and de-duplicated by every constructor, so this is a binary search per
+        // learner and not a scan: see `retain_absent`.
+        retain_absent(&mut l, &self.members);
         self.learners = l;
         self
     }
@@ -122,4 +124,26 @@ impl Config {
         l.push(n);
         Config::new(self.members.clone(), self.version + 1, term).with_learners(l)
     }
+}
+
+/// Drop from `items` everything that also appears in `sorted`, which must be strictly ascending.
+///
+/// **One binary search per item, not a scan.** This used to be `items.retain(|n|
+/// !sorted.contains(n))`: O(items × sorted), and it runs on every configuration a peer's frame
+/// carries (`transport::decode_config` builds each one through [`Config::with_learners`]). At the
+/// wire's per-configuration cap that was a million comparisons per configuration, about 1.07e9 for
+/// one 8 MiB `Append` of them — work a peer could buy with bytes (D207). Here it is
+/// O(items × log sorted), so decoding a configuration is O(n log n) and a frame's work is linear in
+/// its bytes up to that log.
+///
+/// Generic over the element so that a test can count its comparisons with an instrumented `Ord`:
+/// the cost is the whole point of this function, and a cost is only pinned by counting it.
+pub(super) fn retain_absent<T: Ord>(items: &mut Vec<T>, sorted: &[T]) {
+    // A binary search over an unsorted list answers wrongly and silently, so the precondition is
+    // checked where it is cheap to check: linear, and only in debug builds.
+    debug_assert!(
+        sorted.windows(2).all(|w| w[0] < w[1]),
+        "retain_absent needs a strictly ascending reference list"
+    );
+    items.retain(|n| sorted.binary_search(n).is_err());
 }
