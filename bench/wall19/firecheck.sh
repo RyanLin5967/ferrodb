@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wall #19 + D199 fire-check: each mutant reverts ONE piece of the refusal, the reap pruning, or the
 # lease-reap attestation, and must turn at least one named test red. Pre-registration: artie-research frontier/lane_wall19_attested.md,
-# section 10.7 (supersedes 10.6, 10.4, 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
+# sections 10.7 and 11 (they supersede 10.6, 10.4, 9.4 and 8.4). Run from the worktree root at DEFAULT QoS (never taskpolicy -b). This is fan work:
 # it runs only when FAN-QUEUE row #14 is released.
 #
 # Blind spots, stated: it runs three selections per mutant (the attest lib module, the whole lease-thread
@@ -11,7 +11,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=1db848e           # the tree these mutants were written against
+SUBJECT_SHA=da1811b           # the tree these mutants were written against (1db848e before §11)
 OUT=bench/wall19/firecheck
 mkdir -p "$OUT"
 
@@ -42,9 +42,11 @@ MUTANTS=(
   "M11_attest_before_landed|$R|"'"                Ok(r) if r.generation > b.generation => landed.push(b),\n"|"                Ok(_) => landed.push(b),\n"'
   "M12_lease_reap_current_epoch|$R|"'"            let _ = Self::append_reap(&mut h, branch, fork_epoch, false);\n"|"            let _ = Self::append_reap(&mut h, branch, self.branches.current_epoch(), false);\n"'
   "M13_opened_follows_latest|$A|"'"            let opened = self.heads.get(&e.branch).map_or(e.epoch, \u007ct\u007c t.opened);\n"|"            let opened = e.epoch;\n"'
-  "M14_unreadable_not_counted|$R|"'"                h.count_refusal();\n"|""'
+  "M14_unreadable_not_counted|$R|"'"        for branch in unreadable {\n            if h.head_of(branch).is_some() {\n                h.count_refusal();\n            }\n"|"        for branch in unreadable {\n            if h.head_of(branch).is_some() {\n            }\n"'
   "M15_unreadable_as_landed|$R|"'"                Err(_) => unreadable.push(b),\n"|"                Err(_) => landed.push(b),\n"'
   "M16_first_entry_not_last|$A|"'"            if e.branch == branch {\n                last = Some(i);\n"|"            if e.branch == branch && last.is_none() {\n                last = Some(i);\n"'
+  "M17_seal_attests_behind_the_fallible_step|$R|"'"        let retired = self.retire(branch);\n"|"        let retired = Ok::<(), FerroError>(self.retire(branch)?);\n"'
+  "M18_seal_attests_a_flip_it_did_not_make|$R|"'"            .filter(\u007cr\u007c r.generation == branch.generation && r.state != BranchState::Reaped);\n"|"            ;\n"'
 )
 
 run_targets() { # $1 = label
@@ -69,6 +71,16 @@ summarise() { # $1 = label
 echo "== control (unmutated $SUBJECT_SHA)"
 run_targets control
 summarise control | tee "$OUT/summary.txt"
+# The control must be clean, or every "kill" below could be the control's own failure (the defect
+# D233 review 2 G1 found in the same script shape): any FAILED line, a missing result line, or a
+# non-zero rc voids the run.
+for t in lib lease integ; do
+  f="$OUT/control.$t.txt"
+  if grep -qE "^test .* FAILED$" "$f" || ! grep -qE "^test result:" "$f" || ! grep -qE "^${t}_rc=0$" "$f"; then
+    echo "control: VOID ($t is not clean)" | tee -a "$OUT/summary.txt"
+    exit 2
+  fi
+done
 
 survivors=0
 for m in "${MUTANTS[@]}"; do
