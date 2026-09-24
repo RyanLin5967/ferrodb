@@ -126,8 +126,7 @@ impl CatalogPage {
         // field, and writing 4 back out alongside a v2 body is exactly the misparse the stamp
         // exists to prevent.
         bytes[0] = CATALOG_PAGE_TYPE;
-        bytes[1..5].copy_from_slice(&self.page_id.to_be_bytes());
-        bytes[5..9].copy_from_slice(&self.next_catalog_page.to_be_bytes());
+        Self::stamp_links(&mut bytes, self.page_id, self.next_catalog_page);
         // Guard 1/8 — the page's table count. Checked here, before the body loop writes anything,
         // so an over-count refuses rather than reaching a slice index.
         let num_entries = fits_u16(|| "the catalog page's table count".to_string(), self.entries.len())?;
@@ -257,6 +256,15 @@ impl CatalogPage {
     }
 
     // header -> entries (table name -> page id -> schema (column name -> datatype tag & null tag) -> index)
+    /// Write a page's own id and its successor's into a serialized image, where `serialize` puts them.
+    ///
+    /// One definition of where the two links live, used by `serialize` and by `Catalog::persist`, which
+    /// serializes every page once before it knows the page ids it will write them to (D270).
+    pub(crate) fn stamp_links(image: &mut [u8; PAGE_SIZE], page_id: u32, next: u32) {
+        image[1..5].copy_from_slice(&page_id.to_be_bytes());
+        image[5..9].copy_from_slice(&next.to_be_bytes());
+    }
+
     pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
         // An allowlist, and it has to be: byte 0 was previously written and never read, so a page
         // that is neither format is a page this build cannot parse. Falling through to "assume the
@@ -396,8 +404,10 @@ impl CatalogPage {
 ///   too) (D249).
 /// - `create_table`, `create_index` and `create_fulltext_index` ask it before they allocate their
 ///   pages, which nothing would free after a refusal (D254).
-/// - `Catalog::persist` asks it of every entry before it writes any page, because an entry no page
-///   can hold used to send its placement loop round for ever, truncating the catalog's image (D254).
+/// - `Catalog::persist` lays every page out in memory before it writes any (D270), and asks it of an
+///   entry that fits no empty page: such an entry used to send its placement loop round for ever,
+///   truncating the catalog's image (D254). Every other refusal comes from `persist` serializing its
+///   page images, once, before the first write.
 ///
 /// **It is not a second length check.** It runs `serialize`, the single authority the header above
 /// describes, so a change to any guard in there changes this answer with it, and nothing here can
