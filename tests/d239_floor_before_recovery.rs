@@ -32,11 +32,17 @@ const FILLER_ROWS: u32 = 3_000;
 const REGION_FULL: &str = "no free page below the reserved arena region";
 const OVERLAP_REFUSAL: &str = "overlaps pages the bitmap allocator owns";
 
-/// One stdout line with the CLI's prompts taken off. The binary prints `ferrodb=> ` with no newline
-/// before reading each line (`run_cli`'s read loop), so a statement's output lands on its prompt's
-/// line, and a statement that printed only to stderr leaves its prompt in front of the next one.
+/// One stdout line with the CLI's prompts taken off. The binary prints a prompt with no newline
+/// before reading each line (`run_cli`'s read loop): `ferrodb=> `, or `     ...? ` while a
+/// statement is still open. So a statement's output lands on its prompt's line, and a statement
+/// that printed only to stderr leaves its prompt in front of the next one. Both forms are stripped,
+/// however many pile up.
 fn without_prompts(line: &str) -> &str {
-    line.trim().trim_start_matches("ferrodb=> ").trim()
+    let mut rest = line.trim();
+    while let Some(after) = rest.strip_prefix("ferrodb=>").or_else(|| rest.strip_prefix("...?")) {
+        rest = after.trim_start();
+    }
+    rest
 }
 
 /// Run the real binary on `db` with `sql` as its stdin. The SQL goes through a file, not a pipe:
@@ -139,9 +145,11 @@ fn an_open_that_rebuilds_into_a_full_table_region_never_writes_the_arena() {
     // The premise, checked last so that a claim failure above reports first: the reopen's rebuild
     // needed more pages than the table region had, so it was refused for a full region (D229
     // schedule (a) is why it fails rather than finishing). An open that SUCCEEDS means the rebuild
-    // fit, and then this fixture never reached the allocation D239 is about: a fix to D216 (no
-    // rebuild after a clean exit) or D222 (the rebuild frees the whole old tree) does that. Then
-    // re-derive the fixture; do not read the assertions above as evidence.
+    // fit, and then this fixture never reached the allocation D239 is about. Three landings retire
+    // this premise: D216 (no rebuild after a clean exit), D222 (the rebuild frees the whole old
+    // tree) and D229(a) (the rebuild checks for space, or resets, before it frees anything, so the
+    // refusal may change shape). When one lands, re-aim the fixture; do not read the assertions
+    // above as evidence.
     assert!(
         !second.status.success() && err2.contains(REGION_FULL),
         "premise: the reopen was not refused for a full table region, so its rebuild never asked \
@@ -178,7 +186,6 @@ fn rust_files(dir: &str, out: &mut Vec<String>) {
 /// Does this `use` line import the function `recover` itself, as a whole word?
 fn imports_recover(line: &str) -> bool {
     let line = line.trim_start();
-    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
     line.starts_with("use ")
         && line.contains("wal::recovery::")
         && line.match_indices("recover").any(|(at, word)| {
@@ -186,43 +193,55 @@ fn imports_recover(line: &str) -> bool {
         })
 }
 
-/// Entry points that run recovery but whose runtime has no page store, so their databases never
-/// have an arena to protect. Each is checked to still import `recover`, so an entry cannot outlive
-/// its reason unnoticed.
-const NO_ARENA: &[&str] = &["examples/crash_mid_merge.rs"];
+fn ident(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Where in `code` the free function `recover` is first CALLED, if anywhere: `recover(` preceded by
+/// neither an identifier character nor `.` (a method, such as `cow::dedup`'s), and not its
+/// definition. A qualified call, `recovery::recover(`, counts: `:` is not an identifier character.
+fn first_recover_call(code: &str) -> Option<usize> {
+    code.match_indices("recover(").map(|(at, _)| at).find(|&at| {
+        let before = code[..at].chars().next_back();
+        !ident(before) && before != Some('.') && !code[..at].trim_end().ends_with("fn")
+    })
+}
 
 /// **D239.** Every entry point that runs recovery registers the persisted arena floor first.
 ///
 /// pgserver never rebuilds, so the binary test above cannot reach it: its exposure is recovery's
 /// own allocations (`add_to_directory` takes a new page when a directory page is full).
-/// `table_dump` runs the same recovery and never attaches the arena at all. So the order is pinned
-/// in the source of every file under `src/` and `examples/` that imports `wal::recovery::recover`.
-/// Those files are found, not listed, so a new entry point is held to the order without anyone
-/// remembering to add it here. The three known ones must be among those found, which is what makes
-/// an empty or shrunken search fail.
+/// `table_dump` and `crash_mid_merge` run the same recovery and never attach the arena at all.
 ///
-/// Stated blind spot: an entry point that stops importing `recover` (a shared open function, D204's
-/// `open_recovered`) drops out of the search and fails the known-three assertion; the check must
-/// then be pointed at that function.
+/// Entry points are found by CALL SITE, not listed: every file under `src/` and `examples/` that
+/// calls the free function `recover(` outside `src/wal/recovery.rs` (the definition and its own
+/// tests). Each must call `reserve_persisted_floor(` before its first such call. Two cross-checks
+/// make a quiet search fail loudly:
+/// - the files that IMPORT `wal::recovery::recover` must be exactly the files found by call site,
+///   so a call through a path the import scan cannot see, or an import with no call, is reported;
+/// - the four known entry points must all be among those found.
+///
+/// Stated limits: it reads the working tree, not the committed blob (the certification runs on a
+/// clean checkout, where they are the same); order is text position in comment-stripped source;
+/// and an entry point that opens through a shared function (D204's `open_recovered`) stops calling
+/// `recover(` itself and drops out, failing the known-four assertion, after which this must be
+/// pointed at that function.
 #[test]
 fn every_recovering_entry_point_reserves_the_arena_floor_first() {
     let mut files = Vec::new();
     rust_files("src", &mut files);
     rust_files("examples", &mut files);
-    let mut checked = Vec::new();
-    let mut exempt = Vec::new();
+    let mut calling = Vec::new();
+    let mut importing = Vec::new();
     for path in files {
+        if path == "src/wal/recovery.rs" {
+            continue;
+        }
         let code = code_of(&path);
-        if !code.lines().any(imports_recover) {
-            continue;
+        if code.lines().any(imports_recover) {
+            importing.push(path.clone());
         }
-        if NO_ARENA.contains(&path.as_str()) {
-            exempt.push(path);
-            continue;
-        }
-        let recover_at = code.find("recover(&txn)").unwrap_or_else(|| {
-            panic!("{path}: imports `recover` but never calls `recover(&txn)`; point this at it")
-        });
+        let Some(recover_at) = first_recover_call(&code) else { continue };
         match code.find("reserve_persisted_floor(") {
             Some(reserve_at) => assert!(
                 reserve_at < recover_at,
@@ -230,14 +249,24 @@ fn every_recovering_entry_point_reserves_the_arena_floor_first() {
             ),
             None => panic!("D239: {path} never reserves the arena floor before recovery"),
         }
-        checked.push(path);
+        calling.push(path);
     }
-    for known in ["src/cli/cli.rs", "examples/pgserver.rs", "examples/table_dump.rs"] {
+    calling.sort();
+    importing.sort();
+    assert_eq!(
+        importing, calling,
+        "the files importing `recover` and the files calling it differ, so one scan is blind to a \
+         way in"
+    );
+    for known in [
+        "examples/crash_mid_merge.rs",
+        "examples/pgserver.rs",
+        "examples/table_dump.rs",
+        "src/cli/cli.rs",
+    ] {
         assert!(
-            checked.iter().any(|p| p == known),
-            "{known} was not found by the search, which then proves nothing about it: {checked:?}"
+            calling.iter().any(|p| p == known),
+            "{known} was not found by the search, which then proves nothing about it: {calling:?}"
         );
     }
-    exempt.sort();
-    assert_eq!(exempt, NO_ARENA, "a NO_ARENA entry no longer imports `recover`; drop it");
 }
