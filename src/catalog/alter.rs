@@ -704,7 +704,7 @@ impl Catalog {
         // catalog — the I19 state `finish` exists to rule out. Here a refusal, or a failed sync,
         // returns with the catalog and the heap agreeing on the new shape. What it does NOT
         // restore is the caller's DDL record: both callers log it only after this returns `Ok`,
-        // exactly as after any other failure following the install.
+        // so the change feed never hears of this ALTER (see "Not closed here" below).
         //
         // **One sync for all of them, before any later table is touched.** They are queued with
         // `stamp_pending` and made durable with one `flush`: this table's rewritten pages, and the
@@ -715,6 +715,22 @@ impl Catalog {
         // **Only if this rewrite moved an attributed row.** `flush` writes whatever the store has
         // pending, and a store poisoned by another statement's failed append refuses every
         // non-empty flush; a rewrite that stamped nothing has no business failing on that.
+        //
+        // **After `epoch_bump` too, and that is load-bearing.** A failure here must not leave the
+        // catalog changed with the epoch unmoved: cached reader snapshots would keep decoding this
+        // table with its old shape (`a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered`
+        // checks the epoch moved).
+        //
+        // What moved to buy this, stated rather than left to be found: a plain `ALTER TABLE`'s
+        // stamps used to be durable row by row DURING the rewrite, and are now durable once, after
+        // the install — the same windows `provenance::deferred`'s header lists for a MERGE's
+        // rewrite. And a `persist` failure inside `finish` (itself the I19 state) now returns
+        // before any moved row is re-stamped.
+        //
+        // Not closed here: a refusal after the install leaves the ALTER applied and its DDL record
+        // unlogged (both callers log only on `Ok`). Refusing the ALTER in `plan_alters`, before the
+        // heap moves, whenever its rewrite would stamp and the store is refusing writes would
+        // close it; that is lane D219's proposal, not this change.
         if let Some(store) = &prov {
             if !moved.is_empty() {
                 for (rid, who) in &moved {
@@ -1180,6 +1196,17 @@ mod tests {
         for s in &sql {
             run(parse(s), &mut catalog, bp.clone(), txn.clone(), &mut session).unwrap();
         }
+        let dir_root = catalog.require_table("p").unwrap().first_directory_page_id;
+        let pages: std::collections::BTreeSet<u32> = HeapFileManager::open(dir_root, bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid.page_id))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the fixture must pack exactly one heap page, or ADD COLUMN need not relocate a row: {pages:?}"
+        );
         let durable =
             Arc::new(DurableProvenanceStore::open(dir.path().join("alter.provenance")).unwrap());
         let run_id = durable
@@ -1238,6 +1265,7 @@ mod tests {
         let guard = ProvenanceFlush::new(f.durable.clone());
         let stamper = Arc::clone(guard.stamper());
         f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        let epoch_before = f.catalog.epoch();
 
         let err = add_column(&mut f, &stamper).expect_err(
             "the ALTER succeeded: either the injected flush failure was swallowed, or the rewrite \
@@ -1263,6 +1291,11 @@ mod tests {
         assert!(
             after.iter().any(|r| !rids.contains(r)),
             "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
+        assert!(
+            f.catalog.epoch() > epoch_before,
+            "a failed flush skipped the epoch bump, so cached reader snapshots keep decoding the \
+             altered table with its OLD shape"
         );
     }
 
@@ -1312,6 +1345,57 @@ mod tests {
         assert!(
             after.iter().any(|r| !before.contains(r)),
             "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
+    }
+
+    /// **D219: a plain ALTER makes its rewrite's stamps durable with ONE sync, and each moved row
+    /// is attributed at its NEW rid.** The rewrite used to sync once per moved row. Every row is
+    /// attributed here, so every row must still be attributed after the ALTER, wherever it moved.
+    #[test]
+    fn a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        for rid in &before {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        let syncs_before = f.durable.sync_counts();
+        add_column(&mut f, &prov).expect("a healthy ALTER was refused");
+        let syncs = f.durable.sync_counts().total() - syncs_before.total();
+        let after = rids_of(&f);
+        assert!(
+            after.iter().any(|r| !before.contains(r)),
+            "premise: the rewrite moved no row, so this test proves nothing"
+        );
+        assert_eq!(syncs, 1, "a plain ALTER that moved {} rows synced provenance {syncs} times", after.len());
+        for rid in &after {
+            assert_eq!(
+                f.durable.attribute(*rid).unwrap(),
+                f.run,
+                "row at {rid:?} lost its author across the ALTER: a moved row was stamped at the \
+                 wrong rid, or not at all"
+            );
+        }
+    }
+
+    /// **A rewrite that moves exactly ONE attributed row still stamps it.** The boundary of the
+    /// "only if this rewrite moved an attributed row" condition: one is enough.
+    #[test]
+    fn a_rewrite_that_moves_one_attributed_row_still_stamps_it() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        let attributed = before[0];
+        f.durable.stamp(attributed, f.run).unwrap();
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        add_column(&mut f, &prov).expect("a healthy ALTER was refused");
+        let after = rids_of(&f);
+        assert!(!after.contains(&attributed), "premise: the attributed row did not move");
+        let authored: Vec<RecordId> =
+            after.iter().copied().filter(|r| f.durable.attribute(*r).unwrap() == f.run).collect();
+        assert_eq!(
+            authored.len(),
+            1,
+            "exactly the one attributed row must carry its author at its new rid: {authored:?}"
         );
     }
 }
