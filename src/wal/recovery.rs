@@ -1885,4 +1885,111 @@ use super::*;
         assert_eq!(rows("SELECT id, v FROM u;"), only, "`u` after the reopen: a row of the dropped `t` was replayed into it, or its own was lost");
         assert_eq!(rows("SELECT id, v FROM u WHERE id = 101;"), only, "`u` by key after the reopen");
     }
+
+    /// **D250 review 2's R2-1 (lane §3.10 test 14): a table dropped twice at one root is completed once,
+    /// and the database opens.** `DROP t`, a re-CREATE at the dropped root whose sync fails (no
+    /// `CreateTable` is logged), then a second `DROP t` whose record is durable and whose mutation
+    /// fails. Both `DropTable` records pass every clause of the completion. At `b57a5d0` each was
+    /// completed, the second `forget_dropped_table` failed `require_table`, and `open_recovered`
+    /// answered `Err` at this open and at every later one. Only the LAST `DropTable` per root counts.
+    #[test]
+    fn a_table_dropped_twice_at_one_root_is_completed_once_and_the_database_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("dropped_twice.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            let root = catalog.get_table("t").unwrap().first_directory_page_id;
+            run_sql("DROP TABLE t;", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the CREATE failed, but not at its sync: {e}"),
+                Ok(_) => panic!("premise failed: the CREATE's checkpoint did not fail"),
+            }
+            armed.store(false, Ordering::SeqCst);
+            assert_eq!(
+                catalog.get_table("t").expect("premise failed: the failed CREATE left no table in the running catalog").first_directory_page_id,
+                root,
+                "premise failed: the re-created table did not land on the dropped root"
+            );
+            let record = {
+                let e = catalog.get_table("t").unwrap();
+                crate::wal::txn::DdlRecord {
+                    op: DdlOp::DropTable,
+                    table: "t".into(),
+                    dir_root: e.first_directory_page_id,
+                    time_travel_root: e.time_travel_root,
+                    columns: Vec::new(),
+                }
+            };
+            let err = txn
+                .drop_checkpointed(record, || Err::<(), _>(FerroError::Internal("injected: the second drop failed before it freed anything".into())))
+                .expect_err("premise failed: the second DROP succeeded although its mutation failed");
+            assert!(err.to_string().contains("injected"), "premise failed: the second DROP failed, but not in its mutation: {err}");
+            // The crash: every handle goes, with two `DropTable` records of `t` at one root in the log.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock)
+            .unwrap_or_else(|e| panic!("the open after a table was dropped twice at one root failed, and so would every later one: {e}"));
+        assert!(o.catalog.get_table("t").is_none(), "the logged DROP of the re-created `t` was not completed");
+        assert_eq!(o.completed_drops, vec!["t".to_string()], "the open did not complete the DROP of `t` exactly once");
+    }
+
+    /// **D250 review 2's R2-2 (lane §3.10 test 15): a table re-created at the dropped root and then
+    /// altered survives a crash.** Its CREATE failed at the sync, so it logged no `CreateTable`, and it
+    /// holds no row; but the ALTER answered `Ok` and logged an `AlterColumn` at the root after the
+    /// DROP's record. ALTER does not checkpoint, so the DROP's record stays in the log without a pin.
+    /// At `b57a5d0` only a `CreateTable` counted as re-creation, so the open forgot `t` and the
+    /// acknowledged ALTER with it. Any DDL record at the root after the DROP now keeps the table.
+    #[test]
+    fn a_table_recreated_at_the_dropped_root_and_then_altered_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("recreated_altered.db");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let open = |p: PathBuf| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(p).unwrap();
+            let page_file = open(db.clone());
+            let wal_file = open(PathBuf::from(format!("{}.wal", db.display())));
+            let (bp, _wal, txn, mut catalog) =
+                manual_db(&db, Arc::new(SyncFailsWhenArmed { file: page_file, armed: armed.clone() }), Arc::new(wal_file));
+            run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn).unwrap();
+            run_sql("INSERT INTO t VALUES (1, 10);", &mut catalog, &bp, &txn).unwrap();
+            let root = catalog.get_table("t").unwrap().first_directory_page_id;
+            run_sql("DROP TABLE t;", &mut catalog, &bp, &txn).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            match run_sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog, &bp, &txn) {
+                Err(e) => assert!(e.to_string().contains("injected"), "premise failed: the CREATE failed, but not at its sync: {e}"),
+                Ok(_) => panic!("premise failed: the CREATE's checkpoint did not fail"),
+            }
+            armed.store(false, Ordering::SeqCst);
+            assert_eq!(
+                catalog.get_table("t").expect("premise failed: the failed CREATE left no table in the running catalog").first_directory_page_id,
+                root,
+                "premise failed: the re-created table did not land on the dropped root"
+            );
+            run_sql("ALTER TABLE t ADD COLUMN w INTEGER;", &mut catalog, &bp, &txn)
+                .unwrap_or_else(|e| panic!("premise failed: the ALTER was not acknowledged: {e}"));
+            assert_eq!(
+                catalog.get_table("t").unwrap().first_directory_page_id,
+                root,
+                "premise failed: the ALTER moved `t` off the dropped root, so the root match alone would keep it"
+            );
+            // The crash: every handle goes.
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).expect("the open after the ALTER failed");
+        assert!(
+            o.catalog.get_table("t").is_some(),
+            "the re-created `t`, altered with `Ok` after its failed CREATE, was forgotten at the next open, and the \
+             acknowledged ALTER with it"
+        );
+        run_sql("SELECT id, w FROM t;", &mut o.catalog, &o.bp, &o.txn)
+            .unwrap_or_else(|e| panic!("the altered `t` does not answer for the column the ALTER added: {e}"));
+    }
 }
