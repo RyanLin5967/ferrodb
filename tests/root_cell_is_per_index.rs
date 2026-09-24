@@ -85,28 +85,16 @@ impl Db {
     }
 
     fn rows(&mut self, sql: &str) -> Vec<Vec<Value>> {
-        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
-        let mut p = Parser::new(tokens);
-        let mut stmts = p.parse();
-        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
-        match run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut Session::new()) {
-            Ok(Outcome::Rows(r)) => r,
-            Ok(_) => Vec::new(),
-            Err(e) => panic!("`{sql}` failed: {e}"),
-        }
+        rows_on(&mut self.catalog, &self.bp, &self.txn, sql)
     }
 
     fn ids(&mut self, sql: &str) -> Vec<i32> {
-        let mut ids: Vec<i32> = self
-            .rows(sql)
-            .into_iter()
-            .map(|r| match r[0] {
-                Value::Integer(i) => i,
-                ref other => panic!("expected an Integer primary key, got {other:?}"),
-            })
-            .collect();
-        ids.sort();
-        ids
+        ids_of(self.rows(sql))
+    }
+
+    /// `ids`, run against another catalog over the same pages: a reader's cached snapshot.
+    fn ids_against(&self, catalog: &mut Catalog, sql: &str) -> Vec<i32> {
+        ids_of(rows_on(catalog, &self.bp, &self.txn, sql))
     }
 
     /// The plan the optimizer builds for a SELECT: the same `optimize` that `run` plans with.
@@ -141,6 +129,32 @@ impl Db {
             e.fulltext_indexes.iter().find(|i| i.column_name == column).map(|i| i.root_page_id),
         )
     }
+}
+
+/// Run one statement against `catalog`.
+fn rows_on(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>, sql: &str) -> Vec<Vec<Value>> {
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let mut stmts = p.parse();
+    assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+    match run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut Session::new()) {
+        Ok(Outcome::Rows(r)) => r,
+        Ok(_) => Vec::new(),
+        Err(e) => panic!("`{sql}` failed: {e}"),
+    }
+}
+
+/// The first column of every row, as the Integer primary key it must be, sorted.
+fn ids_of(rows: Vec<Vec<Value>>) -> Vec<i32> {
+    let mut ids: Vec<i32> = rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("expected an Integer primary key, got {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Rows in each index-scan fixture below.
@@ -297,6 +311,57 @@ fn an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree() 
     let (on_b_root, _) = d.record_roots("b");
     assert!(on_a_root.is_some() && on_b_root.is_some(), "premise failed: an index record is missing");
     assert_ne!(on_a_root, on_b_root, "the indexes on `a` and `b` record one tree between them");
+}
+
+/// **D215 — SEARCH descends the SHARED full-text cell, so a reader's cached catalog snapshot still
+/// finds a row whose posting moved in a root split.**
+///
+/// D53's contract, in `Catalog::epoch`'s doc: a reader re-takes its snapshot only when the schema
+/// epoch moves; a root move does not move it; and "a snapshot whose recorded root is stale is
+/// still correct — `open_table` reads the cell, not the record". SEARCH read the RECORD
+/// (`open_posting_tree(ft_root, ..)`, a private cell). After a root split the recorded page is the
+/// LEFTMOST leaf, which keeps the left half, and `postings_for_token` scans from there, reaches the
+/// next leaf, meets a smaller token and stops (`if tok != want { break }`).
+///
+/// ⚠ Not reachable through a server TODAY: `executor::try_run_read` serves only `EXPLAIN` and
+/// `SELECT`, so SEARCH runs under the exclusive catalog lock on the live catalog, whose record is
+/// current at every statement boundary. This drives SEARCH against a snapshot directly, which is
+/// the position the shared read path puts every statement it serves in. FAILS before D215's fix
+/// (INFERRED) at the snapshot's search, with `[]` against `[0]`.
+#[test]
+fn search_through_a_cached_snapshot_finds_a_row_after_a_posting_root_split() {
+    let mut d = Db::new();
+    d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    let mut snapshot = d.catalog.clone();
+    let recorded = d.record_roots("body").1.expect("premise failed: no full-text record");
+
+    // `zulu` sorts after every `aNNNNN`, so the first split leaves it in the RIGHT half, away from
+    // the page the snapshot recorded.
+    d.rows("INSERT INTO t VALUES (0, 'zulu');");
+    let mut id = 1;
+    while d.record_roots("body").1 == Some(recorded) {
+        assert!(id <= 5000, "premise failed: 5000 postings never split the posting tree's root");
+        d.rows(&format!("INSERT INTO t VALUES ({id}, 'a{id:05}');"));
+        id += 1;
+    }
+    assert_eq!(
+        snapshot.epoch(),
+        d.catalog.epoch(),
+        "premise failed: a write moved the schema epoch, so a reader would have re-taken its snapshot"
+    );
+    assert_eq!(
+        snapshot.get_table("t").unwrap().fulltext_indexes[0].root_page_id,
+        recorded,
+        "premise failed: the snapshot's record moved, so it is not stale"
+    );
+    assert_eq!(d.ids("SEARCH t (body) FOR 'zulu';"), vec![0], "premise failed: the live catalog's search misses the row");
+
+    assert_eq!(
+        d.ids_against(&mut snapshot, "SEARCH t (body) FOR 'zulu';"),
+        vec![0],
+        "a cached snapshot's SEARCH descended its recorded root, the pre-split leftmost leaf, and missed the row"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
