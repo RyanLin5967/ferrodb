@@ -321,7 +321,7 @@ mod tests {
         let p = primary("window");
         seed(&p, 4);
         p.wal
-            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![7; 8] })
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![7; 8], init: false })
             .unwrap();
 
         let out = p.dir.join("bk");
@@ -452,7 +452,7 @@ mod tests {
     fn a_checkpoint_may_not_discard_a_pinned_range() {
         let p = primary("pinned");
         p.wal
-            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![1; 8] })
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![1; 8], init: false })
             .unwrap();
         p.wal.flush().unwrap();
 
@@ -462,7 +462,7 @@ mod tests {
 
         // More work, then a checkpoint. The pinned range must survive it.
         p.wal
-            .append(2, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 3, slot: 0, tuple: vec![2; 8] })
+            .append(2, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 3, slot: 0, tuple: vec![2; 8], init: false })
             .unwrap();
         p.wal.flush().unwrap();
         p.wal.truncate(9).unwrap();
@@ -490,7 +490,7 @@ mod tests {
     fn pinning_an_lsn_the_log_has_already_dropped_is_refused() {
         let p = primary("gone");
         p.wal
-            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![3; 8] })
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![3; 8], init: false })
             .unwrap();
         p.wal.flush().unwrap();
         p.wal.truncate(5).unwrap();

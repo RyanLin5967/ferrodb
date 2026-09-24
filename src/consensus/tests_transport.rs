@@ -198,7 +198,8 @@ fn a_v1_peer_is_refused_at_the_handshake_rather_than_misparsed_later() {
     // completes the handshake and fails several frames later with "unknown replication frame" —
     // an error naming the symptom at an arbitrary point in the stream instead of the
     // incompatibility at the point it could have been refused.
-    assert_eq!(REPL_VERSION, 2, "consensus traffic requires the protocol version to be 2");
+    // ⚖ (lane_d268 §1.2): 2 until D268; 3 since tag 12. Consensus still needs 2 or later.
+    assert_eq!(REPL_VERSION, 3, "consensus traffic requires version 2 or later, and this build speaks 3 (D268)");
 
     let mut v1 = Vec::new();
     v1.extend_from_slice(&REPL_MAGIC.to_be_bytes());

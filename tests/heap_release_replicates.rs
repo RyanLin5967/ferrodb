@@ -44,7 +44,7 @@ impl Pair {
     }
 
     fn insert(&self, txn: u64, slot: u16, len: usize, byte: u8) -> u64 {
-        self.log(txn, RecKind::HeapInsert { dir_root: 1, page_id: PAGE, slot, tuple: vec![byte; len] })
+        self.log(txn, RecKind::HeapInsert { dir_root: 1, page_id: PAGE, slot, tuple: vec![byte; len], init: false })
     }
 
     /// Flush, ship everything past what the replica has applied, and apply it.

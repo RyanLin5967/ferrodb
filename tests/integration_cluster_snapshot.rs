@@ -637,7 +637,7 @@ fn the_redo_window_that_travels_with_a_snapshot_is_replayed_into_it() {
     // left exactly as it was.
     let wal = ferrodb::wal::log::WalManager::new(src.path().join("window.wal")).unwrap();
     let tuple = vec![0xC7u8; 24];
-    wal.append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: target, slot: 0, tuple: tuple.clone() })
+    wal.append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: target, slot: 0, tuple: tuple.clone(), init: false })
         .unwrap();
     wal.flush().unwrap();
     let wal = std::sync::Arc::new(wal);
@@ -728,6 +728,7 @@ fn an_install_discards_the_receivers_own_wal() {
                 page_id: 1,
                 slot: 0,
                 tuple: vec![0x3Cu8; 16],
+                init: false,
             },
         )
         .unwrap();

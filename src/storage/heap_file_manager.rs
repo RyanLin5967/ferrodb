@@ -156,9 +156,12 @@ impl HeapFileManager {
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let mut page = Page::deserialize_at(page_id, frame.data)?;
         let tuple_bytes = tuple.data.clone();
+        // D268: the first tuple on the page. Its record tells redo to reset the page before applying
+        // it, because after a power loss the bytes on disk can be a previous owner's.
+        let init = page.slot_arr.is_empty();
         let slot_num = page.insert(tuple)?;
         if let Some(txn) = &self.txn {
-            let lsn = txn.log_insert(self.txn_id, self.first_directory_page_id, page_id, slot_num, &tuple_bytes)?;
+            let lsn = txn.log_insert(self.txn_id, self.first_directory_page_id, page_id, slot_num, &tuple_bytes, init)?;
             page.lsn = lsn;
         }
         frame.data = page.serialize()?;

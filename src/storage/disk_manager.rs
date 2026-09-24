@@ -214,6 +214,55 @@ impl DiskManager{
         Ok(())
     }
 
+    /// **D267: mark `page_id` allocated if its bit is clear.** Returns whether the bitmap changed,
+    /// and writes the bitmap page only then.
+    ///
+    /// Redo rebuilds a page from the log, and the replica applier builds one from a shipped record,
+    /// but neither set the page's bit. [`DiskManager::allocate`] sets it with an unsynced write, and
+    /// only a checkpoint syncs this file, while a COMMIT syncs only the log. So after a power loss
+    /// the log could hold a page whose bit was lost. Recovery rebuilt it and the directory repair
+    /// listed it, and the next `allocate`, which hands out the lowest clear bit, handed it to a
+    /// second owner, whose `new_page` zero-wrote it on disk.
+    ///
+    /// Refused, like [`DiskManager::deallocate`], for a page inside a reserved region, which has no
+    /// bit here, and for a page past the bitmap chain. The second is reachable only when the
+    /// chain's own growth was lost too (a database past `BITS_PER_BITMAP` pages). Recovery then
+    /// fails rather than leave a page it rebuilt allocatable.
+    pub fn claim(&self, page_id: u32) -> Result<bool, FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        if let Some(r) = self.region_containing(page_id) {
+            return Err(FerroError::Io(format!(
+                "page {} is inside the reserved '{}' region [{}, {}) and has no bit in this \
+                 allocator to claim",
+                page_id, r.name, r.lo, r.hi
+            )));
+        }
+        let mut current_bitmap_id = 0;
+        let mut jumps_needed = page_id / BITS_PER_BITMAP;
+        let mut page_bitmap = self.read(current_bitmap_id)?;
+        while jumps_needed > 0 {
+            let next_bitmap_id = u32::from_le_bytes(page_bitmap[0..4].try_into().unwrap());
+            if next_bitmap_id == 0 {
+                return Err(FerroError::Io(format!(
+                    "page {page_id} is past every bitmap page, so it cannot be marked allocated; the \
+                     bitmap's growth was lost"
+                )));
+            }
+            current_bitmap_id = next_bitmap_id;
+            page_bitmap = self.read(current_bitmap_id)?;
+            jumps_needed -= 1;
+        }
+        let local_page_id = page_id % BITS_PER_BITMAP;
+        let byte_index = (local_page_id / 8) as usize + 4;
+        let bit_index = local_page_id % 8;
+        if page_bitmap[byte_index] & (1 << bit_index) != 0 {
+            return Ok(false);
+        }
+        page_bitmap[byte_index] |= 1 << bit_index;
+        self.write(current_bitmap_id, &page_bitmap)?;
+        Ok(true)
+    }
+
     /// Highest page the **bitmap allocator** has handed out, plus one.
     ///
     /// Distinct from [`DiskManager::high_water`], which additionally clamps with `next_page_id`.

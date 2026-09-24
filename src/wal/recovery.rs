@@ -88,11 +88,19 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     touched.sort_unstable();
 
     // restore pages with broken file extensions
+    //
+    // **D267: and mark each page the log names allocated.** Its bitmap bit was set by an unsynced
+    // write, and a power loss can drop it while the log, which a COMMIT syncs, keeps the page's
+    // records. Redo then rebuilds the page and the directory repair lists it, and without this the
+    // next `allocate` handed it to a second owner. `open_recovered`'s checkpoint makes the bit
+    // durable. Cost, stated: a page of a table that a later `DropTable` in this log dropped is
+    // claimed too, and leaks. It is never handed to two owners.
     let bp = &txn.bp;
     for (_, page_id) in &touched {
         if bp.disk_manager.read(*page_id).is_err() {
             bp.disk_manager.write(*page_id, &Page::empty(*page_id).serialize()?)?;
         }
+        bp.disk_manager.claim(*page_id)?;
     }
 
     // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
@@ -207,10 +215,29 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
     let frame_i = bp.fetch_page(page_id)?;
     let mut frame = bp.frame_write(frame_i);
     let stored_id = u32::from_be_bytes(frame.data[1..5].try_into().unwrap());
-    let mut page = if stored_id != page_id {
-        Page::empty(page_id)
-    } else {    
-        Page::deserialize_at(page_id, frame.data)?
+    let mut page = match op {
+        // **D268: the first tuple on its page resets the page first**, unless the page already holds
+        // its own image at or past this record, which the LSN gate below then skips as usual.
+        //
+        // A reused page keeps its old owner's image on disk, with its own id. A power loss can drop
+        // every write of the reuse, and this parsed that image and applied the new owner's first
+        // insert onto it: a live slot 0 refused the restore at every open, and a free one took the
+        // row while the old owner's other rows stayed. Any image here that is not this page's own at
+        // or past this record predates the page's first insert: a previous owner's, zeros, or
+        // another structure's. So a refused parse is not an error in this arm; everywhere else it
+        // still is (D256).
+        //
+        // Gated, not an unconditional reset (PostgreSQL's `XLogInitBufferForRedo`), because this
+        // engine writes heap pages without logging in one place: `catalog::alter::rewrite_heap`
+        // through `HeapFileManager::open`. Under a kept log such a page carries rows that no record
+        // describes, over a retained init record, and a reset would drop them
+        // (`tests/d268_power_loss_redo.rs`, test 3).
+        RecKind::HeapInsert { init: true, .. } => match Page::deserialize_at(page_id, frame.data) {
+            Ok(own) if own.page_id == page_id && own.lsn >= lsn => own,
+            _ => Page::empty(page_id),
+        },
+        _ if stored_id != page_id => Page::empty(page_id),
+        _ => Page::deserialize_at(page_id, frame.data)?,
     };
 
     if page.lsn >= lsn {

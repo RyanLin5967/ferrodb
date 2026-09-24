@@ -649,7 +649,7 @@ mod tests {
         w.append(
             txn,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty), init: false },
         )
         .unwrap();
     }
@@ -1286,6 +1286,7 @@ mod tests {
                 page_id: 1,
                 slot: 0,
                 tuple: tuple_bytes(id, v),
+                init: false,
             },
         )
         .unwrap();

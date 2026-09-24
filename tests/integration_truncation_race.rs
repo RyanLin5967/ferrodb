@@ -59,6 +59,7 @@ fn a_truncation_racing_a_read_never_yields_a_frame_at_the_wrong_lsn() {
                         page_id: 2,
                         slot: 0,
                         tuple: vec![n; 32],
+                        init: false,
                     },
                 );
                 let _ = wal.flush();

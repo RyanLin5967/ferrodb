@@ -1256,7 +1256,7 @@ mod tests {
         w.append(
             txn,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, Some(qty)) },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, Some(qty)), init: false },
         )
         .unwrap();
     }
@@ -1628,7 +1628,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)) },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 2, slot: 0, tuple: tuple_bytes(3, Some(31)), init: false },
         )
         .unwrap();
         w.append(1, 0, &RecKind::Commit).unwrap();
@@ -1664,7 +1664,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 8, page_id: 9, slot: 0, tuple: tuple_bytes(3, Some(30)) },
+            &RecKind::HeapInsert { dir_root: 8, page_id: 9, slot: 0, tuple: tuple_bytes(3, Some(30)), init: false },
         )
         .unwrap();
         insert(&w, 1, 4, 40);
@@ -1685,7 +1685,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(4, None) },
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(4, None), init: false },
         )
         .unwrap();
         w.append(1, 0, &RecKind::Commit).unwrap();
@@ -1707,7 +1707,7 @@ mod tests {
         w.append(
             1,
             0,
-            &RecKind::HeapInsert { dir_root: 404, page_id: 1, slot: 0, tuple: tuple_bytes(1, Some(1)) },
+            &RecKind::HeapInsert { dir_root: 404, page_id: 1, slot: 0, tuple: tuple_bytes(1, Some(1)), init: false },
         )
         .unwrap();
         insert(&w, 1, 2, 20);

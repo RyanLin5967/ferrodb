@@ -70,7 +70,14 @@ pub const REPL_MAGIC: u32 = 0xFEDB_0001;
 /// incompatibility at the point it could have been refused. Both peers of a pair are built from
 /// this same constant, so they always move together; a mixed-version pair is an operator running
 /// two builds, and that is exactly the case this refuses.
-pub const REPL_VERSION: u16 = 2;
+///
+/// **3 since D268.** The stream, and consensus `WalBatch` commands, carry raw log frames, which the
+/// replica decodes with `RecKind::deserialize`. D268 added tag 12 (an init-flagged `HeapInsert`),
+/// and D213 had added tag 11 (`HeapRelease`) without a bump. A version-2 peer decodes neither, so it
+/// failed several frames in, on the first new page the primary filled. It is refused here now. The
+/// consensus MAC domain carries this byte (`consensus::signing`), so a version-2 node's tags no
+/// longer verify either.
+pub const REPL_VERSION: u16 = 3;
 
 /// The one tag carrying a `consensus::Message` — see [`crate::consensus::transport`].
 ///
@@ -90,7 +97,7 @@ pub const REPL_VERSION: u16 = 2;
 /// the same style as `H`/`R`/`U`/`E`.
 ///
 /// **It must stay disjoint from every replication tag.** A consensus client that dials a
-/// replication listener now passes the handshake — both speak version 2 — and is caught one frame
+/// replication listener now passes the handshake — both speak the same version — and is caught one frame
 /// later by that tag mismatch instead. `consensus::transport` pins the disjointness with a test
 /// that reads the tag byte off each encoded `Message` rather than off a constant, so the check is
 /// against the real wire bytes.
@@ -769,6 +776,9 @@ impl ReplicaApplier {
                         &crate::storage::heap_page::Page::empty(page_id).serialize()?,
                     )?;
                 }
+                // D267, as `recover` does: a page this replica holds is allocated here too, or a
+                // promoted replica's allocator hands it to a second owner.
+                self.bp.disk_manager.claim(page_id)?;
             }
         }
 
