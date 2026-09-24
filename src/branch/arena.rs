@@ -1870,7 +1870,11 @@ impl ArenaPageStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(FerroError::Io(e.to_string())),
         };
-        dm.reserve_from(Self::base_page_in_state(&bytes)?)
+        // MUTANT (fire-check only, never land): a checkpoint that cannot be read registers nothing, silently.
+        match Self::base_page_in_state(&bytes) {
+            Ok(base) => dm.reserve_from(base),
+            Err(_) => Ok(()),
+        }
     }
 
     /// Read `base_page` out of a checkpoint image, without loading it.
