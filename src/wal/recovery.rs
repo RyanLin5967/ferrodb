@@ -1097,11 +1097,53 @@ use super::*;
         (arrived, release)
     }
 
+    /// A checkpoint entry point, as a test drives it. Every entry point reaches the same body, and
+    /// each shape below runs through two of them: `checkpoint` (DDL, CLI exit, explicit) and
+    /// `checkpoint_keeping_owed`, #16's automatic trigger after a commit (lane_d253 AMENDMENT 2).
+    type CheckpointEntry = fn(&TxnManager) -> Result<(), FerroError>;
+
+    fn via_checkpoint(txn: &TxnManager) -> Result<(), FerroError> {
+        txn.checkpoint()
+    }
+
+    fn via_checkpoint_keeping_owed(txn: &TxnManager) -> Result<(), FerroError> {
+        txn.checkpoint_keeping_owed().map(|_| ())
+    }
+
+    #[test]
+    fn a_commit_that_lands_inside_a_checkpoint_survives_a_crash() {
+        commit_inside_the_window(via_checkpoint);
+    }
+
+    #[test]
+    fn a_commit_that_lands_inside_a_checkpoint_keeping_owed_survives_a_crash() {
+        commit_inside_the_window(via_checkpoint_keeping_owed);
+    }
+
+    #[test]
+    fn an_uncommitted_write_made_as_a_checkpoint_starts_is_undone_after_a_crash() {
+        uncommitted_write_as_it_starts(via_checkpoint);
+    }
+
+    #[test]
+    fn an_uncommitted_write_made_as_a_checkpoint_keeping_owed_starts_is_undone_after_a_crash() {
+        uncommitted_write_as_it_starts(via_checkpoint_keeping_owed);
+    }
+
+    #[test]
+    fn a_checkpoint_with_nothing_appended_in_its_window_still_truncates() {
+        nothing_in_the_window(via_checkpoint);
+    }
+
+    #[test]
+    fn a_checkpoint_keeping_owed_with_nothing_appended_in_its_window_still_truncates() {
+        nothing_in_the_window(via_checkpoint_keeping_owed);
+    }
+
     /// Shape (a): an acknowledged COMMIT between the checkpoint's page flush and its truncation.
     /// Its page change reached no disk, because it came after `flush_all`, so only its records can
     /// bring it back after a crash, and at `9aa6968` the truncation discarded them.
-    #[test]
-    fn a_commit_that_lands_inside_a_checkpoint_survives_a_crash() {
+    fn commit_inside_the_window(entry: CheckpointEntry) {
         let dir = tempfile::tempdir().unwrap();
         let (dir_root, before, during);
         {
@@ -1118,7 +1160,7 @@ use super::*;
             let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_before_truncate);
             let a = {
                 let txn = txn.clone();
-                std::thread::spawn(move || txn.checkpoint())
+                std::thread::spawn(move || entry(&txn))
             };
             arrived
                 .recv_timeout(std::time::Duration::from_secs(60))
@@ -1186,8 +1228,7 @@ use super::*;
     /// releases the attach table and before `checkpoint_locked` runs appends BELOW any sample
     /// taken inside `checkpoint_locked`, so only a sample taken under the attach-table hold sees
     /// that anything moved.
-    #[test]
-    fn an_uncommitted_write_made_as_a_checkpoint_starts_is_undone_after_a_crash() {
+    fn uncommitted_write_as_it_starts(entry: CheckpointEntry) {
         let dir = tempfile::tempdir().unwrap();
         let (dir_root, before);
         {
@@ -1202,7 +1243,7 @@ use super::*;
             let (arrived, release) = park_checkpoint_at(&txn.checkpoint_pause_at_entry);
             let a = {
                 let txn = txn.clone();
-                std::thread::spawn(move || txn.checkpoint())
+                std::thread::spawn(move || entry(&txn))
             };
             arrived
                 .recv_timeout(std::time::Duration::from_secs(60))
@@ -1237,8 +1278,7 @@ use super::*;
     /// NEGATIVE CONTROL: a checkpoint with nothing appended in its window truncates, exactly as
     /// before. Without it a fix that kept the log on every checkpoint would pass the two tests
     /// above and grow the log for ever.
-    #[test]
-    fn a_checkpoint_with_nothing_appended_in_its_window_still_truncates() {
+    fn nothing_in_the_window(entry: CheckpointEntry) {
         let dir = tempfile::tempdir().unwrap();
         let (dir_root, rid);
         {
@@ -1256,7 +1296,7 @@ use super::*;
                 "premise failed: the log holds nothing to discard, so a checkpoint already ran at \
                  COMMIT (is FERRODB_CHECKPOINT_INTERVAL set?). This run is VOID"
             );
-            txn.checkpoint().unwrap();
+            entry(&txn).unwrap();
             let (new_base, end) =
                 (wal.base_lsn.load(Ordering::SeqCst), wal.next_lsn.load(Ordering::SeqCst));
             assert!(new_base > base, "the checkpoint kept the log ({base} -> {new_base})");
