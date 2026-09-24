@@ -18,8 +18,11 @@
 //! Placing a one-relation conjunct on a leaf that is a LEFT JOIN needs the rule for which side of
 //! an outer join a filter may go below, and `optimizer::push` — the WHERE pushdown — did not have
 //! it: `a LEFT JOIN b ON a.id = b.id WHERE b.v = 5` filtered b below the left join and returned
-//! the NULL-extended rows the WHERE must exclude. D255 fixes that too, and both placements now
-//! share it.
+//! the NULL-extended rows the WHERE must exclude. That is ledger D266, fixed here because both
+//! placements now share the rule.
+//!
+//! And over an INNER join a WHERE conjunct is a join predicate: `a JOIN b ON TRUE WHERE a.id = b.id`
+//! was refused like `ON TRUE` alone, because the reorderer never saw the WHERE (the C4 caveat).
 //!
 //! Every assertion is on the ANSWER, compared as a sorted row set, except where a test says it is
 //! pinning a plan and why. `tests/d64_expression_depth.rs` also writes `ON 1` and `ON 1 = 1`, but it
@@ -479,4 +482,85 @@ fn thirty_three_two_row_relations_chain_to_exactly_two_rows() {
     let n = 33;
     let mut db = chain_db(n);
     assert_eq!(db.rows(&chain_sql(n, "r0.id", |i| format!("r0.id = r{i}.id"))), r(&[&[1], &[2]]));
+}
+
+// ---- WHERE over an INNER join is a join predicate (C4) ---------------------------------------
+
+/// Over an INNER join a WHERE conjunct and an ON conjunct are the same predicate, so a WHERE that
+/// links two relations must link them in the search. `pushdown` leaves such a conjunct in a filter
+/// over the join, and the reorderer used to see that filter as an opaque leaf or never see it at all:
+/// with `ON TRUE` the join below it was a cross product, refused at 12 relations or fewer.
+#[test]
+fn a_where_conjunct_linking_two_relations_is_their_join_predicate() {
+    // The filter directly over the join.
+    let mut db = ab();
+    let q = "SELECT a.id, b.id FROM a JOIN b ON TRUE WHERE a.id = b.id;";
+    assert_eq!(db.rows(q), r(&[&[1, 1], &[2, 2], &[3, 3]]));
+    let plan = db.explain(&format!("EXPLAIN {q}"));
+    assert!(!plan.contains("(on true)"), "the WHERE conjunct did not become the join predicate:\n{plan}");
+
+    // Deep in the tree, where `pushdown` stops it at the join of r0 and r1, past and at the limit.
+    for n in [MAX_DP_RELATIONS + 1, MAX_DP_RELATIONS] {
+        let mut db = chain_db(n);
+        let mut q = chain_sql(n, "r0.id, r1.id", |i| if i == 1 { "TRUE".into() } else { format!("r0.id = r{i}.id") });
+        q.pop();
+        q.push_str(" WHERE r0.id = r1.id;");
+        assert_eq!(db.rows(&q), r(&[&[1, 1], &[2, 2]]), "n = {n}");
+        let plan = db.explain(&format!("EXPLAIN {q}"));
+        assert!(!plan.contains("(on true)"), "n = {n}: the WHERE conjunct did not link r0 and r1:\n{plan}");
+    }
+}
+
+/// CONTROL — passes at 9aa6968 and must keep passing. Planning must never evaluate a user's
+/// expression: `i32::MIN / -1` has no `i32` result and `evaluate`'s arithmetic panics on it in every
+/// build profile, so a planner that folded constants by evaluating them would panic on EXPLAIN,
+/// which reads no row at all. At 9aa6968 the conjunct was dropped, so this planned then too.
+#[test]
+fn planning_never_evaluates_a_constant_conjunct() {
+    let mut db = ab();
+    let plan = db.explain("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id AND (0 - 2147483647 - 1) / (0 - 1) = 0;");
+    assert!(plan.contains(" join "), "expected a join in the plan:\n{plan}");
+}
+
+/// A relation joined by a conjunct on itself alone: filtered, then crossed. Past the limit
+/// 9aa6968 dropped the filter (a cross product of both of r1's rows); at the limit it refused.
+#[test]
+fn a_relation_filtered_but_not_linked_is_a_filtered_cross_product_at_and_past_the_dp_limit() {
+    for n in [MAX_DP_RELATIONS + 1, MAX_DP_RELATIONS] {
+        let mut db = chain_db(n);
+        let q = chain_sql(n, "r0.id, r1.id", |i| if i == 1 { "r1.v = 20".into() } else { format!("r0.id = r{i}.id") });
+        assert_eq!(db.rows(&q), r(&[&[1, 2], &[2, 2]]), "n = {n}");
+    }
+}
+
+// ---- outer joins: what must NOT move (D266) ----------------------------------------------------
+
+/// CONTROL — passes at 9aa6968 and must keep passing. Three things an outer join must keep, next to
+/// the placement changes above, plus the join types the planner does not run.
+#[test]
+fn outer_join_controls_that_held_before_d255_and_must_keep_holding() {
+    let mut db = left_join_db();
+    // The LEFT join's OWN ON decides matches only: a conjunct on its preserved side filters nothing,
+    // it NULL-extends. (An INNER join's ON over a left-join leaf is the other case — test 13.)
+    assert_eq!(
+        db.rows("SELECT la.id, lb.id FROM la LEFT JOIN lb ON la.id = lb.id AND la.v = 1;"),
+        vec![vec![Some(1), None], vec![Some(2), None]],
+    );
+    // A WHERE over both sides of a LEFT join stays above it.
+    assert_eq!(
+        db.rows("SELECT la.id, lb.id FROM la LEFT JOIN lb ON la.id = lb.id WHERE la.v + 5 = lb.v;"),
+        r(&[&[1, 1]]),
+    );
+    // RIGHT and FULL parse and bind, then the planner refuses them by name — after `pushdown` has
+    // run, so a WHERE on their nullable side can never come back as a wrong answer end to end.
+    // `push`'s rule for them is pinned at its own level, in `optimizer::tests`.
+    for q in [
+        "SELECT la.id FROM la RIGHT JOIN lb ON la.id = lb.id WHERE la.v = 0;",
+        "SELECT la.id FROM la FULL JOIN lb ON la.id = lb.id WHERE lb.v = 5;",
+    ] {
+        match db.exec(q) {
+            Err(e) => assert!(e.to_string().contains("right/full not implemented"), "`{q}`: {e}"),
+            Ok(_) => panic!("`{q}` answered; the planner does not implement RIGHT or FULL"),
+        }
+    }
 }
