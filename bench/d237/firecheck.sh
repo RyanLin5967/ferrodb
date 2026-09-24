@@ -73,17 +73,32 @@ target_args() { # $1 = target
   esac
 }
 
+# A command runs in the background and the script waits on it, so a TERM or INT reaches the traps at once
+# instead of after the command (bash defers a trap until a foreground child exits, and `timeout` puts
+# cargo in its own process group, out of reach of a signal to this script's group). The trap stops the
+# child before src/ is restored.
+child=""
+waited() { # the command's rc
+  local rc
+  "$@" &
+  child=$!
+  wait "$child"
+  rc=$?
+  child=""
+  return "$rc"
+}
+
 run_target() { # $1 = label, $2 = target
   local rc
   # shellcheck disable=SC2046
-  timeout 1800 cargo test $(target_args "$2") > "$OUT/$1.$2.out" 2>&1
+  waited timeout 1800 cargo test $(target_args "$2") > "$OUT/$1.$2.out" 2>&1
   rc=$?
   echo "rc=$rc" >> "$OUT/$1.$2.out"
 }
 
 listed_in() { # $1 = target: what the harness says it will run, at SUBJECT_SHA (the list is kept)
   # shellcheck disable=SC2046
-  timeout 1800 cargo test $(target_args "$1") -- --list > "$OUT/control.$1.list" 2>&1
+  waited timeout 1800 cargo test $(target_args "$1") -- --list > "$OUT/control.$1.list" 2>&1
   grep -cE ': test$' "$OUT/control.$1.list"
 }
 
@@ -346,9 +361,16 @@ on_exit() {
   git diff --quiet "$SUBJECT_SHA" -- src/ tests/ ||
     echo "ON EXIT: src/ or tests/ still differ from $SUBJECT_SHA; restore with: git checkout $SUBJECT_SHA -- src/" >&2
 }
+on_signal() { # $1 = the exit status
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+  fi
+  exit "$1"
+}
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 bad=0
 restore() {
