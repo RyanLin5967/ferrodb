@@ -274,3 +274,64 @@ Every mutant has at least one killing test. Any mutant that survives is reported
 - `run`, `sync_roots` and `sync_fulltext_roots` keep their signatures at `115f0b7` (RUN, grep).
 - It is built with plumbing onto a new branch, `d208-root-cell-per-index-on-115f0b7`. Its sha is in the lane report, because a body cannot name its own commit.
 - `d208-root-cell-per-index-on-00f4c39` (`1877e03`) is SUPERSEDED: it sits on `00f4c39`, which #16 has moved past.
+
+---
+
+## Amendment 5 (appended before any run; nothing above is edited): D214 in its principled form, and D222 merged
+
+The lead's decision: take the review's PRINCIPLED F1 and REPLACE the compare-exchange. The compare-exchange reconciled two copies of the primary root; this removes the second copy. Nothing has been built or run. Every expectation is INFERRED.
+
+| sha | what |
+|---|---|
+| `3bcdf5c` | **RED**: T10, through the real ALTER path. It compiles against `ad8adf3` |
+| `459ff80` | the principled D214; U1 and U2 re-cut to `finish`'s new signature |
+| `a7f5d1b` | merge of `d222-index-root-after-backfill` @ `bd023f6` (D222's own red `f7f9022` and fix `bd023f6`); merge-tree clean |
+| this commit | this amendment. `src/` and `tests/` are identical to `a7f5d1b` |
+
+### The design (READ at `459ff80`)
+- `AlterPlan` carries the primary index's SHARED cell, `primary_cell: Arc<AtomicU32>`, taken from `root_cell(table, None)`. The only exception is a private cell seeded from the record for a table the catalog never gave a cell, the same reasoning as `open_table`'s fallback.
+- `commit_rewrite` opens the tree with `open_shared(primary_cell)`, so a root move lands in the cell as it happens. It no longer returns a root.
+- `finish` writes `entry.primary_index_root = primary_cell.load(Acquire)` and **never writes the cell**.
+- U1 ("record == cell == moved, same `Arc`") and U2 ("a cell ahead is never regressed", now also "record == cell") therefore hold BY CONSTRUCTION. The record is copied from the cell, and nothing in the ALTER path stores into the cell.
+
+### Changes to registered tests (logged here)
+- **Amendment 4's F1 contract (the compare-exchange) is WITHDRAWN**, together with K15 and K18 as defined there. Their patterns no longer match anything.
+- **U1 and U2 are re-cut.** `finish` no longer takes a root, so each now:
+  1. moves the cell (a split through the shared handle, or an earlier INSERT's);
+  2. calls `finish(.., &cell, ..)`;
+  3. asserts record == cell and that the cell is untouched.
+
+  No assertion was weakened, and U2 gained "record == cell". Their earlier reds (at `f83c082` and `5f19277`) were taken against the old signature and are not repeated. Their red is now the mutant runs K15 and K18c.
+- **New: T10**, `root_cell_is_per_index::an_alter_after_a_lagging_record_keeps_the_cell_and_catches_the_record_up`.
+  1. It grows `t` until the primary root really splits, bounded at 5000 rows.
+  2. It sets the in-memory record back to the pre-split page. This is the ONE simulated step: the lag a failed INSERT leaves before `sync_roots`.
+  3. It runs `ALTER TABLE t RENAME COLUMN v TO w`.
+  4. It asserts the cell is the same `Arc` on the post-split root, and the record == the post-split root.
+  5. It INSERTs a high key and looks up a right-half key, with an EXPLAIN premise for the primary index scan.
+
+### RED at `3bcdf5c` (its code is `ad8adf3`'s)
+- `--test root_cell_is_per_index`: **13 run, 1 FAILED**. T10 fails at "the ALTER left the record behind the cell it planned from": the compare-exchange leaves the cell alone and writes the stale planned root into the record. Its premises (a real split; the record caught up before the rollback) and its two cell assertions pass.
+- Falsifiers:
+  - T10 passes here, which would mean the compare-exchange version already recorded from the cell;
+  - "5000 rows never split the primary root";
+  - the EXPLAIN premise failing.
+
+### GREEN at `a7f5d1b` (or at this commit)
+- `root_cell_is_per_index` **13/13**; `catalog::alter::tests` **2/2**; `d222_index_root_after_backfill` **4/4**. That last is its own lane's expectation, and it is green here because this branch now carries its fix.
+- The D53 files are untouched. `::open_shared(` sites over comment-stripped `src/`: 9 → **10** (`commit_rewrite`), floor 6. Counted by the Python port (RUN). The ⚖ port also finds 0 offenders at `a7f5d1b` (RUN).
+- Everything in the earlier GREEN sections still holds.
+
+### Per-target suite
+- **2629 run, passed=2628, failed=1** (D197's premise test).
+- That is `d7891d5`'s 2611 (quoted from #16 §14), plus this branch's 14 (T2–T10, F4a–c, U1, U2), plus D222's 4.
+
+### Mutants: the F1 rows of the table in force (base `a7f5d1b`); every other row of amendment 4 stands
+
+| mutant | edit | target | expected |
+|---|---|---|---|
+| K15 | `finish` does not write the record (`let _ = primary_cell;`) | lib `catalog::alter::` and integration | U1, U2 and T10 FAIL |
+| K18a | the plan ignores the cell and seeds a private one from the record | integration | T10 FAILS (the record is caught up to a stale private cell, not the live one) |
+| K18b | `commit_rewrite` opens the tree PRIVATELY again at the cell's value | both | **SURVIVES: an EQUIVALENT mutant.** No rewrite can split (a same-size replace of an existing key), so a private handle's root never diverges from the cell. No test can tell the two apart, and none is claimed to. `open_shared` is there so the structure has one copy, not because a test can see it |
+| K18c | `finish` stores the stale record INTO the cell (the first D214's regression) | lib and integration | U1, U2 and T10 FAIL |
+
+T10 is expected to pass under every other mutant: none of K1–K14 or K16–K22 touches the primary cell or ALTER.
