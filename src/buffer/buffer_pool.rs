@@ -268,6 +268,7 @@
 //! trace over 4096 pages, 7899 evictions, byte-identical output and equal sha256 before and after.
 //! The gate is forced to fire in the same file (deleting `touch` changes the sequence), so
 //! "identical" is a result rather than an instrument that cannot see anything.
+use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
@@ -616,7 +617,91 @@ impl Drop for FrameWriteGuard<'_> {
     }
 }
 
+/// A pin on one page, **released when this drops** (D237). Take one with
+/// [`BufferPoolManager::pin`].
+///
+/// `fetch_page` returns a bare frame index and leaves the matching `unpin_page` to the caller, so
+/// every `?` between the two returned with the page still pinned. `HeapFileManager::read` was one:
+/// a slot that reads `SlotDeleted`, which D202 makes reachable from SQL, left its page pinned for
+/// the life of the process, and the next `DROP TABLE` stopped part way at `free_page`'s refusal.
+/// The shape is `wal::log::WalPin`'s, applied to a page.
+///
+/// # Declare it before the frame guard
+///
+/// Locals drop in reverse order, so a pin declared first is released after the frame lock taken
+/// from it. The unpin takes that frame's lock itself (`release_pin_if_labelled`), so the other
+/// order would block on a lock this thread still holds.
+///
+/// # Dirtiness
+///
+/// - [`PagePin::unpin`] states the flag, exactly as the hand-written `unpin_page(id, dirty)` it
+///   replaces did, so every path that already chose one keeps it.
+/// - A pin dropped without it (an early return) unpins dirty if [`PagePin::write`] was taken, and
+///   clean otherwise. Whatever sits in a frame that was written is what readers have already seen,
+///   so it is kept rather than thrown away on eviction. For every caller converted in D237 the
+///   frame is unchanged on those paths anyway (`frame.data = x?` assigns only when `x` is `Ok`),
+///   so the cost is at most one write-back of identical bytes.
+///
+/// # Borrowed, where `cow::PageHandle` owns an `Arc`
+///
+/// `PageHandle` is the same guard for the copy-on-write store, which keeps handles in a write
+/// journal and so needs them to own the pool. It pays one `Arc` clone per fetch and one drop per
+/// release: two atomic read-modify-writes on a counter every thread shares. D35 took two
+/// acquisitions of exactly that kind of line off this hit path, so the heap does not put them
+/// back. Its callers hold the pool across the access anyway.
+///
+/// # Blind spot: a panic keeps the pin
+///
+/// The drop does nothing while the thread is panicking. A panic under a frame's write lock
+/// poisons it, the unpin would then panic on that lock, and a panic inside a drop during
+/// unwinding aborts the process. So a panic leaks the pin, which is what it did before this guard
+/// existed.
+pub struct PagePin<'a> {
+    pool: &'a BufferPoolManager,
+    page_id: u32,
+    frame_i: usize,
+    wrote: Cell<bool>,
+    stated: Option<bool>,
+}
+
+impl<'a> PagePin<'a> {
+    /// The frame holding the page, for a read through `frames[..]` or `frame_read`.
+    pub fn frame(&self) -> usize {
+        self.frame_i
+    }
+
+    /// Write-lock the frame. The only way to write through a pin, because it is how the pin knows
+    /// the page may be dirty.
+    pub fn write(&self) -> FrameWriteGuard<'a> {
+        self.wrote.set(true);
+        let pool: &'a BufferPoolManager = self.pool;
+        pool.frame_write(self.frame_i)
+    }
+
+    /// Release the pin now, marking the page dirty or not exactly as asked.
+    pub fn unpin(mut self, dirty: bool) {
+        self.stated = Some(dirty);
+        // `self` drops here, and the drop unpins with the stated flag.
+    }
+}
+
+impl Drop for PagePin<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let dirty = self.stated.unwrap_or(self.wrote.get());
+        self.pool.unpin_page(self.page_id, dirty);
+    }
+}
+
 impl BufferPoolManager {
+    /// Pin `page_id` and return the pin as a guard that releases it on drop. See [`PagePin`].
+    pub fn pin(&self, page_id: u32) -> Result<PagePin<'_>, FerroError> {
+        let frame_i = self.fetch_page(page_id)?;
+        Ok(PagePin { pool: self, page_id, frame_i, wrote: Cell::new(false), stated: None })
+    }
+
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
         let shadows: Vec<FrameShadow> = (0..MAX_BUFFER_POOL_PAGES).map(|_| FrameShadow::new()).collect();
@@ -1335,6 +1420,46 @@ impl BufferPoolManager {
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
             self.arc_locked().remove(page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Free every page in `page_ids`, **or none of them** (D237).
+    ///
+    /// Refuses whole, before it frees anything, if any one of them is pinned or being faulted in:
+    /// [`BufferPoolManager::invalidate_all`]'s rule, applied to a set. [`BufferPoolManager::free_page`]
+    /// refuses one page at a time, so a caller freeing a structure in a loop stopped part way.
+    /// `Catalog::drop_table` did: it freed the heap, met a leaked pin further on, and returned with
+    /// the heap's pages free while the catalog still named them. The next allocation handed them to
+    /// another table, and a retried DROP freed them from under it.
+    ///
+    /// **What it does not cover** (both are left to D229's durable pending-free list):
+    /// - A pin taken between the check and the frees. The check lets go of its locks before
+    ///   freeing, because `free_page` takes the table's write lock. So the caller has to keep other
+    ///   users of these pages out: `drop_table` runs under the statement exclusion with the attach
+    ///   table shut (`TxnManager::ddl_checkpointed`). If one got in anyway, `free_page`'s own check
+    ///   would refuse its page, part way through.
+    /// - `DiskManager::deallocate` failing part way, on I/O or on a page inside a reserved region.
+    pub fn free_pages(&self, page_ids: &[u32]) -> Result<(), FerroError> {
+        {
+            // Lock-order: `in_transit -> page_table -> frame`, the module's order, as in
+            // `invalidate_all`. See src/storage/page_latch.rs.
+            let _pool = enter_pool();
+            let transit = self.in_transit.lock().unwrap();
+            let pt = self.page_table.read().unwrap();
+            for page_id in page_ids {
+                if transit.contains(page_id) {
+                    return Err(FerroError::PagePinned);
+                }
+                if let Some(&frame_i) = pt.get(page_id) {
+                    if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                        return Err(FerroError::PagePinned);
+                    }
+                }
+            }
+        }
+        for &page_id in page_ids {
+            self.free_page(page_id)?;
         }
         Ok(())
     }

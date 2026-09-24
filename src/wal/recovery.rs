@@ -110,11 +110,11 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     // repair directory
     for (dir_root, page_id) in &touched {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
-        let frame_i = bp.fetch_page(*page_id)?;
-        let frame = bp.frames[frame_i].read().unwrap();
+        let pin = bp.pin(*page_id)?;
+        let frame = bp.frames[pin.frame()].read().unwrap();
         let page = Page::deserialize(frame.data)?;
         drop(frame);
-        bp.unpin_page(*page_id, false);
+        pin.unpin(false);
         let free = page.get_free_space_end() - page.get_free_space_start();
         match hfm.update_directory_entry(*page_id, free) {
             Ok(()) => {}
@@ -140,8 +140,8 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
         RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..} => *page_id,
         _ => return Ok(())
     };
-    let frame_i = bp.fetch_page(page_id)?;
-    let mut frame = bp.frame_write(frame_i);
+    let pin = bp.pin(page_id)?;
+    let mut frame = pin.write();
     let stored_id = u32::from_be_bytes(frame.data[1..5].try_into().unwrap());
     let mut page = if stored_id != page_id {
         Page::empty(page_id)
@@ -151,7 +151,7 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
 
     if page.lsn >= lsn {
         drop(frame);
-        bp.unpin_page(page_id, false);
+        pin.unpin(false);
         return Ok(());
     }
     match kind {
@@ -170,7 +170,7 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
     page.lsn = lsn;
     frame.data = page.serialize()?;
     drop(frame);
-    bp.unpin_page(page_id, true);
+    pin.unpin(true);
     Ok(())
 }
 

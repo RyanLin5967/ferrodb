@@ -13,12 +13,12 @@ pub struct HeapScanner {
 
 impl HeapScanner {
     pub fn load_page(&self, page_id: u32) -> Result<Page, FerroError> {
-        let frame_i = self.buffer_pool.fetch_page(page_id)?;
+        let pin = self.buffer_pool.pin(page_id)?;
         let page = {
-            let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+            let frame = self.buffer_pool.frames[pin.frame()].read().unwrap();
             Page::deserialize(frame.data)?
         };
-        self.buffer_pool.unpin_page(page_id, false);
+        pin.unpin(false);
         Ok(page)
     }
 
