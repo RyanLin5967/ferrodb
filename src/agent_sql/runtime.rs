@@ -9914,4 +9914,135 @@ mod tests {
             plan.blocked_by
         );
     }
+
+    // ---- Amendment 12: a fresh review of `4436e7f..ff971ee` -------------------------------------
+
+    /// **F1: a merge whose author stamp fails is still finished.** The publish had committed and
+    /// its versions were recorded, and the stamp's error used to return before `attest_merge` and
+    /// `seal`. That left a published branch LIVE: a second MERGE would publish it again, and an
+    /// ABANDON would drop the capture of a merge whose rows are in main.
+    ///
+    /// At `ff971ee` the branch is still live after the failed stamp.
+    #[test]
+    fn a_merge_whose_author_stamp_fails_is_still_sealed() {
+        let (_dir, bp, mut catalog, txn) = txn_fixture("f1_sealed");
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut run_main = |sql: &str, catalog: &mut Catalog| {
+            crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), &mut main)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        run_main("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog);
+        for id in 1..=3 {
+            run_main(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog);
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let b_txn = rt.state.lock().unwrap().workspaces[&b].txn;
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+            {
+                let st = rt.state.lock().unwrap();
+                assert!(
+                    !st.workspaces.contains_key(&b),
+                    "the merge published, yet its branch is still live and can be merged again"
+                );
+                assert!(
+                    st.published_txns.contains(&b_txn.0),
+                    "the merge published, yet its txn is not recorded as published, so an ABANDON \
+                     would drop the capture REVERT needs"
+                );
+            }
+            assert!(rt.merge(&mut ctx, b).is_err(), "a second MERGE of a published branch was accepted");
+        }
+        let rows = match run_main("SELECT id, v FROM t;", &mut catalog) {
+            crate::execution::executor::Outcome::Rows(r) => r,
+            _ => panic!("fixture: expected rows"),
+        };
+        assert_eq!(rows.len(), 3, "fixture: expected three rows");
+        for row in &rows {
+            match (&row[0], &row[1]) {
+                (Value::Integer(id), Value::Integer(v)) => {
+                    assert_eq!(*v, id * 10 + 1, "row {id} did not move exactly once")
+                }
+                other => panic!("fixture: not an (INTEGER, INTEGER) row: {other:?}"),
+            }
+        }
+    }
+
+    /// **F3: a sweep's budget counts every interval it visits, found or not.** Otherwise one call
+    /// walks the whole queue whenever the queued ranges hold nothing, and the per-call stall is
+    /// the queue's length rather than the budget.
+    ///
+    /// At `ff971ee` a sweep with budget 2 consumed all 10 empty intervals.
+    #[test]
+    fn version_history_sweep_budget_counts_empty_intervals() {
+        let mut st = State::default();
+        for i in 0..10u64 {
+            st.add_pending(10 * i, 10 * i + 5);
+        }
+        assert_eq!(st.retention.pending.len(), 10, "fixture: the intervals should be disjoint");
+        st.sweep_pending(2);
+        assert_eq!(
+            st.retention.pending.len(),
+            8,
+            "a sweep with budget 2 visited {} intervals",
+            10 - st.retention.pending.len()
+        );
+    }
+
+    /// **F6: a read that carries no seq is refused.** Every read path pairs its snapshot with one,
+    /// so `None` could only come from a new caller. Accepting it would bring back Q7: the latest
+    /// version named for a row the scan may not have seen, and a clock taken at record time.
+    ///
+    /// At `ff971ee` it was accepted.
+    #[test]
+    fn a_read_without_a_paired_seq_is_refused() {
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            st.insert_workspace(b, pinned("b_7", 100, 0));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let err = rt
+            .record_read(
+                b,
+                TableId(1),
+                AccessShape::IndexLookup,
+                &[(RowId(1), row)],
+                None,
+                None,
+                ReadPurpose::Inspection,
+                None,
+            )
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("carries no seq")),
+            "a read with no paired seq must be refused: {err:?}"
+        );
+    }
 }
