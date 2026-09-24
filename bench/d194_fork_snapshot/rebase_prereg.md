@@ -1193,3 +1193,11 @@ ignored**.
 
 Correction to the line above: six tests means 2178 + 6 = **2184 passed**. The durable-store test is
 also a lib test.
+
+**Correction to that correction.** The count is five new tests, not six:
+- A: two;
+- F: one;
+- D: two, the runtime test and the durable test.
+
+The first figure stands: **2183 passed**. Amendment 13's "Six new tests" heading is also five. I
+recounted by listing the names above.
