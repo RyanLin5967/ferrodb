@@ -211,3 +211,42 @@ then take the old `t`'s pages (the lowest clear bits), the open frees them under
 that the intent was carried out (none of the old `t`'s pages is left allocated and unnamed), which amendment 7 listed.
 The GREEN phase and mutant base is `1ef22d1`: `wal::recovery::tests_crash_frees::` **15 run, 15 passed**, predicted.
 `lane_d229_run.sh` carries 11 mutants (M1, M2, M4-M7, M9-M11, M13, M14), one site each at `1ef22d1` (PATTERNS_ONLY).
+
+**Amendment 9 (D229 review 1, `frontier/d229_review1.md` @ `78627e0`; the lead's decisions; registered BEFORE the code).**
+The lead numbered this "amendment 7"; 7 and 8 were already taken, so it is 9.
+
+- **R1, the fix:** when the intent file is already gone (`NotFound`), `free_intent::store` still fsyncs the directory. That
+  fsync is what makes an earlier remove durable, and the quarantine is released only after `store` returns `Ok` (A4).
+- **R7, the seam:**
+  - `free_intent::store` and the stale marker's fsync in `RebuildOwed::made_durable` go through a `&dyn FileOps`
+    (`storage::atomic_file`). `FileOps` gains `remove`, with a default that calls `std::fs::remove_file`.
+  - `TxnManager` holds the ops: `OsFileOps` by default, or a double in this crate's tests through the open's cfg(test)
+    seam.
+  - `txn::sync_file_and_directory` goes (its one caller moves to the ops).
+  - The release-quarantine file (#16's mismatch record) is a separate writer. It is not D229's and is left alone.
+- **New tests, each predicted GREEN at the tip, and each a mutant-only red:**
+  - `a_retried_intent_removal_syncs_the_directory_before_the_quarantine_is_released` (R1). The ops fail the directory
+    fsync that follows the intent's removal, once. The intent stays pending and its pages stay quarantined. The retry
+    meets `NotFound` and must still fsync the directory before the release. Mutant **M17**: `NotFound` returns before the
+    directory fsync (R1's defect).
+  - `an_intent_whose_removal_fails_keeps_its_pages_out_of_use_until_it_is_gone` (A4's order). The ops fail the intent's
+    removal once; a new table fills; the retry succeeds; then the crash. The reopen must find the new table whole, the
+    dropped table's pages not leaked, and no page reached while free. Mutant **M16**: the quarantine is released before
+    `store`.
+  - `a_rebuilding_open_makes_its_trigger_durable_before_its_first_free` (caveat 1). A planted stale marker and a log
+    that owes a rebuild. One event log, shared by the ops and by wrappers around the page file and the log, must show
+    the log's fsync and the marker's file and directory fsyncs before the open's first bitmap write. Mutants **M18**
+    (drop the marker's fsyncs) and **M19** (drop the log's `sync_file`).
+  - `a_page_the_log_relinks_after_its_bit_was_lost_has_its_bit_set_again` (caveat 2, the rebit). A `SyncOnly` crash
+    loses a new heap page's bitmap bit while its insert's record is durable. The open relinks the page, and the oracle
+    requires every reached page to be allocated. Mutant **M15**: drop the `set_allocated` call.
+- **Not made killable, and why:** the pre-free `disk_manager.sync()` in `free_pending_frees` stays EQUIVALENT. Every
+  caller has just synced: the checkpoint, or an open that checkpoints because D250's re-appended `DropTable` record makes
+  its log non-empty. This harness has no model in which a kill -9's unsynced writes are later lost to a power loss.
+- **R4:** a correction appended to `frontier/d229_design.md` at §5.1 row 3, in its own commit (artie-research).
+- **R5:** the unlogged F2 sweep's doc stops stating the retired A3 premise. It is a guard with no mutant of its own (M3,
+  its named killer, was retired in amendment 3). Had M3 stood, its killer was R1's two-crash test (the review's reading).
+- **R6:** `table_pages_names_both_heaps_and_every_tree` loses its vacuous `distinct.len() == pages.len()`. It gains:
+  - a test-side raw walk into a `Vec`, which must hold no page twice and must equal `table_pages` as a set;
+  - a planted alias (the primary root listed in the heap's directory) that `table_pages` must refuse. That second check
+    is the one that can fail: a `collect_pages` that stopped refusing would pass the first.
