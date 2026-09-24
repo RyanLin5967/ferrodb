@@ -2558,6 +2558,9 @@ fn read_vs_n_summary(
         // rebuilt for the stale-index marker and is NOT A RESULT for every arm-3 value, so it sets
         // no baseline and carries no flag. (`stale` absent reads as u64::MAX, which H6 also takes.)
         let is_h6 = |r: &RestartRow| r.get("stale") != 0;
+        // A20.7: ONE binding for the rows arm 3 counts (a child line, not H6). The L2 statement and
+        // the ARM3 refusal both read it; Y1 was these two filters diverging.
+        let counted = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
         let mut loads: Vec<u64> = restart_rows
             .iter()
             .filter(|r| !r.child.is_empty() && !is_h6(*r))
@@ -2650,7 +2653,6 @@ fn read_vs_n_summary(
         );
         // A15.3: a clean-load statement only when every counted row has both readings. A16.8: and
         // only when a row was counted at all, since "every counted row" is vacuous over none.
-        let counted = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
         if counted == 0 {
             println!("  L2: no row was counted.");
         } else if counted < 2 {
@@ -2686,9 +2688,8 @@ fn read_vs_n_summary(
              (A16.5)."
         );
         // A18.1: an H6 row is no point of the curve (A17.2), so it is not counted here either.
-        let measured = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
-        if measured < 2 {
-            failures.push(format!("arm 3: {measured} restart(s) measured; one point is not a curve"));
+        if counted < 2 {
+            failures.push(format!("arm 3: {counted} restart(s) measured; one point is not a curve"));
         }
     }
     println!();
