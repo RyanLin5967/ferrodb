@@ -1454,3 +1454,78 @@ Nothing here has been run (quiet mode), and no code changes except one doc comme
 ### Counts
 
 Unchanged: `f1_lease_grace` **41**, the lib filter **52**, **base + 58**.
+
+## Amendment 16 — D244 review 2's R2-3 (`frontier/d244_review2.md` @ `40fd938`): this branch's `[0x08]` collides with wall21's. Written before the change.
+
+Nothing here has been run (quiet mode).
+
+### The collision (lead-verified by diffing both branches against `9aa6968`)
+
+- This branch has `tag::ALIVE = 0x08`. wall21 (`wall21-reaped-subtree` @ `1ab35e9`) has
+  `tag::UNRELEASED = 0x08`.
+- `tree_keys.rs` auto-merges with NO conflict, and the merged file holds both constants and both
+  one-byte keys.
+- wall21's `create` writes `[0x08]` with an empty value. This branch's `open` and `resume_leases`
+  refuse any `[0x08]` that is not 16 bytes (`AliveState::decode`). So a build with both bricks at the
+  first `LeaseThread::start`.
+- In the other direction, wall21's "index built" check reads an `ALIVE` record as its marker.
+
+### The lead's decisions, and what changes
+
+1. **The registry.** `0x08` = `UNRELEASED` (wall21), `0x09` = `ALIVE`, `0x0A` = `FIRST_START`: this
+   branch's two tags move up by one.
+   - Every doc, assertion message and comment in this branch that names `[0x08]`/`[0x09]` for these
+     keys is updated: `table_catalog.rs`, `tree_keys.rs`, `types.rs`, the cost example.
+   - Assertion MESSAGES change, and no asserted condition does.
+   - The two group tests (`the_alive_key_is_its_own_group_…`, `the_first_start_key_is_its_own_group_…`)
+     name the tags symbolically (`tag::ALIVE`, `alive()`, …), so they follow the renumbering unchanged.
+   - Earlier amendments' `[0x08]`/`[0x09]` mean `ALIVE`/`FIRST_START` as they stood then, and are
+     left as written (append-only).
+2. **The next collision is made unrepresentable.** `pub mod tag`'s constants become a `#[repr(u8)] pub
+   enum Tag` with an explicit discriminant per variant:
+   - `Record = 0x00`, `Deadline = 0x01`, `State = 0x02`, `Child = 0x03`, `FreeId = 0x04`,
+     `Envelope = 0x05`, `Arena = 0x06`, `Header = 0x07`, `Alive = 0x09`, `FirstStart = 0x0A`.
+   - A duplicate discriminant is compile error E0081.
+   - The constants stay as derived aliases, `pub const X: u8 = Tag::X as u8;`, so every caller and
+     match pattern is unchanged.
+   - A doc rule on the enum: a new tag is a new VARIANT, never a literal.
+   - `0x08` is documented as wall21's, which adds `Unreleased = 0x08` as a variant at its merge (the
+     lead is telling it). Until then, a new test,
+     `tree_keys::tests::the_lease_tags_leave_0x08_to_wall21s_unreleased_span`, pins that neither of this
+     branch's tags is `0x08`. After wall21's merge, E0081 subsumes it.
+3. **"`[0x07]` is the maximum key" (R2-8).** Searched this lane's report, PREREG and code with
+   `grep -n "maximum key|0x07"`. No such claim was found. The nearest is amendment 11's cost note:
+   "`[0x09]` sorts after `[0x07]` (HEADER), which every fork rewrites, so it usually shares that leaf".
+   It is corrected here:
+   - after wall21's merge, `UNRELEASED`'s `[0x08][id]` span lies between `HEADER` and this branch's
+     keys, and is unbounded after reaper-less use;
+   - so `FIRST_START` (now `[0x0A]`) need not share `HEADER`'s leaf, and a soft mark can dirty one more
+     page per commit.
+   - The cost measurement (g2) runs on this branch alone and does not see that.
+
+### The D244 merge obligations (R2-7), recorded; they extend amendment 15
+
+- **(a) `switch_header_magic` also blinds D244's exit repair.** It stores `published_root` before
+  `write_header_page`, and `publish_root_durably` returns early when `published_root == root`. So
+  after the merge, a failed switch would not be repaired at exit either. Amendment 15 (b) fixes both
+  failures at once: store `header_magic` and `published_root` only after the write returns `Ok`.
+- **(b) No soft mark at a clean exit.** If this branch's `stage()` (soft mark, then publish) simply
+  becomes D244's `mutate`, then `publish_root_durably` writes a soft mark at every clean exit of an
+  unmarked catalog. For example, a catalog whose stop-time heartbeat failed.
+  - **The lead's decision: the exit must not.** D244's exit publish goes through this branch's
+    `stage_mark`-shaped variant (publish only).
+  - The soft mark rides only a `mutate` whose body is a real commit and succeeded.
+- **(c) Carried from D244 review 1's F4:**
+  - `publish_root`'s swap-before-write;
+  - `stage_mark` and its callers `resume_leases` and `record_lease_alive`;
+  - `open_from_header`'s torn-magic switch;
+  - `release_id`;
+  - the one `cfg(test)` `c.stage()` in `a_record_of_the_wrong_width_is_refused_at_resume_and_at_open`.
+    It must become the merged API: a test edit at the merge, recorded here in advance; its asserted
+    refusal does not change.
+
+### Counts
+
+- `tree_keys::tests` +1.
+- **base + 59**.
+- `f1_lease_grace` **41** and the lib filter **52** are unchanged (the new test is outside the filter).
