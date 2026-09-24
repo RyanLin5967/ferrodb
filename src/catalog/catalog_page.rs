@@ -413,7 +413,7 @@ pub(crate) fn refuse_unless_encodable(entry: &TableEntry) -> Result<(), FerroErr
     if !page.has_space(entry) {
         return Err(FerroError::Constraint(format!(
             "the catalog entry of table {} would be {} bytes, more than one {}-byte catalog page \
-             holds; refused before anything was written",
+             holds; refused before any catalog page was written",
             elide(&entry.name),
             HEADER_SIZE + entry.length(),
             PAGE_SIZE
