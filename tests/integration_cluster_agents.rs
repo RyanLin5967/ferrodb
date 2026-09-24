@@ -1405,9 +1405,9 @@ impl Fleet {
     /// to how fast the socket threads ran, and the election is a function of the machine again —
     /// by way of the network rather than the clock.
     ///
-    /// **A frame the transport counts as lost refuses the turn at once.** Which frame a full queue
-    /// or a broken write takes is the scheduler's choice, so a turn taken without it is a replay
-    /// that is no longer a function of the turns. A healthy localhost fleet loses none.
+    /// **A frame the transport counts as lost refuses the turn at once.** Which frame a full queue,
+    /// a broken write or a full inbox takes is the scheduler's choice, so a turn taken without it
+    /// is a replay that is no longer a function of the turns. A healthy localhost fleet loses none.
     ///
     /// **Its one wall-clock read is a failure bound, and it cannot choose an outcome:** running
     /// out returns an error naming the unbalanced counts, and the turn is not taken. A frame lost
@@ -1428,8 +1428,9 @@ impl Fleet {
             if lost > 0 {
                 return Err(FerroError::Internal(format!(
                     "the fleet's transports counted {lost} frame(s) lost of {sent} sent. Which \
-                     frames a full queue or a broken connection takes is the scheduler's choice, \
-                     so a turn taken without them would no longer be a function of the turns"
+                     frames a full queue, a broken connection or a full inbox takes is the \
+                     scheduler's choice, so a turn taken without them would no longer be a \
+                     function of the turns"
                 )));
             }
             if sent == received {

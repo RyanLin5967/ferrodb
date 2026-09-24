@@ -136,9 +136,9 @@ pub enum Clock {
     /// wall clock left on the delivery path. What remains on the wall is connection setup: a dial
     /// retried every `reconnect_delay`, and a handshake the receiver gives up on after
     /// `handshake_deadline`. Frames wait in the sender's queue until a connection exists, so setup
-    /// can delay a turn; a receiver that gives up on a handshake the dialler already finished loses
-    /// the dialler's first frame uncounted, which a harness waiting for delivery refuses by name.
-    /// Neither can change what a turn does.
+    /// can delay a turn. A receiver that gives up on a handshake still answers it before closing,
+    /// so the dialler believes it is connected and its first frame is lost uncounted — which a
+    /// harness waiting for delivery refuses by name. Neither can change what a turn does.
     ///
     /// ⛔ **Never a server's clock.** The objection in
     /// `a_tick_is_delivered_on_the_clock_and_missed_ticks_are_caught_up` still holds for any
@@ -159,11 +159,18 @@ pub enum Clock {
 /// inbox — the counter moves just before the channel send — which is why `Node::collect` waits for
 /// the count rather than draining whatever the channel holds.
 ///
-/// **What it cannot see, stated rather than left to be found:** a frame written whole and then
-/// lost with its connection, and a frame the reader closed its connection over (an unknown tag, a
-/// decode failure). Neither is counted anywhere, so a fleet that suffers one never balances. That
-/// is the direction to fail in: a harness waiting for the balance refuses by name, where one that
-/// took the turn anyway would run it with a message missing.
+/// **Quiet is not enough for a replay.** Which frame a full queue or a broken write takes is the
+/// scheduler's choice, so a harness that needs a turn to be a function of the turns wants
+/// `lost == 0` as well, and `Fleet::deliver` in `tests/integration_cluster_agents.rs` refuses a
+/// turn on any.
+///
+/// **What it cannot see, stated rather than left to be found:** a frame the reader closed its
+/// connection over (an unknown tag, a decode failure), and — by ordinary TCP behaviour, not
+/// measured here — a frame written whole into a connection its peer has already closed, which the
+/// write reports as sent. Nor the two losses only shutdown causes: queues cleared by
+/// `Transport::shutdown`, and a `send` racing it. None is counted anywhere, so a fleet that
+/// suffers one never balances. That is the direction to fail in: a harness waiting for the
+/// balance refuses by name, where one that took the turn anyway would run it a message short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Frames {
     pub sent: u64,
@@ -437,8 +444,9 @@ impl<A: Applier> Node<A> {
         // path, so it is switched off there.** It closes a connection that has been quiet for
         // `idle_deadline` of wall time, and a turn-driven cluster leaves connections quiet for as
         // long as its test likes — two followers under a stable leader never speak to each other.
-        // The next frame written into a closed connection dies without being counted, and the
-        // harness waiting for it refuses the turn. How long a pause lasted is exactly the fact
+        // The next frame written into the closed connection is reported sent and lost uncounted
+        // (ordinary TCP behaviour, not measured here), and the harness waiting for it refuses the
+        // turn. How long a pause lasted is exactly the fact
         // `Clock::Pumped` exists to keep from deciding anything.
         let mut transport = opts.transport;
         if opts.clock == Clock::Pumped {

@@ -562,12 +562,14 @@ fn collect_is_refused_on_a_wall_clock_node() {
 /// is wall time, and a turn-driven cluster leaves connections quiet for as long as its test likes;
 /// closed, the next frame written into one dies uncounted and the harness refuses the turn.
 ///
-/// **The wall-clock node is the control, and it runs first.** Same 50 ms deadline, same pause — and
-/// its connection IS closed, so the pause is long enough and the pumped node's open connection is
-/// the override, not the timing. Without the control this would pass against a transport whose
-/// idle close never fired at all.
+/// **The wall-clock node is the control, and it runs first.** Same 50 ms deadline, and its
+/// connection IS closed; how long that took is measured, and the pumped node is then left quiet for
+/// at least twice as long before it is looked at. So its open connection is the override and not a
+/// connection thread that had not yet got round to checking. Without the control this would pass
+/// against a transport whose idle close never fired at all.
 #[test]
 fn a_pumped_node_does_not_close_a_connection_for_being_quiet() {
+    let mut control_took: Option<Duration> = None;
     for pumped in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let l = listener();
@@ -601,27 +603,32 @@ fn a_pumped_node_does_not_close_a_connection_for_being_quiet() {
 
         t2.send(&hello).unwrap();
         await_received(&n, 1);
-        // Twenty idle deadlines of silence.
-        std::thread::sleep(Duration::from_secs(1));
+        let quiet_since = Instant::now();
 
         if pumped {
+            // Twenty idle deadlines at least, and never less than twice what the control needed.
+            let took = control_took.expect("the control arm runs first");
+            std::thread::sleep(Duration::from_secs(1).max(took * 2));
             assert_eq!(
                 n.net.idle_closed(),
                 0,
-                "a pumped node closed a connection for a second of wall-clock silence"
+                "a pumped node closed a connection for wall-clock silence; the control closed its \
+                 own after {took:?}"
             );
             t2.send(&hello).unwrap();
             await_received(&n, 2);
         } else {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = quiet_since + Duration::from_secs(20);
             while n.net.idle_closed() == 0 {
                 assert!(
                     Instant::now() < deadline,
                     "the control did not fire: a wall-clock node with a 50 ms idle deadline kept a \
-                     quiet connection open, so the pumped arm's open connection proves nothing"
+                     quiet connection open for 20 s, so the pumped arm's open connection proves \
+                     nothing"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
+            control_took = Some(quiet_since.elapsed());
         }
         t2.shutdown();
         n.shutdown();
