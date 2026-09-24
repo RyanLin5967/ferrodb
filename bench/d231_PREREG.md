@@ -139,3 +139,92 @@ The harness exits 2, and does not score the step, when:
 * the run reaches other than 50 verdicts.
 
 Exit 0 requires FAIL = 0 and PASS = 50.
+
+## Amendment 2 (D231 review 4, N1-N7 and H1-H2; lead decisions 2026-09-24)
+
+Written before steps 26-32 exist and before any run of them, stub model included. It supersedes amendment 1's totals,
+for the script at the commit that follows this amendment. Steps 1-25 and their predictions are unchanged. The
+`build.rs` behaviour these steps pin is new at that same commit:
+
+* **N1.** The stamp is `unknown` unless `git rev-parse --show-toplevel` is the package root.
+* **N2.** The stamp is `unknown` when any index entry carries assume-unchanged (a lowercase `ls-files -v` tag) or
+  skip-worktree (`S`), or when `core.ignoreStat` is true.
+* **N4.** A failed `git status` stamps `unknown`. It used to keep the sha and mark it dirty.
+* **N6.** The sha is read, then `status` runs, then the sha is read again, and the stamp is `unknown` if it moved.
+
+### New steps, per arm (32 in all), and what each must show at the tip
+
+The first link of the chain is `refs/heads/d231-link-<arm>` ("link"). Step 27 adds `refs/heads/d231-link2-<arm>`
+("link2") in front of it.
+
+| n | change before the build | tip stamp | tip rerun |
+|---|---|---|---|
+| 26 | an UNRELATED packed ref deleted (`update-ref -d` of a packed remote-tracking ref). This rewrites `packed-refs`, and nothing HEAD resolves through moves. Witness: only `packed-refs` moved; index, HEAD, link and `$first` did not (N3) | at Q0 +DIRTY | **no** |
+| 27 | symref link2 → link; HEAD → link2. HEAD now resolves through three links: link2 → link → `$first` | at Q0 +DIRTY | yes |
+| 28 | `git update-ref $first S0` moves the chain's THIRD link. Witness: only `$first`'s file moved; index, HEAD, link2 and link did not (N5) | at S0 +DIRTY | yes |
+| 29 | index touched, then made unreadable (`chmod 000`), so `git status` fails. The mode is restored after the build (N4) | at unknown +DIRTY | yes |
+| 30 | index touched, now readable again: the `unknown` does not stick | at S0 +DIRTY | yes |
+| 31 | a comment appended to `src/lib.rs`, then `update-index --assume-unchanged src/lib.rs` (premise asserted: `ls-files -v` tags it `h`). `git status` no longer lists the edit. The bit is cleared and the file restored after the build (N2) | at unknown +DIRTY | yes |
+| 32 | `git archive S0` extracted into the checkout's gitignored `target/d231-export/`, probe written, built there with the arm's target dir. git discovers the ENCLOSING checkout (N1) | at unknown +DIRTY | yes |
+
+### Predictions
+
+**At the D231 tip: 64 PASS / 0 FAIL, exit 0.** No step depends on timing.
+
+**At `9aa6968`: nominally 32 PASS / 32 FAIL, exit 1.**
+
+| arm | PASS | FAIL |
+|---|---|---|
+| clone | 1 4 7 8 11 14 17 19 20 22 27 30 | 2 3 5 6 9 10 12 13 15 16 18 21 23 24 25 26 28 29 31 32 |
+| linked | 1 3 4 5 7 8 10 11 13 14 16 17 19 20 22 23 24 27 28 30 | 2 6 9 12 15 18 21 25 26 29 31 32 |
+
+Why each NEW base step comes out as it does:
+
+* **clone 26:** FAIL. There is no re-run, so the stamp is still step 25's clean `at Q0`, because the base honoured the
+  replacement. If a re-run happened it would still FAIL, on `rerun=yes`.
+* **linked 26:** FAIL on `rerun=yes`. The base re-runs on every build.
+* **27:** PASS in both arms. HEAD moved, and the base watches HEAD.
+* **clone 28:** FAIL. There is no re-run (`$first`'s file is not watched), so the stamp is still `at Q0`.
+* **linked 28:** PASS.
+* **29:** FAIL in both arms. The base keeps the sha and marks it dirty: `at S0 +DIRTY`.
+* **30:** PASS in both arms. The index moved, and the base watches it.
+* **31:** FAIL in both arms. The base's status skips the assume-unchanged entry; the staged README still makes it
+  `at S0 +DIRTY`, not `unknown`.
+* **32:** FAIL in both arms. The export's base build script stamps the enclosing checkout's HEAD, `at S0 +DIRTY`.
+
+### Base steps that depend on timing, and the only flips allowed
+
+Amendment 1's list stands:
+* clone 2, 9, 12, 15 and 18 may go FAIL→PASS with `rerun=no`;
+* clone 5, 23 and 24 may go FAIL→PASS with `rerun=yes`.
+
+Amendment 2 adds one:
+* **clone 28 may go FAIL→PASS with `rerun=yes`**, only if a racy write-back is still pending from sub-second
+  preceding builds. That is the same mechanism as clone 5, 23 and 24.
+* Steps 26, 27 and 29-32 come out the same either way at the base.
+
+So a base run gives **PASS between 32 and 41, FAIL between 23 and 32, and exit 1**. Only the named steps may differ, and
+only in the named direction. Any other deviation is a MISMATCH.
+
+### Mutants these steps must kill (at the tip)
+
+| mutant | killed by step |
+|---|---|
+| `packed-refs` watched as well | 26 |
+| only the first two links watched (`links.len() < 2`) | 28 |
+| a failed `git status` keeps the sha (the old behaviour), or reads clean | 29 |
+| no `--show-toplevel` check (N1) | 32 |
+| no index-bit check (N2) | 31 |
+
+Amendment 1's kill map stands for steps 1-25.
+
+### Added to "not exercised by any step"
+
+* the skip-worktree (`S`) tag and `core.ignoreStat`. The code refuses both; step 31 exercises only assume-unchanged.
+* the N6 re-read of the sha. No step can move HEAD inside one build script run.
+* `core.preferSymlinkRefs` (N7, a known limit). With it, HEAD is a symlink and `--git-path HEAD` names its target's
+  realpath, so a HEAD retarget moves no watched file. The option is deprecated and not set on this machine (review 4,
+  MEASURED).
+
+The exit condition becomes: exit 0 requires FAIL = 0 and PASS = 64, and a run that reaches anything other than 64
+verdicts exits 2.
