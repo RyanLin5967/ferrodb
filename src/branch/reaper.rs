@@ -867,7 +867,8 @@ impl TwoTierReaper {
                 // parking branch's record being readable. Nothing moves the answer before the
                 // release below: the extent holding a parked page is not empty, so no sweep
                 // collects it, and the drain touches it before releasing into it (D221).
-                if self.store.arena_owner(pf.arena_id) != Some(pf.owner) {
+                // MUTANT (fire-check only, never land): only a foreign owner is refused; a gone extent is released into.
+                if matches!(self.store.arena_owner(pf.arena_id), Some(h) if h != pf.owner) {
                     self.foreign_arenas_skipped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
