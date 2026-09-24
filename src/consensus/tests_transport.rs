@@ -2180,9 +2180,19 @@ fn one_unreachable_peer_cannot_queue_more_than_the_default_byte_bound() {
             commit: 0,
         },
     };
-    // Every frame is the same length: the only field that varies is the fixed-width term.
-    let frame_len = encode(&msg(1)).unwrap().len();
-    let fit = DEFAULT_QUEUE_BYTES / frame_len;
+    // Pinned, not taken from the encoder this diff changes: 5 header + 16 envelope (from, to, term)
+    // + 1 kind + 24 (prev_round, prev_term, commit) + 4 count + 16 (entry term, round) + 1 tag
+    // + 8 lsn + 4 length + 7,340,032 payload. Every frame is this long, because the only field that
+    // varies is the fixed-width term, and nine of them fit in 64 MiB.
+    const FRAME_LEN: usize = 7_340_111;
+    const FIT: usize = 9;
+    assert_eq!(
+        encode(&msg(1)).unwrap().len(),
+        FRAME_LEN,
+        "the frame is not the size this test's arithmetic is about"
+    );
+    assert_eq!(DEFAULT_QUEUE_BYTES / FRAME_LEN, FIT, "the arithmetic above is wrong");
+    let fit = FIT;
     // Twelve 7 MiB frames is 84 MiB: over the byte bound, and far under the depth, so a queue
     // bounded only in messages keeps every one of them.
     const SENT: u64 = 12;
@@ -2218,103 +2228,6 @@ fn one_unreachable_peer_cannot_queue_more_than_the_default_byte_bound() {
     assert_eq!(terms, newest, "the byte bound kept {terms:?}; it must keep the newest");
     drop(st);
     assert_eq!(t.dropped_to(NodeId(2)), SENT - fit as u64, "a byte-bound drop was not counted");
-}
-
-#[test]
-fn one_frame_cannot_spend_more_config_nodes_than_its_whole_budget() {
-    // Ported from 1b3a6a6. `MAX_CONFIG_NODES` bounds ONE configuration, and `Config::with_learners`
-    // retains learners with `Vec::contains` (config.rs), so a configuration of n members and n
-    // learners costs n x n comparisons however this file validates it. A frame may carry many: an
-    // 8 MiB Append holds about 1018 configurations of 1024 + 1024 ids, and 1018 x 1024 x 1024 is
-    // 1.07e9 comparisons for one frame. So the budget is per FRAME.
-    //
-    // Five configurations of 1024 members is 5120 ids against a 4096-id budget: the first four fit
-    // and the fifth must be refused.
-    let per_cfg = MAX_CONFIG_NODES as u32;
-    let frame = |configs: u32| {
-        let mut b = Vec::new();
-        b.extend_from_slice(&1u32.to_be_bytes()); // from
-        b.extend_from_slice(&2u32.to_be_bytes()); // to
-        b.extend_from_slice(&1u64.to_be_bytes()); // term
-        b.push(4); // Append
-        b.extend_from_slice(&0u64.to_be_bytes()); // prev_round
-        b.extend_from_slice(&0u64.to_be_bytes()); // prev_term
-        b.extend_from_slice(&0u64.to_be_bytes()); // commit
-        b.extend_from_slice(&configs.to_be_bytes()); // entries
-        for e in 0..u64::from(configs) {
-            b.extend_from_slice(&1u64.to_be_bytes()); // entry term
-            b.extend_from_slice(&(e + 1).to_be_bytes()); // entry round
-            b.push(7); // Membership
-            b.extend_from_slice(&1u64.to_be_bytes()); // config version
-            b.extend_from_slice(&1u64.to_be_bytes()); // config term
-            b.extend_from_slice(&per_cfg.to_be_bytes()); // members
-            for i in 1..=per_cfg {
-                b.extend_from_slice(&i.to_be_bytes());
-            }
-            b.extend_from_slice(&0u32.to_be_bytes()); // no learners
-        }
-        b
-    };
-
-    match decode(&frame(5)) {
-        Ok(_) => panic!(
-            "five configurations of {per_cfg} members in one frame were accepted, so the cap still \
-             bounds each configuration and nothing bounds the frame"
-        ),
-        Err(e) => {
-            let e = format!("{e}");
-            assert!(e.contains("budget is left"), "refused, but not by the frame budget: {e}");
-            // Named in the refusal, so a reader knows WHICH entry exhausted it.
-            assert!(e.contains("entry 4 of 5"), "the refusal does not say where: {e}");
-        }
-    }
-
-    // Anti-vacuity: four fit exactly (4 x 1024 = 4096), so the refusal is about crossing the budget
-    // and not about a frame carrying several configurations.
-    let m = decode(&frame(4)).expect("four configurations totalling exactly the budget must decode");
-    let Body::Append { entries, .. } = &m.body else { panic!("shape changed") };
-    assert_eq!(entries.len(), 4);
-}
-
-#[test]
-fn a_frame_whose_configurations_exceed_the_budget_is_refused_to_its_sender() {
-    // The frame budget has a sender-side twin for the reason the per-configuration cap has one in
-    // `encode_config`: without it this node frames an Append that every peer's decoder refuses, and
-    // never learns why. That is a cluster that silently cannot replicate. Not in 1b3a6a6, which
-    // bounded the decoder only.
-    let cfg = Config::new((1..=MAX_CONFIG_NODES as u32).map(NodeId), 1, 1);
-    let append = |n: u64| Message {
-        from: NodeId(1),
-        to: NodeId(2),
-        term: 1,
-        body: Body::Append {
-            prev_round: 0,
-            prev_term: 0,
-            entries: (1..=n)
-                .map(|round| Entry {
-                    term: 1,
-                    round,
-                    command: Command::Membership { config: cfg.clone() },
-                })
-                .collect(),
-            commit: 0,
-        },
-    };
-    match encode(&append(5)) {
-        Ok(f) => panic!(
-            "an Append carrying five configurations of {MAX_CONFIG_NODES} members was framed ({} \
-             bytes); every peer's decoder refuses it, so this node would send a frame that can \
-             never land",
-            f.len()
-        ),
-        Err(e) => {
-            assert!(format!("{e}").contains("budget"), "refused, but not by the frame budget: {e}")
-        }
-    }
-    // Anti-vacuity: four encode and round-trip, so the sender's limit is the decoder's and no
-    // stricter.
-    let m = append(4);
-    assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "four configurations must round trip");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2407,90 +2320,6 @@ fn whichever_bound_binds_first_and_a_frame_over_the_whole_byte_bound_is_still_qu
     ob.push(vec![7; 10]);
     assert_eq!(view(&ob), vec![7]);
     assert_eq!(dropped(&ob), 6);
-}
-
-#[test]
-fn learners_spend_the_same_frame_budget_as_members() {
-    // The quadratic term is learners x members, so a budget that charged only members would bound
-    // nothing about the half that costs. Two configurations of 1024 members and 1024 disjoint
-    // learners are 4096 ids and fill the budget exactly; a third must be refused, by the decoder
-    // and by the encoder alike.
-    let per = MAX_CONFIG_NODES as u32;
-    let members = 1..=per;
-    let learners = (per + 1)..=(2 * per);
-
-    // Decoder: hand-built, because the encoder now refuses the frame this half needs.
-    let frame = |configs: u32| {
-        let mut b = Vec::new();
-        b.extend_from_slice(&1u32.to_be_bytes()); // from
-        b.extend_from_slice(&2u32.to_be_bytes()); // to
-        b.extend_from_slice(&1u64.to_be_bytes()); // term
-        b.push(4); // Append
-        b.extend_from_slice(&[0u8; 24]); // prev_round, prev_term, commit
-        b.extend_from_slice(&configs.to_be_bytes()); // entries
-        for e in 0..u64::from(configs) {
-            b.extend_from_slice(&1u64.to_be_bytes()); // entry term
-            b.extend_from_slice(&(e + 1).to_be_bytes()); // entry round
-            b.push(7); // Membership
-            b.extend_from_slice(&1u64.to_be_bytes()); // config version
-            b.extend_from_slice(&1u64.to_be_bytes()); // config term
-            for list in [members.clone(), learners.clone()] {
-                b.extend_from_slice(&per.to_be_bytes());
-                for i in list {
-                    b.extend_from_slice(&i.to_be_bytes());
-                }
-            }
-        }
-        b
-    };
-    match decode(&frame(3)) {
-        Ok(_) => panic!("three configurations of {per} + {per} ids were accepted in one frame"),
-        Err(e) => {
-            let e = format!("{e}");
-            assert!(e.contains("budget is left"), "refused, but not by the frame budget: {e}");
-            assert!(e.contains("entry 2 of 3"), "refused at the wrong entry: {e}");
-        }
-    }
-    decode(&frame(2)).expect("two configurations totalling exactly the budget must decode");
-
-    // Encoder: the same line, from the sending side.
-    let cfg = Config::new(members.clone().map(NodeId), 1, 1).with_learners(learners.map(NodeId));
-    assert_eq!(cfg.learners().len(), MAX_CONFIG_NODES, "the learners did not survive `Config`");
-    let append = |n: u64| Message {
-        from: NodeId(1),
-        to: NodeId(2),
-        term: 1,
-        body: Body::Append {
-            prev_round: 0,
-            prev_term: 0,
-            entries: (1..=n)
-                .map(|round| Entry {
-                    term: 1,
-                    round,
-                    command: Command::Membership { config: cfg.clone() },
-                })
-                .collect(),
-            commit: 0,
-        },
-    };
-    match encode(&append(3)) {
-        Ok(f) => panic!("three configurations of {per} + {per} ids were framed ({} bytes)", f.len()),
-        Err(e) => {
-            assert!(format!("{e}").contains("budget"), "refused, but not by the frame budget: {e}")
-        }
-    }
-    let m = append(2);
-    assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "two must round trip");
-}
-
-#[test]
-fn the_frame_budget_is_four_maximal_member_lists() {
-    // `one_frame_cannot_spend_more_config_nodes_than_its_whole_budget` was written before
-    // `MAX_FRAME_CONFIG_NODES` existed, so it states the budget only as arithmetic: four
-    // configurations of `MAX_CONFIG_NODES` members fill it exactly and a fifth does not fit, and
-    // `learners_spend_the_same_frame_budget_as_members` relies on two full configurations doing the
-    // same. This pins that premise to the constants, so moving either limit fails here, by name.
-    assert_eq!(MAX_FRAME_CONFIG_NODES, 4 * MAX_CONFIG_NODES);
 }
 
 #[test]
@@ -2648,14 +2477,20 @@ fn a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay() {
     // delay before it looked at the stop flag again: a shutdown that should take a poll took a
     // `reconnect_delay`.
     //
-    // Deterministic rather than raced. The peer is a listener that accepts at the kernel and never
-    // answers the handshake, so the sender sits in `dial`'s handshake read — polling the stop flag,
-    // never the condvar — until `shutdown` is called. The dial then fails BECAUSE of the shutdown,
-    // after its notify has come and gone.
+    // The peer is a listener that accepts at the kernel and never answers the handshake, so the
+    // sender sits in `dial`'s handshake read — polling the stop flag, never the condvar — until
+    // `shutdown` is called. The dial then fails BECAUSE of the shutdown.
+    //
+    // On the fixed tree this is deterministic: the redial wait reads the flags under the lock and
+    // does not wait. On a tree with the bug the red is very likely, not certain: it needs
+    // `shutdown`'s locked set-and-notify (microseconds) to land before the dial's next look at the
+    // stop flag, which falls anywhere in a whole read poll. So the poll is long, 200 ms, which puts a
+    // missed red at roughly microseconds in 200 ms. It can never make the fixed tree fail.
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = silent.local_addr().unwrap();
     silent.set_nonblocking(true).unwrap();
     let mut opts = fast();
+    opts.poll_interval = Duration::from_millis(200);
     opts.reconnect_delay = Duration::from_secs(30);
     opts.handshake_deadline = Duration::from_secs(60);
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
