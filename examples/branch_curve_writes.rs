@@ -2579,6 +2579,18 @@ fn read_vs_n_summary(
              average, so around an open of a few seconds both readings describe mostly the minute BEFORE it. \
              L2 = 0 on a short open is not evidence of a quiet open."
         );
+        // A16.4: the rows left out of every arm-3 value, named, so no value reads as covering them.
+        let h6_rows: Vec<usize> =
+            restart_rows.iter().filter(|r| !r.child.is_empty() && is_h6(*r)).map(|r| r.n).collect();
+        println!(
+            "  arm 3: H6 rows, excluded from every arm-3 value and from the load median: {}",
+            if h6_rows.is_empty() { "none".to_string() } else { format!("N={h6_rows:?}") }
+        );
+        println!(
+            "  arm 3: R7's step times (lock, recover, sql_catalog, branch_catalog, effect_log, runtime, \
+             provenance; the RESTART rows above) are REPORTED, not judged, with L2 and G7 beside them (A16.4). \
+             recover_us is reported too; `recovered` judges its fact (A16.5)."
+        );
         let measured = restart_rows.iter().filter(|r| !r.child.is_empty()).count();
         if measured < 2 {
             failures.push(format!("arm 3: {measured} restart(s) measured; one point is not a curve"));
