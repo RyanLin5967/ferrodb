@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1812,11 +1812,7 @@
+@@ -1855,11 +1855,7 @@
              if st.stopped {
                  break;
              }

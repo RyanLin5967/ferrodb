@@ -1,0 +1,11 @@
+--- a/src/consensus/replicate.rs
++++ b/src/consensus/replicate.rs
+@@ -639,7 +639,7 @@
+             Some(t) => t.slice_from(
+                 round,
+                 MAX_ENTRIES_PER_APPEND,
+-                super::transport::append_entries_budget(),
++                usize::MAX,
+             ),
+             None => Vec::new(),
+         }

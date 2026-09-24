@@ -489,3 +489,25 @@ bytes.
 | M25 `cut_one_early` | `>=` for `>` | **E** (exact case: 1 entry, want 2) |
 | M26 `envelope_not_reserved` | a budget without the Append envelope | **E** (one-byte-over case: 2 entries) |
 | M27 `empty_when_first_too_big` | no at-least-one rule | **none: SURVIVES**. No entry the log admits exceeds the budget (above), so the rule never binds on legal input |
+
+---
+
+## Amendment 7 — D220's fix made, mutants cut, before any run (nothing built)
+
+The fix is **`9bd9c7f`**. It follows amendment 6's plan with one addition: `encode_signed`'s body construction is
+extracted, unchanged, as `message_body`, so that `append_entries_budget` measures exactly what `encode_signed`
+frames. Test counts are unchanged:
+
+- the transport module has 57 tests (the fix adds none there);
+- the replicate module has 57.
+
+**All 22 mutants are now re-generated from `9bd9c7f`**, and every patch passes `git apply --check`. M1–M22 have
+the same edits; only their hunk line numbers moved. M23–M27 are new, with the kill sets and survivals registered in
+amendment 6.
+
+**Command for M23–M27:** `timeout 900 cargo test --no-fail-fast --lib consensus::replicate::tests_replicate::`.
+They mutate the Append batch, which that module tests. The transport module is not run for them: they change
+nothing its tests exercise except the refactored `message_body`, and no mutant touches that.
+
+**Run G4 at the tip:** `consensus::replicate::tests_replicate::` gives **57 passed**, and
+`consensus::transport::tests::` gives **57 passed**. Per-target: **2593**.

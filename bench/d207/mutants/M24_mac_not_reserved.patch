@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -229,7 +229,7 @@
+     // An empty `Append` cannot fail to encode; if it somehow did, a zero budget still sends one
+     // entry per `Append` (see `replicate.rs`), which degrades rather than stalls.
+     message_body(&empty)
+-        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))
++        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len()))
+ }
+ 
+ /// The bytes the encoder writes for one entry inside an `Append`, measured by writing it.

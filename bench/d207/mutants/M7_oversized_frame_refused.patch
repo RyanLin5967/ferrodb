@@ -1,6 +1,6 @@
 --- a/src/consensus/transport.rs
 +++ b/src/consensus/transport.rs
-@@ -1153,6 +1153,10 @@
+@@ -1196,6 +1196,10 @@
      fn push(&self, frame: Vec<u8>) {
          let mut st = self.state.lock().unwrap();
          if st.stopped {

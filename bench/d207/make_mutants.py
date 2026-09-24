@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write D207's mutants of src/consensus/transport.rs and config.rs as `git apply`-able patches.
+"""Write D207's and D220's mutants of consensus/transport.rs, config.rs and replicate.rs as patches.
 
 Each mutant re-introduces one defect (or removes one guard) by an exact-string edit that must match
 exactly once, or the script refuses. Reads the file from a commit, never from the working tree, and
@@ -17,6 +17,7 @@ import sys
 
 PATH = "src/consensus/transport.rs"
 CONFIG = "src/consensus/config.rs"
+REPLICATE = "src/consensus/replicate.rs"
 
 SETUP_EXIT = """                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.shutdown(Shutdown::Both);
@@ -90,6 +91,31 @@ MUTANTS = [
         "                    // descriptor exhaustion these meters exist to show. Counted with the others.\n                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);\n",
         "                    // descriptor exhaustion these meters exist to show. Counted with the others.\n",
     )]),
+    # --- amendment 6: D220, the Append byte budget --------------------------------------------------
+    ("M24_mac_not_reserved", [(
+        "        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))\n",
+        "        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len()))\n",
+    )]),
+    ("M26_envelope_not_reserved", [(
+        "        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))\n",
+        "        .map_or(0, |_b| MAX_FRAME_BYTES.saturating_sub(signing::MAC_LEN))\n",
+    )]),
+]
+
+# Mutants of replicate.rs (D220), same shape.
+REPLICATE_MUTANTS = [
+    ("M23_append_count_only", [(
+        "                super::transport::append_entries_budget(),\n",
+        "                usize::MAX,\n",
+    )]),
+    ("M25_cut_one_early", [(
+        "            if !taken.is_empty() && bytes.saturating_add(len) > max_bytes {\n",
+        "            if !taken.is_empty() && bytes.saturating_add(len) >= max_bytes {\n",
+    )]),
+    ("M27_empty_when_first_too_big", [(
+        "            if !taken.is_empty() && bytes.saturating_add(len) > max_bytes {\n",
+        "            if bytes.saturating_add(len) > max_bytes {\n",
+    )]),
 ]
 
 # Mutants of config.rs, same shape.
@@ -116,7 +142,7 @@ def main() -> int:
     sha = sys.argv[1]
     out = pathlib.Path("bench/d207/mutants")
     out.mkdir(parents=True, exist_ok=True)
-    for path, mutants in ((PATH, MUTANTS), (CONFIG, CONFIG_MUTANTS)):
+    for path, mutants in ((PATH, MUTANTS), (CONFIG, CONFIG_MUTANTS), (REPLICATE, REPLICATE_MUTANTS)):
         rc = write(sha, path, mutants, out)
         if rc:
             return rc
