@@ -217,7 +217,12 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    txn.checkpoint()?;
+    // D230: persist the catalog from its in-memory records, then checkpoint. A `sync_roots` whose
+    // persist failed this session left the catalog page behind the trees, and a checkpoint alone
+    // would flush that page and truncate the log, so the next open would not rebuild and would read
+    // it. On failure the log is kept for the next open to rebuild from, and the error names the
+    // roots. See `catalog::clean_exit`.
+    crate::catalog::clean_exit::checkpoint_for_exit(&catalog.lock(), &txn)?;
     // Persist where the arena starts and what it has allocated. Without this the next open finds
     // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
     store.checkpoint(Path::new(&arena_path))?;

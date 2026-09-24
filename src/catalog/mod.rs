@@ -5,3 +5,4 @@ pub mod catalog;
 pub mod stats;
 pub mod alter;
 pub mod system_views;
+pub mod clean_exit;
