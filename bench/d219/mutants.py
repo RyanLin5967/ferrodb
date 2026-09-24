@@ -152,32 +152,38 @@ MUTANTS = {
         "        if file.pending.is_empty() {\n            return Ok(());\n        }\n        self.refuse_if_poisoned()?;\n",
         "        self.refuse_if_poisoned()?;\n        if file.pending.is_empty() {\n            return Ok(());\n        }\n",
     ),
-    # ---- the rewrite's own flush (6f22427, placed after finish by 77bddcb) ------------------------
-    # A rewrite's stamps are never flushed at install, so they wait for the merge's final sync
-    # (review 2 F1) and one table's wait for the next table's rewrite (review 3 F1).
-    "M19_rewrite_does_not_flush": (
+    # ---- the rewrite's stamps, written after finish (see run.sh FIX) ---------------------------------
+    # A rewrite's moved rows are never stamped at all.
+    "M19_rewrite_does_not_stamp": (
         ALTER,
-        "        if stamped {\n            if let Some(store) = &prov {\n                store.flush()?;\n            }\n        }\n",
+        "                for (rid, who) in &moved {\n                    store.stamp_pending(*rid, *who)?;\n                }\n                store.flush()?;\n",
         "",
     ),
-    # The flush runs whether or not this rewrite stamped: a store poisoned with someone else's
-    # pending records fails a plain ALTER of an unattributed table (review 4 F1).
-    "M20_flush_even_if_nothing_stamped": (
+    # The flush runs whether or not this rewrite moved an attributed row: a store poisoned with
+    # someone else's pending records fails a plain ALTER of an unattributed table (review 4 F1).
+    "M20_flush_even_if_nothing_moved": (
         ALTER,
-        "        if stamped {\n            if let Some(store) = &prov {\n                store.flush()?;\n            }\n        }\n",
-        "        if let Some(store) = &prov {\n            store.flush()?;\n        }\n",
+        "            if !moved.is_empty() {\n",
+        "            if true {\n",
     ),
-    # The flush runs BEFORE finish: a failed flush leaves the rewrite under the old catalog (I19).
-    "M21_flush_before_finish": (
+    # The stamps written BEFORE finish (as the rewrite loop used to): a refusal or a failed flush
+    # leaves the rewrite under the old catalog, the I19 state (reviews 4 F1, 5 F1).
+    "M21_stamps_before_finish": (
         ALTER,
-        "    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))\n",
-        "    if stamped {\n        if let Some(store) = prov {\n            store.flush()?;\n        }\n    }\n    Ok((primary.root_page_id.load(Ordering::Relaxed), stamped))\n",
+        "        self.finish(&table, new_schema, primary_root_now, carried)?;\n",
+        "        if let Some(store) = &prov {\n            for (rid, who) in &moved {\n                store.stamp_pending(*rid, *who)?;\n            }\n            store.flush()?;\n        }\n        self.finish(&table, new_schema, primary_root_now, carried)?;\n",
     ),
     # A failed flush swallowed: the ALTER reports success with its stamps not durable.
     "M22_flush_error_swallowed": (
         ALTER,
         "                store.flush()?;\n",
         "                let _ = store.flush();\n",
+    ),
+    # A refused stamp swallowed: the ALTER reports success with its moved rows unattributed.
+    "M23_stamp_refusal_swallowed": (
+        ALTER,
+        "                    store.stamp_pending(*rid, *who)?;\n",
+        "                    let _ = store.stamp_pending(*rid, *who);\n",
     ),
 }
 
