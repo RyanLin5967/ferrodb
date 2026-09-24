@@ -516,3 +516,32 @@ K now asserts that `n.transport_counters()`'s `idle_probes` and `idle_redials` E
 - The lead's 2608 comes from review 2 and reproduces exactly: it is the merge of `d815c1b` with `49ba420`,
   2604 + I, B, P, H. The merge that was actually made took D207's final `1eaf1a7`, which adds W1–W4. K and T come
   on top of that.
+
+---
+
+## Amendment 7 — review 2's changes recorded, before any run (nothing built)
+
+| commit | what |
+|---|---|
+| `5c6e330` | amendment 6 |
+| `8a2b344` `8dda35b` | G2 and the doc nits in `transport.rs`, **comments only**, then a reflow of one comment |
+| `bdf6b0e` | test T (additions), plus three test comments corrected. B's elapsed check is now labelled a fixture guard; its assertion is unchanged |
+| `d9824d2` | K asserts equality, bracketed, as amendment 6 registered |
+| `5b7d98d` | N9 and N10; N1–N10 regenerated from `d9824d2` |
+
+- **No code line in `transport.rs` changed since `bf1fd63`.** Instrument: `git diff bf1fd63 5b7d98d --
+  src/consensus/transport.rs`, keeping `^[-+]` lines and dropping comment lines, leaves 0.
+- **The removed test lines are four comment lines in `tests_transport.rs` and K's four lines in `tests_node.rs`.**
+  K's lines are the two `>= 1` assertions, their comment and the snapshot binding. The new equality assertion
+  covers them, because the premise (≥ 1 each) still stands in front of it.
+- **Counts at `5b7d98d`:** transport **63**, node 14, log 58, replicate 60. `git diff 9aa6968 5b7d98d` adds 35
+  `#[test]` and removes 0. **Per-target: 2579 + 35 = 2614** (predicted; the base is D207's, never measured).
+- **Mutants:** all ten patches pass `git apply --check` against `5b7d98d`'s tree. N1–N8 keep their edits; only hunk
+  context moved.
+
+| mutant | module | predicted |
+|---|---|---|
+| N1–N6 | transport | as amendment 2 |
+| N7, N8 | node | K, at the equality |
+| **N9** | transport | **T** only |
+| **N10** | transport | **SURVIVES**, a known survivor (amendment 6, G4). A kill is an unregistered result, and it is reported as one |
