@@ -823,7 +823,8 @@ fn scan_once(
     // is one no in-process producer recorded, so the first one is the finding. A counter only a
     // test reads is the D127 defect again: a real event that reaches nobody.
     let slice_found = reaper.slice_freed() - slice_freed_before;
-    if slice_found > 0 {
+    // MUTANT (fire-check only, never land): the slice find reaches no reader.
+    if slice_found > u64::MAX - 1 {
         out(format!(
             "lease: the orphan sweep's slice freed {slice_found} extent(s) that no in-process \
              producer recorded. They are collected, so nothing is lost now, but the producer \
