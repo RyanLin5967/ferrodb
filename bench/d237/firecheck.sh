@@ -11,7 +11,7 @@
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
-SUBJECT_SHA=f651096           # the fix; the mutants' text is taken from it
+SUBJECT_SHA=83f620c           # the fix f651096 plus the SQL test's reworded premise; the mutants' src text is f651096's, unchanged at 83f620c
 BASE_SHA=9aa6968              # the red arm's src/
 OUT=bench/d237/firecheck
 mkdir -p "$OUT"
