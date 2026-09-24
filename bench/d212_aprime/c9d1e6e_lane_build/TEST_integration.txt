@@ -1,0 +1,273 @@
+# 2026-09-24T21:54:46Z HEAD=c9d1e6e dirty=0
+# cmd: timeout 1800 cargo test --no-fail-fast --test d212_nonce_ids --test d212_history_durable --test d212_history_crash --test d212_history_window --test d212_history_pin --test d212_history_reach --test d212_history_snapshot --test d212_step0_revert_identity --test d226_revert_restores_row_author --test wal_format_upgrade --test open_path_allowlist --test integration_capability_envelope --test agent_sql_surface
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d212-history-store.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.40s
+     Running tests/agent_sql_surface.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/agent_sql_surface-1b7715eaa715b953)
+
+running 32 tests
+test begin_agent_session_forks_a_branch_and_interns_the_run ... ok
+test a_comparison_on_a_branch_does_not_round_the_literal ... ok
+test agent_statements_outside_a_session_name_the_missing_branch ... ok
+test branch_writes_are_invisible_to_main_and_to_siblings ... ok
+test a_conflicting_merge_attributes_nothing ... ok
+test abandon_drops_the_branch_and_leaves_main_untouched ... ok
+test a_malformed_model_is_refused_rather_than_recorded_blank ... ok
+test captured_frames_reach_the_effect_log_as_one_frame_per_task ... ok
+test as_of_branch_sees_uncommitted_inserts_and_deletes_too ... ok
+test a_guard_that_fails_against_merged_state_returns_the_predicate_itself ... ok
+test a_second_agent_session_on_one_connection_is_refused ... ok
+test a_nested_task_forks_from_its_parents_state_and_then_diverges ... ok
+test a_session_declaring_no_model_is_recorded_as_unspecified_not_guessed ... ok
+test an_lww_column_resolves_with_loss_and_never_reports_clean ... ok
+test a_merge_with_no_downstream_reader_reverts_without_cascading ... FAILED
+test a_solo_merge_is_clean_and_publishes_to_main ... FAILED
+test a_whole_numbered_literal_updates_a_float_column_on_a_branch_and_on_trunk ... ok
+test a_multi_row_merge_publishes_every_row_in_one_transaction ... ok
+test select_as_of_branch_reads_another_branchs_uncommitted_state ... ok
+test diff_of_an_untouched_branch_is_empty_but_still_a_changeset ... ok
+test ordinary_statements_are_unaffected_by_the_agent_surface ... ok
+test revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request ... FAILED
+test diff_marks_a_row_the_target_moved_under ... ok
+test reverting_an_unknown_merge_is_an_error_not_a_no_op ... ok
+test inserts_and_deletes_on_a_branch_are_also_invisible_until_merge ... ok
+test diff_returns_a_structured_changeset_with_ops_and_outcomes ... ok
+test concurrent_assignments_conflict_rather_than_silently_picking_one ... ok
+test row_authorship_survives_the_merge_that_published_it ... ok
+test two_branches_decrementing_the_same_row_compose_arithmetically ... ok
+test two_decrements_inside_one_task_are_not_collapsed ... ok
+test two_runs_are_attributed_separately_and_interned_once_each ... ok
+test row_authorship_survives_a_process_restart_when_provenance_is_durable ... ok
+
+failures:
+
+---- a_merge_with_no_downstream_reader_reverts_without_cascading stdout ----
+
+thread 'a_merge_with_no_downstream_reader_reverts_without_cascading' (356296588) panicked at tests/agent_sql_surface.rs:92:23:
+REVERT MERGE m_1; failed: merge error: unknown merge m_1: it is an old-format merge id, with no run nonce, minted by a build before D212 (a'). Merge ids now read m_<nonce>_<n>, and nothing can say which merge an old-format id named any more, so REVERT refuses it rather than guess
+
+---- a_solo_merge_is_clean_and_publishes_to_main stdout ----
+
+thread 'a_solo_merge_is_clean_and_publishes_to_main' (356296593) panicked at tests/agent_sql_surface.rs:409:5:
+assertion `left == right` failed
+  left: "m_c3b015db35ef7b12_1"
+ right: "m_1"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request stdout ----
+
+thread 'revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request' (356296967) panicked at tests/agent_sql_surface.rs:92:23:
+REVERT MERGE m_1; failed: merge error: unknown merge m_1: it is an old-format merge id, with no run nonce, minted by a build before D212 (a'). Merge ids now read m_<nonce>_<n>, and nothing can say which merge an old-format id named any more, so REVERT refuses it rather than guess
+
+
+failures:
+    a_merge_with_no_downstream_reader_reverts_without_cascading
+    a_solo_merge_is_clean_and_publishes_to_main
+    revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request
+
+test result: FAILED. 29 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+error: test failed, to rerun pass `--test agent_sql_surface`
+     Running tests/d212_history_crash.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_crash-882cc413349fb2eb)
+
+running 3 tests
+test exit_6_a_merge_killed_after_its_commit_is_revertible_after_reopen ... ok
+test a_merge_whose_own_commit_checkpointed_is_revertible_after_a_kill ... ok
+test exit_7_a_revert_killed_part_way_is_all_or_none_and_a_retry_applies_once ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.94s
+
+     Running tests/d212_history_durable.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_durable-446e2147e9bf8ab1)
+
+running 10 tests
+test a_capture_the_history_cannot_encode_refuses_the_merge_before_its_schema_edit ... ok
+test a_revert_on_a_runtime_another_runtime_overtook_is_refused ... ok
+test a_runtime_is_refused_after_another_published_a_merge_with_no_rows ... ok
+test a_runtime_whose_clock_another_runtime_overtook_cannot_publish ... FAILED
+test exit_4_a_task_after_a_restart_never_takes_a_pre_restart_txn_id ... ok
+test exit_1_a_point_read_after_a_restart_names_the_pre_restart_merge_it_read ... ok
+test exit_3_a_dependent_published_before_the_restart_still_blocks_after_it ... ok
+test exit_2_a_scan_after_a_restart_is_later_than_the_pre_restart_write_it_covers ... ok
+test exit_3b_an_ancestor_published_through_its_child_still_blocks_after_a_restart ... ok
+test exit_5_a_pre_restart_id_reverts_the_pre_restart_merge_once_across_restarts ... ok
+
+failures:
+
+---- a_runtime_whose_clock_another_runtime_overtook_cannot_publish stdout ----
+
+thread 'a_runtime_whose_clock_another_runtime_overtook_cannot_publish' (356301527) panicked at tests/d212_history_durable.rs:120:23:
+MERGE; failed: provenance error: provenance slot prov1 is already declared as agent=a run=r_a model=unspecified/unspecified branch=b0@g0; refusing to redeclare it as agent=c run=r_c model=unspecified/unspecified branch=b0@g0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_runtime_whose_clock_another_runtime_overtook_cannot_publish
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+error: test failed, to rerun pass `--test d212_history_durable`
+     Running tests/d212_history_pin.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_pin-10e87e9669231a86)
+
+running 1 test
+test falsifier_4_under_a_pin_the_hook_reads_no_log_and_writes_once_per_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/d212_history_reach.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_reach-89397a94667516ef)
+
+running 5 tests
+test a_runtime_attached_to_one_database_refuses_another_databases_history ... ok
+ferrodb: a checkpoint flushed every page but kept the log: REVERT's history could not be written to /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpgM2Lbb/reach1.db.history (io error: writing /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpgM2Lbb/reach1.db.history: Permission denied (os error 13)); it stays queued, and the next checkpoint retries
+test a_fresh_log_moves_the_old_history_aside ... ok
+test a_merge_through_the_open_path_is_revertible_after_a_crash ... ok
+test a_failed_open_checkpoint_leaves_the_queue_and_the_next_publish_takes_fresh_ids ... ok
+test another_databases_history_is_refused_at_open ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/d212_history_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_snapshot-64f115416671443d)
+
+running 4 tests
+test an_install_carries_the_senders_revert_history ... ignored, D212 (a') AMENDED 2 F6: a snapshot does not ship <db>.history yet; required before D212 is enabled on a clustered member (single-node lands first)
+test an_install_without_the_nodes_history_store_is_refused ... ok
+test an_install_requeues_the_redo_windows_committed_history ... ok
+test a_capture_ships_the_queued_history_and_nothing_past_its_end ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/d212_history_window.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_window-a1ef2f835dbae68f)
+
+running 8 tests
+test f5_an_open_without_the_store_keeps_the_history_the_store_lacks ... FAILED
+test falsifier_3_after_a_checkpoint_the_history_is_in_the_store_and_not_the_log ... ok
+test exit_8_a_revert_older_than_the_window_is_refused_and_names_it ... ok
+test a_revert_after_ten_reverts_visits_only_its_plan ... ok
+test a_merge_the_store_still_holds_but_the_window_has_left_is_refused_after_a_restart ... ok
+test falsifier_5b_store_bytes_stay_flat_with_an_idle_transaction ... ok
+test falsifier_5_the_queue_stays_bounded_while_checkpoints_are_blocked ... ok
+test falsifier_1_the_history_file_is_flat_in_the_merges_ever_made ... ok
+
+failures:
+
+---- f5_an_open_without_the_store_keeps_the_history_the_store_lacks stdout ----
+
+thread 'f5_an_open_without_the_store_keeps_the_history_the_store_lacks' (356305873) panicked at tests/d212_history_window.rs:71:39:
+called `Result::unwrap()` on an `Err` value: Internal("the log holds 1 REVERT history record(s) and no history store is attached, so the next checkpoint would discard them; open the database through wal::recovery::open_recovered, which attaches <db>.history before recovering")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    f5_an_open_without_the_store_keeps_the_history_the_store_lacks
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.08s
+
+error: test failed, to rerun pass `--test d212_history_window`
+     Running tests/d212_nonce_ids.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_nonce_ids-1591586327ce5901)
+
+running 3 tests
+test an_old_format_merge_id_is_refused_by_its_format_naming_the_upgrade ... ok
+test a_first_merge_is_named_by_this_runs_nonce_not_by_a_counter_from_one ... ok
+test a_restored_copy_never_reissues_an_id_the_original_issued_after_the_copy ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/d212_step0_revert_identity.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_step0_revert_identity-dce4bccb060f5793)
+
+running 7 tests
+test reverting_an_add_merge_twice_moves_the_value_once ... ok
+test a_dependent_undone_by_a_cascade_is_not_undone_again_by_its_own_revert ... ok
+test a_cascade_that_fails_part_way_changes_nothing ... ok
+test a_live_dependent_the_cascade_could_not_undo_stays_revertible_once_it_publishes ... ok
+test a_failed_cascade_does_not_poison_the_key_its_retry_reinserts ... ok
+test an_unpublished_id_from_an_earlier_run_is_refused_as_that_runs ... ok
+test a_merge_id_from_before_a_restart_never_names_a_merge_made_after_it ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+
+     Running tests/d226_revert_restores_row_author.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d226_revert_restores_row_author-2a6e334a8ad3e139)
+
+running 3 tests
+test a_reverted_insert_leaves_no_author_for_the_row_it_removed ... ok
+test a_reverted_update_of_an_unattributed_row_leaves_nobody_on_record ... ok
+test a_reverted_update_hands_the_row_back_to_the_run_that_wrote_it_before ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/integration_capability_envelope.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_capability_envelope-b9f082ac8228acf2)
+
+running 23 tests
+test a_branch_being_reaped_cannot_write_even_with_its_workspace_intact ... ok
+test an_ungoverned_branch_writes_exactly_as_before ... ok
+test a_forbidden_table_is_refused_even_when_the_statement_matches_no_row ... ok
+test an_agent_session_inherits_the_envelope_of_the_branch_it_forked_from ... ok
+test a_write_that_changes_nothing_costs_no_budget ... ok
+test a_branch_cannot_widen_its_own_envelope ... ok
+test installing_an_envelope_does_not_reach_a_session_that_is_already_open ... ok
+test budget_already_spent_is_not_handed_back_by_a_restart ... ok
+test a_statement_refused_by_escrow_spends_no_envelope_budget ... ok
+test the_envelope_reads_one_funnel_while_three_reach_branch_state ... FAILED
+test an_envelope_survives_a_restart_of_the_branch_metadata_layer ... ok
+test an_insert_cannot_write_a_column_the_branch_was_never_granted ... ok
+test a_verb_off_the_allowlist_is_refused_and_one_on_it_still_writes ... ok
+test a_table_off_the_allowlist_is_refused_and_one_on_it_still_writes ... ok
+test an_envelope_survives_closing_and_reopening_the_database ... ok
+test an_assignment_that_lowers_a_bounded_value_is_refused_not_just_a_decrement ... ok
+test branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap ... ok
+test a_statement_that_overruns_the_row_budget_is_refused_whole ... ok
+test dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns ... ok
+test merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap ... FAILED
+test the_envelope_governs_agent_session_writes_only ... ok
+test no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap ... ok
+test the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete ... ok
+
+failures:
+
+---- the_envelope_reads_one_funnel_while_three_reach_branch_state stdout ----
+
+thread 'the_envelope_reads_one_funnel_while_three_reach_branch_state' (356335574) panicked at tests/integration_capability_envelope.rs:1448:5:
+assertion `left == right` failed: the fields of `AgentRuntime`'s `State` have changed. If a new one holds per-branch state that a statement can write, it is a second funnel and the envelope does not govern it. Add the field here only after deciding which it is.
+  left: ["workspaces", "names", "next_txn", "next_merge", "apply_seq", "applied", "applied_by_cell", "merges", "quarantine_reasons", "escrow", "versions", "captures", "published_txns", "txn_refs", "policy", "revert"]
+ right: ["workspaces", "names", "next_txn", "next_merge", "apply_seq", "applied", "applied_by_cell", "merges", "quarantine_reasons", "escrow", "versions", "captures", "published_txns", "txn_refs", "policy"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap stdout ----
+
+thread 'merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap' (356335191) panicked at tests/integration_capability_envelope.rs:141:46:
+REVERT MERGE m_1 CASCADE; failed: merge error: unknown merge m_1: it is an old-format merge id, with no run nonce, minted by a build before D212 (a'). Merge ids now read m_<nonce>_<n>, and nothing can say which merge an old-format id named any more, so REVERT refuses it rather than guess
+
+
+failures:
+    merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap
+    the_envelope_reads_one_funnel_while_three_reach_branch_state
+
+test result: FAILED. 21 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.68s
+
+error: test failed, to rerun pass `--test integration_capability_envelope`
+     Running tests/open_path_allowlist.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/open_path_allowlist-bc66f45e7c5f25a7)
+
+running 6 tests
+test the_scanner_catches_a_bare_opener_and_ignores_everything_else ... ok
+test the_scanner_sees_what_the_first_version_missed ... ok
+test both_production_entry_points_build_their_runtime_through_the_opened_database ... ok
+test both_production_entry_points_open_through_the_shared_function ... ok
+test the_shared_function_recovers_and_then_rebuilds ... ok
+test only_the_open_path_runs_recovery_or_opens_a_catalog ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
+     Running tests/wal_format_upgrade.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/wal_format_upgrade-4625c1cef2be8c28)
+
+running 5 tests
+test a_version_2_log_refuses_the_records_whose_meaning_changed ... ok
+test a_version_2_log_refuses_new_transactions_until_a_checkpoint_upgrades_it ... ok
+test a_crash_between_the_upgrade_header_and_the_truncation_leaves_an_empty_version_3_log ... ok
+test a_pre_d213_log_with_an_insert_into_a_relocations_bytes_opens ... ok
+test an_empty_version_2_log_is_upgraded_at_open_so_writes_work ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+error: 4 targets failed:
+    `--test agent_sql_surface`
+    `--test d212_history_durable`
+    `--test d212_history_window`
+    `--test integration_capability_envelope`
+# rc=101 end=2026-09-24T21:55:35Z
