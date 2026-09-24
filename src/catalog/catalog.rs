@@ -479,7 +479,7 @@ impl Catalog {
                 // owed (F2), which keeps every later log until some persist succeeds. This one
                 // usually does, since the entry that could not be written is gone; if it fails too,
                 // the debt stays set and the log stays kept, which is the safe direction.
-                let _ = self.persist();
+                // D230 MUTANT M18: no re-persist after the undo
                 Err(e)
             }
         }
