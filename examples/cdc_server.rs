@@ -252,10 +252,12 @@ fn main() {
                 // The condition is "nothing left to emit", NOT "cursor has reached the frontier".
                 // Those are not the same and the difference hangs the server forever: the cursor
                 // tracks COMMITS, while the frontier is a byte position that includes records
-                // producing no events — a `TxnEnd` sits above the final commit permanently, so
-                // `cursor >= frontier` is never satisfied and a consumer waiting for EOF waits for
-                // ever. Caught by the Go consumer, which reads until close rather than stopping at
-                // a client-side limit the way the earlier tests did.
+                // producing no events. Until D252 a `TxnEnd` sat above the final commit
+                // permanently, so `cursor >= frontier` was never satisfied and a consumer waiting
+                // for EOF waited for ever. Caught by the Go consumer, which reads until close
+                // rather than stopping at a client-side limit the way the earlier tests did. A
+                // caught-up cursor now passes that tail, but a transaction in flight still holds
+                // it below the frontier.
                 if finished_before_pump {
                     break;
                 }

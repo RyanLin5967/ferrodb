@@ -18,10 +18,17 @@
 //! never read. The rows are gone from the feed permanently, and nothing downstream can tell,
 //! because a feed that is missing records looks exactly like a feed that had none.
 //!
-//! So the cursor advances **only to the highest `commit_end_lsn` actually emitted**. If a pump
-//! emits nothing, the cursor does not move at all, however much log it just read. Re-reading the
-//! records of an in-flight transaction on the next pump is pure waste and is the correct waste:
-//! the alternative is losing them.
+//! So while a transaction is in flight the cursor advances **only to the highest `commit_end_lsn`
+//! actually emitted**, and never past that transaction's first record. If such a pump emits nothing,
+//! the cursor does not move at all, however much log it just read. Re-reading the records of an
+//! in-flight transaction on the next pump is pure waste and is the correct waste: the alternative is
+//! losing them.
+//!
+//! **With nothing in flight and nothing refused, the cursor moves to where the read stopped (D252).**
+//! Every record below there has been decided about, including those that yield no event: the
+//! `TxnEnd` after every commit, a rollback, a run declaration. A cursor that stopped at the last
+//! commit left every subscription, however caught up, pinning the log below its end, so no
+//! checkpoint truncated while any subscription lived.
 //!
 //! # The other rule, inherited
 //!
@@ -181,10 +188,12 @@ impl Pumped {
     ///
     /// **An upper bound, not an exact distance, and the difference is not pedantry.** The cursor
     /// tracks *commits* while the frontier is a byte position that includes records producing no
-    /// events at all — a `TxnEnd` sits above the final commit permanently. So a fully caught-up
-    /// consumer reports a small non-zero lag rather than zero, and code that waits for `lag == 0`
-    /// waits for ever. That mistake hung the CDC server until a Go consumer reading to EOF found
-    /// it; "nothing left to emit" is the caught-up test, not "lag is zero".
+    /// events at all. Until D252 a `TxnEnd` sat above the final commit permanently, so a fully
+    /// caught-up consumer reported a small non-zero lag, and code that waited for `lag == 0` waited
+    /// for ever. That mistake hung the CDC server until a Go consumer reading to EOF found it. A
+    /// caught-up cursor now passes that tail, but a transaction in flight still holds it at the
+    /// transaction's first record while the frontier moves on, so "nothing left to emit" is still
+    /// the caught-up test, not "lag is zero".
     pub fn lag_bytes(&self) -> u64 {
         self.frontier.saturating_sub(self.cursor)
     }
@@ -311,9 +320,11 @@ impl FeedStreamer {
         let to = frontier.min(cursor.saturating_add(self.max_bytes));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
-        // **The cursor rule**, and it has FOUR parts now. Three of the four have cost real data.
+        // **The cursor rule**, and it has FIVE parts now. Three of them have cost real data, and the
+        // fifth (D252, below) cost the log its truncation.
         //
-        // First: only past a commit that was actually decoded. An empty pump does not move.
+        // First: only past a commit that was actually decoded, or, by the fifth, past a tail that
+        // yields no event when nothing is open or refused. A pump that reads nothing does not move.
         //
         // Second: computed over every event the batch DECIDED about, before the delivery filters
         // below narrow it. A commit whose events were suppressed by the snapshot boundary, or
@@ -413,9 +424,15 @@ impl FeedStreamer {
             .max()
             .unwrap_or(cursor)
             .max(cursor);
-        let next = match decoded.open_from {
-            Some(open_from) => emitted_max.min(open_from),
-            None => emitted_max,
+        // Fifth, D252: with nothing open and nothing refused, everything the walk read has been
+        // decided about, including the records after the last commit that yield no event (its
+        // `TxnEnd`, a rollback, a run declaration), so the cursor passes them. Stopping at the last
+        // `commit_end_lsn` left every subscription, however caught up, pinning the log below its
+        // end, and no checkpoint truncated while one lived.
+        let next = match (decoded.open_from, refused_commit) {
+            (Some(open_from), _) => emitted_max.min(open_from),
+            (None, Some(_)) => emitted_max,
+            (None, None) => decoded.walked_to.max(emitted_max),
         };
 
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
@@ -469,6 +486,13 @@ impl FeedStreamer {
 /// its subscription is a log that never shrinks. That is the trade every replication slot makes,
 /// and it is the right one here — the alternative was measured too, and it is a feed that breaks
 /// every 256 commits.
+///
+/// **And because `truncate` discards the whole log or none of it, a checkpoint reclaims it only
+/// when every live subscription has read to its end.** A caught-up cursor does reach the end
+/// (D252). The automatic checkpoint, though, runs inside the commit that triggers it, before any
+/// subscriber can have read that commit, unless it wins the race to read it, so under a steady
+/// write load a subscription keeps the log until a checkpoint lands while every subscriber is
+/// caught up. Discarding the prefix below the oldest pin is what would remove that.
 pub struct Subscription {
     wal: std::sync::Arc<WalManager>,
     cursor: u64,
@@ -566,14 +590,13 @@ impl Subscription {
     /// discards precisely the records it is about to ask for — the same check-then-act shape that
     /// has produced most of the defects in this codebase.
     ///
-    /// **Moving the pin forward is not load-bearing today, and that is worth stating rather than
-    /// implying otherwise.** `truncate` discards the whole log rather than a prefix, so a pin held
-    /// at the subscription's *start* blocks reclamation exactly as effectively as one held at its
-    /// cursor — measured, by removing the forward move and watching every test still pass. What it
-    /// does change is `min_pinned_lsn`, which is the signal a prefix-truncating checkpoint would
-    /// consult, and which is asserted below. So this is the same kind of thing as the base
-    /// comparison in `read_from`: correct, cheap, and the piece that starts mattering the day
-    /// truncation learns to discard a prefix.
+    /// **Moving the pin forward is load-bearing since D252.** `truncate` discards the whole log or
+    /// none of it, so the log is reclaimed only once every pin has reached its end, and only a pin
+    /// that follows a caught-up cursor gets there (`tests/d252_caught_up_subscription_lets_the_log_truncate.rs`).
+    /// Before D252 the cursor stopped below every commit's `TxnEnd`, a pin at the subscription's
+    /// start blocked reclamation exactly as well as one at its cursor, and removing the forward
+    /// move passed every test. It also moves `min_pinned_lsn`, asserted below, and the newest pin,
+    /// which decides whether a checkpoint the pins keep re-declares the schema (D234).
     pub fn pump<W: Write>(
         &mut self,
         streamer: &FeedStreamer,

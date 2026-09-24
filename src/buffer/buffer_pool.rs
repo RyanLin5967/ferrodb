@@ -1461,9 +1461,10 @@ impl BufferPoolManager {
     /// that the change's data record is in the log.
     ///
     /// The mark and not the whole log, which was this fix's first version (the D216 adversary's F4).
-    /// A commit leaves its `TxnEnd` in the buffer, so "flush the whole log" cost a log write and an
-    /// fsync on nearly every eviction of a dirty index, catalog or directory page in a 1024-frame
-    /// pool. Against the mark, a page whose changes were committed finds its records already durable
+    /// At `00f4c39` a commit left its `TxnEnd` in the buffer (D252 writes it with the `Commit`),
+    /// and under load the buffer holds the open transactions' records, so "flush the whole log" cost
+    /// a log write and an fsync on nearly every eviction of a dirty index, catalog or directory page
+    /// in a 1024-frame pool. Against the mark, a page whose changes were committed finds its records already durable
     /// (`an_index_page_whose_records_are_durable_does_not_flush_the_log`). What is left costs what
     /// the heap page already costs: a flush when the page holds a change whose records are not yet
     /// durable. Unmeasured.

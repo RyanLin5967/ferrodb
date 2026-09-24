@@ -40,7 +40,8 @@ fn writing_back_a_dirty_arena_page_does_not_flush_the_log() {
 
     let arena_page = bp.new_page().unwrap();
     assert!(arena_page > 0, "premise failed: page 0 would read as a heap page naming itself");
-    // Something waiting in the log buffer, as a commit's TxnEnd always is.
+    // Something waiting in the log buffer, as an open transaction's records are (and, at
+    // `00f4c39`, every commit's TxnEnd).
     wal.append(999, 0, &RecKind::Begin).unwrap();
     let frame_i = bp.fetch_page(arena_page).unwrap();
     {

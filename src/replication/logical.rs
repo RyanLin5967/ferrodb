@@ -336,6 +336,16 @@ pub struct Decoded {
     /// with nothing staged and emit nothing at all. `open` alone cannot express that, because it
     /// names the transactions without saying where they began.
     pub open_from: Option<u64>,
+    /// Where the walk stopped: every record in `[from_lsn, walked_to)` was read and decided about,
+    /// including the records that yield no event (a `TxnEnd`, an `Abort`, a transaction-0 run
+    /// declaration). Always a record boundary.
+    ///
+    /// **D252: what lets a caught-up cursor pass a log's no-event tail.** An event's
+    /// `commit_end_lsn` ends at its `Commit`, and a cursor computed only from events stopped there,
+    /// below the `TxnEnd` every commit appends, so a live subscription pinned the log below its end
+    /// and no checkpoint truncated while it lived. With nothing open and nothing refused, a caller
+    /// may advance to here.
+    pub walked_to: u64,
 }
 
 impl Decoded {
@@ -1128,6 +1138,7 @@ impl LogicalDecoder {
             }
             lsn = next;
         }
+        out.walked_to = lsn;
 
         // I20: publish what this walk learned, so the next range starts from it. Merged rather than
         // assigned — two threads may pump concurrently through one `Arc<FeedStreamer>`, and a range

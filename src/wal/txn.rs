@@ -692,8 +692,17 @@ impl TxnManager {
             self.append_chained(txn_id, &RecKind::RunIdentity { run })?;
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
+        // **D252: the `TxnEnd` goes in before the flush that makes the `Commit` durable, so it is
+        // written with it.** A change-feed reader reads only what is durable, and this record used
+        // to wait in the buffer for the next flush: usually the checkpoint's own, which then found
+        // every subscription pinned below it and kept the whole log. The flush still asks for the
+        // `Commit`, which is what the caller is owed; it writes the whole buffer, so the `TxnEnd`
+        // rides along at no extra fsync. Only a concurrent flush landing between the two appends
+        // leaves it buffered, which delays a truncation to the next flush and loses nothing. A
+        // failed append here still returns only after the `Commit` is durable, as before.
+        let end = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.wal.flush_up_to(commit_lsn)?;
-        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        let _ = end?;
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
         // D202: committed, so nothing may ever undo these writes. Dropped here and not left for
