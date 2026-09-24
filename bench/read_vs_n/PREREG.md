@@ -288,3 +288,109 @@ where the implementation's protocol differs from the text above.**
 segment divides by 8. Every "250" in sections 2 and 3 now reads "256", and no prediction moves: 256 sits in the
 same regime (all resident, h = 2). The `control-drift` fire mode spins 10·2^checkpoint µs per read rather than
 2^checkpoint µs, so it clears G7's 1.5 band by construction between the first two checkpoints.
+
+**A3, 2026-09-24. ARM 2, MERGE vs N and vs M: its pre-registration, written from the lead's resent brief BEFORE any
+arm-2 code. Section 0's "brief did not arrive" is superseded by this entry. Line numbers are `9aa6968`'s, from
+`git show 9aa6968:src/agent_sql/runtime.rs | grep -n`, and each is paired with a symbol.**
+
+*What this measures, and what it does not.* This is `9aa6968`'s behaviour, the **BEFORE arm**. Two of the walls on
+this axis have fixes on other branches: wall #17 (DIFF) on `wall17-diff-scan`, and wall #18 (REVERT's rescan) on
+`wall18-revert-rescan`. Neither branch is merged here. This arm issues neither DIFF nor REVERT:
+
+* DIFF is not on the MERGE path. Its only caller is `dispatch.rs:465` (`runtime.diff`). Wall #17's before-curve is
+  D191's (FAN-QUEUE #6), and this arm does not duplicate it.
+* What this arm does measure is #18's side note: `highest_applied_seq` (`:6310`), which `publish_evaluation_as`
+  calls once per merge (`:5165`, `fresh_reservation(highest_applied_seq(&state.applied), base)`).
+* Wall #12 (the per-cell rescan) is fixed at `9aa6968` by D86's index. `concurrent_op` reads it (`:5342`,
+  `state.applied_at_cell`), so this arm sees wall #12's AFTER state.
+
+*Whole-log passes on the merge path, found by READING `merge` (`:3387`) → `evaluate_merge` (`:4280`) →
+`publish_evaluation_as` (`:4905`) → `record_applied` (`:5362`) → `attest_merge` (`:3711`) → `seal` (`:5654`):*
+
+* **exactly one**: `highest_applied_seq`, `applied.iter().map(|a| a.seq).max()`. It visits every entry, because
+  `max` consumes the whole iterator.
+* Every other access to a growing collection is a keyed lookup or an insert: `workspaces.get`,
+  `captures.get` / `.entry` (`:5477`), `versions.insert` (`:5410`), `merges.insert` (`:5482`),
+  `published_txns.insert` (`:5681`), and `applied_at_cell`, D86's index.
+* The pass over `state.workspaces` in `capture_is_protected` is a `debug_assert`, and `seal` reaches it only for an
+  UNpublished branch (`:5713`).
+* The other passes over `applied` in the file are cherry-pick (`RuntimeCherryLog::project`), REVERT (`undo_txn`)
+  and DIFF (`:3207`). None is on this path.
+
+*The workload.* A SQL table `m (id INTEGER NOT NULL, v INTEGER)` is created on trunk once, with a plain session. A
+merge cycle, run through `execution::executor::run` under the statement lock, as `run_cli`'s `execute_sql` does:
+
+1. `BEGIN AGENT SESSION AS 'mK';`
+2. `INSERT INTO m VALUES (id, id);`, with an id never used before, so every cycle writes a NEW row and a new cell;
+3. `MERGE;`, the ONLY statement inside the timer and the counter brackets.
+
+The cycles run sequentially on one thread.
+
+*Why an INSERT.* The publish step issues `Stmt::Insert` for a new row (`PendingWrite::Insert`, `:6677`). An UPDATE
+would be `build_scan`'s O(table) seq scan (D176/D178), a known wall on a different axis, and would bury this one.
+
+*`State` is in memory.* `reopen_with_storage` builds `State::default()` (`:1408`), so `applied`, `captures` and
+`merges` are EMPTY after every open (READ). M therefore counts merges since the last open.
+
+*The two separable axes:*
+
+* **(i) N grows, M fixed.** At every checkpoint, K = 64 cycles (`CURVE_MERGE_K`) run immediately after an open,
+  so `applied` starts at 0. With the restart arm on, the open is the restart arm's reopen; otherwise the merge arm
+  closes and reopens first. The N live idle branches are the fork phase's. They live in the CATALOG and the ARENA
+  (they persist) and are NOT open sessions in the runtime's `State`, which a restart empties anyway. **This axis is
+  "N live written branches", not "N open sessions".** W4 measured the session axis.
+* **(ii) N fixed, M grows.** After the last checkpoint, reopen, then run cycles up to M = 256, 1024, 4096, 16384
+  (`CURVE_MERGE_M`). Each target reports the last 64 merges before it.
+
+*Per-merge counters.* All are integers, bracketing `MERGE;` alone:
+
+* `V_hi`: entries `highest_applied_seq` visited. A new observing static, `MERGE_APPLIED_VISITED`, incremented by
+  the entries actually iterated.
+* `V_cell`: entries read through D86's index in `concurrent_op`. New static, `MERGE_CELL_INDEX_VISITED`.
+* `applied`, `captures`, `merges`, `versions`, `workspaces` before and after, from a new observing accessor,
+  `AgentRuntime::state_sizes`.
+* `attested_len` (existing).
+* `seq_scan_counters` tuples and `index_scan_counters` (existing, D176).
+* `wal::log::FSYNC_CALLS` (existing).
+* The read census on the merging thread: `c.desc`, `c.att`, `c.fault`.
+
+| # | per-merge prediction | axis (i): N grows | axis (ii): M grows | basis |
+|---|---|---|---|---|
+| Q1 | `V_hi` = `applied` length before that merge, **exactly** | flat: batch mean a(K−1)/2 at every N | **LINEAR**: a·M; the total over M merges is Θ(M²) | READ `:6310`, `:5165` |
+| Q2 | Δ`applied` per merge = a, a constant (INFERRED a ∈ {1, 2}: one op per written cell or per row) | flat | flat | READ `push_applied` `:5392` |
+| Q3 | `V_cell` = 0: a new row's cell has no history in D86's index | flat 0 | flat 0 | READ `:5342` |
+| Q4 | `captures` +1 per merge (created at `begin_session` `:1783`, kept by `seal` for a published branch) | +K per batch, reset at open | **LINEAR** in M | READ `:872`, `:5713` |
+| Q5 | `merges` +1 and `versions` +1 per merge; `workspaces` returns to its pre-merge value | same | LINEAR / LINEAR / flat | READ `:5482`, `:5410`, `:5685` |
+| Q6 | `attested_len` +3 per cycle (fork `:1674`, merge `:5241`, reap `seal`) — wall #19 | +3K per batch | **LINEAR** in M | READ |
+| Q7 | seq-scan tuples per merge = **0** (Insert publish; the pk point lookup is an index scan, D176) | flat 0 | flat 0, although the table grows by one row per merge | READ `:6677` + D176 |
+| Q8 | index scans, FSYNC calls and census `c.desc` per merge: constants | flat | flat | READ |
+| Q9 | census `c.fault` on the merging thread ≈ 0 at every N: the catalog keys a merge touches are its own new record and trunk's newest child entries, which are hot, unlike arm 1's random keys | flat ≈ 0 | flat ≈ 0 | INFERRED from `keys::child` ordering |
+| Q10 | ns/merge | **FLAT**: ns(10^6)/ns(1000) in [0.7, 1.5]; no N-dependent pass on the path | **flat within noise to M = 16,384**: the one growing term is `V_hi` × ~1–3 ns per entry (INFERRED), ≤ ~50 µs against a fsync-bound fixed cost of ms. The wall shows in the COUNTER at this M, not the clock. Log-log slope of ns over M in [−0.1, +0.2] | INFERRED |
+
+*What other outcomes would mean:*
+
+* `V_hi` ≠ `applied` before: the counter is mis-wired, or the call runs more or less than once per merge. Nothing
+  in the arm can be read until that is explained.
+* `V_cell` > 0: the workload wrote a cell with history, and the fixture is wrong.
+* Seq-scan tuples > 0: some step reached `build_scan`, and the tuples will grow with the table, which grows with
+  M. That is a second M-dependence, and it is D178's.
+* `captures`, `merges` or `attested` flat: something prunes them, which contradicts the field docs. Say so where
+  those docs are.
+* ns/merge growing in M faster than `V_hi` × 3 ns explains: another growing term. Compare `captures` and
+  `attested`, and profile before naming it.
+* ns/merge growing in N on axis (i): a catalog cost on the merge path that the source reading missed. `c.fault`
+  and `c.desc` say whether it is residency or count.
+
+*Guards* (NOT A RESULT, exit 2), each with a forced-fire mode:
+
+| guard | condition | fire mode |
+|---|---|---|
+| M1 | every `MERGE` reported `applied_to_target` (a quarantined merge returns `Ok` having done nothing, the D68 lesson) | `merge-quarantined` quarantines the branch first |
+| M2 | axis (i)'s batch started at `applied` = 0 | `wrong-start` |
+| M3 | Q1's identity at every merge | `wrong-visits` |
+| M4 | Δ`applied` constant across every merge of the run | `wrong-delta` |
+| M5 | live branches after each batch = before it | `wrong-live-merge` |
+
+`wrong-start`, `wrong-visits`, `wrong-delta` and `wrong-live-merge` offset the expected value, which tests the
+comparison. `merge-quarantined` is a real injection. The new statics get a forced fire of their own in
+`tests/read_vs_n_merge_census.rs`, a separate test binary, so no parallel test can move them.
