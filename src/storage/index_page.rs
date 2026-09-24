@@ -80,12 +80,23 @@ const LEAF_HEADER_SIZE: usize = 27;
 /// that meets one refuses by name rather than guessing:
 ///
 /// - a leaf left at exactly `B` bytes around such an entry, where [`BPlusTreeLeafPage::split_point`]
-///   can find no cut: the insert that needs the split is refused;
+///   can find no cut: the insert that needs the split is refused. **This one no executor
+///   pre-check can see**, because it depends on the page, not the row: it can fire inside a
+///   secondary or posting insert AFTER the heap write and the primary upsert. What keeps that from
+///   leaving a primary entry pointing at an undone slot is the abort undoing the primary-index
+///   writes it recorded (D202, `TxnManager::record_primary_write`, on `rollback-index-orphan`).
+///   **D225 therefore lands after D202**; `a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry`
+///   is red without it;
 /// - a heap row whose entry is over the bound, met by the crash-recovery rebuild: refused before
 ///   any tree is freed (`wal::recovery`), and the database does not open until that row is
 ///   shortened or deleted with the build that wrote it;
-/// - a branch whose stored capability envelope is over the bound: every rewrite of its record is
-///   refused (`TableBranchCatalog::write_record`).
+/// - a primary key over the bound, met by an ALTER that rewrites rows or an UPDATE of that row:
+///   refused before the first row is written (`catalog::alter::prepare_rewrite`, the UPDATE
+///   pre-pass), because either may have to re-point the key's entry;
+/// - a branch whose stored capability envelope is over the bound: rewrites of its record that
+///   leave the envelope unchanged go through (`TableBranchCatalog::envelope_write`), so its lease
+///   can be renewed and it can be reaped; a CHANGED envelope is refused, which includes
+///   `charge_row_writes` and `restrict_envelope`.
 pub const MAX_ENTRY_BYTES: usize = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
 
 /// Bytes `t` occupies on a page. One definition, so the split, the fullness test and the entry

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
+use ferrodb::catalog::column::{DataType, Value};
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -41,7 +41,7 @@ use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::{HeapFileManager, RecordId};
 use ferrodb::storage::index::BPlusTreeManager;
-use ferrodb::storage::index_page::{BPlusTreePage, BTreeSerialize};
+use ferrodb::storage::index_page::{admit_entry, BPlusTreeLeafPage, BPlusTreePage, BTreeSerialize};
 use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::recovery::rebuild_indexes;
@@ -126,6 +126,30 @@ impl Db {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// The plan text `EXPLAIN` gives for `sql`.
+    fn plan(&mut self, sql: &str) -> String {
+        match self.sql(&format!("EXPLAIN {sql}")) {
+            Outcome::Explain(text) => text,
+            _ => panic!("EXPLAIN {}: expected a plan", abbreviate(sql)),
+        }
+    }
+
+    /// Put `vals` into `table`'s heap directly, below every write path, as a build before D225
+    /// could have stored it. Stamped with the `begin_ts` of the table's first row, which a
+    /// committed SQL INSERT wrote, so a statement's snapshot sees it.
+    fn legacy_row(&self, table: &str, vals: &[Value]) {
+        let entry = self.catalog.get_table(table).expect("table").clone();
+        let heap = HeapFileManager::open(entry.first_directory_page_id, self.bp.clone());
+        let (_, first) = heap
+            .scan()
+            .next()
+            .expect("premise: the table holds a committed row to copy the stamp from")
+            .expect("read it");
+        let begin_ts = first.version_header().expect("its header").begin_ts;
+        heap.insert(Tuple::serialize(vals, &entry.schema, begin_ts).expect("encode the legacy row"))
+            .expect("put it in the heap");
     }
 
     /// The root the catalog records for the secondary index on `table.column`.
@@ -451,6 +475,9 @@ fn a_multi_row_update_is_refused_before_its_first_row_is_written() {
     d.sql(&format!("INSERT INTO u VALUES ('{long_key}', 2, 'x');"));
     d.sql(&format!("INSERT INTO u VALUES ('f1', 10, '{}');", "f".repeat(1300)));
     d.sql(&format!("INSERT INTO u VALUES ('f2', 11, '{}');", "g".repeat(1300)));
+    // Premise (ii), asserted rather than assumed: the lookup by key below reads the primary index.
+    let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
+    assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
     let e = d.err(&format!("UPDATE u SET v = '{}' WHERE n < 3;", "z".repeat(2020)));
     assert!(e.contains("index entry too large: 2046 bytes"), "not the named refusal: {}", abbreviate(&e));
@@ -477,6 +504,9 @@ fn a_multi_row_update_refused_for_not_null_writes_no_row_first() {
     d.sql(&format!("INSERT INTO u VALUES ('a', 1, 'x', '{}');", "z".repeat(2000)));
     d.sql("INSERT INTO u VALUES ('k', 2, 'x', NULL);");
     d.sql(&format!("INSERT INTO u VALUES ('f1', 10, '{}', NULL);", "f".repeat(1300)));
+    // Premise (ii), asserted rather than assumed: the lookup by key below reads the primary index.
+    let plan = d.plan("SELECT n FROM u WHERE id = 'a';");
+    assert!(plan.contains("Index scan on u (col 0"), "premise failed: the key lookup is not a primary index scan: {plan}");
 
     let e = d.err("UPDATE u SET a = b WHERE n < 3;");
     assert!(e.contains("is declared NOT NULL"), "not the NOT NULL refusal: {}", abbreviate(&e));
@@ -576,4 +606,211 @@ fn a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_f
         Some(()),
         "the old secondary tree no longer answers: it was freed"
     );
+}
+
+// ---- Review 4 (PREREG amendment 1): legacy data and the pre-checks' untested arms --------------
+//
+// "Legacy" means data a build before D225 could have written: an entry over `MAX_ENTRY_BYTES`
+// that its count split happened to accept. This build cannot write one through any path, so it is
+// put below them: into the heap with `legacy_row`, or into an index page directly.
+
+/// **F1a — an ALTER that would re-point a legacy oversized primary key is refused before any row
+/// moves.** The legacy key is 2100 characters, a (3 + 2100) + 6 = 2109-byte primary entry.
+/// `commit_rewrite` re-points the entry of every row it moves, through `upsert`, which would
+/// refuse it part way through the heap, after earlier rows were converted in place. The ALTER is
+/// asked the bound for every key before the first tuple moves. Red at `72e1620`: the ALTER is
+/// accepted (the legacy row has no primary entry to re-point).
+#[test]
+fn an_alter_that_would_repoint_a_legacy_oversized_key_is_refused_before_any_row_moves() {
+    let mut d = db();
+    d.sql("CREATE TABLE k (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("INSERT INTO k VALUES ('a', 1);");
+    d.legacy_row("k", &[Value::Varchar("p".repeat(2100)), Value::Integer(2)]);
+
+    let e = d.err("ALTER TABLE k ALTER COLUMN n TYPE BIGINT;");
+    assert!(
+        e.contains("this ALTER would re-point the primary-index entry") && e.contains("index entry too large: 2109 bytes"),
+        "not the named refusal: {}",
+        abbreviate(&e)
+    );
+    assert_eq!(
+        d.catalog.get_table("k").unwrap().schema.columns[1].data_type,
+        DataType::Integer,
+        "the refused ALTER installed the new shape"
+    );
+    assert_eq!(d.ids("SELECT n FROM k;"), vec![1, 2], "the refused ALTER changed a row");
+}
+
+/// **F1b — an UPDATE of a row under a legacy oversized primary key is refused before it is
+/// written.** Same 2109-byte key. The UPDATE may have to re-point the key's entry if the heap
+/// moves the row, which is not known until the row is written, so the pre-pass asks for every row.
+/// `SET n = 3` is the same size, so the heap updates in place: without the check the UPDATE
+/// would succeed, which is what makes this a killer. Red at `72e1620`: the UPDATE is accepted.
+#[test]
+fn an_update_of_a_row_under_a_legacy_oversized_key_is_refused_before_it_is_written() {
+    let mut d = db();
+    d.sql("CREATE TABLE k (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("INSERT INTO k VALUES ('a', 1);");
+    d.legacy_row("k", &[Value::Varchar("p".repeat(2100)), Value::Integer(2)]);
+
+    let e = d.err("UPDATE k SET n = 3 WHERE n = 2;");
+    assert!(e.contains("index entry too large: 2109 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids("SELECT n FROM k;"), vec![1, 2], "the refused UPDATE changed a row");
+}
+
+/// **F1c, the merged-tree test — a no-cut refusal after the heap write leaves no dangling primary
+/// entry.** RED BY DESIGN on `d225-byte-split` alone; green on the merge with #16.
+///
+/// The secondary index's root leaf is written to its page directly, as an earlier build could
+/// leave it: `('m' x 2992, 100)` of 3000 bytes and `('z' x 1061, 101)` of 1069, exactly the
+/// 4069-byte body, full. A new `('a' x 2026, 1)` is 2034 bytes, which every pre-check admits, and
+/// sorts first: cutting after it leaves 4069 on the right, which is full, and cutting after `m`
+/// leaves 5034 on the left. So the tree refuses inside the secondary insert, AFTER the heap write
+/// and the primary upsert, where no executor pre-check can see it. The abort undoes the heap row.
+/// Only D202 (#16, `record_primary_write`) undoes the primary entry; without it, id 1 points at a
+/// deleted slot and the INSERT that reuses it fails with `SlotDeleted`.
+#[test]
+fn a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(3000));");
+    d.sql("CREATE INDEX iv ON t (v);");
+    let root = d.index_root("t", "v");
+    let mut legacy = BPlusTreeLeafPage::<(Value, Value), ()>::new(root);
+    legacy.insert_entry((Value::Varchar("m".repeat(2992)), Value::Integer(100)), ());
+    legacy.insert_entry((Value::Varchar("z".repeat(1061)), Value::Integer(101)), ());
+    assert_eq!(legacy.payload_len(), 4069, "premise: exactly the leaf body");
+    assert!(legacy.is_full(), "premise: an earlier build left it full");
+    let image = legacy.serialize().expect("premise: a leaf of exactly the body serializes");
+    {
+        let frame_i = d.bp.fetch_page(root).unwrap();
+        let mut frame = d.bp.frame_write(frame_i);
+        frame.data = image;
+        drop(frame);
+        d.bp.unpin_page(root, true);
+    }
+    let first = (Value::Varchar("a".repeat(2026)), Value::Integer(1));
+    assert_eq!(entry_bytes(&first), 2034, "premise: 3 + 2026 + 5");
+    admit_entry(&first, &()).expect("premise: every pre-check admits it");
+
+    let e = d.err(&format!("INSERT INTO t VALUES (1, '{}');", "a".repeat(2026)));
+    assert!(e.contains("no split point"), "not the no-cut refusal: {}", abbreviate(&e));
+    // Red here on d225 alone: "the slot is delted".
+    d.sql("INSERT INTO t VALUES (1, 'short');");
+    assert_eq!(d.ids("SELECT id FROM t WHERE id = 1;"), vec![1]);
+    assert_eq!(d.ids("SELECT id FROM t WHERE v = 'short';"), vec![1]);
+}
+
+/// **S1 — an INSERT whose posting is over the bound, into an existing full-text index, is refused
+/// and writes nothing.** A posting `('y' x 255, 'p' x 1800)` is (3 + 255) + (3 + 1800) = 2061
+/// bytes; the row itself is admitted (primary entry 3 + 1800 + 6 = 1809). "Writes nothing" is the
+/// part the INSERT's full-text pre-check exists for: without it the tree refuses in `post_tokens`,
+/// after the heap write and the primary upsert, and re-inserting the key fails with `SlotDeleted`
+/// (on d225 alone; #16's undo would repair it).
+#[test]
+fn an_insert_whose_posting_is_over_the_bound_into_an_existing_full_text_index_writes_nothing() {
+    let mut d = db();
+    d.sql("CREATE TABLE f (id VARCHAR(2000) NOT NULL, n INTEGER, body VARCHAR(300));");
+    d.sql("CREATE FULLTEXT INDEX ff ON f (body);");
+    let pk = "p".repeat(1800);
+
+    let e = d.err(&format!("INSERT INTO f VALUES ('{pk}', 1, '{}');", "y".repeat(255)));
+    assert!(e.contains("index entry too large: 2061 bytes"), "not the named refusal: {}", abbreviate(&e));
+
+    d.sql(&format!("INSERT INTO f VALUES ('{pk}', 2, 'short');"));
+    assert_eq!(d.ids("SELECT n FROM f;"), vec![2], "the refused row left something behind");
+    let root = d.fulltext_root("f", "body");
+    assert_eq!(
+        scan_all(&Tree::open(root, d.bp.clone())),
+        vec![(Value::Varchar("short".into()), Value::Varchar(pk.clone()))],
+        "the posting tree holds something the refused row posted"
+    );
+}
+
+/// **S2 — an UPDATE whose new posting is over the bound is refused before the row moves.** The
+/// same 2061-byte posting, reached by UPDATE. The row grows 250 bytes beside a 2000-byte filler
+/// on its page, so the heap relocates it (INFERRED from `HeapFileManager::update`, not measured)
+/// and would re-point its primary entry before `post_tokens` refused. The filler's one
+/// 2000-character run is over `MAX_TOKEN_BYTES`, so it posts nothing. The key lookup's plan is
+/// asserted, not assumed.
+#[test]
+fn an_update_whose_new_posting_is_over_the_bound_is_refused_before_the_row_moves() {
+    let mut d = db();
+    d.sql("CREATE TABLE g (id VARCHAR(2000) NOT NULL, n INTEGER, body VARCHAR(3000));");
+    d.sql("CREATE FULLTEXT INDEX fg ON g (body);");
+    let pk = "p".repeat(1800);
+    d.sql(&format!("INSERT INTO g VALUES ('{pk}', 1, 'short');"));
+    d.sql(&format!("INSERT INTO g VALUES ('f', 10, '{}');", "g".repeat(2000)));
+    let plan = d.plan(&format!("SELECT n FROM g WHERE id = '{pk}';"));
+    assert!(plan.contains("Index scan on g (col 0"), "premise failed: the key lookup is not a primary index scan: {}", abbreviate(&plan));
+
+    let e = d.err(&format!("UPDATE g SET body = '{}' WHERE n = 1;", "y".repeat(255)));
+    assert!(e.contains("index entry too large: 2061 bytes"), "not the named refusal: {}", abbreviate(&e));
+    assert_eq!(d.ids(&format!("SELECT n FROM g WHERE id = '{pk}';")), vec![1], "the row is unreachable by its key");
+    assert_eq!(d.ids("SELECT n FROM g WHERE body = 'short';"), vec![1], "the refused UPDATE changed the row");
+}
+
+/// **S3, primary arm — a crash-recovery rebuild over a legacy oversized primary key is refused by
+/// name before anything is freed.** The 2109-byte key from F1a. The primary tree is the first one
+/// the rebuild frees, so the discriminators are about it: the catalog still names its root, the
+/// old tree still answers for key `'a'`, and the next page the allocator hands out is not that
+/// root (a freed root is the lowest free page).
+#[test]
+fn a_rebuild_over_a_legacy_oversized_primary_key_is_refused_before_anything_is_freed() {
+    let mut d = db();
+    d.sql("CREATE TABLE k (id VARCHAR(3000) NOT NULL, n INTEGER);");
+    d.sql("INSERT INTO k VALUES ('a', 1);");
+    d.legacy_row("k", &[Value::Varchar("p".repeat(2100)), Value::Integer(2)]);
+    let root = d.catalog.get_table("k").unwrap().primary_index_root;
+
+    let e = rebuild_indexes(&mut d.catalog, &d.bp).expect_err("the rebuild must refuse the legacy key");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("cannot rebuild the indexes of 'k'")
+            && msg.contains("its primary entry")
+            && msg.contains("index entry too large: 2109 bytes"),
+        "not the named refusal: {}",
+        abbreviate(&msg)
+    );
+    assert_eq!(d.catalog.get_table("k").unwrap().primary_index_root, root, "the primary tree was rebuilt");
+    let primary = BPlusTreeManager::<Value, RecordId>::open(root, d.bp.clone());
+    assert!(primary.search(&Value::Varchar("a".into())).unwrap().is_some(), "the old primary tree lost key 'a'");
+    let next = d.bp.new_page().unwrap();
+    assert_ne!(next, root, "the primary root came back from the allocator: it was freed before the refusal");
+}
+
+/// **S3, full-text arm — the same, for a legacy posting over the bound.** The legacy row is
+/// `('p' x 1800, 'y' x 255)`: its primary entry (1809) is admitted and its posting (2061) is not.
+/// The rebuild would free the primary tree first and rebuild it, adding the legacy key, then free
+/// the posting tree. So: the old primary tree must not hold the legacy key (only a rebuild adds
+/// it), the old posting tree must still hold `('kept', 'a')`, and the next page handed out must
+/// not be either root.
+#[test]
+fn a_rebuild_over_a_legacy_oversized_posting_is_refused_before_anything_is_freed() {
+    let mut d = db();
+    d.sql("CREATE TABLE f (id VARCHAR(2000) NOT NULL, body VARCHAR(300));");
+    d.sql("CREATE FULLTEXT INDEX ff ON f (body);");
+    d.sql("INSERT INTO f VALUES ('a', 'kept');");
+    let pk = "p".repeat(1800);
+    d.legacy_row("f", &[Value::Varchar(pk.clone()), Value::Varchar("y".repeat(255))]);
+    let primary_root = d.catalog.get_table("f").unwrap().primary_index_root;
+    let posting_root = d.fulltext_root("f", "body");
+
+    let e = rebuild_indexes(&mut d.catalog, &d.bp).expect_err("the rebuild must refuse the legacy posting");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("cannot rebuild the indexes of 'f'")
+            && msg.contains("a posting in the full-text index on 'body'")
+            && msg.contains("index entry too large: 2061 bytes"),
+        "not the named refusal: {}",
+        abbreviate(&msg)
+    );
+    let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, d.bp.clone());
+    assert_eq!(primary.search(&Value::Varchar(pk)).unwrap(), None, "the primary tree was rebuilt: it holds the legacy key");
+    assert_eq!(
+        Tree::open(posting_root, d.bp.clone()).search(&(Value::Varchar("kept".into()), Value::Varchar("a".into()))).unwrap(),
+        Some(()),
+        "the old posting tree no longer answers: it was freed"
+    );
+    let next = d.bp.new_page().unwrap();
+    assert!(next != primary_root && next != posting_root, "page {next}, an old root, came back from the allocator");
 }

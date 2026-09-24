@@ -77,6 +77,7 @@ use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
+use crate::storage::index_page::admit_entry;
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
 
@@ -961,6 +962,23 @@ fn prepare_rewrite(
         let was = tuple.data.len();
         let mut values = tuple.deserialize(&shapes[0])?;
         let key = values.first().cloned();
+        // **D225 — every key's primary entry is asked the entry bound here, while nothing has been
+        // written.** `commit_rewrite` re-points the primary entry of each row the rewrite moves,
+        // through `upsert`, which refuses an entry over `MAX_ENTRY_BYTES`. Which rows move is not
+        // known until the heap is written, so every key is asked, and a refusal leaves the table
+        // exactly as it was. This build cannot write such a key; an earlier build could.
+        if let Some(k) = &key {
+            admit_entry(k, &RecordId::new(0, 0)).map_err(|e| {
+                let shown: String = format!("{k:?}").chars().take(60).collect();
+                FerroError::Constraint(format!(
+                    "this ALTER would re-point the primary-index entry of the row whose first \
+                     column is {shown}, and that entry is over the B+tree entry bound ({e}). A \
+                     build before D225 could store such a key; this one cannot re-point it. \
+                     Nothing has been written; rewrite that row under a shorter key with the build \
+                     that wrote it, then run the ALTER again."
+                ))
+            })?;
+        }
 
         let mut converted: Option<Tuple> = None;
         let mut over = false;

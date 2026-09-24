@@ -78,8 +78,8 @@ impl Modify for Update {
         // entry pointing at a deleted slot (`execution::insert` gives the same argument). Asking
         // per row inside the write loop is not enough either, because a later row's refusal lands
         // after the earlier rows are written. So all of them are asked first, here, for exactly
-        // the entries the loop below will add: a changed secondary value, and the tokens of
-        // changed text. The assignments are evaluated here too, still once per row, and the NOT
+        // the entries the loop below may add: the primary re-point, a changed secondary value,
+        // and the tokens of changed text. The assignments are evaluated here too, still once per row, and the NOT
         // NULL check moves with them: it reads only the new values, and inside the loop it had
         // the same late-refusal shape.
         let mut planned = Vec::with_capacity(res.len());
@@ -97,6 +97,10 @@ impl Modify for Update {
                 }
             }
             let pk = &old_values[0];
+            // The primary re-point, `upsert(pk, new_rid)`, happens only if the heap moves the row,
+            // which is not known until it is written, so it is asked for every row. This build
+            // cannot write a key over the bound; an earlier build could.
+            admit_entry(pk, &RecordId::new(0, 0))?;
             for handle in &self.secondary_indexes {
                 let new_v = &new_values[handle.col_index];
                 if &old_values[handle.col_index] != new_v {
