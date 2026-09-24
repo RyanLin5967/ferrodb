@@ -826,6 +826,24 @@ impl RebaseReport {
     }
 }
 
+/// What `REBASE`'s first phase established, carried to its second (`AgentRuntime::rebase_commit`).
+///
+/// The lengths are the re-check's fingerprint of the workspace: a write, a pick or a sibling merge
+/// onto the branch appends ops and usually rows, and a schema edit grows `schema_edits`, so if any of
+/// them landed between the phases the commit sees a different number and refuses.
+struct RebaseValidation {
+    branch: BranchId,
+    old_at: Option<Arc<Snapshot>>,
+    old_seq: u64,
+    new_at: Arc<Snapshot>,
+    new_seq: u64,
+    rows_len: usize,
+    ops_len: usize,
+    edits_len: usize,
+    moved_rows: Vec<(String, RowId)>,
+    moved_shapes: Vec<String>,
+}
+
 /// **D194 step 4.** The primary-key value to look a staged row up by at a new instant.
 ///
 /// The row id is a one-way hash of the key, so the key has to come from an image: the base image
@@ -3740,12 +3758,30 @@ impl AgentRuntime {
     ///
     /// # Atomicity
     ///
-    /// The new instant is taken under the state lock with `apply_seq`, like a fork. Validation reads
-    /// the tables outside that lock; the commit re-takes it and refuses (an `Err`, retryable) if the
-    /// workspace's pin, staged set, ops or schema edits changed, or main published a merge, in
-    /// between. Over pgwire the statement-wide catalog lock already serialises all of those, so the
-    /// check covers the embedded API rather than a path the server can reach.
+    /// Two phases, `rebase_validate` then `rebase_commit`. The new
+    /// instant is taken under the state lock with `apply_seq`, like a fork. Validation reads the
+    /// tables outside that lock; the commit re-takes it and refuses (an `Err`, retryable) if the
+    /// workspace's pin, staged set, ops or schema edits changed, or main's merge clock moved, in
+    /// between. Over pgwire every statement that can change one of those — a write, a MERGE, a fork,
+    /// ABANDON, an ALTER — holds the exclusive catalog for its whole run, as REBASE does, so the
+    /// server cannot interleave them. What CAN run beside a REBASE there is a SELECT on the shared
+    /// read path, and it changes none of the re-checked fields: it may add a read premise, which the
+    /// commit's premise check reads under its own lock, or pin a branch that was never pinned, which
+    /// only a fork without a transaction manager produces and pgwire never does. The split is also
+    /// the seam the race test drives (`tests::rebase_is_refused_retryably_...`): it calls the two
+    /// phases itself and lands the change in between, with no timing involved.
     pub fn rebase(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<RebaseReport, FerroError> {
+        let validated = self.rebase_validate(ctx, branch)?;
+        self.rebase_commit(validated)
+    }
+
+    /// `REBASE`, phase 1: the new instant, and every staged base and shape checked against it. Reads
+    /// and records; changes nothing. See [`AgentRuntime::rebase`].
+    fn rebase_validate(
+        &self,
+        ctx: &ExecCtx,
+        branch: BranchId,
+    ) -> Result<RebaseValidation, FerroError> {
         if self.branches.get(branch)?.state == BranchState::Quarantined {
             return Err(FerroError::Branch(format!(
                 "{branch} is quarantined and cannot be rebased: {}. A hold keeps the branch's view as \
@@ -3806,7 +3842,35 @@ impl AgentRuntime {
             }
         }
 
-        // ---- commit: re-check, 2. premises, re-pin — under one lock ----------------------------
+        Ok(RebaseValidation {
+            branch,
+            old_at,
+            old_seq,
+            new_at,
+            new_seq,
+            rows_len: rows.len(),
+            ops_len: ops.len(),
+            edits_len: edits,
+            moved_rows,
+            moved_shapes,
+        })
+    }
+
+    /// `REBASE`, phase 2: re-check that nothing moved since phase 1, check the premises, and re-pin —
+    /// all under one lock. The re-check is what makes the two phases one decision.
+    fn rebase_commit(&self, v: RebaseValidation) -> Result<RebaseReport, FerroError> {
+        let RebaseValidation {
+            branch,
+            old_at,
+            old_seq,
+            new_at,
+            new_seq,
+            rows_len,
+            ops_len,
+            edits_len,
+            moved_rows,
+            moved_shapes,
+        } = v;
         let mut state = self.state.lock().unwrap();
         let (txn, unchanged) = {
             let ws = state.workspaces.get(&branch).ok_or_else(|| {
@@ -3823,9 +3887,9 @@ impl AgentRuntime {
                 ws.txn,
                 same_pin
                     && ws.fork_seq == old_seq
-                    && ws.rows.len() == rows.len()
-                    && ws.frame.ops.len() == ops.len()
-                    && ws.schema_edits.len() == edits,
+                    && ws.rows.len() == rows_len
+                    && ws.frame.ops.len() == ops_len
+                    && ws.schema_edits.len() == edits_len,
             )
         };
         if !unchanged || state.apply_seq != new_seq {
