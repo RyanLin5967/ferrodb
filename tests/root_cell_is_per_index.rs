@@ -351,13 +351,21 @@ fn each_index_kind_on_one_column_holds_its_own_cell_in_either_order() {
 /// The structural twin of `a_rebuild_leaves_a_btree_index_beside_a_fulltext_index_on_its_own_tree`:
 /// cell == record for each kind after `rebuild_indexes`, and each is still the `Arc` a statement
 /// could have been holding (D205's store-in-place, per kind).
+///
+/// The DROP is load-bearing, as in D205's DROP schedule. It leaves free pages BELOW `t`'s trees,
+/// so the rebuild's allocation puts every fresh root somewhere new. Without it a rebuilt tree can
+/// land on its old page, and then a cell nobody repointed still reads equal to its record: a
+/// mutant that stores the B-tree root into the wrong cell would pass. The two premises say so.
 #[test]
 fn a_rebuild_stores_each_fresh_root_into_its_own_kinds_cell() {
     let mut d = Db::new();
+    d.rows("CREATE TABLE a (id INTEGER NOT NULL, v INTEGER);");
     d.rows("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
     d.rows("INSERT INTO t VALUES (1, 'alpha beta');");
     d.rows("CREATE INDEX ib ON t (body);");
     d.rows("CREATE FULLTEXT INDEX fb ON t (body);");
+    d.rows("DROP TABLE a;");
+    let (btree_before, fulltext_before) = d.record_roots("body");
     let btree = d.cell(IndexTree::Secondary("body"));
     let fulltext = d.cell(IndexTree::FullText("body"));
 
@@ -365,6 +373,8 @@ fn a_rebuild_stores_each_fresh_root_into_its_own_kinds_cell() {
 
     let (btree_record, fulltext_record) = d.record_roots("body");
     assert!(btree_record.is_some() && fulltext_record.is_some(), "premise failed: an index record is missing");
+    assert_ne!(btree_record, btree_before, "premise failed: the rebuilt B-tree is on its old page, so an unrepointed cell would still match");
+    assert_ne!(fulltext_record, fulltext_before, "premise failed: the rebuilt posting tree is on its old page, so an unrepointed cell would still match");
     assert_eq!(Some(btree.load(Ordering::SeqCst)), btree_record, "after a rebuild, the B-tree cell does not name the rebuilt B-tree");
     assert_eq!(Some(fulltext.load(Ordering::SeqCst)), fulltext_record, "after a rebuild, the full-text cell does not name the rebuilt posting tree");
     assert!(Arc::ptr_eq(&btree, &d.cell(IndexTree::Secondary("body"))), "the rebuild REPLACED the B-tree cell");
