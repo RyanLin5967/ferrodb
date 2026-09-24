@@ -21,9 +21,9 @@
 //! stale-reader bug, which LMDB answers only with a manual `mdb_reader_check`; client cooperation
 //! is not a viable contract, so it is not part of this one.
 
-use std::collections::BTreeSet;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
@@ -42,7 +42,40 @@ use crate::error::FerroError;
 /// of an in-process error path — a drain that released pages and then failed before its narrowed
 /// sweep could free the emptied extent. Sixty seconds is twice the lease thread's own scan
 /// interval, which is the shortest cadence that is not "every tick".
+///
+/// **D221.** A due pass no longer runs that global scan: see [`ORPHAN_SWEEP_SLICE`].
 pub(crate) const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
+
+/// **D221.** Live arenas one due pass of the cadence examines beyond its recorded residue.
+///
+/// A due pass used to run [`TwoTierReaper::collect_orphaned_extents`], every live arena. The
+/// lease loop waits 30 s after each pass and the interval is 60 s, so once reaping plus that scan
+/// took 30 s every pass was due, and at 10^6 arenas the lease thread would have spent at least
+/// half its time scanning (read-vs-n PREREG R5 puts one scan at 10-90 s; inferred, unmeasured).
+///
+/// A due pass now examines two things:
+///
+/// * **The residue** (`deferred`): every arena an in-process failure left unswept. Each producer
+///   records its own, so this is O(what went wrong), normally zero. The producers, and where each
+///   one records, are listed at `TwoTierReaper::collect_orphans_if_due`.
+/// * **A slice of this many live arenas**, in ROTATIONS. A rotation begins by fixing its end at
+///   the highest live arena id. Each pass then resumes after the last arena the previous one
+///   examined and never goes past that end, and the next rotation starts again from the lowest
+///   id. This is the bounded fallback for a producer the residue does not see. None is reachable
+///   in production, but the list is an argument, and the fallback is what makes a gap in it a
+///   delay instead of a leak. Every arena live when a rotation begins is examined within
+///   `ceil(live / ORPHAN_SWEEP_SLICE)` due passes, and an arena claimed during one is examined
+///   in the next. At 10^6 arenas a rotation is 977 passes, 16-24 hours at one due pass every
+///   60-90 s (arithmetic). The next open examines them all regardless.
+///
+///   The end is fixed because arena ids only grow. A slice that always took "the next ones up"
+///   is outrun as soon as claims arrive faster than one slice per pass, about 11-17 a second, and
+///   it then never comes back to the old ids at all. That is what the fresh-context review of
+///   this change found in its first version.
+///
+/// 1,024 is a cost choice. At R5's inferred 10-90 µs per visit it is 10-90 ms per due pass, fixed
+/// whatever the live count. The full scan now runs only at open.
+pub(crate) const ORPHAN_SWEEP_SLICE: usize = 1024;
 
 /// Sentinel for "no orphan collection this reaper knows the time of", so the first due-check
 /// collects rather than waiting out an interval measured from the epoch.
@@ -127,12 +160,41 @@ pub struct TwoTierReaper {
     /// early return. Recorded here instead, and drained through the narrowed sweep that already
     /// exists, the periodic cost becomes O(residue) — normally zero.
     deferred: Mutex<BTreeSet<ArenaId>>,
+    /// **D221.** The last arena the steady-state slice examined. The next slice starts after it.
+    /// `0` before the first slice: arena 0 is the shared/trunk arena and is never an extent.
+    slice_cursor: AtomicU32,
+    /// **D221.** The last arena of the current rotation: the highest live id when it began. A
+    /// cursor at or past it means the rotation is over. See [`ORPHAN_SWEEP_SLICE`].
+    rotation_end: AtomicU32,
+    /// **D221.** Arenas a live `DeferTouched` guard holds, and how many guards hold each.
+    ///
+    /// Between a page's release (or a reap's `Reaped` mark) and the sweep that follows it, an
+    /// extent is collectable and not yet swept. The slice runs outside the statement lock, so it
+    /// can meet an extent in exactly that window, on a reap or drain a statement thread is in the
+    /// middle of. Counting that in `slice_freed` would make the detector fire on healthy traffic,
+    /// and freeing it would take work the guard's own sweep is about to do. So the slice skips
+    /// arenas held here. A guard registers an arena BEFORE the release that can empty it, and
+    /// on drop records it in `deferred` BEFORE unregistering it, so no such extent is ever in
+    /// neither place. The fresh-context review found this window in the first version.
+    in_flight: Mutex<BTreeMap<ArenaId, u32>>,
+    /// **D221.** Arenas per steady-state slice: [`ORPHAN_SWEEP_SLICE`], except in tests.
+    sweep_slice: usize,
+    /// **D221.** Extents the steady-state SLICE freed. **Expected to stay ZERO.**
+    ///
+    /// The residue runs before the slice in every due pass, and the slice skips every arena a
+    /// reap or drain in flight holds (`in_flight`), so an extent the slice frees is one that no
+    /// in-process producer recorded or is about to sweep. That is either a producer the list at
+    /// `collect_orphans_if_due` misses or one of its stated cases, so the first increment is the
+    /// finding. The same job `open_sweep_freed` does for a restart.
+    slice_freed: AtomicU64,
     /// Extents freed by the full sweep at open. **Must be ZERO after a clean shutdown.**
     ///
     /// This is the detector for the one risk the D83 change carries: a producer of collectable
     /// extents that neither a drain nor a crash accounts for would simply stop being collected
     /// until the next open. A non-zero reading here after a clean close is that producer saying so
-    /// out loud, instead of a 60-second full scan quietly hiding it.
+    /// out loud, instead of a 60-second full scan quietly hiding it. Since D221 the steady-state
+    /// slice can collect such a producer's extents before the close, and it counts them in
+    /// `slice_freed`, so the two counters together are the detector.
     open_sweep_freed: AtomicU64,
     /// Arenas the full sweep at open examined. Observing only; see [`Self::open_sweep_visits`].
     open_sweep_visits: AtomicU64,
@@ -158,7 +220,26 @@ impl TwoTierReaper {
             open_sweep_freed: AtomicU64::new(0),
             open_sweep_visits: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
+            slice_cursor: AtomicU32::new(0),
+            rotation_end: AtomicU32::new(0),
+            in_flight: Mutex::new(BTreeMap::new()),
+            sweep_slice: ORPHAN_SWEEP_SLICE,
+            slice_freed: AtomicU64::new(0),
         }
+    }
+
+    /// Test-only: a different slice size, so the rotation can be exercised over a handful of
+    /// arenas. `0` leaves the residue as the steady-state sweep's only input, which is how a test
+    /// shows that a producer is RECORDED rather than found by the slice.
+    #[cfg(test)]
+    pub(crate) fn with_sweep_slice(mut self, arenas: usize) -> Self {
+        self.sweep_slice = arenas;
+        self
+    }
+
+    /// **D221.** Extents the steady-state slice freed. See the field: the expected value is zero.
+    pub fn slice_freed(&self) -> u64 {
+        self.slice_freed.load(Ordering::Relaxed)
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
@@ -416,9 +497,10 @@ impl TwoTierReaper {
     /// else does it: a crash between `mark_reaped` and `free_arena` leaves a durable extent
     /// charged to a branch that no longer exists, and no in-process caller holds its id to pass
     /// to [`Self::sweep_touched_extents`]. But a crash is its only producer, so the complete
-    /// answer is needed exactly once per open — [`Self::resume_interrupted_reaps`] — plus the
-    /// bounded cadence in [`Self::collect_orphans_if_due`] for the residue of an in-process error
-    /// path (a drain that released pages and then failed before its narrowed sweep ran).
+    /// answer is needed exactly once per open — [`Self::resume_interrupted_reaps`]. The cadence in
+    /// [`Self::collect_orphans_if_due`] covered the residue of in-process error paths by calling
+    /// this too, until D221: it now sweeps the recorded residue plus a fixed slice of the live
+    /// arenas, and this whole scan runs only at open.
     ///
     /// It has no business running once per reaped branch, and "make it faster" — memoizing
     /// `get_raw` across the scan — was rejected in D40 for shrinking a constant while leaving
@@ -457,11 +539,51 @@ impl TwoTierReaper {
         self.last_orphan_sweep_ms.store(now_millis, Ordering::SeqCst);
     }
 
-    /// Run [`Self::collect_orphaned_extents`] if at least [`ORPHAN_SWEEP_INTERVAL_MS`] of cluster
-    /// time has passed since it last ran, and never more often than that.
+    /// Run one steady-state collection if at least [`ORPHAN_SWEEP_INTERVAL_MS`] of cluster time
+    /// has passed since the last, and never more often than that. A collection is the recorded
+    /// residue, then one [`ORPHAN_SWEEP_SLICE`] of the live arenas (D221). The full scan,
+    /// [`Self::collect_orphaned_extents`], runs only at open.
     ///
-    /// "Last ran" includes the open's sweep, which `LeaseThread::start` stamps (D209), so the first
-    /// due-check after an open waits a full interval instead of repeating it.
+    /// "Since the last" includes the open's sweep, which `LeaseThread::start` stamps (D209), so the
+    /// first due-check after an open waits a full interval instead of repeating it.
+    ///
+    /// **D221 — what the residue must hold, producer by producer.** An extent is collectable when
+    /// its owner is gone (`Reaped`, regenerated, or unreadable) and it holds no page. In a running
+    /// process that state arises only in the ways below. Each one either records the extent in
+    /// `deferred` or cannot occur:
+    ///
+    /// * **A drain releases the last page of a dead owner's extent.** `drain_pending_seeded`
+    ///   sweeps what it touched, and its `DeferTouched` guard records the set on any early return
+    ///   or panic (D83). Its pages come from the pending-free log, which the slow path and
+    ///   `free_page` fill.
+    /// * **A reap's slow path empties the branch's own extents, then fails before its drain**, in
+    ///   `detach_from_parent`'s catalog reads, or by a panic. The seed is now held by a
+    ///   `DeferTouched` from the moment `reap` captures it.
+    /// * **A reap's fast path fails part-way.** The record stays `Reaping`, which is not "gone",
+    ///   so no sweep may free its extents, and the next open resumes the reap. Unchanged.
+    /// * **A claim the catalog refuses.** `alloc_arena` now asks the catalog before it publishes
+    ///   the extent, so a refusal leaves none behind.
+    /// * **`free_page` releases a page into an extent.** Not recorded, and it needs not be: its
+    ///   callers free only pages the freeing branch OWNS (`cow_page` sets `retire_previous` only
+    ///   when the source is the writer's own; `unlink_up` retires only the branch's own shadows),
+    ///   so the extent's owner is live at that moment. When that owner is later reaped, `reap`
+    ///   seeds its own arenas. The slice covers it regardless.
+    /// * **Something other than this reaper marks a record `Reaped`**: the runtime's no-reaper
+    ///   `seal`, or a test writing the catalog directly. Neither production binary runs a lease
+    ///   thread without attaching the reaper to its runtime. The slice covers the extents that
+    ///   were already empty. The rest still hold pages, which no sweep ever frees; that is the
+    ///   no-reaper `seal`'s own leak, documented there.
+    /// * **A snapshot install replaces the extent map in a running process**
+    ///   (`consensus::snapshot` calls `load_state` on a live store). An installed image can hold
+    ///   empty extents whose owners are gone, and nothing records them. Latent: neither production
+    ///   caller of `LeaseThread::start` runs consensus. The slice covers them, within a rotation.
+    /// * **A claim races a reap outside the statement lock.** `reap` reads the arena list before
+    ///   its `Reaping` mark, so an extent claimed in between is freed by nobody. `RuntimeLock`
+    ///   serialises both today. W4 removes that lock and must supply the barrier; until then the
+    ///   slice covers it.
+    ///
+    /// `slice_freed` counts what the slice finds, and the expected count is zero outside the last
+    /// two cases.
     ///
     /// `now_millis` is the cluster's time as the lease thread read it, not a local clock — the
     /// same reading `reap_expired` is deciding expiry on, so the cadence cannot disagree with the
@@ -475,12 +597,12 @@ impl TwoTierReaper {
             return Ok(0);
         }
         // Stamp BEFORE the scan, not after: two lease ticks racing here would otherwise both read
-        // the old stamp and both pay for a full scan. Losing one collection to a crash between
+        // the old stamp and both pay for the pass. Losing one collection to a crash between
         // stamp and scan costs nothing — open collects the same extents.
         self.last_orphan_sweep_ms.store(now_millis, Ordering::SeqCst);
-        // **D83: drain the recorded residue FIRST, then the full scan — which STAYS.**
+        // **D83: drain the recorded residue FIRST. D221: then a SLICE, where the full scan was.**
         //
-        // ⛔ I removed the full scan here and replaced it with the residue drain alone. That was
+        // ⛔ D83 removed the full scan here and replaced it with the residue drain alone. That was
         // WRONG and two tests said so within a minute:
         // `the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence` fails, because
         // its fixture `orphan_one_extent` produces a CRASH orphan — it reaps the record, which
@@ -489,18 +611,17 @@ impl TwoTierReaper {
         // the only instrument that can find them". A set recorded by a drain structurally cannot
         // contain an extent no drain ever touched.
         //
-        // So the residue drain is ADDITIVE, not a replacement: it returns work an early return had
-        // dropped on the floor, promptly and at O(residue). The full scan keeps its own job.
+        // D221 keeps that finding and drops the price. The residue is now complete for every
+        // in-process producer the list above names, and a producer it does not name still meets
+        // the slice. At that test's size every live arena fits in one slice, so it collects on the
+        // first due pass exactly as before. At 10^6 arenas the same orphan waits up to one rotation
+        // of the slice, or the next open, instead of costing every due pass a full scan.
         //
-        // ⚠ AND THE WALL D83 SET OUT TO REMOVE IS STILL THERE. The O(live arenas) scan still runs
-        // inside the per-statement lock. That is NOT this function's defect to fix — it is W4's
-        // open half, the outer `RuntimeLock` held across the whole of `scan_once`
-        // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
-        // lock, and no landed change touches it.
+        // D88 moved this work out of the per-statement lock; D221 bounds it.
         // ⛔ **D128 SITE 3 — AND ITS FIX ALREADY EXISTED TWENTY LINES AWAY, UNUSED HERE.** This
         // was a bare `mem::take` followed by TWO `?`. Either one returning dropped the whole
         // deferred set on the floor: those arenas are then never swept by the cheap residue path,
-        // and only a later full `collect_orphaned_extents` scan can recover them. `DeferTouched`
+        // and only the slice or the next open's full scan can recover them. `DeferTouched`
         // (below) is exactly the RAII answer and `drain_pending_seeded` already uses it — routing
         // this call site through the guard the file itself defines is the whole fix.
         //
@@ -516,30 +637,80 @@ impl TwoTierReaper {
         // through the cadence gate without ever reaching the defect — which is exactly what the
         // first version of `a_failing_residue_sweep_puts_the_deferred_arenas_back` did.
         let residue = std::mem::take(&mut *self.deferred.lock().unwrap());
-        let mut guard = DeferTouched { deferred: &self.deferred, touched: residue, swept: false };
+        let mut guard = DeferTouched::armed(self, residue);
         let recovered = if guard.touched.is_empty() {
             0
         } else {
             // An `Err` here drops `guard` with `swept == false`, which puts every arena back.
             self.sweep_touched_extents(&guard.touched)?
         };
-        // Swept, so the guard must NOT restore: `collect_orphaned_extents` failing below is not a
-        // reason to re-sweep work that already succeeded.
+        // Swept, so the guard must NOT restore: the slice failing below is not a reason to
+        // re-sweep work that already succeeded. Dropped HERE rather than at the end, because the
+        // slice skips every arena a guard holds and these are finished.
         guard.swept = true;
-        Ok(recovered + self.collect_orphaned_extents()?)
+        drop(guard);
+        Ok(recovered + self.collect_orphaned_slice()?)
+    }
+
+    /// **D221.** Examine the next [`ORPHAN_SWEEP_SLICE`] live arenas of the current rotation, and
+    /// free any that are collectable. See the constant for what a rotation is and why it has a
+    /// fixed end.
+    ///
+    /// The bounded fallback behind the residue. It asks exactly the question
+    /// [`Self::collect_orphaned_extents`] asks, of at most a slice of the arenas that scan would
+    /// walk, so the cost per pass is fixed. A pass examines each arena at most once, and a pass
+    /// that finishes a rotation stops there rather than running into the next.
+    fn collect_orphaned_slice(&self) -> Result<u32, FerroError> {
+        let limit = self.sweep_slice;
+        if limit == 0 {
+            return Ok(0);
+        }
+        let cursor = ArenaId(self.slice_cursor.load(Ordering::SeqCst));
+        let end = ArenaId(self.rotation_end.load(Ordering::SeqCst));
+        let mut slice = self.store.live_arenas_between(cursor, end, limit);
+        if slice.is_empty() {
+            // The rotation is over, or none has begun. The next one covers every arena live now;
+            // an arena claimed after this line waits for the one after.
+            let Some(last) = self.store.last_live_arena() else { return Ok(0) };
+            self.rotation_end.store(last.0, Ordering::SeqCst);
+            slice = self.store.live_arenas_between(ArenaId(0), last, limit);
+        }
+        let mut freed = 0u32;
+        for (arena, owner) in slice {
+            // Advanced BEFORE the arena is examined, so an arena whose free keeps failing costs
+            // itself a rotation instead of pinning every later pass to the same place.
+            self.slice_cursor.store(arena.0, Ordering::SeqCst);
+            // Held across the question and the free, so no guard can take this arena between
+            // them. Lock order: `in_flight` before the catalog's and the store's locks, and a
+            // guard takes `in_flight` while holding neither.
+            let held = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+            if held.contains_key(&arena) {
+                continue;
+            }
+            self.sweep_visits.fetch_add(1, Ordering::Relaxed);
+            if self.extent_is_collectable(arena, owner) {
+                self.store.free_arena(arena)?;
+                self.slice_freed.fetch_add(1, Ordering::Relaxed);
+                freed += 1;
+            }
+            drop(held);
+        }
+        Ok(freed)
     }
 
     /// [`Reaper::drain_pending`], told up front about arenas the caller already touched.
     ///
-    /// **D40.** `seed` carries the candidates the pending-free log cannot name — `reap` passes
-    /// the arenas of the branch it just retired, which the slow path releases pages into and
-    /// `mark_reaped` then makes ownerless. Everything else is accumulated here from
+    /// **D40.** The guard's `touched` arrives holding the candidates the pending-free log cannot
+    /// name — `reap` passes the arenas of the branch it just retired, which the slow path releases
+    /// pages into and `mark_reaped` then makes ownerless. Everything else is accumulated here from
     /// `pf.arena_id` as pages are released. The union is swept once at the end, and it is
     /// *exactly* the set the old global scan could have found anything in.
-    fn drain_pending_seeded(&self, seed: BTreeSet<ArenaId>) -> Result<u32, FerroError> {
+    ///
+    /// **D221 — it takes the GUARD, not the set.** It used to take the seed as a plain set and
+    /// arm the guard here, so a `reap` that failed between capturing its seed and calling this
+    /// dropped the seed in a local. The caller arms the guard where the seed is captured.
+    fn drain_pending_seeded(&self, mut guard: DeferTouched<'_>) -> Result<u32, FerroError> {
         let mut released = 0u32;
-        // D83: `touched` lives in a guard so that an early return RECORDS it instead of losing it.
-        let mut guard = DeferTouched { deferred: &self.deferred, touched: seed, swept: false };
         // Retest to a fixed point: releasing pages can empty an extent, and freeing that extent
         // can retire an id, neither of which changes `live_children` — but a caller may have
         // detached several branches before draining, so loop until nothing moves.
@@ -568,10 +739,10 @@ impl TwoTierReaper {
                     // nothing can see the page". That premise is false.
                     //
                     // This owner WAS published: the extent it names was created by `alloc_arena`,
-                    // which ends in `catalog.add_arena`, and every catalog refuses that for a
-                    // branch with no record. And a record that is missing *right now* has not
-                    // stopped existing: nothing ever deletes a record, and retirement is a state
-                    // flip to `Reaped`.
+                    // which calls `catalog.add_arena` before publishing it (D221), and every
+                    // catalog refuses that for a branch with no record. And a record that is
+                    // missing *right now* has not stopped existing: nothing ever deletes a record,
+                    // and retirement is a state flip to `Reaped`.
                     //
                     // ⚠ **D126 changed WHICH failures reach here, not what to do about them.**
                     // This used to say the miss was routine: `TableBranchCatalog::upsert` was
@@ -615,10 +786,11 @@ impl TwoTierReaper {
                 if pinned {
                     still_pinned.push(pf);
                 } else {
+                    // The page goes back into this extent, so this extent is the only kind of
+                    // thing that can become empty. Recorded rather than rediscovered, and held
+                    // BEFORE the release (D221), so the slice never meets it emptied and unheld.
+                    guard.touch(pf.arena_id);
                     self.store.release_page(pf.page_id, pf.arena_id);
-                    // The page went back into this extent, so this extent is the only kind of
-                    // thing that can have become empty. Recorded rather than rediscovered.
-                    guard.touched.insert(pf.arena_id);
                     released += 1;
                     moved = true;
                 }
@@ -656,17 +828,54 @@ impl TwoTierReaper {
 /// is idempotent — `arena_owner` returns `None` for an extent already freed).
 struct DeferTouched<'a> {
     deferred: &'a Mutex<BTreeSet<ArenaId>>,
+    /// **D221.** Every arena in `touched` is registered here while the guard lives. See
+    /// `TwoTierReaper::in_flight`.
+    in_flight: &'a Mutex<BTreeMap<ArenaId, u32>>,
     touched: BTreeSet<ArenaId>,
     swept: bool,
 }
 
+impl<'a> DeferTouched<'a> {
+    /// A guard holding `seed`, each arena registered in flight.
+    fn armed(reaper: &'a TwoTierReaper, seed: BTreeSet<ArenaId>) -> Self {
+        let mut guard = DeferTouched {
+            deferred: &reaper.deferred,
+            in_flight: &reaper.in_flight,
+            touched: BTreeSet::new(),
+            swept: false,
+        };
+        for arena in seed {
+            guard.touch(arena);
+        }
+        guard
+    }
+
+    /// Hold `arena`. Called BEFORE anything is released into it.
+    fn touch(&mut self, arena: ArenaId) {
+        if self.touched.insert(arena) {
+            let mut held = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+            *held.entry(arena).or_insert(0) += 1;
+        }
+    }
+}
+
 impl Drop for DeferTouched<'_> {
     fn drop(&mut self) {
-        if self.swept || self.touched.is_empty() {
-            return;
+        // Recorded BEFORE it is unregistered, so the slice never finds an arena this guard held
+        // in neither place.
+        if !self.swept && !self.touched.is_empty() {
+            if let Ok(mut d) = self.deferred.lock() {
+                d.extend(self.touched.iter().copied());
+            }
         }
-        if let Ok(mut d) = self.deferred.lock() {
-            d.extend(self.touched.iter().copied());
+        let mut held = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        for arena in &self.touched {
+            if let Some(n) = held.get_mut(arena) {
+                *n -= 1;
+                if *n == 0 {
+                    held.remove(arena);
+                }
+            }
         }
     }
 }
@@ -730,7 +939,17 @@ impl Reaper for TwoTierReaper {
         // pending-free log does not name, so `drain_pending` is seeded with them explicitly. The
         // old code found them by scanning every live arena in the database; this is the same set,
         // asked of the caller that already has it.
-        let own_arenas: BTreeSet<ArenaId> = rec.arenas.iter().copied().collect();
+        //
+        // **D221 — and RECORDED from here on, not merely carried.** This was a plain set handed to
+        // `drain_pending_seeded`, which armed the guard only once it was running. Between here and
+        // there sit the `Reaped` mark and `detach_from_parent`, whose `has_live_children` is a
+        // catalog read that can fail. On the slow path the retire has already emptied these
+        // extents by then, and the mark makes them ownerless. So a failure there left them
+        // collectable, named by nothing, and found only by a scan of every live arena, which the
+        // steady-state sweep no longer runs. Armed here, any exit or panic from this point leaves
+        // them in the residue. An exit before the mark records them too, which is harmless: their
+        // owner reads `Reaping`, not gone, so the residue sweep examines them and frees nothing.
+        let own_arenas = DeferTouched::armed(self, rec.arenas.iter().copied().collect());
 
         if !self.catalog.has_live_children(rec.branch_id.id)? {
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
@@ -809,9 +1028,9 @@ impl Reaper for TwoTierReaper {
         // This used to be an unconditional global scan here *as well as* one inside every `reap`
         // above. The per-reap copies are gone (see `sweep_touched_extents`), and what is left is
         // the only caller that can reasonably pay for a full pass: a periodic lease scan, which
-        // already holds the cluster's time. It is still O(live_arenas) when it fires, which is
+        // already holds the cluster's time. It was still O(live_arenas) when it fired, which is
         // why it fires at most once per `ORPHAN_SWEEP_INTERVAL_MS` — the complete answer is at
-        // open, in `resume_interrupted_reaps`.
+        // open, in `resume_interrupted_reaps`. Since D221 a firing is O(residue + slice).
         // **D88: the orphan sweep is NOT run here any more — see `lease_thread::scan_once`.**
         //
         // It used to run inside `reap_expired`, which `scan_once` calls inside `with_lock` — and
@@ -828,7 +1047,7 @@ impl Reaper for TwoTierReaper {
     }
 
     fn drain_pending(&self) -> Result<u32, FerroError> {
-        self.drain_pending_seeded(BTreeSet::new())
+        self.drain_pending_seeded(DeferTouched::armed(self, BTreeSet::new()))
     }
 }
 
@@ -2639,6 +2858,209 @@ mod tests {
              emptied extents are not in the residue. Nothing names them any more; only a scan of \
              every live arena, or the next open, can find them."
         );
+
+        // Recorded means collected, by the residue, on the next due pass. The residue runs before
+        // the slice, so a slice that found these instead would mean they were never in it.
+        failing.answer.store(u64::MAX, Ordering::SeqCst);
+        reaper.collect_orphans_if_due(1_000_000).unwrap();
+        for a in own.iter().copied() {
+            assert_eq!(
+                h.store.arena_owner(a),
+                None,
+                "D221 U1: extent {a} was recorded but the next due pass did not collect it"
+            );
+        }
+        assert_eq!(reaper.deferred_len(), 0, "the residue was swept and must be empty again");
+        assert_eq!(
+            reaper.slice_freed(),
+            0,
+            "the slice freed an extent the residue should already have freed"
+        );
+    }
+
+    /// **D221: the residue alone collects what was recorded, and nothing else.**
+    ///
+    /// With the slice switched off, a due pass visits exactly the residue. A recorded orphan is
+    /// collected and an unrecorded one is not. The unrecorded one is the control: if it went too,
+    /// something other than the residue was sweeping, and a pass over a recorded orphan would say
+    /// nothing about the residue at all.
+    #[test]
+    fn d221_the_residue_alone_collects_what_was_recorded_and_nothing_else() {
+        let (h, _r) = setup();
+        let reaper =
+            TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store)).with_sweep_slice(0);
+        let (recorded, _) = orphan_one_extent(&h);
+        let (unrecorded, _) = orphan_one_extent(&h);
+        reaper.deferred.lock().unwrap().extend(recorded.iter().copied());
+
+        let before = reaper.sweep_visits();
+        reaper.collect_orphans_if_due(1_000_000).unwrap();
+
+        assert_eq!(
+            reaper.sweep_visits() - before,
+            recorded.len() as u64,
+            "with no slice, a due pass must visit exactly its residue"
+        );
+        for a in recorded.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "recorded orphan {a} survived the residue");
+        }
+        for a in unrecorded.iter().copied() {
+            assert!(
+                h.store.arena_owner(a).is_some(),
+                "control: unrecorded orphan {a} was collected with the slice off, so something \
+                 other than the residue is sweeping"
+            );
+        }
+        assert_eq!(reaper.deferred_len(), 0, "the residue was swept and must be empty again");
+        assert_eq!(reaper.slice_freed(), 0, "the slice is off and must have freed nothing");
+    }
+
+    /// **D221: the slice rotates over every live arena, costs a fixed amount per pass, and finds
+    /// what the residue never held.**
+    ///
+    /// A due pass visits its residue plus exactly one slice, whatever the live count. Within
+    /// `ceil(live / slice)` due passes every live arena has been examined, so an orphan no
+    /// producer recorded (the crash shape, made in-process) is still collected in-process, and
+    /// `slice_freed` counts it: the detector fires on the case it exists for.
+    #[test]
+    fn d221_the_slice_rotates_over_every_live_arena_and_finds_what_the_residue_did_not() {
+        const SLICE: usize = 3;
+        let (h, _r) = setup();
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_sweep_slice(SLICE);
+        let mut kept = Vec::new();
+        for _ in 0..10 {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+            kept.push(h.store.arena_for(b.branch_id).unwrap());
+        }
+        let (orphan, _) = orphan_one_extent(&h);
+        let live = h.store.live_arenas().len();
+        assert!(live > 2 * SLICE, "fixture: {live} live arenas fit in two slices; nothing rotates");
+        assert_eq!(reaper.deferred_len(), 0, "fixture: no residue, so any find is the slice's");
+
+        // Two live arenas in the residue on the first pass: it visits them AND a whole slice.
+        let residue = [kept[0], kept[1]];
+        reaper.deferred.lock().unwrap().extend(residue);
+
+        let rotation = live.div_ceil(SLICE);
+        let t0 = 1_000_000u64;
+        for pass in 0..rotation {
+            let expect = SLICE + if pass == 0 { residue.len() } else { 0 };
+            let before = reaper.sweep_visits();
+            reaper.collect_orphans_if_due(t0 + pass as u64 * ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+            assert_eq!(
+                reaper.sweep_visits() - before,
+                expect as u64,
+                "due pass {pass} visited the wrong number of arenas: it must be the residue plus \
+                 one slice, whatever the live count ({live})"
+            );
+        }
+        for a in orphan.iter().copied() {
+            assert_eq!(
+                h.store.arena_owner(a),
+                None,
+                "unrecorded orphan {a} survived a whole rotation ({rotation} due passes of {SLICE})"
+            );
+        }
+        for a in kept.iter().copied() {
+            assert!(h.store.arena_owner(a).is_some(), "a live branch's extent {a} was freed");
+        }
+        assert_eq!(
+            reaper.slice_freed(),
+            orphan.len() as u64,
+            "the slice collected the unrecorded orphan but its detector did not count it"
+        );
+    }
+
+    /// **D221: a rotation ENDS, however fast new arenas arrive.**
+    ///
+    /// Arena ids only grow, so every new claim lands above the slice's cursor. The first version
+    /// of the slice always took "the next ones up" and wrapped only when fewer than a slice
+    /// remained. With one slice's worth of new arenas arriving before every pass it never wrapped,
+    /// so an orphan behind the cursor was never examined again (the fresh-context review's red
+    /// test, reproduced here). A rotation now has a fixed end, the highest id when it began, so
+    /// the orphan is reached in the next rotation.
+    #[test]
+    fn d221_an_orphan_behind_the_cursor_is_reached_while_new_arenas_keep_arriving() {
+        const SLICE: usize = 3;
+        const PASSES: u64 = 4;
+        let (h, _r) = setup();
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_sweep_slice(SLICE);
+        let claim = |n: usize| {
+            for _ in 0..n {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+                h.store.arena_for(b.branch_id).unwrap();
+            }
+        };
+
+        // The branch to be orphaned claims first, so its extent has the lowest id.
+        let doomed =
+            h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap().branch_id;
+        let doomed_arena = h.store.arena_for(doomed).unwrap();
+        claim(2 * SLICE - 1);
+        let t0 = 1_000_000u64;
+        reaper.collect_orphans_if_due(t0).unwrap();
+
+        // Examined above while its owner was live; the cursor is past it now. Orphaned by a path
+        // no producer records: the owner marked Reaped outside the reaper, the extent empty.
+        h.catalog.set_state(doomed, BranchState::Live, BranchState::Reaped).unwrap();
+        assert!(h.store.extent_is_empty(doomed_arena), "fixture: the doomed extent holds pages");
+        assert_eq!(reaper.deferred_len(), 0, "fixture: no residue, so any find is the slice's");
+
+        let mut reached = None;
+        for pass in 1..=PASSES {
+            claim(SLICE);
+            reaper.collect_orphans_if_due(t0 + pass * ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+            if h.store.arena_owner(doomed_arena).is_none() {
+                reached = Some(pass);
+                break;
+            }
+        }
+        assert!(
+            reached.is_some(),
+            "D221: with a slice of new arenas arriving before every pass, the orphan behind the \
+             cursor was not reached in {PASSES} passes: the slice chases new ids and its rotation \
+             never ends"
+        );
+    }
+
+    /// **D221: the slice leaves alone an extent a reap or drain is still holding.**
+    ///
+    /// The slice runs outside the statement lock. Between a drain's release (or a reap's
+    /// `Reaped` mark) and that drain's own sweep, the extent is collectable. A slice meeting it
+    /// there would count a healthy reap as an unrecorded producer, which would make `slice_freed`
+    /// fire on ordinary traffic. The guard holds the extent in flight; the slice skips it; if the
+    /// drain then fails, the guard records it and the residue collects it.
+    #[test]
+    fn d221_the_slice_skips_an_extent_a_guard_holds_and_the_guard_records_it() {
+        let (h, _r) = setup();
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+        let (orphan, _) = orphan_one_extent(&h);
+
+        // A drain on a statement thread, mid-flight: it holds the arenas it released pages into.
+        let mid_drain = DeferTouched::armed(&reaper, orphan.iter().copied().collect());
+        reaper.collect_orphans_if_due(1_000_000).unwrap();
+        for a in orphan.iter().copied() {
+            assert!(
+                h.store.arena_owner(a).is_some(),
+                "the slice freed extent {a} while a drain's guard held it"
+            );
+        }
+        assert_eq!(reaper.slice_freed(), 0, "a held extent was counted as an unrecorded producer");
+
+        // The drain fails before its sweep: the guard records what it held.
+        drop(mid_drain);
+        assert_eq!(reaper.deferred_len(), orphan.len(), "the failed drain's guard recorded none");
+        assert!(
+            reaper.in_flight.lock().unwrap().is_empty(),
+            "a dropped guard left arenas registered in flight, which the slice would skip forever"
+        );
+        reaper.collect_orphans_if_due(1_000_000 + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+        for a in orphan.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "the recorded extent {a} was not collected");
+        }
+        assert_eq!(reaper.slice_freed(), 0, "the residue, not the slice, must have collected it");
     }
 
             }

@@ -422,7 +422,8 @@ impl LeaseThread {
         //
         // The clock is `scan_once`'s, so the interval is measured in one unit. A node that cannot
         // read it (a cluster member with no applied tick) stamps nothing and keeps the old
-        // behaviour: its first scan that knows the time sweeps again. That is the safe direction.
+        // behaviour: its first scan that knows the time runs a due pass straight away (since
+        // D221 the residue plus a slice, not a second full sweep). That is the safe direction.
         // An interval has to start at a reading of the clock it is measured in, and the only cost
         // is the repeat this row removes everywhere else.
         if let Ok(now) = LeaseDeadline::try_now_millis() {
@@ -797,10 +798,11 @@ fn scan_once(
     // **D88: the orphan sweep runs OUTSIDE the statement lock.**
     //
     // `with_lock` above is the table-catalog mutex in both production shapes, so anything inside
-    // it stalls every connection for its duration. `collect_orphans_if_due` is O(live arenas) and
-    // does not touch the table catalog at all — it reads `live_arenas`, asks the BRANCH catalog
-    // whether each owner is dead, and frees through the page store, each of which has its own
-    // lock. Running it here keeps the cadence and the work identical and removes the stall.
+    // it stalls every connection for its duration. `collect_orphans_if_due` does not touch the
+    // table catalog at all — it reads live arenas, asks the BRANCH catalog whether each owner is
+    // dead, and frees through the page store, each of which has its own lock. Running it here
+    // keeps the cadence and the work identical and removes the stall. (It was O(live arenas) per
+    // due pass until D221; it is now the recorded residue plus a fixed slice.)
     //
     // ⚠ Ordered AFTER the reap, not before: a reap is what produces collectable extents, so
     // sweeping first would always be one tick behind. And any error is reported rather than

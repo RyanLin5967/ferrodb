@@ -235,8 +235,9 @@ const BLOCK: usize = 64;
 const READ_THREADS: [usize; 2] = [1, 8];
 /// The parent's lease thread runs its first pass and then sleeps for this long. The leases in this
 /// workload never expire, so its only other work would be the 60 s orphan sweep — a full catalog
-/// walk dropped into a timed window at a random moment. The CHILD, which is the restart being
-/// measured, uses the production interval.
+/// walk dropped into a timed window at a random moment (since D221 a residue plus a fixed slice,
+/// which is still work in a timed window). The CHILD, which is the restart being measured, uses
+/// the production interval.
 const PARENT_SCAN_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// Which PREREG arms this invocation runs. `None` from [`Arms::from_env`] means the historical

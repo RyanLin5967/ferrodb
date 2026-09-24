@@ -1275,7 +1275,8 @@ impl RuntimeLock for StandOffGate {
 /// So the stamp is bracketed. It must be at or after `entered`, the lease clock read inside the
 /// lock just before the resume ran. It must be at or before `after`, read once the first pass has
 /// finished. A due-check one millisecond short of an interval from `entered` must NOT sweep; one a
-/// full interval after `after` MUST, and must visit every live arena again.
+/// full interval after `after` MUST, and must visit every live arena again (since D221 a due pass
+/// visits one slice of the live arenas, and this fixture's few fit in one).
 ///
 /// Blind spots, stated. A MISSING stamp passes here: the first pass then sweeps and stamps its own
 /// `now`, which lands inside the bracket. The red test above is what catches that. And a stamp
