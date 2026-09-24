@@ -1146,7 +1146,9 @@ impl ArenaPageStore {
     /// This is the closing half of `reaper::drain_pending`'s read-modify-write: by the time it runs,
     /// the reclaimable pages have been released into their extents' recycled lists and the survivors
     /// are back on the log. That whole shape lives only in the free-space map, so it persists here
-    /// for the same reason `free_arena` does — once per drain, which is once per reap.
+    /// for the same reason `free_arena` does: once per drain, which is once per reap. The exception
+    /// is a drain that removed nothing and owes no recycled list. It persists NOTHING, because the
+    /// record would describe no change (see the elision below and [`Self::TAIL_PENDING_DRAINED`]).
     pub fn put_pending(&self, entries: Vec<PendingFree>) -> Result<(), FerroError> {
         // **D183 — a delta, not the whole image.** What this call changes is the pending-free log
         // and the recycled lists of the extents the drain released into; that is list-shaped
@@ -6730,6 +6732,17 @@ mod tests {
 /// and is now a bounded appended record. Every band therefore asserts the unchanged total AND the
 /// inverted split, so a "fix" that simply stopped persisting — which is data loss, not a fix —
 /// fails the first half while satisfying the second.
+///
+/// ⚠ **On branch `d183-drain-elide` that invariant no longer holds as written, and that is
+/// deliberate.** A drain that released nothing and owes no recycled list now writes NO record
+/// (see `put_pending`), so an interior reap whose live child pins every parked page makes ONE
+/// durable write where it made two. The total that stays invariant is records PLUS elided drains,
+/// and `ArenaPageStore::elided_drains` counts the second term, so "stopped persisting" is still
+/// told apart from "had nothing to persist". The bands in `d183adv_a1_what_the_real_reaper_costs`,
+/// `d183adv_a5_the_interior_cost_is_no_longer_a_class` and
+/// `d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending` still assert the OLD
+/// total. Re-stating them is a test edit, and it waits on a decision
+/// (`frontier/lane_d183_tail_replay.md` §5 in artie-research).
 #[cfg(test)]
 mod d183_adversary {
     use super::harness::Harness;
