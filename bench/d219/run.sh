@@ -25,7 +25,7 @@ DEFERALL=882e475 # every stamp deferred to the final sync (86e1762) + the schema
 ONEFLUSH=b875ab3 # ONE flush after all the rewrites (eff03e8) + the two-table red test
 ALTERRED=789d1da # catalog::alter tests 1-2 on 6f22427's code (flush before finish, unconditional)
 POISONRED=33e3d67 # catalog::alter test 3 on 77bddcb's code (stamps still written inside the rewrite loop)
-FIX=7999830      # the whole fix: a rewrite's stamps written after finish with one flush
+FIX=f513a37      # the whole fix: a rewrite's stamps written after finish with one flush, + review-6 tests
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -119,7 +119,6 @@ mutant M6_empty_batch_is_a_write provenance::durable::tests::an_empty_batch_is_n
 mutant M7_no_interned_guard provenance::store::tests::a_batch_of_rows_is_refused_whole_or_applied_whole
 mutant M8_counter_books_the_wrong_kind provenance::durable::tests::the_sync_counter_fires_once_per_append_by_kind_and_not_for_a_failed_one INTEGRATION
 mutant M9_publish_stamps_eager INTEGRATION
-mutant M10_rewrite_stamps_eager INTEGRATION
 mutant M11_no_explicit_flush INTEGRATION provenance::
 mutant M12_pending_written_last provenance::deferred::tests::stamps_through_the_stamper_ride_the_next_sync_and_write_the_same_file
 mutant M13_pending_ignores_the_refusal provenance::deferred::tests::the_stamper_refuses_at_the_stamp_and_queues_nothing_it_refused
@@ -133,6 +132,10 @@ mutant M20_flush_even_if_nothing_moved catalog::alter::tests::an_alter_that_stam
 mutant M21_stamps_before_finish catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 mutant M22_flush_error_swallowed catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 mutant M23_stamp_refusal_swallowed catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered
+mutant M24_rewrite_stamps_eagerly catalog::alter::tests::a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync
+mutant M25_stamp_the_old_rid catalog::alter::tests::a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync
+mutant M26_more_than_one_moved_row catalog::alter::tests::a_rewrite_that_moves_one_attributed_row_still_stamps_it
+mutant M27_epoch_bump_after_provenance catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"

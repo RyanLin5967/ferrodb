@@ -7,7 +7,13 @@
                                                   refusing unless its pattern matches exactly once
 
 A mutant whose pattern matches zero or several sites is REFUSED, never applied: a pattern that
-silently matched nothing would report every test "surviving" a mutation that never happened.
+silently matched nothing would report every test "surviving" a mutation that never happened. A
+mutant is (path, old, new), or (path, [(old, new), ...]) for one that must edit two places at once;
+every pair must match exactly once.
+
+M10 (the rewrite given the eager store instead of the stamper) was REMOVED at f513a37: since
+7999830 the rewrite queues and flushes on whatever store it is handed, so the two are the same
+program — an equivalent mutant, which can only "survive".
 
 Two mutants are pre-registered to SURVIVE, and are run so each blind spot is measured rather than
 asserted:
@@ -97,12 +103,6 @@ MUTANTS = {
         "            let author = Some((Arc::clone(&prov), snapshot.prov));\n",
         "            let author = Some((Arc::clone(self.provenance()), snapshot.prov));\n",
     ),
-    # The ALTER rewrite stamps through the eager store again: one sync per moved row.
-    "M10_rewrite_stamps_eager": (
-        RUNTIME,
-        "                .plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))\n",
-        "                .plan_alters(&report.table, &actions, &ctx.txn, Some(self.provenance()))\n",
-    ),
     # No explicit flush after record_applied. Pre-registered SURVIVOR (see docstring).
     "M11_no_explicit_flush": (
         RUNTIME,
@@ -185,7 +185,45 @@ MUTANTS = {
         "                    store.stamp_pending(*rid, *who)?;\n",
         "                    let _ = store.stamp_pending(*rid, *who);\n",
     ),
+    # ---- review 6 ---------------------------------------------------------------------------------
+    # The rewrite's stamps synced one by one again (a plain ALTER pays one sync per moved row).
+    "M24_rewrite_stamps_eagerly": (
+        ALTER,
+        "                    store.stamp_pending(*rid, *who)?;\n",
+        "                    store.stamp(*rid, *who)?;\n",
+    ),
+    # A moved row stamped at the rid it LEFT.
+    "M25_stamp_the_old_rid": (
+        ALTER,
+        "                moved.push((new_rid, who));\n",
+        "                moved.push((rid, who));\n",
+    ),
+    # The boundary: one moved attributed row is not enough.
+    "M26_more_than_one_moved_row": (
+        ALTER,
+        "            if !moved.is_empty() {\n",
+        "            if moved.len() > 1 {\n",
+    ),
+    # The epoch bump AFTER the provenance block: a failed flush leaves readers on the old shape.
+    "M27_epoch_bump_after_provenance": (
+        ALTER,
+        [
+            (
+                "        self.epoch_bump();\n        // **D219 — the moved rows' stamps",
+                "        // **D219 — the moved rows' stamps",
+            ),
+            (
+                "        Ok(shapes[1..].iter().map(shape_of).collect())\n",
+                "        self.epoch_bump();\n        Ok(shapes[1..].iter().map(shape_of).collect())\n",
+            ),
+        ],
+    ),
 }
+
+
+def pairs(edit):
+    """`[old, new]` or `[[(old, new), ...]]`, as unpacked from a MUTANTS value, as a list of pairs."""
+    return edit[0] if len(edit) == 1 else [tuple(edit)]
 
 
 def refuse(msg):
@@ -196,27 +234,30 @@ def refuse(msg):
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--check":
         sha = sys.argv[2]
-        for name, (path, old, _new) in MUTANTS.items():
+        for name, (path, *edit) in MUTANTS.items():
             blob = subprocess.run(
                 ["git", "show", f"{sha}:{path}"], capture_output=True, text=True, check=True
             ).stdout
-            n = blob.count(old)
-            print(f"{name}: {n} match(es) in {sha}:{path}")
-            if n != 1:
-                refuse(f"{name} matches {n} sites in {sha}:{path}")
+            for old, _new in pairs(edit):
+                n = blob.count(old)
+                print(f"{name}: {n} match(es) in {sha}:{path}")
+                if n != 1:
+                    refuse(f"{name} matches {n} sites in {sha}:{path}")
         print(f"all {len(MUTANTS)} patterns match exactly one site in {sha}")
         return
     if len(sys.argv) != 2 or sys.argv[1] not in MUTANTS:
         refuse(f"usage: mutants.py --check <sha> | mutants.py <{'|'.join(MUTANTS)}>")
     name = sys.argv[1]
-    path, old, new = MUTANTS[name]
+    path, *edit = MUTANTS[name]
     with open(path) as f:
         text = f.read()
-    n = text.count(old)
-    if n != 1:
-        refuse(f"{name} matches {n} sites in {path}")
+    for old, new in pairs(edit):
+        n = text.count(old)
+        if n != 1:
+            refuse(f"{name} matches {n} sites in {path}")
+        text = text.replace(old, new)
     with open(path, "w") as f:
-        f.write(text.replace(old, new))
+        f.write(text)
     print(f"applied {name} to {path}")
 
 
