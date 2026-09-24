@@ -345,3 +345,107 @@ The harness refuses on any other triple.
     `version_history` (⚖2).
 - Under `-b`: 2157 / 2.
 - `cargo build --examples`: compiles, including the new example.
+
+## Amendment 5 (append-only, before any run; written BEFORE the code and test it describes): a fresh-context review of `0570fe8..7c92d8d`
+
+The review was read-only, in a fresh context, and its report is in the lane report §9. It found no wrong
+answer: under Amendment 4's rule no live pin loses an entry it reads, and it re-derived every
+Amendment 4 test outcome by hand. It did find five defects in the design and in this document. Each is
+corrected here before the code that fixes it.
+
+1. **The per-seal cost claim was false.** Amendment 4 said reclaim costs "O(log n) per entry freed".
+   But `trim_history` drained a `Vec<u64>` from the front, which moves every entry that stays. A seal
+   therefore cost O(entries kept) per row.
+   - **Fix:** a row's unreachable prefix is dropped only once it is at least half the vector. A drain
+     then never moves more entries than it frees, which is amortised O(1) moves per entry freed. The
+     price is holding at most as many dead entries as live ones.
+   - **Index key:** `trimmable` now keys a row by the entry just after its oldest REACHABLE one, not by
+     its second-oldest entry, which the dead prefix would make wrong.
+   - **Unindexing:** the key is recomputed at the current horizon. That is sound because the horizon
+     only ever rises, except when it leaves "no pin" (`u64::MAX`), and at that horizon no row is indexed.
+
+2. **Amendment 4's rule keeps entries no pin can read.** It keeps everything at or above the oldest
+   pin's version. In the harness, an OLD pin taken before every publish would hold
+   256 × 128 = 32,768 entries and could read none of them. The tightened rule below is not the lead's
+   rule restated.
+   - **Tightened rule:** when `v` supersedes a row's newest entry `h` in sequence order, `h` stays only
+     if a live pin lies in `[h, v)`. The check is `pins.range(h..v)`, O(log n).
+   - **Why it is safe:** a pin taken later is at or above every `begin_ts` already published. An entry
+     no live pin reads when it is superseded can therefore never be read.
+   - **Unchanged:** the oldest-pin reclaim stays, for the entries a sealed pin DID read.
+   - **Still unbounded, stated here rather than found later:** an entry kept for a pin that is then
+     sealed while an OLDER pin lives stays until the oldest pin passes it. That is at most one entry per
+     row per such pin.
+
+3. **The guard is now membership, not a floor.** `exact_from` was a scalar that assumed nothing below
+   the oldest pin is kept. With (2), entries between pins are dropped too, so the history answers
+   exactly only for LIVE PIN VALUES.
+   - **Rule:** a read is refused iff `seen_through` is not a key of `retention.pins`, checked in
+     O(log n).
+   - **Not refused:** a read whose own pin moved, while another live branch still pins that value (a
+     child that inherited it, say). It is answered exactly.
+   - `exact_from` is removed.
+
+4. **The race's route was misstated** in the `record_read` comment and in Amendment 4. They said "from
+   another connection", and that `ABANDON` is serialised by `&mut Catalog`. Both were wrong.
+   - **Over pgwire the race cannot happen.** Each connection registers a read slot
+     (`pgwire/mod.rs:439`), and a shared-path `SELECT` holds its read pass across all of
+     `try_run_read`. Every exclusive statement's `ServerContext::catalog()` first drains the registered
+     readers (`drain_readers`).
+   - **In-process it can.** `AgentRuntime::abandon(&self)` and `forget_reaped_branches(&self)` take no
+     `ExecCtx`. A library caller that reads through a catalog clone can race them, or can race a
+     `REBASE` made under a different catalog handle.
+   - **The guard stays**, with the route named correctly.
+   - **Writes are unaffected.** Writes and `REBASE` both take `&mut Catalog` through `ExecCtx`, so they
+     are serialised with each other. A write whose branch is sealed mid-statement already refuses in
+     `stage_all` ("no agent session").
+
+5. **The harness was not d55's `exec`.** It made a fresh catalog cache and an unregistered read slot on
+   every call, so every statement took the exclusive path and cloned the catalog.
+   - **Fix:** each session now carries its own cache and registered slot, as `d55_agent_read_scaling`'s
+     worker threads do.
+   - **What it affected:** the hop integers never depended on this; the latencies did.
+   - **Also added:** the harness now prints the `SEQ_SCAN_TUPLES` delta it names, and REFUSES a seqscan
+     point read whose delta is not `ROWS`.
+
+**Correction to Amendment 4's M11 integer:** under M11, `..._is_freed_when_the_oldest_pin_is_sealed`
+held 101 entries, not 103, because publishes 1–3 still trim at publish time. The verdict (FAILS) was
+right. The table below replaces Amendment 4's mutant table.
+
+### Tests, replacing Amendment 4's table (all in `runtime.rs` `mod tests`)
+
+Amendment 4's six tests stand, and one is added. The new test names only fields and functions that exist
+at `0570fe8`, so its red state can be observed at `0570fe8` AND at `7c92d8d`, which carries Amendment 4's
+rule alone.
+
+| test | `0570fe8` | `7c92d8d` | fix |
+|---|---|---|---|
+| `version_history_holds_only_the_versions_live_pins_read`: row 1 gets 3 publishes, a pin at 3, then 100 more; row 2 gets 100 publishes after the pin | **FAILS** at row 1: len 103, bound 2 | **FAILS** at row 1: len 101, bound 2 | passes: row 1 is `[3, 103]` and names 3; row 2 is `[latest]` |
+
+The other six have the same outcome at every commit. At the fix they derive as follows:
+- keeps-what-a-pin-reads: len 2, names 3.
+- freed-at-seal: len 1, names 103.
+- flat publish loop: held 4.
+- flat SQL loop: 2 == 2.
+- never-names: refused, because 3 is not in pins `{5}`.
+- pin audit: panics.
+
+`cargo test --lib version_history` selects **7**, and all 7 pass at the fix in debug.
+
+### Mutants, replacing Amendment 4's
+
+| id | edit | expected |
+|---|---|---|
+| M11 | `reclaim_history` returns at once | `..._is_freed_when_the_oldest_pin_is_sealed` FAILS (len 2, want 1). `..._merge_loop_through_sql` FAILS on the bound, since every row keeps at least 2 entries and held is then ≥ 4 > 2. The other five pass. |
+| M12 | the in-order supersession never pops (no `pins.range` check) | `..._holds_only_the_versions_live_pins_read` FAILS (row 1 len 101). The flat publish loop PASSES because the no-pin trim covers it: recorded, not a gap. |
+| M13 | `State::pin` does not index a lazy pin | debug: "pins disagree with a scan" in at least one lib or agent-target test (`grep -c 'pins disagree'` ≥ 1). |
+| M14 | the membership refusal in `record_read` is removed | `..._never_names_a_version_a_read_did_not_see` FAILS: `Ok`, naming `begin_ts 0`, want 3. |
+
+### Counts, replacing Amendment 4's
+
+- Run of record at default QoS: **58 result lines, 2159 passed (2152 + 7), 1 failed, 2 ignored**.
+  - The failure is the envelope tripwire at `get_mut(` **5**. Its State allowlist also needs
+    `version_history` and `retention`.
+- Under `-b`: 2158 / 2.
+- `cargo test --lib rebase`: 4.
+- `cargo build --examples`: compiles.
