@@ -160,7 +160,8 @@ fn main() {
     // at exit, so it makes the one call rather than calling that function. Both run whatever the
     // other returns, so a failed publish does not cost the arena its checkpoint (D244 review 3,
     // R3-F2); the publish's error is reported first.
-    let published = branches.publish_root_durably();
+    // D244 MUTANT MF: pgserver skips the branch catalog's publish
+    let published: Result<(), ferrodb::error::FerroError> = Ok(());
     let arena_checkpoint = store.checkpoint(Path::new(&arena_path));
     if let (Err(_), Err(a)) = (&published, &arena_checkpoint) {
         let _ = writeln!(std::io::stderr(), "pgserver: the arena checkpoint failed as well ({a})");
