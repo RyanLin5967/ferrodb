@@ -1271,3 +1271,55 @@ fn f1_a_lease_that_lapsed_while_nothing_was_scanning_survives_the_scans_after_a_
     assert_eq!(state_of(&f, branch), BranchState::Reaped);
     assert!(f.h.store.live_page_count().unwrap() < with_pages, "the reap freed nothing");
 }
+
+/// **Rule 5's crash path — the Turso lane's R2 lesson.** A mark written only on a clean close
+/// loses the whole of the last run's open time after a crash, and the next start then credits it
+/// as downtime. Here the thread is never stopped: one scan runs on an armed reaper and the
+/// "process" ends there, with no `stop` and no `Drop` of any `LeaseThread`. The mark the next
+/// start measures from must be that scan's, not the one written at start.
+#[test]
+fn f1_every_scan_records_the_mark_so_a_crash_does_not_lose_the_time_since_start() {
+    let f = table_fixture();
+    let marked_at_start = match f.reaper.resume_lease_clock().unwrap() {
+        LeaseResume::FirstStart { now_millis } => now_millis,
+        other => panic!("a fresh table catalog must report a first start, got {other:?}"),
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let before_scan = LeaseDeadline::now_millis();
+    assert!(before_scan > marked_at_start, "premise: the scan must read a later clock than start");
+
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &|_| {});
+    assert_eq!(counters.snapshot().scans, 1, "premise: the scan must have completed");
+
+    // The crash is here. The next start asks the catalog what it last recorded.
+    match f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap() {
+        LeaseResume::Resumed { last_alive, .. } => assert!(
+            last_alive >= before_scan,
+            "the next start measures from {last_alive}, the mark written at START \
+             ({marked_at_start}), not the scan's (>= {before_scan}): the scan recorded nothing, so \
+             after a crash every lease would be handed all the time since the process started"
+        ),
+        other => panic!("the catalog lost its mark: {other:?}"),
+    }
+}
+
+/// The other side of arming: a reaper that never resumed the lease clock writes no mark, however
+/// many scans run through it. Every `scan_once` a test drives by hand is such a reaper, and so is
+/// any caller that is not `LeaseThread` — a mark from one of them would be a "last alive" that no
+/// enforcing process ever wrote, and the next real start would measure its downtime from it.
+#[test]
+fn f1_a_reaper_that_never_resumed_the_clock_writes_no_mark() {
+    let f = table_fixture();
+    let counters = Counters::default();
+    for _ in 0..3 {
+        scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &|_| {});
+    }
+    assert_eq!(counters.snapshot().scans, 3, "premise: the scans must have completed");
+    let now = LeaseDeadline::now_millis();
+    assert_eq!(
+        f.h.catalog.resume_leases(now).unwrap(),
+        LeaseResume::FirstStart { now_millis: now },
+        "an unarmed reaper recorded a last-alive mark"
+    );
+}

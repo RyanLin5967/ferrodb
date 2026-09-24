@@ -125,11 +125,15 @@ impl Display for CommitHash {
     }
 }
 
-/// Wall-clock deadline, unix epoch milliseconds.
+/// Lease deadline, in milliseconds on the unix-epoch scale **as the lease clock reckons them**.
 ///
 /// Leases are the answer to the abandoned-agent problem (DESIGN.md exit criterion 8): a
 /// background scan hard-reaps anything past deadline **without the client ever calling close**.
 /// Every branch carries one; there is no exemption class.
+///
+/// The scale is the wall clock's, and on a standalone node the clock is anchored to it — but since
+/// F2 it is not a wall-clock reading: it advances monotonically inside a process and is stopped
+/// while no process is running (see `cluster::local_lease_millis` and [`LeaseResume`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct LeaseDeadline(pub u64);
 
@@ -220,6 +224,48 @@ impl LeaseDeadline {
     pub fn is_expired_now(&self) -> Result<bool, crate::cluster::GrantError> {
         Ok(self.is_expired_at(Self::try_now_millis()?))
     }
+}
+
+/// What resuming the lease clock at startup did — F1's restart grace.
+///
+/// # The rule, and whose it is
+///
+/// Chubby §2.9: *"The authoritative timer for session leases runs at the master, so until a new
+/// master is elected the session lease timer is stopped; this is legal because it is equivalent to
+/// extending the client's lease."* And §2.8: the master *"is free to advance this timeout further
+/// into the future, but may not move it backwards in time."*
+///
+/// Before this existed, a database restarted after an outage longer than a branch's remaining
+/// lease reaped that branch on its first scan: the outage was charged to every lease, the agent
+/// never had a chance to act, and nothing could tell "abandoned before the outage" from "expired
+/// because of it". Now each catalog that can keeps a durable **last-alive mark** — the lease clock
+/// reading at which leases were last being enforced — and at startup every live lease that was
+/// still running at that mark is extended by the measured downtime. A lease that had already run
+/// out before the mark is left exactly as it was, and is reaped: extending by the downtime cannot
+/// bring a deadline at or before the mark back past the restart, so there is nothing to write.
+///
+/// Every variant is an outcome to REPORT. Two of them mean the grace was not applied, and both
+/// say why rather than looking like a restart that happened to extend nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseResume {
+    /// This catalog keeps no last-alive mark, so downtime cannot be measured and no lease was
+    /// extended — a lease that lapsed while the process was down is reaped on the first scan, as
+    /// before F1. The trait's default; `TableBranchCatalog`, which both binaries open, overrides it.
+    NoMark,
+    /// This process is a cluster member. Its lease time is the replicated `LeaseTick`, identical on
+    /// every member; extending deadlines on one node's restart would make the nodes disagree about
+    /// whether a branch is live, which exit criterion 9 forbids. Stopping the timer during a
+    /// cluster outage is the tick's proposer's to do. Nothing was extended.
+    Clustered,
+    /// No mark had been recorded yet — a new database, or the first start of a build with this
+    /// grace. The downtime before this start cannot be measured, so nothing was extended; the mark
+    /// is now `now_millis`, and every later start is measured from marks.
+    FirstStart { now_millis: u64 },
+    /// The clock was resumed. `downtime_millis` is `now_millis - last_alive`, saturating at zero
+    /// when the lease clock reads earlier than the mark (the wall clock stepped back between
+    /// processes: every deadline then already has more time than it had, and nothing moves
+    /// backwards). `extended` live leases were moved later by exactly `downtime_millis`.
+    Resumed { last_alive: u64, now_millis: u64, downtime_millis: u64, extended: u64 },
 }
 
 /// Lifecycle of a branch. `Reaping` is observable: the reaper marks before it frees, so a crash
@@ -317,6 +363,12 @@ pub enum BranchError {
     /// already lifted, or re-marking a branch somebody else is reaping.
     UnexpectedState { branch: BranchId, expected: BranchState, actual: BranchState },
     /// The lease expired; the branch is eligible for non-cooperative reaping.
+    ///
+    /// **Raised, not just defined, since F1's adjacent point.** It was constructed nowhere, so a
+    /// branch whose lease had run out but which the scan had not reached yet — up to one scan
+    /// interval for every branch that expires — could still be forked from (the child then pinned
+    /// it) and written to (the write was then thrown away with it). `AgentRuntime` now refuses both
+    /// with this; see `AgentRuntime::refuse_if_lease_expired`. Reads are not refused.
     LeaseExpired { branch: BranchId, deadline: LeaseDeadline, now_millis: u64 },
     /// A write was attempted against a read-only or already-merged branch.
     NotWritable(BranchId),

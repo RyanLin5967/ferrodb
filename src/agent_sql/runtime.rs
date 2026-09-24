@@ -1635,6 +1635,11 @@ impl AgentRuntime {
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
+        // **F1, adjacent point.** A child forked from a parent whose lease has run out pins that
+        // parent — its pages stay reachable through the child's root — while extending nothing:
+        // the parent is still reaped on the next scan and its record goes with it. Neon refuses to
+        // "create children from expiring branches"; so does this, before anything is staged.
+        self.refuse_if_lease_expired(parent)?;
         // STAGED, not durable. The ticket travels out with the session; see the type's docs.
         let (record, fork_seq_ticket) = self
             .branches
@@ -2583,6 +2588,15 @@ impl AgentRuntime {
             }
         };
 
+        // **F1, adjacent point — the second door into a branch's staged state.** `stage_all`
+        // refuses an expired lease; this path never reaches `stage_all` (`record.rs`, "The
+        // branch-scoped schema path"), so it refuses for itself. The session check comes first,
+        // as it does there, so a sealed branch still says "no agent session" rather than "reaped".
+        if !self.state.lock().unwrap().workspaces.contains_key(&branch) {
+            return Err(FerroError::Branch(format!("no agent session on branch {branch}")));
+        }
+        self.refuse_if_lease_expired(branch)?;
+
         let mut state = self.state.lock().unwrap();
         let ws = state
             .workspaces
@@ -2977,6 +2991,55 @@ impl AgentRuntime {
         Ok(self.branches.get(branch)?.envelope)
     }
 
+    // ---- the lease -------------------------------------------------------------------------
+
+    /// Refuse to fork from, or write to, `branch` if its lease has expired — **F1's adjacent
+    /// point**, and the only place `BranchError::LeaseExpired` is constructed.
+    ///
+    /// An expired branch that the scan has not reached yet is an ordinary state, not a race: every
+    /// branch that expires sits in it for up to one scan interval, and for as long as a statement
+    /// holds the runtime lock the scan waits on. Before this, nothing refused it. A fork from it
+    /// succeeded and the child pinned it without extending it; a write to it succeeded and was
+    /// thrown away when the scan arrived. Called by the three doors that create or write branch
+    /// state — `begin_session_as_staged` (for the PARENT), `stage_all` and `stage_schema_edit`.
+    /// Reads are not refused: an agent may look at what it has until the branch is gone.
+    ///
+    /// **The predicate is the reaper's, not the record's**: `BranchCatalog::enforced_lease` answers
+    /// only for a `Live` non-trunk branch, which is what a scan reaps. A quarantined branch's
+    /// deadline expired long ago and is never enforced, so it is not refused here for it.
+    ///
+    /// Trunk is skipped without a read: it holds a lease nobody may act on, and it is the parent of
+    /// almost every fork, so asking would add a catalog descent to every `BEGIN AGENT SESSION`.
+    ///
+    /// **The clock is the one the reaper uses**, `LeaseDeadline::try_now_millis`, so "refused here"
+    /// and "reapable there" are the same predicate on the same reading. On a cluster member that has
+    /// applied no tick it REFUSES, carrying the `GrantError`: that node cannot tell whether the
+    /// lease is live, and a guard that cannot decide must not fall through to allow. (A fork there
+    /// would already abort in `LeaseDeadline::from_now`; this turns that into a refusal.)
+    ///
+    /// Not atomic with what follows it, and it does not need to be. A lease can only move LATER
+    /// under this check (a renewal), which makes a refusal conservative and retryable; and a reap
+    /// that lands after the check is still caught where it always was — `fork_staged` and the
+    /// envelope read both `check_readable`, and refuse a `Reaping` or `Reaped` branch.
+    fn refuse_if_lease_expired(&self, branch: BranchId) -> Result<(), FerroError> {
+        if branch.is_trunk() {
+            return Ok(());
+        }
+        let Some(deadline) = self.branches.enforced_lease(branch)? else {
+            return Ok(());
+        };
+        let now = LeaseDeadline::try_now_millis()?;
+        if deadline.is_expired_at(now) {
+            return Err(crate::branch::types::BranchError::LeaseExpired {
+                branch,
+                deadline,
+                now_millis: now,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Stage every row of ONE statement, or none of them.
     ///
     /// # The defect this shape exists to prevent
@@ -3020,6 +3083,12 @@ impl AgentRuntime {
         if !self.state.lock().unwrap().workspaces.contains_key(&branch) {
             return Err(FerroError::Branch(format!("no agent session on branch {}", branch)));
         }
+
+        // **F1, adjacent point — before anything is decided, charged or staged.** A branch whose
+        // lease has run out is the next scan's to reap, and a row written into it now is thrown
+        // away with it. After the session check, so a sealed branch still says "no agent session",
+        // and before the envelope, so a refused statement spends no budget.
+        self.refuse_if_lease_expired(branch)?;
 
         // **The capability envelope, read from the branch's own DURABLE record.**
         //

@@ -143,6 +143,18 @@ impl CoreRecord {
     pub fn serialize_core(&self) -> Vec<u8> {
         self.0.serialize_core()
     }
+    /// The same core with its lease deadline replaced — F1's restart grace, which moves every live
+    /// deadline and must not pay a hydration per branch to do it.
+    ///
+    /// **Safe by direction, like [`CoreRecord::narrow`]:** it changes one fixed-width core field and
+    /// yields a `CoreRecord`, so the result is exactly as incomplete as its input and still cannot
+    /// be mistaken for a whole record. What it makes possible is rewriting the stored core — whose
+    /// bytes never held `arenas` or `envelope` — without routing through `write_record`, which
+    /// reconciles the arena span against the record it is handed and would empty it.
+    pub fn with_lease_deadline(mut self, deadline: LeaseDeadline) -> CoreRecord {
+        self.0.lease_deadline = deadline;
+        self
+    }
 }
 
 impl BranchRecord {

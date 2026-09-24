@@ -23,12 +23,14 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::record::{CoreRecord, BranchRecord};
-use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState};
+use crate::branch::types::{
+    ArenaId, BranchError, BranchId, BranchState, LeaseDeadline, LeaseResume,
+};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
 use crate::error::FerroError;
@@ -136,6 +138,14 @@ pub struct TwoTierReaper {
     /// to bump is a counter the next caller forgets. `scan_once` additionally *reports* the text;
     /// this is the floor that makes a refusal impossible to drop entirely, whoever asked for it.
     refused_reaps: AtomicU64,
+    /// **F1.** Whether this reaper resumed a lease clock whose last-alive mark its catalog keeps,
+    /// and so owes that mark a heartbeat. Set by [`Self::resume_lease_clock`] and nothing else.
+    ///
+    /// A flag rather than a question put to the catalog on every scan, because the answer is only
+    /// meaningful after a resume: a reaper that never resumed — every caller of `scan_once` that is
+    /// not `LeaseThread`, and every test that drives a sweep by hand — must not start writing marks
+    /// that the next start would measure a downtime from.
+    lease_marks: AtomicBool,
 }
 
 impl TwoTierReaper {
@@ -149,7 +159,45 @@ impl TwoTierReaper {
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
+            lease_marks: AtomicBool::new(false),
         }
+    }
+
+    /// **F1 — resume the lease clock before the first scan.** See [`LeaseResume`] for the rule.
+    ///
+    /// The other half of startup beside [`Self::resume_interrupted_reaps`], and called beside it
+    /// by `LeaseThread::start`, on the caller's thread and under the runtime lock: a restart that
+    /// scanned first would reap every branch whose lease lapsed while the process was down, which
+    /// is the defect this exists to remove.
+    ///
+    /// Not applied on a cluster member ([`LeaseResume::Clustered`]): lease time there is the
+    /// replicated tick, the same on every member, and extending deadlines on one node's restart is
+    /// the divergence exit criterion 9 forbids. A member does not arm the heartbeat either, so a
+    /// tick value never becomes a mark a later standalone start would measure from.
+    pub fn resume_lease_clock(&self) -> Result<LeaseResume, FerroError> {
+        if crate::cluster::is_clustered() {
+            return Ok(LeaseResume::Clustered);
+        }
+        // Standalone, so this cannot refuse; `?` rather than a fabricated reading if it ever does.
+        let now = LeaseDeadline::try_now_millis()?;
+        let resumed = self.catalog.resume_leases(now)?;
+        if resumed != LeaseResume::NoMark {
+            self.lease_marks.store(true, Ordering::SeqCst);
+        }
+        Ok(resumed)
+    }
+
+    /// **F1 — the heartbeat the next start measures downtime from.** Records `now_millis` as the
+    /// catalog's last-alive mark, if [`Self::resume_lease_clock`] armed this reaper; otherwise a
+    /// no-op, and deliberately silent, because an unarmed reaper already said why when it resumed.
+    ///
+    /// Skipped on a cluster member for the reason `resume_lease_clock` gives, re-checked here
+    /// because the authority is process-scoped and can change after startup.
+    pub fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
+        if !self.lease_marks.load(Ordering::SeqCst) || crate::cluster::is_clustered() {
+            return Ok(());
+        }
+        self.catalog.record_lease_alive(now_millis)
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].

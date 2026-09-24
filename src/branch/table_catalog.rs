@@ -850,6 +850,85 @@ impl TableBranchCatalog {
         Ok(out)
     }
 
+    /// The durable last-alive mark, or `None` if none was ever recorded. See
+    /// [`crate::branch::LeaseResume`].
+    fn alive_mark(&self) -> Result<Option<u64>, FerroError> {
+        match self.tree.search(&keys::alive())? {
+            None => Ok(None),
+            Some(b) if b.len() == 8 => Ok(Some(u64::from_be_bytes(b[..].try_into().unwrap()))),
+            // Refused rather than read as "no mark": that reading would skip the grace for this
+            // restart, and whatever lapsed during the outage would be reaped on a guess.
+            Some(b) => Err(BranchError::Corrupt(format!(
+                "the last-alive mark must be 8 bytes, got {}; refusing to measure downtime from it",
+                b.len()
+            ))
+            .into()),
+        }
+    }
+
+    /// Move every `Live` non-trunk deadline strictly after `mark` later by `by`. Returns how many
+    /// moved. **Call under `logical`**, inside the one write [`BranchCatalog::resume_leases`] makes.
+    ///
+    /// # Why not `renew_lease` per branch
+    ///
+    /// Each `renew_lease` is its own durable write — one fsync apiece, and one caller here, so
+    /// group commit has nothing to batch. `lease_thread.rs`'s `REAP_CHUNK` note records ~58 ms per
+    /// reap on this machine, fsync-bound; if a lone durable write costs even a tenth of that, 10⁶
+    /// live branches is well over an hour of startup (INFERRED, not measured). This moves them all
+    /// inside ONE stage/durable, which is also what makes the extension and the new mark a single
+    /// atomic step.
+    ///
+    /// # Why not `write_record`
+    ///
+    /// `write_record` rewrites the state key, the envelope key and every arena key, and range-scans
+    /// the arena span to reconcile it — O(arenas) per branch to change one fixed-width field. This
+    /// writes exactly the two things a deadline lives in: the RECORD core (via
+    /// [`CoreRecord::with_lease_deadline`], so no hydration and no arena span is touched) and the
+    /// branch's one DEADLINE key, moved. The state, envelope and arena keys are not part of a
+    /// deadline and are not rewritten.
+    ///
+    /// # Cost, stated rather than hidden
+    ///
+    /// **O(live branches) at startup** — every lease running at the mark is a real write, and at
+    /// steady state that is every live branch. UNMEASURED here (no compute in this lane). It is the
+    /// same complexity class as the open-time orphan sweep `resume_interrupted_reaps` already runs
+    /// (`collect_orphaned_extents`, O(live arenas)); it is NOT the "one descent" `open` itself is.
+    /// The O(1) alternative is a durable downtime credit added to every deadline at the catalog
+    /// boundary; it was not taken because every read path of every catalog would have to apply it,
+    /// and one that did not would make a lease decision on the wrong scale.
+    ///
+    /// The DEADLINE index is a hint, as it is for `expired_before`: an entry is acted on only if the
+    /// record it names is `Live`, non-trunk, and still carries exactly the deadline the entry was
+    /// filed under. Collected first and rewritten after, because the rewrite moves keys forward
+    /// inside the very span being scanned.
+    fn extend_leases_after(&self, mark: u64, by: u64) -> Result<u64, FerroError> {
+        let (lo, hi) = keys::deadlines_after(mark);
+        let mut running: Vec<(u64, u64)> = Vec::new();
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, _) = entry?;
+            if let Some(pair) = keys::deadline_from_key(&k) {
+                running.push(pair);
+            }
+        }
+        let mut moved = 0u64;
+        for (deadline, id) in running {
+            let Some(core) = self.core(id)? else { continue };
+            if !Self::in_deadline_index(core.state(), core.branch_id())
+                || core.lease_deadline().0 != deadline
+            {
+                continue;
+            }
+            // Saturating: a deadline that would pass `u64::MAX` is already "never", and wrapping
+            // it would be a deadline in 1970.
+            let later = LeaseDeadline(deadline.saturating_add(by));
+            self.upsert(keys::record(id), core.with_lease_deadline(later).serialize_core())?;
+            self.remove_if_present(&keys::deadline(deadline, id))?;
+            self.upsert(keys::deadline(later.0, id), Vec::new())?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
     /// Live branches, for parity with `LogBranchCatalog::live_count`.
     pub fn live_count(&self) -> Result<usize, FerroError> {
         let (lo, hi) = keys::whole_state(BranchState::Live.as_u8());
@@ -1420,6 +1499,54 @@ impl BranchCatalog for TableBranchCatalog {
         self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
+    }
+
+    fn enforced_lease(&self, branch: BranchId) -> Result<Option<LeaseDeadline>, FerroError> {
+        // One point lookup on the core, for `envelope_of`'s reason: this is asked on every agent
+        // write, and `get` would range-scan the branch's arena span to answer about one field.
+        // `in_deadline_index` is the predicate the reaper's own query is built on, so "refused
+        // here" and "reapable there" cannot drift apart.
+        let rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        Ok(Self::in_deadline_index(rec.state(), rec.branch_id()).then_some(rec.lease_deadline()))
+    }
+
+    fn resume_leases(&self, now_millis: u64) -> Result<crate::branch::LeaseResume, FerroError> {
+        use crate::branch::LeaseResume;
+        // Under `logical` for the whole read-modify-write, like every mutator here: the mark read,
+        // the deadlines moved and the new mark are one step, and nothing may renew or fork between.
+        let _g = self.logical.lock().unwrap();
+        let outcome = match self.alive_mark()? {
+            None => LeaseResume::FirstStart { now_millis },
+            Some(last_alive) => {
+                let downtime_millis = now_millis.saturating_sub(last_alive);
+                let extended = if downtime_millis == 0 {
+                    0
+                } else {
+                    self.extend_leases_after(last_alive, downtime_millis)?
+                };
+                LeaseResume::Resumed { last_alive, now_millis, downtime_millis, extended }
+            }
+        };
+        // The new mark goes in the SAME write as the extension. Written separately, a crash
+        // between the two leaves extended deadlines beside the old mark, and the next start
+        // measures the same outage again and extends every lease twice.
+        self.upsert(keys::alive(), now_millis.to_be_bytes().to_vec())?;
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)?;
+        Ok(outcome)
+    }
+
+    fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
+        // One key. Under `logical` because `resume_leases` reads and writes this key under it, and
+        // durable because a mark that never reaches the disk is a restart that credits the whole
+        // uptime since the last one that did as downtime.
+        let _g = self.logical.lock().unwrap();
+        self.upsert(keys::alive(), now_millis.to_be_bytes().to_vec())?;
         let seq = self.stage()?;
         drop(_g);
         self.durable(seq)
@@ -2736,3 +2863,188 @@ enum ChildLiveness {
     // variant unconstructed would only invite the next reader to resolve into it again.
 }
 
+
+/// **F1 — the restart grace, at the catalog.** `resume_leases` is Chubby's stopped timer: every
+/// lease still running at the last-alive mark moves later by exactly the downtime, in one write
+/// with the new mark. The end-to-end claim is pinned through `pgserver` in
+/// `tests/integration_server_reaps.rs`; these pin the edges that test cannot reach.
+#[cfg(test)]
+mod f1_lease_grace {
+    use super::*;
+    use crate::branch::LeaseResume;
+
+    fn sidecar(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-f1-grace-{}-{tag}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn lease(c: &TableBranchCatalog, b: BranchId) -> u64 {
+        c.get_raw(b.id).unwrap().lease_deadline.0
+    }
+
+    fn expired_ids(c: &TableBranchCatalog, now: u64) -> Vec<u64> {
+        c.expired_before(now).unwrap().iter().map(|r| r.branch_id().id).collect()
+    }
+
+    #[test]
+    fn a_first_start_records_a_mark_and_extends_nothing() {
+        let path = sidecar("first");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap().branch_id;
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        assert_eq!(c.alive_mark().unwrap(), None, "a new catalog has no mark");
+
+        assert_eq!(c.resume_leases(5_000).unwrap(), LeaseResume::FirstStart { now_millis: 5_000 });
+        assert_eq!((lease(&c, a), lease(&c, b)), (1_000, 9_000), "nothing to measure from");
+        assert_eq!(c.alive_mark().unwrap(), Some(5_000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_resume_moves_exactly_the_leases_running_at_the_mark_by_exactly_the_downtime() {
+        let path = sidecar("exact");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let before_mark = c.fork(BranchId::TRUNK, LeaseDeadline(900)).unwrap().branch_id;
+        // Expired AT the mark: `is_expired_at` is inclusive, so this lease had run out while the
+        // database was still up. The boundary a strict/non-strict slip would move.
+        let at_mark = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap().branch_id;
+        let running = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        let never = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX - 5)).unwrap().branch_id;
+        let held = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+        c.set_state(held, BranchState::Live, BranchState::Quarantined).unwrap();
+        // The narrow write must leave the unbounded fields alone: `write_record` handed a core
+        // record would have emptied the arena span, which is the leak `CoreRecord` exists to stop.
+        c.add_arena(running, ArenaId(77)).unwrap();
+        c.restrict_envelope(running, CapabilityEnvelope::new(0b111, 10)).unwrap();
+
+        c.record_lease_alive(1_000).unwrap();
+        let resumed = c.resume_leases(4_000).unwrap();
+        assert_eq!(
+            resumed,
+            LeaseResume::Resumed {
+                last_alive: 1_000,
+                now_millis: 4_000,
+                downtime_millis: 3_000,
+                extended: 2
+            },
+            "exactly `running` and `never` were still running at the mark"
+        );
+        assert_eq!(lease(&c, before_mark), 900, "a lease that ran out before the mark was moved");
+        assert_eq!(lease(&c, at_mark), 1_000, "a lease that ran out AT the mark was moved");
+        assert_eq!(lease(&c, running), 4_500, "moved by other than the downtime");
+        assert_eq!(lease(&c, never), u64::MAX, "saturates, never wraps to 1970");
+        assert_eq!(lease(&c, held), 1_500, "a quarantined branch is not Live and is not extended");
+        assert_eq!(lease(&c, BranchId::TRUNK), crate::branch::TRUNK_LEASE.0);
+
+        let whole = c.get(running).unwrap();
+        assert_eq!(whole.arenas, vec![ArenaId(77)], "the extension dropped the branch's arenas");
+        assert!(whole.envelope.is_some(), "the extension dropped the branch's envelope");
+
+        // The DEADLINE index moved WITH the records: what the reaper is asked agrees with what the
+        // records say, and no stale entry was left at the old deadline.
+        assert_eq!(expired_ids(&c, 4_000), vec![before_mark.id, at_mark.id]);
+        assert_eq!(expired_ids(&c, 4_499), vec![before_mark.id, at_mark.id]);
+        assert_eq!(expired_ids(&c, 4_500), vec![before_mark.id, at_mark.id, running.id]);
+        assert_eq!(c.alive_mark().unwrap(), Some(4_000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resuming_twice_at_the_same_reading_extends_the_outage_once() {
+        // The extension and the new mark are one write, so the second resume measures from the
+        // mark the first one left and finds no downtime. Written as two writes, a crash between
+        // them would be this test with the second resume measuring from the OLD mark.
+        let path = sidecar("twice");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(2_000)).unwrap().branch_id;
+        c.record_lease_alive(1_000).unwrap();
+        c.resume_leases(4_000).unwrap();
+        assert_eq!(lease(&c, b), 5_000);
+        assert_eq!(
+            c.resume_leases(4_000).unwrap(),
+            LeaseResume::Resumed {
+                last_alive: 4_000,
+                now_millis: 4_000,
+                downtime_millis: 0,
+                extended: 0
+            }
+        );
+        assert_eq!(lease(&c, b), 5_000, "the same outage was credited twice");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_clock_behind_the_mark_moves_nothing_and_the_mark_follows_the_clock() {
+        // The wall clock stepped BACK between two processes: every deadline already has more time
+        // than it had, so nothing moves — and the mark is overwritten, not kept as a maximum, or
+        // the next outage would be measured from a point the clock has not reached.
+        let path = sidecar("behind");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(6_000)).unwrap().branch_id;
+        c.record_lease_alive(5_000).unwrap();
+        assert_eq!(
+            c.resume_leases(3_000).unwrap(),
+            LeaseResume::Resumed {
+                last_alive: 5_000,
+                now_millis: 3_000,
+                downtime_millis: 0,
+                extended: 0
+            }
+        );
+        assert_eq!(lease(&c, b), 6_000, "a deadline moved backwards, or forwards for no outage");
+        assert_eq!(c.alive_mark().unwrap(), Some(3_000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_mark_and_the_extension_survive_a_close_and_reopen_from_the_file_alone() {
+        let path = sidecar("durable");
+        let b = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_500)).unwrap().branch_id;
+            c.record_lease_alive(1_000).unwrap();
+            c.resume_leases(4_000).unwrap();
+            b
+        };
+        let re = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert_eq!(re.alive_mark().unwrap(), Some(4_000), "the new mark was not durable");
+        assert_eq!(lease(&re, b), 4_500, "the extension was not durable");
+        assert!(expired_ids(&re, 4_499).is_empty(), "the old DEADLINE key survived the reopen");
+        assert_eq!(expired_ids(&re, 4_500), vec![b.id]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_mark_of_the_wrong_width_is_refused_rather_than_read_as_absent() {
+        // Absent means "first start: extend nothing". Reading a damaged mark that way would skip
+        // the grace for exactly the restart that needed it.
+        let path = sidecar("corrupt");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        c.upsert(keys::alive(), vec![1, 2, 3]).unwrap();
+        let err = c.resume_leases(4_000).unwrap_err().to_string();
+        assert!(err.contains("last-alive mark must be 8 bytes"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforced_lease_is_the_reapers_predicate_and_refuses_a_reaped_branch() {
+        let path = sidecar("enforced");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_234)).unwrap().branch_id;
+        let held = c.fork(BranchId::TRUNK, LeaseDeadline(1_234)).unwrap().branch_id;
+        assert_eq!(c.enforced_lease(b).unwrap(), Some(LeaseDeadline(1_234)));
+        // Trunk and a quarantined branch carry deadlines nobody enforces.
+        assert_eq!(c.enforced_lease(BranchId::TRUNK).unwrap(), None);
+        c.set_state(held, BranchState::Live, BranchState::Quarantined).unwrap();
+        assert_eq!(c.enforced_lease(held).unwrap(), None, "a quarantined lease is not enforced");
+        // Agrees with the reaper's own question at the same instant: `held` is expired by its
+        // record and still absent from the answer.
+        assert_eq!(expired_ids(&c, 5_000), vec![b.id]);
+        c.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+        let err = c.enforced_lease(b).unwrap_err().to_string();
+        assert!(err.contains("has been reaped"), "a reaped branch answered a deadline: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
