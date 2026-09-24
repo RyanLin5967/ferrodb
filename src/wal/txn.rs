@@ -147,6 +147,11 @@ pub struct TxnManager {
     /// decision 3: the stderr line is printed when this CHANGES (owed, then clear again), not at every
     /// checkpoint that keeps the log. `DEFERRED_CHECKPOINTS` counts every one.
     keeping_log: std::sync::atomic::AtomicBool,
+    /// Owed releases that are page/log MISMATCHES whose quarantine record could not be written, so
+    /// they stay owed (review 3's decision 6). Review 4's finding 4: a DROP must not discard one of
+    /// these, because its truncation would remove the only record of it; see
+    /// [`TxnManager::drop_checkpointed`].
+    unrecorded: Mutex<Vec<(u64, RetiredSlot)>>,
 }
 
 /// A heap slot retired by a logged delete, as the commit must release it. D213.
@@ -211,6 +216,8 @@ pub fn release_mismatches() -> u64 {
 ///   Any caller counts: the automatic trigger, a DDL, an open, or an explicit `checkpoint`, which
 ///   also returns its refusal.
 /// - automatic checkpoints that FAILED.
+/// - checkpoints whose truncation a WAL pin cancelled: `WalManager::truncate` keeps the log, and
+///   answers `Ok`, while a pin is below its end (review 4's finding 5).
 ///
 /// Review 2's C4. A deferral is not the commit's failure: `TxnManager::commit` has written `TxnEnd`
 /// by then and answers `Ok`. **Review 3's decision 3:** an automatic deferral resets the trigger's
@@ -285,7 +292,7 @@ pub fn index_undo_failures() -> u64 {
 ///
 /// The tree is held by its shared root cell, not by a page id, so a split during the transaction
 /// cannot leave this pointing at a stale root. The cell cannot be retired under an open
-/// transaction: DROP and ALTER refuse while any transaction is active (`ddl_checkpointed`,
+/// transaction: DROP and ALTER refuse while any transaction is active (`drop_checkpointed`,
 /// `Catalog::alter_table`), and `Catalog::sync_root_cells` keeps the existing cell for a live
 /// table (`or_insert_with`).
 pub struct PrimaryWrite {
@@ -418,7 +425,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -1183,11 +1190,14 @@ impl TxnManager {
                 // Review 3's decision 6: the durable record first, the drop after. See
                 // `RELEASE_MISMATCHES`.
                 let quarantine = release_quarantine(&self.wal.path);
-                let line = format!(
-                    "txn={txn_id} dir_root={} page={} slot={} found={found} error={e}\n",
-                    r.dir_root, r.page_id, r.slot
-                );
-                if let Err(qe) = append_durably(&quarantine, &line) {
+                let key = format!("txn={txn_id} dir_root={} page={} slot={} ", r.dir_root, r.page_id, r.slot);
+                let line = format!("{key}found={found} error={e}\n");
+                if let Err(qe) = append_once_durably(&quarantine, &key, &line) {
+                    let mut unrecorded = self.unrecorded.lock().unwrap();
+                    if !unrecorded.contains(&(txn_id, r)) {
+                        unrecorded.push((txn_id, r));
+                    }
+                    drop(unrecorded);
                     if first {
                         let _ = writeln!(
                             std::io::stderr(),
@@ -1201,6 +1211,7 @@ impl TxnManager {
                     }
                     return true;
                 }
+                self.unrecorded.lock().unwrap().retain(|u| *u != (txn_id, r));
                 RELEASE_MISMATCHES.fetch_add(1, Ordering::Relaxed);
                 let _ = writeln!(
                     std::io::stderr(),
@@ -1562,6 +1573,17 @@ impl TxnManager {
                      records onto pages the DROP freed"
                 )));
             }
+            // Review 4's finding 4: the retry above was this DROP's attempt to record them.
+            let unrecorded =
+                self.unrecorded.lock().unwrap().iter().filter(|(_, r)| frees.contains(&r.dir_root)).count();
+            if unrecorded > 0 {
+                return Err(FerroError::Wal(format!(
+                    "DROP refused: {unrecorded} page/log mismatch(es) on this table could not be written to the \
+                     quarantine at {}, and the DROP would discard them and truncate the log that holds the only \
+                     record of them; make that path writable and retry",
+                    release_quarantine(&self.wal.path).display()
+                )));
+            }
         }
         let out = f()?;
         if !frees.is_empty() {
@@ -1693,10 +1715,23 @@ impl TxnManager {
             }
             return Ok(owed);
         }
+        // Read before `truncate`, which keeps the log, and answers `Ok`, while a WAL pin is below its
+        // end (review 4's finding 5).
+        let base = self.wal.base_lsn.load(Ordering::SeqCst);
+        let end = self.wal.next_lsn.load(Ordering::SeqCst);
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
         self.wal.truncate(self.txn_ids.issued_through())?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
+        if base < end && self.wal.base_lsn.load(Ordering::SeqCst) == base {
+            // CANCELLED by a pin: nothing was discarded, so nothing is replayed (a replay would put a
+            // second copy of every declaration into the kept log), the owed state is not "settled",
+            // and it is counted as the deferral it is. **Residual, stated:** an empty log that gets an
+            // append between the reads above and `truncate` can be misread as truncated;
+            // `truncate` does not report its decision.
+            DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        }
         if self.keeping_log.swap(false, Ordering::SeqCst) {
             let _ = writeln!(std::io::stderr(), "ferrodb: the owed releases are settled, and checkpoints truncate the log again");
         }
@@ -1936,6 +1971,22 @@ pub fn release_quarantine(wal_path: &Path) -> PathBuf {
     let mut path = wal_path.as_os_str().to_os_string();
     path.push(".release-quarantine");
     PathBuf::from(path)
+}
+
+/// [`append_durably`], unless a line starting with `key` is already in the file: then only make the
+/// file durable. Review 4's finding 3: a dropped mismatch writes no `HeapRelease`, so every open
+/// before the log truncates finds it again, and it is recorded once. A file that cannot be read
+/// (not merely absent) is an error, so the caller keeps the release owed.
+fn append_once_durably(path: &Path, key: &str, line: &str) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if existing.lines().any(|l| l.starts_with(key)) => {
+            std::fs::File::open(path)?.sync_all()?;
+            sync_directory_of(path)
+        }
+        Ok(_) => append_durably(path, line),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => append_durably(path, line),
+        Err(e) => Err(e),
+    }
 }
 
 /// Append `line` to the file at `path`, creating it, and make both durable: the file's data, and on
