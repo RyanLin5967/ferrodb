@@ -2609,7 +2609,8 @@ fn read_vs_n_summary(
              table, so L2 (this table) and G7 (this section's head) sit beside them only by joining the rows on N \
              (A17.3). recover_us is reported too; `recovered` judges its fact (A16.5)."
         );
-        let measured = restart_rows.iter().filter(|r| !r.child.is_empty()).count();
+        // A18.1: an H6 row is no point of the curve (A17.2), so it is not counted here either.
+        let measured = restart_rows.iter().filter(|r| !r.child.is_empty() && !is_h6(*r)).count();
         if measured < 2 {
             failures.push(format!("arm 3: {measured} restart(s) measured; one point is not a curve"));
         }
