@@ -470,3 +470,45 @@ M25b: `rec.set_deadline(StoredDeadline::inward(lease, OffsetCell::new().load()))
   `a_lease_written_after_a_resume_reads_back_exactly_as_it_was_given`, which reads 13000 where
   10000 is due.
 - Of the same deliberate class: `AliveState::decode(&[0; 16])?.offset()`.
+
+## Amendment 8 — C2b, the reap re-check (lead). Written before its fix.
+
+**Red at `fb9bc43`** (test only, against `d87a8fc`'s API):
+`lease_thread::tests::f1_an_unresumed_marked_catalog_is_not_reaped_by_the_recheck_either` →
+**FAIL**. The panic is "the re-check answered Reaped on a catalog that refuses expiry questions".
+`reap_if_still_expired` decides from `get_raw`, which C2 does not refuse.
+
+**The fix will do:** `reap_if_still_expired` asks `BranchCatalog::enforced_lease`, which is the
+refused predicate and the reaper's own, and no longer reads `get_raw(..).lease_deadline`.
+- `Err(Branch)` → `ReapOutcome::Refused`. This is counted, and it carries the catalog's reason, so
+  D127's semantics are unchanged. The C2 refusal itself arrives through this arm.
+- `Ok(None)` → `NotExpired`. That covers a branch no longer enforced, e.g. one quarantined between the
+  candidate query and the re-check. The old read would have reaped it on its long-expired deadline.
+  This is a behaviour change, in the direction of keeping.
+- `Ok(Some(d))` → `NotExpired` if `d` is not expired; otherwise `reap` runs, as before.
+
+**The existing `reaper.rs` test at ~2385–2477** (`a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved`,
+instantiated for BOTH catalogs by `reaper_suite!`), predicted per arm (INFERRED):
+
+| arm | today | after the fix |
+|---|---|---|
+| 1 | Reaped; `refused` unchanged | the same: Live, deadline 0 |
+| 2 | NotExpired; `refused` unchanged | the same: `u64::MAX − 1` |
+| 3 (never-minted id) | `get_raw` → `NotFound` → Refused, +1 | `enforced_lease` → `core` `NotFound` (table) / `get` `NotFound` (log) → `Branch` → Refused, +1 |
+| 4 (stale generation) | `get_raw` is generation-blind, so `reap(stale)` refuses → Refused, +1, branch Live | `check_readable` refuses `Reaped` first → Refused, +1, branch Live |
+
+**None turns red.** No ⚖.
+
+**Other re-check exercisers, checked:**
+- `lease_thread::tests` d98 (renewed under the sweep → NotExpired) and d127 (`RefusesLiveChildren`:
+  the refusal comes from `reap`, after a re-check that passes). Their decorators do not override
+  `enforced_lease`; the default reads through their forwarding `get`.
+- `tests/d124_owner_record_refusal.rs` hides records from `get_raw` for the `free_page` /
+  `drain_pending` sites only, which the re-check no longer touches.
+
+**Mutant M30:** restore the `get_raw(..).lease_deadline.is_expired_at(now)` re-check → the C2b test
+FAILS.
+
+**Counts, per-target:** base + 30. Lib filter
+`cargo test --lib -- f1_lease_grace lease_thread::tests::f1_ cluster::tests::f2_ the_alive_key_is_its_own_group an_over_long_lease_from_now`
+→ **24** (14 + 5 + 3 + 1 + 1).
