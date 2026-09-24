@@ -205,7 +205,7 @@ A REVERT is one transaction, a second REVERT of the same merge is refused rather
 (D218), and each reverted row goes back to the author it had before the merge (D226). That last
 step runs just after the revert commits, because authorship lives in the provenance store and not in
 the WAL: a crash between the two leaves the reverted run still named, exactly as a crash just after a
-merge's commit leaves its rows unattributed.
+merge's commit leaves its rows naming the author they had before it.
 
 ---
 

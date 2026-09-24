@@ -11,7 +11,7 @@
 //! | test | crash point | contract | pre-registered mutant |
 //! |---|---|---|---|
 //! | (6) | `FERRODB_CRASH_AFTER_PUBLISH_COMMIT`: after the publish commit, before anything in memory records the merge | the reopened database can REVERT the merge | the history is written in a transaction of its own after the publish commits (the sidecar-after-commit shape) |
-//! | (7) | `FERRODB_CRASH_MID_REVERT=1`: after the revert's first inverse write, its transaction open | after reopen no row is reverted; a retry reverts once; a further REVERT is refused, across a restart too | inverses commit one at a time; or `write_revert` writes no `REVERTED` record |
+//! | (7) | `FERRODB_CRASH_MID_REVERT=1`: after the revert's first inverse write, its transaction open | after reopen no row is reverted; a retry reverts once; a further REVERT is refused, across a restart too | inverses commit one at a time; or `write_revert_record` writes no `REVERTED` record |
 //!
 //! Both are RED at Step 0 (`b2269c9`) at their first assertion: the crash points do not exist
 //! there, so the armed process exits cleanly.

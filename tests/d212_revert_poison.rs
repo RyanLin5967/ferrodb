@@ -1,21 +1,30 @@
-//! **D212 option (a): a history write that fails inside the publish poisons the REVERT history,
-//! and nothing merges or reverts until the database is reopened.**
+//! **D212 option (a): a history write that fails inside its transaction poisons the REVERT
+//! history, and nothing merges or reverts until the database is reopened.**
 //!
-//! In its own test binary, and with one test in it, because the failure is injected by
-//! `FERRODB_FAIL_HISTORY_WRITE` — process-wide state that a sibling test would read too.
+//! In its own test binary, and with one test in it, because the failures are injected by
+//! `FERRODB_FAIL_HISTORY_WRITE` — process-wide state that a sibling test would read too. Each named
+//! site fails once, in the order the scenario reaches them: the merge-id reservation, the publish,
+//! the REVERT's record.
 //!
-//! The shape is the one `plan_history` cannot refuse up front: the user's rows are already written
-//! in the publish transaction when the history write fails, as a full disk would make it. The
-//! transaction aborts, but this runtime's counters were advanced for it, so continuing would key
-//! the next records and version upserts off a picture of the file that is no longer true.
+//! A failure there is the shape nothing can refuse up front: the transaction is open, and at the
+//! publish and the REVERT the user's rows are already written in it. The transaction aborts, but
+//! this runtime's counters were advanced for it, so continuing would key the next records and
+//! version upserts off a picture of the file that is no longer true.
 //!
 //! Pre-registered mutants (in `src/agent_sql/runtime.rs`), each RED here:
-//! - `poison_history` does nothing: the second MERGE is accepted.
-//! - `publish_evaluation_as` skips `history_usable()`: the second MERGE is accepted.
-//! - `revert_merge` skips `history_usable()`: the REVERT answers about `m_1` (an unpublished id),
-//!   not about the history.
-//! Also RED at `0185f06` (option (a) before this fix), which has no injection point: the first
-//! MERGE lands.
+//! - `poison_history` does nothing: the MERGE after the reservation failure is accepted.
+//! - `next_merge_id` skips `history_usable()`: the same MERGE reserves again and is accepted.
+//! - `reserve_merge_ids`, or the publish path after `write_history`, does not poison on the write
+//!   failure: the MERGE after it is accepted.
+//! - `revert_merge` does not poison when `write_revert_record` fails: the second REVERT is accepted.
+//! - `revert_merge` skips `history_usable()`: the first REVERT answers about `m_1` (an id never
+//!   minted), not about the history.
+//!
+//! Not covered: the three sites that poison on a `commit` error, and the one on a `record_applied`
+//! error after the commit. No injection reaches inside `TxnManager::commit` or the provenance store.
+//!
+//! RED at `0185f06` (no injection point) and at `8a0b934` (whose injection took a count, not site
+//! names): the first MERGE lands.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -101,6 +110,11 @@ impl Db {
         self.exec("MERGE;", &mut a)
     }
 
+    fn revert(&mut self, merge_id: &str) -> Result<Outcome, FerroError> {
+        let mut s = Session::with_runtime(self.runtime.clone());
+        self.exec(&format!("REVERT MERGE {merge_id};"), &mut s)
+    }
+
     fn qty_of(&mut self, id: i32) -> i32 {
         let mut s = Session::with_runtime(self.runtime.clone());
         let rows = match self.ok("SELECT id, qty FROM inventory;", &mut s) {
@@ -114,10 +128,20 @@ impl Db {
     }
 }
 
+/// `Err` whose text names `what`, or a panic saying which statement was accepted instead.
+fn refused(result: Result<Outcome, FerroError>, what: &str, statement: &str) {
+    match result {
+        Err(e) => assert!(e.to_string().contains(what), "{statement} refused, but not for {what}: {e}"),
+        Ok(Outcome::Agent(AgentOutput::Merge(m))) => panic!("{statement} was accepted: {m}"),
+        Ok(Outcome::Agent(AgentOutput::Revert(p))) => panic!("{statement} was accepted: {p:?}"),
+        Ok(_) => panic!("{statement} returned something other than a report or a plan"),
+    }
+}
+
 #[test]
 fn a_failed_history_write_refuses_merge_and_revert_until_the_database_is_reopened() {
-    // SAFETY: the only test in this binary, set before any runtime reads it. One injected failure.
-    unsafe { std::env::set_var("FERRODB_FAIL_HISTORY_WRITE", "1") };
+    // SAFETY: the only test in this binary, set before any runtime reads it.
+    unsafe { std::env::set_var("FERRODB_FAIL_HISTORY_WRITE", "reserve,publish,revert") };
 
     let dir = tempfile::tempdir().unwrap();
     let mut db = Db::open(dir.path());
@@ -128,47 +152,29 @@ fn a_failed_history_write_refuses_merge_and_revert_until_the_database_is_reopene
     }
     drop(s);
 
-    // The failure itself: the MERGE fails, and the rows it had written are rolled back with it.
-    match db.bump_and_merge("first", 1) {
-        Err(e) => assert!(
-            e.to_string().contains("FERRODB_FAIL_HISTORY_WRITE"),
-            "failed, but not at the injection: {e}"
-        ),
-        Ok(Outcome::Agent(AgentOutput::Merge(m))) => {
-            panic!("the MERGE whose history write failed was reported, not refused: {m}")
-        }
-        Ok(_) => panic!("MERGE returned something other than a report"),
-    }
-    assert_eq!(db.qty_of(1), 10, "the aborted publish left its row write behind");
+    // ---- 1. the merge-id reservation's write fails ------------------------------------------
+    let r = db.bump_and_merge("first", 1);
+    refused(r, "FERRODB_FAIL_HISTORY_WRITE at reserve", "the MERGE whose reservation failed");
+    assert_eq!(db.qty_of(1), 10, "a MERGE whose id was never minted published its row");
+    // Poisoned: the injection is spent, so a refusal from here on is the poison's.
+    let r = db.bump_and_merge("second", 2);
+    refused(r, POISONED, "a MERGE after the reservation failed");
+    assert_eq!(db.qty_of(2), 10, "the refused MERGE published its row");
+    let r = db.revert("m_1");
+    refused(r, POISONED, "a REVERT after the reservation failed");
 
-    // Poisoned: the next MERGE is refused before it publishes — the injection is spent, so a
-    // refusal here is the poison's, not a second injected failure.
-    match db.bump_and_merge("second", 2) {
-        Err(e) => assert!(e.to_string().contains(POISONED), "refused, but not for the poison: {e}"),
-        Ok(Outcome::Agent(AgentOutput::Merge(m))) => {
-            panic!("a MERGE was accepted after the history write failed: {m}")
-        }
-        Ok(_) => panic!("MERGE returned something other than a report"),
-    }
+    // ---- 2. the publish's history write fails, after the rows are written in its txn --------
+    let mut db = db.restart();
+    let r = db.bump_and_merge("third", 1);
+    refused(r, "FERRODB_FAIL_HISTORY_WRITE at publish", "the MERGE whose history write failed");
+    assert_eq!(db.qty_of(1), 10, "the aborted publish left its row write behind");
+    let r = db.bump_and_merge("fourth", 2);
+    refused(r, POISONED, "a MERGE after the history write failed");
     assert_eq!(db.qty_of(2), 10, "the refused MERGE published its row");
 
-    // ...and so is every REVERT, whatever it names.
-    let mut s = Session::with_runtime(db.runtime.clone());
-    match db.exec("REVERT MERGE m_1;", &mut s) {
-        Err(e) => {
-            assert!(e.to_string().contains(POISONED), "REVERT refused, but not for the poison: {e}")
-        }
-        Ok(Outcome::Agent(AgentOutput::Revert(p))) => {
-            panic!("a REVERT was accepted after the history write failed: {p:?}")
-        }
-        Ok(_) => panic!("REVERT returned something other than a plan"),
-    }
-    drop(s);
-
-    // Reopening reads the truth from disk, and both work again. Anti-vacuity: the refusals above
-    // are the poison's, not a database that cannot merge.
+    // ---- 3. a REVERT's record fails, after its inverses are written in its txn ---------------
     let mut db = db.restart();
-    let merge_id = match db.bump_and_merge("third", 2) {
+    let merge_id = match db.bump_and_merge("fifth", 1) {
         Ok(Outcome::Agent(AgentOutput::Merge(m))) => {
             assert!(m.applied_to_target, "the merge after the reopen did not land: {m}");
             m.merge_id
@@ -176,14 +182,23 @@ fn a_failed_history_write_refuses_merge_and_revert_until_the_database_is_reopene
         Ok(_) => panic!("MERGE after the reopen returned something other than a report"),
         Err(e) => panic!("MERGE after the reopen failed: {e}"),
     };
-    assert_eq!(db.qty_of(2), 11);
-    let mut s = Session::with_runtime(db.runtime.clone());
-    match db.ok(&format!("REVERT MERGE {merge_id};"), &mut s) {
-        Outcome::Agent(AgentOutput::Revert(p)) => {
+    assert_eq!(db.qty_of(1), 11);
+    let r = db.revert(&merge_id);
+    refused(r, "FERRODB_FAIL_HISTORY_WRITE at revert", "the REVERT whose record failed");
+    assert_eq!(db.qty_of(1), 11, "the aborted REVERT left its inverse behind");
+    let r = db.revert(&merge_id);
+    refused(r, POISONED, "a REVERT after its record failed");
+    assert_eq!(db.qty_of(1), 11, "the refused REVERT inverted the row");
+
+    // Anti-vacuity: after a reopen the same REVERT goes through, so every refusal above was the
+    // poison's and not a database that cannot merge or revert.
+    let mut db = db.restart();
+    match db.revert(&merge_id) {
+        Ok(Outcome::Agent(AgentOutput::Revert(p))) => {
             assert!(!p.is_blocked(), "{merge_id} was blocked: {p:?}")
         }
-        _ => panic!("REVERT MERGE {merge_id} did not return a plan"),
+        Ok(_) => panic!("REVERT MERGE {merge_id} did not return a plan"),
+        Err(e) => panic!("REVERT MERGE {merge_id} after the reopen failed: {e}"),
     }
-    drop(s);
-    assert_eq!(db.qty_of(2), 10, "the REVERT after the reopen did not undo its merge");
+    assert_eq!(db.qty_of(1), 10, "the REVERT after the reopen did not undo its merge");
 }

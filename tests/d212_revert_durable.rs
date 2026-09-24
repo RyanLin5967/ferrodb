@@ -13,8 +13,9 @@
 //! | (3) | captures | `plan_history` plans no `CAPTURE` records |
 //! | (3b) | inherited captures | `plan_history` plans the merging task's capture only |
 //! | (4) | `next_txn` | `attach_history` skips `state.next_txn = max(..)` |
-//! | (5) | `next_merge`, `merges`, `applied`, revert markers | skip `state.next_merge = max(..)`; or no `MERGES_TABLE` row; or no `APPLIED` record; or `write_revert` writes no `REVERTED` record |
-//! | two runtimes | the durable version clock | the publish's freshness check drops `durable_seq` |
+//! | (5) | `next_merge`, `merges`, `applied`, revert markers | skip `state.next_merge = max(..)`; or no `MERGES_TABLE` row; or no `APPLIED` record; or `write_revert_record` writes no `REVERTED` record |
+//! | two runtimes (both tests) | the durable counters, compared with this runtime's view | `durable_history_unmoved` returns the row without comparing; or `reserve_merge_ids` adopts the whole durable row into the cursor |
+//! | capture encodable | E82: every refusal before the first write | `publish_evaluation_as` skips `captures_encodable` |
 //!
 //! Every restart here is real: the files are checkpointed, every in-process object — sessions
 //! first — is dropped, and a new `Catalog`, WAL, buffer pool, branch catalog and `AgentRuntime` are
@@ -349,8 +350,8 @@ fn exit_5_a_pre_restart_id_reverts_the_pre_restart_merge_once_across_restarts() 
 /// **Two runtimes over one database** (option (a) review, F1). A runtime that attached before
 /// another one published holds a version clock the other has already used. Publishing on it would
 /// stamp versions, and file captures under txn ids, that the durable history already holds — and
-/// after a restart a REVERT would read both merges as one. Its publish is refused against the clock
-/// the history last committed, read from disk at the publish.
+/// after a restart a REVERT would read both merges as one. Its publish is refused because the
+/// history on disk moved since it read it.
 ///
 /// RED at `0185f06`, which checked only this runtime's own `applied`: the second merge lands.
 #[test]
@@ -382,4 +383,70 @@ fn a_runtime_whose_clock_another_runtime_overtook_cannot_publish() {
     db.merge(&mut c);
     drop(c);
     assert_eq!(db.qty_of(3), 31);
+}
+
+/// **Two runtimes, when the first one's merge published no rows** (review of the F1 fix). Such a
+/// merge moves no version clock, so a check on the clock alone passes the second runtime — yet the
+/// first one filed an `APPLIED` and a `CAPTURE` record under txn 1, which the second one minted too.
+///
+/// RED at `8a0b934`, whose check was the durable version clock: the second merge lands.
+#[test]
+fn a_runtime_is_refused_after_another_published_a_merge_with_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    db.seed(&[(1, 10), (2, 20)]);
+
+    let mut b = Session::with_runtime(Arc::new(AgentRuntime::new()));
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("UPDATE inventory SET qty = 21 WHERE id = 2;", &mut b);
+
+    // A read-only task: its merge publishes a capture and no rows.
+    db.task("a", &["SELECT qty FROM inventory WHERE id = 1;"]);
+
+    let refused = db.exec("MERGE;", &mut b).err().map(|e| e.to_string());
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains("since this one last read it")),
+        "a runtime published after another one wrote the history: {refused:?}"
+    );
+    drop(b);
+    assert_eq!(db.qty_of(2), 20, "the refused merge published its row");
+}
+
+/// **E82 for the history: a capture it cannot encode refuses the merge before ANY write — the
+/// branch's schema edit included** (option (a) review, F3, and the review of its fix). A scan's
+/// region is retained verbatim, and a bound or WHERE text longer than a `u16` length prefix cannot
+/// be. Found only while planning the history, the refusal came after the schema apply, so the new
+/// column reached the target without the rows that came with it.
+///
+/// RED at `8a0b934`, where only `plan_history` refuses: the column count is 4.
+#[test]
+fn a_capture_the_history_cannot_encode_refuses_the_merge_before_its_schema_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path());
+    let mut s = db.session();
+    db.ok("CREATE TABLE notes (id INTEGER NOT NULL, qty INTEGER, note VARCHAR(20));", &mut s);
+    db.ok("INSERT INTO notes VALUES (1, 10, 'a');", &mut s);
+    drop(s);
+    let columns = |db: &Db| db.catalog.get_table("notes").map(|t| t.schema.columns.len());
+    assert_eq!(columns(&db), Some(3), "fixture premise");
+
+    let (mut a, _) = db.agent("wide");
+    db.ok("ALTER TABLE notes ADD COLUMN extra INTEGER;", &mut a);
+    // One byte past what a u16 length prefix holds, as the literal the scan's region retains.
+    let wide = "x".repeat(usize::from(u16::MAX) + 1);
+    db.ok(&format!("SELECT id FROM notes WHERE note = '{wide}';"), &mut a);
+    db.ok("UPDATE notes SET qty = 11 WHERE id = 1;", &mut a);
+
+    let refused = db.exec("MERGE;", &mut a).err().map(|e| e.to_string());
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains(&u16::MAX.to_string())),
+        "the merge was not refused for the length prefix: {refused:?}"
+    );
+    drop(a);
+    assert_eq!(columns(&db), Some(3), "the refused merge applied its schema edit");
+    let mut s = db.session();
+    match db.ok("SELECT id, qty FROM notes;", &mut s) {
+        Outcome::Rows(r) => assert_eq!(r, vec![vec![Value::Integer(1), Value::Integer(10)]]),
+        _ => panic!("SELECT did not return rows"),
+    }
 }
