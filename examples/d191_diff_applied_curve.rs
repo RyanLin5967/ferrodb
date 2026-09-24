@@ -217,6 +217,9 @@ struct Cell {
     med_ns: u128,
     out_rows: usize,
     concurrent: Vec<i64>,
+    /// Whether every rep's concurrent list equals rep 0's, which is the one `concurrent` holds.
+    /// PREREG amendment 1: observation only.
+    conc_reps_agree: bool,
 }
 
 fn cell(s: &Server, sess: &mut Session) -> Cell {
@@ -235,6 +238,7 @@ fn cell(s: &Server, sess: &mut Session) -> Cell {
         med_ns: ns[ns.len() / 2],
         out_rows,
         concurrent: obs[0].concurrent_ids.clone(),
+        conc_reps_agree: obs.iter().all(|o| o.concurrent_ids == obs[0].concurrent_ids),
     }
 }
 
@@ -288,6 +292,9 @@ fn main() {
         "M_vmin", "M_vmax", "M_expect", "M_conc", "M", "rows"
     );
     let mut rows_a: Vec<(usize, u64, u64, u128)> = Vec::new();
+    // PREREG amendment 1 (lane_d191_diff.md): one observation line per K, printed after the table
+    // so every line above keeps its format.
+    let mut outcome_lines: Vec<String> = Vec::new();
     let mut all_ok = true;
     for &k in CHECKPOINTS.iter() {
         while k_done < k {
@@ -355,6 +362,23 @@ fn main() {
             format!("{}/{}/{}", a.out_rows, p.out_rows, mcell.out_rows)
         );
         rows_a.push((k, applied_total, a.vmax, a.med_ns));
+        // PREREG amendment 1: observation only. The ok flags above already CHECK DIFF_ROWS for P
+        // and M (M by its min only) and the concurrent lists for A and P, but never PRINT them, so
+        // a MISMATCH flag could not say which part failed. `min-max` is the format of the `A_frm` column, and a
+        // list is `{:?}`, like `M_conc`.
+        outcome_lines.push(format!(
+            "outcomes K={} A_rows={}-{} A_conc={:?} P_rows={}-{} P_conc={:?} M_rows={}-{} M_conc={:?} conc_reps_agree={}/{}/{}",
+            k,
+            a.rmin, a.rmax, a.concurrent,
+            p.rmin, p.rmax, p.concurrent,
+            mcell.rmin, mcell.rmax, mcell.concurrent,
+            a.conc_reps_agree, p.conc_reps_agree, mcell.conc_reps_agree
+        ));
+    }
+    println!();
+    println!("== OUTCOMES per K (PREREG amendment 1, observation only): DIFF_ROWS min-max and PendingConcurrent ids, arms A / P / M ==");
+    for line in &outcome_lines {
+        println!("{line}");
     }
     println!();
     println!("ops per merge (from reports): min={} max={}", ops_per_merge.iter().min().unwrap(), ops_per_merge.iter().max().unwrap());
