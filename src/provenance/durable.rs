@@ -622,6 +622,10 @@ impl ProvenanceStore for DurableProvenanceStore {
         self.mem.lookup(id)
     }
 
+    fn runs(&self) -> Result<Vec<RunEntity>, FerroError> {
+        self.mem.runs()
+    }
+
     fn attribute(&self, rid: RecordId) -> Result<ProvId, FerroError> {
         self.mem.attribute(rid)
     }

@@ -163,6 +163,14 @@ pub trait ProvenanceStore: Send + Sync {
 
     fn lookup(&self, id: ProvId) -> Result<RunEntity, FerroError>;
 
+    /// Every run interned so far, each carrying its slot.
+    ///
+    /// D227: what an entry point hands to `TxnManager::declare_runs_of` after a restart, so the next
+    /// checkpoint re-declares the runs this store still knows. Required, with no default, for
+    /// `page_dictionary_lens`' reason: an empty default would read exactly like a store that has
+    /// interned nothing.
+    fn runs(&self) -> Result<Vec<RunEntity>, FerroError>;
+
     /// Which run wrote the version in this slot. `ProvId::NONE` when unattributed.
     fn attribute(&self, rid: RecordId) -> Result<ProvId, FerroError>;
 
