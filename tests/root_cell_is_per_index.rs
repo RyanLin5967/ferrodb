@@ -789,9 +789,14 @@ fn a_rename_carries_both_kinds_cells_to_the_new_name() {
 /// `sync_root_cells` never overwrites, and retires a dead key only when it runs. `drop_table`
 /// returns at its `persist()?` before its sync, so a DROP whose persist failed leaves the dead
 /// tree's cell under the key. A CREATE of the same key then kept that cell and descended a FREED
-/// tree. Each test removes a record the way that DROP leaves it (gone from `tables`, no sync), then
-/// creates the same key again. The dead tree's pages are not freed here, so the new tree lands on
-/// new pages, and the premise says so.
+/// tree. Each test removes a record without a sync, then creates the same key again. The dead
+/// tree's pages are not freed here, so the new tree lands on new pages, and the premise says so.
+///
+/// **Only the TABLE test's state is reachable today** (D208 review 2, C5; PREREG amendment 7).
+/// That is a DROP TABLE whose persist failed, then CREATE TABLE. There is no `DROP INDEX`, and after
+/// that failed DROP the CREATE TABLE's sync retires the dead table's index keys before any CREATE
+/// INDEX can run. So the index and full-text tests pin defensive behaviour, for the day an index
+/// can leave its key some other way.
 ///
 /// FAIL at `f612ba8` (INFERRED) at the `ptr_eq`: the create's sync keeps the dead `Arc`.
 fn assert_fresh(dead: &Arc<std::sync::atomic::AtomicU32>, fresh: &Arc<std::sync::atomic::AtomicU32>, record: Option<u32>, what: &str) {
