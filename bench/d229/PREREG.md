@@ -633,3 +633,56 @@ they are appended here, and no test or code behaviour changes.
   is refused until a reopen. That is D250's fail-stop, not a free.
 - F1 (M3) stays the one blocker named by the review. It is answered by amendment 16's move-form M3, whose survival the
   run measures.
+
+**Amendment 19 (the D250 re-merge `387b72a`, d250 @ `4c499f5`, which carries #16 review 7 @ `79483ff`; registered
+BEFORE the code that follows it).**
+
+*The merge.* #16 review 7 brings:
+- `append_once_durably` through `FileOps`, with a re-found key rewritten atomically;
+- `ReleaseError::Retry` recording the page;
+- `aside_path` returning `io::Result`;
+- a `start_fresh_quarantine_at(wal_path, nanos)` seam;
+- `TxnManager::start_new_incarnation`, which moves the quarantine aside and forgets the owed releases and unrecorded
+  mismatches;
+- `PageStoreSnapshots::with_txn`. With a manager wired, the install calls `start_new_incarnation`; otherwise it calls
+  the file transition.
+
+D250's own change is comments only (its open-completion text defers to D229's on this tree).
+
+**The resolution builds one fresh-database shape** on #16's seam:
+- `start_fresh_quarantine` = `start_fresh_quarantine_at(path, now_nanos())`, which is `move_aside_at(quarantine, nanos)`;
+- `start_fresh_database` moves the quarantine, then the intent, at one clock reading;
+- `move_aside_at` is #16's body, with `aside_path(..)?`;
+- the install's no-manager arm and the fresh log call `start_fresh_database`;
+- `open_recovered`'s completion comment stays D229's, as `delete-insert-gap` agreed.
+
+**One merge defect, found by the type pass and fixed in its own commit `fa08855`:** #16 added the same
+`use crate::storage::atomic_file::{FileOps, OsFileOps};` line D229 had, so `387b72a` imports the names twice (E0252,
+INFERRED). `387b72a` is left as it is (append-only), and the green base is after `fa08855`.
+
+*The gap the merge leaves, and its fix.* With a manager wired, the install goes through `start_new_incarnation`. At
+`fa08855` that moves only the quarantine, and it keeps D229's `pending_frees` and their `DiskManager` quarantine:
+- the intent file names the REPLACED database's page ids, so the next open would adopt it and free them under the
+  installed database;
+- the in-memory intents do the same at this manager's next checkpoint;
+- their quarantine keeps those ids from the new database's allocator.
+
+This is review 2's F11 through the door #16 has just added. It is latent: nothing in production calls `with_txn`.
+**Fix:** `start_new_incarnation` calls `start_fresh_database`, and under `release_retry` (lock order: `release_retry`,
+then `pending_frees`, then the pool) it empties `pending_frees` and releases each intent's quarantine.
+- **New red test** `wal::txn::tests::a_new_incarnation_moves_the_drop_intent_aside_and_forgets_the_pending_frees`:
+  - setup: an intent over two fresh pages is planted and adopted (premises: adopted, and its pages quarantined), then
+    `start_new_incarnation`;
+  - after it: the intent file is gone from its path and kept once as `.before-` with the same bytes, no page is pending
+    free, and nothing is quarantined;
+  - predicted RED at `fa08855` (INFERRED), on the file assertion first.
+- **Mutants:**
+  - **M28**: `start_new_incarnation` moves only the quarantine (`start_fresh_quarantine`). Predicted killed at the file
+    assertion.
+  - **M29**: it keeps `pending_frees` and their quarantine. Predicted killed at the pending assertion.
+
+*Carried on unchanged:* amendment 18's scopes; the move-form M3 and its survival prediction; the counts of amendment 17
+plus this test. **D250 is now at `cd0914b`** (#16's lane §21.18-19, a TxnEnd after a durable Commit), which is not
+merged here. The lead has also announced that D250 replaces its open-time re-declaration, with the forget moving inside
+`open_recovered` before the truncation. At that re-merge, amendment 15's re-declaration argument becomes moot, and the
+new order (the forget before or after D229's `free_pending_frees`) is re-checked.
