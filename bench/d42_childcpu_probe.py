@@ -17,8 +17,8 @@ So a threshold set a decade below this floor cannot be reached by a healthy-but-
 which is exactly the direction falsifier 2 tests.
 
 The nodes block in `recv_timeout(min(5ms, until_tick))` (examples/consensus_node.rs:140,
-src/consensus/node.rs:436), so ~200 wakeups/s/node is the duty cycle being measured. It is not
-zero, and it is not a spin.
+Node::poll in src/consensus/node.rs), so ~200 wakeups/s/node is the duty cycle being measured. It
+is not zero, and it is not a spin.
 
 During the same window the probe's own thread runs the identical 10 ms poll loop `wait_for` runs,
 so the self-scheduling floor is measured against the same machine state as the child floor rather

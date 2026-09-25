@@ -715,6 +715,11 @@ pub trait Replicated: Send + Sync {
 
 /// [`Replicated`] over the real driver: a real clock, a real socket, a real fsync.
 ///
+/// "A real clock" is whatever the node was started with. A server's is the wall; a test harness
+/// that turns a whole cluster from one loop starts its nodes on `Clock::Pumped`, where one
+/// [`Replicated::pump`] is one tick and delivery is the harness's job (D73,
+/// `crate::consensus::node::Clock`).
+///
 /// The mutex is what turns `Node`'s `&mut self` into something an `Arc<dyn Replicated>` can hold.
 /// It is not contention worth avoiding: every method here is one turn of a loop that is already
 /// serialised by the node's single event queue.

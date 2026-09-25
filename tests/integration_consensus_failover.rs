@@ -299,7 +299,7 @@ const STARVED_SELF: f64 = 0.085;
 /// ⚠ **THE DESIGN'S STATED PREMISE FOR THIS SIGNAL IS WRONG BY FOUR ORDERS OF MAGNITUDE**, and the
 /// correction is recorded here rather than left in a chat message. `SCALE-DESIGN.md` D42 option C
 /// says "~40 s of child CPU over 45 s of wall means they ran and genuinely failed". They do not:
-/// these nodes block in `recv_timeout(min(5ms, until_tick))` (`src/consensus/node.rs:436`), so a
+/// these nodes block in `recv_timeout(min(5ms, until_tick))` (`Node::poll`), so a
 /// HEALTHY node burns 0.4 % of a core, not 90 %. The DIRECTION option C rests on survives — a node
 /// that is not scheduled consumes less than one that is — but the magnitude does not, and a
 /// threshold set from the design's number would have called every run on this machine starved.

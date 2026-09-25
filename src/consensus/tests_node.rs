@@ -428,3 +428,209 @@ impl snap6::SnapshotStore for CountingStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------- D73: the pumped clock
+
+/// The wall clock's test above falls 20 ticks behind and requires all 20. This one falls behind by
+/// the same amount and requires exactly one tick per poll: under `Clock::Pumped` nothing a harness
+/// does between turns is time, and a single catch-up read of `Instant` would make it so again.
+#[test]
+fn a_pumped_node_takes_one_tick_per_poll_however_far_behind_the_wall_says_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1).tick_of(Duration::from_millis(1)).pumped(),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+
+    n.next_tick = Instant::now() - Duration::from_millis(20);
+    // Three polls, all below the shortest election timeout a node can draw (10 ticks), so a
+    // follower that took one tick per poll is still a follower and its countdown moved by one.
+    for k in 1..=3 {
+        let before = n.sm.since_heard;
+        n.poll(Duration::ZERO).unwrap();
+        assert_eq!(
+            (n.sm.since_heard, n.role()),
+            (before + 1, Role::Follower),
+            "poll {k} of a pumped node moved its election countdown from {before} to {} (role {}); \
+             one poll is one tick, and anything more is the wall clock leaking back in",
+            n.sm.since_heard,
+            n.role()
+        );
+    }
+    n.shutdown();
+}
+
+/// Wait until `n`'s transport has counted `k` frames received. The order under test is fixed by
+/// these waits, not by timing; the bound is only there so a starved machine fails by name.
+fn await_received<A: Applier>(n: &Node<A>, k: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while n.frames().received < k {
+        assert!(
+            Instant::now() < deadline,
+            "the transport counted {} of {k} frames within 20 s",
+            n.frames().received
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// **FORCED FIRE for the sort in `collect`.** The frame from node 3 is made to arrive first — its
+/// arrival is waited for before node 2's is sent — and the queue must still hold node 2's first.
+///
+/// Arrival order across two peers is the scheduler's, so a `collect` that kept it would make a
+/// fleet's replay of one election depend on which socket thread ran first. Forcing the order that
+/// the sort must undo is what makes this able to fail: an arrival order that happened to match
+/// sender order would pass against a `collect` with no sort at all.
+#[test]
+fn a_collected_turn_is_ordered_by_sender_not_by_arrival() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = listener();
+    let addr = l.local_addr().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        l,
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1).pumped(),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+    let peer = |id: u32| {
+        Transport::bind(
+            NodeId(id),
+            "127.0.0.1:0",
+            BTreeMap::from([(NodeId(1), addr)]),
+            TransportOptions::default(),
+        )
+        .expect("a peer transport")
+    };
+    let (t2, t3) = (peer(2), peer(3));
+    let hello = |id: u32| Message {
+        from: NodeId(id),
+        to: NodeId(1),
+        term: 0,
+        body: Body::PreVoteResp { granted: false },
+    };
+
+    t3.send(&hello(3)).unwrap();
+    await_received(&n, 1);
+    t2.send(&hello(2)).unwrap();
+    await_received(&n, 2);
+
+    assert_eq!(n.collect(Duration::from_secs(20)).unwrap(), 2, "collect did not take both frames");
+    let senders: Vec<NodeId> = n
+        .pending
+        .iter()
+        .map(|e| match e {
+            Event::Recv(m) => m.from,
+            other => panic!("collect queued something that is not a message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        senders,
+        vec![NodeId(2), NodeId(3)],
+        "node 3's frame arrived first and was queued first; `collect` must order a turn by sender, \
+         or a fleet's replay depends on which socket thread the scheduler ran first"
+    );
+    t2.shutdown();
+    t3.shutdown();
+    n.shutdown();
+}
+
+/// `collect` on a wall-clock node would be a second reader of an inbox `poll` already reads, and
+/// each would hold part of a turn. Refused, with the reason.
+#[test]
+fn collect_is_refused_on_a_wall_clock_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+    let e = n.collect(Duration::ZERO).expect_err("a wall-clock node accepted `collect`");
+    assert!(format!("{e}").contains("wall clock"), "refused, but not for this reason: {e}");
+    n.shutdown();
+}
+
+/// Under the pumped clock the transport's idle close is off. How long a connection has been quiet
+/// is wall time, and a turn-driven cluster leaves connections quiet for as long as its test likes;
+/// closed, the next frame written into one dies uncounted and the harness refuses the turn.
+///
+/// **The wall-clock node is the control, and it runs first.** Same 50 ms deadline, and its
+/// connection IS closed; how long that took is measured, and the pumped node is then left quiet for
+/// at least twice as long before it is looked at. So its open connection is the override and not a
+/// connection thread that had not yet got round to checking. Without the control this would pass
+/// against a transport whose idle close never fired at all.
+#[test]
+fn a_pumped_node_does_not_close_a_connection_for_being_quiet() {
+    let mut control_took: Option<Duration> = None;
+    for pumped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let l = listener();
+        let addr = l.local_addr().unwrap();
+        let mut opts = NodeOptions::new(dir.path(), BTreeMap::new(), 1);
+        opts.transport.idle_deadline = Duration::from_millis(50);
+        if pumped {
+            opts = opts.pumped();
+        }
+        let n = Node::start(
+            NodeId(1),
+            Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+            l,
+            opts,
+            RecordingApplier::default(),
+        )
+        .unwrap();
+        let t2 = Transport::bind(
+            NodeId(2),
+            "127.0.0.1:0",
+            BTreeMap::from([(NodeId(1), addr)]),
+            TransportOptions::default(),
+        )
+        .expect("a peer transport");
+        let hello = Message {
+            from: NodeId(2),
+            to: NodeId(1),
+            term: 0,
+            body: Body::PreVoteResp { granted: false },
+        };
+
+        t2.send(&hello).unwrap();
+        await_received(&n, 1);
+        let quiet_since = Instant::now();
+
+        if pumped {
+            // Twenty idle deadlines at least, and never less than twice what the control needed.
+            let took = control_took.expect("the control arm runs first");
+            std::thread::sleep(Duration::from_secs(1).max(took * 2));
+            assert_eq!(
+                n.net.idle_closed(),
+                0,
+                "a pumped node closed a connection for wall-clock silence; the control closed its \
+                 own after {took:?}"
+            );
+            t2.send(&hello).unwrap();
+            await_received(&n, 2);
+        } else {
+            let deadline = quiet_since + Duration::from_secs(20);
+            while n.net.idle_closed() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the control did not fire: a wall-clock node with a 50 ms idle deadline kept a \
+                     quiet connection open for 20 s, so the pumped arm's open connection proves \
+                     nothing"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            control_took = Some(quiet_since.elapsed());
+        }
+        t2.shutdown();
+        n.shutdown();
+    }
+}
