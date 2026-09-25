@@ -17,6 +17,7 @@
 //!   p8 <seed>        safety equivalence on a seeded trace, negative controls, and `conform`
 //!   o2 <N>           E-O2 part A (C0..C4), mutants F and S, anti-vacuity, negative control
 //!   timed            P1, P1-fire, A-S, A-Z (run it under lockrun)
+//!   adm              admitted merges per commit batch: HEAD's scalar rule vs per-key certification
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1466,6 +1467,67 @@ fn mode_timed() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// adm: what a batch of concurrent merges admits. After OFL and group commit the log carries only
+// merges, so this is O3's ceiling. HEAD: the real ledger's scalar `last_base_move` rule. PK: the
+// published per-key certification (Database State Machine, Pedone et al. 1999; Hyder), in which a
+// merge is Applied iff no key it read was written after its base. Each merge reads and writes one
+// key drawn from K keys; every merge in a batch carries the head before the batch as its base.
+// ---------------------------------------------------------------------------------------------
+
+fn mode_adm() {
+    let rounds = 64u64;
+    for &k in &[1u64, 16, 256, 1024] {
+        // HEAD, the real ledger
+        let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+        let mut head = Head(ledger.clone());
+        let mut round = 0;
+        for i in 1..=k * rounds {
+            round += 1;
+            head.apply(&Entry { term: 1, round, command: fork_c(cid(1, i)) });
+        }
+        let mut applied = Vec::new();
+        for b in 0..rounds {
+            let base = round;
+            let mut a = 0u64;
+            for j in 0..k {
+                round += 1;
+                if head.apply(&Entry { term: 1, round, command: merge_c(cid(1, b * k + j + 1), base) }) == Some(V::Applied) {
+                    a += 1;
+                }
+            }
+            applied.push(a);
+        }
+        let (mn, mx) = (applied.iter().min().unwrap(), applied.iter().max().unwrap());
+        println!("ADM arm=HEAD k={k} batches={rounds} applied_per_batch_min={mn} max={mx}");
+        check("ADM-HEAD", "HEAD", "exactly 1 per batch", *mn == 1 && *mx == 1, format!("{mn}..{mx}"));
+        // PK, per-key certification
+        for &keys in &[10u64, 1_000, 1_000_000] {
+            let mut rng = Rng(0xAD0 ^ k ^ keys);
+            let mut last_write: BTreeMap<u64, Round> = BTreeMap::new();
+            let mut round = 0;
+            let mut total = 0u64;
+            let mut expect = 0.0f64;
+            for _ in 0..rounds {
+                let base = round;
+                for _ in 0..k {
+                    round += 1;
+                    let key = rng.below(keys);
+                    if last_write.get(&key).copied().unwrap_or(0) <= base {
+                        last_write.insert(key, round);
+                        total += 1;
+                    }
+                }
+                expect += keys as f64 * (1.0 - (1.0 - 1.0 / keys as f64).powf(k as f64));
+            }
+            let per = total as f64 / rounds as f64;
+            let exp = expect / rounds as f64;
+            println!("ADM arm=PK k={k} keys={keys} batches={rounds} applied_per_batch_mean={per:.2} birthday_expectation={exp:.2}");
+            check("ADM-PK", "PK", &format!("within 10% of {exp:.2}"), (per - exp).abs() <= 0.1 * exp.max(1.0), format!("{per:.2}"));
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| -> u64 { args.get(i).and_then(|s| s.parse().ok()).expect("numeric argument") };
@@ -1477,6 +1539,7 @@ fn main() {
         Some("p8") => mode_p8(arg(2)),
         Some("o2") => mode_o2(arg(2)),
         Some("timed") => mode_timed(),
+        Some("adm") => mode_adm(),
         _ => {
             eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
             std::process::exit(2);
