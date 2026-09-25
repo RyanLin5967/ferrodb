@@ -404,4 +404,81 @@ use super::*;
         let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
         assert!(tree.search(&Value::Integer(1)).unwrap().is_some());
     }
+
+    /// **D236 (found as the D216 adversary's F1): a commit whose earlier records were already
+    /// durable must make its own `Commit` durable.**
+    ///
+    /// `WalManager::flush_up_to` returned early when `flushed_lsn >= lsn`. An LSN is where a record
+    /// STARTS, and `flushed_lsn` is one past the last durable byte, so the record first in an empty
+    /// buffer starts exactly at `flushed_lsn` and was never written. `commit` then returned `Ok`
+    /// with its `Commit` only in memory, and a crash undid a transaction whose caller had been told
+    /// it committed. Any flush between a transaction's last record and its commit sets this up. At
+    /// `9aa6968` the reachable one is the buffer pool's eviction gate, draining the whole log to
+    /// write back a dirty heap page (`tests/d236_commit_after_a_drain_survives_kill9.rs` reaches it
+    /// through the CLI). The `wal.flush()` below is that drain, spelled directly.
+    ///
+    /// Ported from `d216-clean-restart` (`c528509`) unchanged: `setup`, `HeapFileManager`,
+    /// `recover` and `flush` have the same signatures at `9aa6968`.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `9aa6968` at the row count (0 against 1).
+    #[test]
+    fn a_commit_is_durable_when_everything_before_it_was_already_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, rid);
+        {
+            let (bp, wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            rid = heap.insert(Tuple::new(vec![4, 5, 6])).unwrap();
+            wal.flush().unwrap();
+            txn.commit(t).unwrap();
+            // The crash: nothing else is written.
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        recover(&txn).unwrap();
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "commit returned Ok, and after a crash the transaction was undone: its Commit never reached the log"
+        );
+        assert_eq!(heap.read(rid).unwrap().data, vec![4, 5, 6]);
+    }
+
+    /// **D236, the page half: a heap page is written only after its own record, even when that
+    /// record was the first in an empty buffer.** The gate asks `flush_up_to(page LSN)`, and the
+    /// page LSN is where its record starts (`heap_file_manager.rs` stamps `page.lsn = lsn` with the
+    /// value `append` returned, in insert, update and both delete paths), so this is the same
+    /// off-by-one. It let a heap page reach the disk ahead of the record that describes it, which
+    /// is the one rule write-ahead logging exists to enforce.
+    ///
+    /// Ported from `d216-clean-restart` (`c528509`) unchanged.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `9aa6968` at the `flushed_lsn` assertion.
+    #[test]
+    fn a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, wal, txn) = setup(dir.path());
+        let t = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t);
+        wal.flush().unwrap();
+        let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
+        let rid = heap.insert(Tuple::new(vec![1, 2, 3])).unwrap();
+        let (first, _) = wal.read_record(flushed).unwrap();
+        assert!(
+            matches!(first.kind, RecKind::HeapInsert { .. }),
+            "premise failed: the record at the flushed point is {:?}, not the insert",
+            first.kind
+        );
+        bp.flush_page(rid.page_id).unwrap();
+        assert!(
+            wal.flushed_lsn.load(Ordering::SeqCst) > flushed,
+            "a heap page reached the disk while its own HeapInsert was still only in memory"
+        );
+        txn.abort(t).unwrap();
+    }
 }

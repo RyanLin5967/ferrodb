@@ -1,0 +1,311 @@
+# D196 land-gate fire-check
+# date        2026-09-24T03:58:14Z
+# source      /Users/idide/projects/ferrodb/.git
+# script blob 60215dc384b2b7b60eb8379580d029356d153ec8  (working copy)
+# candidate C 37d964bd6375baae6c4b17251ba7d748ab5abd58  D196: land-gate refuses unless HEAD is the commit being landed, at step 0 and again at the end
+# pre-D196    9aa6968ec4290f067a69c8b1068b43fc19b0d757  Merge D187: an index scan stops emitting NULL-valued rows, and the entries it skips are still counted as pulled
+# gate blob   C: b5288564b90ad0a22bef5465c0053fdab9ea5b91   pre-D196: a618eb8238cf43e913df016e7f17f2a66a4912de
+# bash        3.2.57(1)-release   git version 2.50.1 (Apple Git-155)
+# clone       /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/repo
+# fixture     M  19baacad244328faff58aa5d9dc139c641434b1f
+# fixture     S  23f7da1eabac09b2d96e9a88e440202834e339da
+# fixture     MS 971f04e0494109d7c729fc7cb4049d829bff4280
+# fake verify dir (empty) /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+
+PRECONDITIONS
+    PASS  precondition: candidate gate text carries the step-0 refusal
+    PASS  precondition: candidate gate text carries the end HEAD check
+    PASS  precondition: pre-D196 gate text lacks the step-0 refusal
+    PASS  precondition: pre-D196 gate text lacks the end HEAD check
+    PASS  precondition: M differs from C
+    PASS  precondition: S's land-gate.sh is C's (only the tools changed)
+    PASS  precondition: C's real tools are not stubs
+    PASS  precondition: under the arms' PATH, cargo resolves to the fake
+    PASS  precondition: the fake cargo exits 97 when reached (got 97)
+    PASS  precondition: the fake cargo leaves the sentinel the arms look for
+
+================================================================================
+ARM A1   gate=tools/land-gate.sh   HEAD=19baacad244328faff58aa5d9dc139c641434b1f   landing=37d964bd6375baae6c4b17251ba7d748ab5abd58   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=19baacad244328faff58aa5d9dc139c641434b1f
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 37d964bd6375baae6c4b17251ba7d748ab5abd58 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: REFUSING — this checkout is not the commit being landed.
+  >   checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo
+  >   HEAD      19baacad244328faff58aa5d9dc139c641434b1f  d196 fixture M: C plus one commit
+  >   landing   37d964bd6375baae6c4b17251ba7d748ab5abd58  D196: land-gate refuses unless HEAD is the commit being landed, at step 0 and again at the end
+  >   Step 3 (prepush.sh) builds THIS checkout, so from here the gate would certify
+  >   19baaca, not 37d964b.
+  >   Run it from the candidate's worktree, using the copy of this script INSIDE it (the gate
+  >   examines the checkout its own file lives in, not your cwd):
+  >     cd <candidate worktree> && bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 37d964bd6375baae6c4b17251ba7d748ab5abd58 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  >   Find that worktree with: git worktree list | grep 37d964b
+  rc=1   HEAD after: 19baacad244328faff58aa5d9dc139c641434b1f
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  has   'land-gate: REFUSING — this checkout is not the commit being landed.'
+            | 1:land-gate: REFUSING — this checkout is not the commit being landed.
+    PASS  has   'HEAD      19baacad244328faff58aa5d9dc139c641434b1f'
+            | 3:  HEAD      19baacad244328faff58aa5d9dc139c641434b1f  d196 fixture M: C plus one commit
+    PASS  has   'landing   37d964bd6375baae6c4b17251ba7d748ab5abd58'
+            | 4:  landing   37d964bd6375baae6c4b17251ba7d748ab5abd58  D196: land-gate refuses unless HEAD is the commit being landed, at step 0 and again at the end
+    PASS  has   'Run it from the candidate's worktree'
+            | 7:  Run it from the candidate's worktree, using the copy of this script INSIDE it (the gate
+    PASS  lacks '[1/3]'
+    PASS  lacks 'land-gate: landing'
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM B1   gate=tools/land-gate.sh   HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58   landing=37d964bd6375baae6c4b17251ba7d748ab5abd58   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 37d964bd6375baae6c4b17251ba7d748ab5abd58 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   37d964bd6375baae6c4b17251ba7d748ab5abd58 (37d964b)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+  >   Looked for SUMMARY.txt and RUNNER.txt. A verdict that exists only in a terminal buffer is not
+  >   evidence. Re-run with VERIFY_OUT='/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty' so the summary is written to disk.
+  > land-gate: REFUSING — certify-head refused (above). Re-run the suite at 37d964bd6375baae6c4b17251ba7d748ab5abd58.
+  rc=1   HEAD after: 37d964bd6375baae6c4b17251ba7d748ab5abd58
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  lacks 'this checkout is not the commit being landed'
+    PASS  has   'HEAD is the commit being landed [step 0]'
+            | 4:land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+    PASS  has   'land-gate: [1/3] certify-head.sh'
+            | 6:land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+    PASS  has   'certify-head: REFUSING — no persisted suite summary'
+            | 7:certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+    PASS  lacks '[2/3]'
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM B2   gate=tools/land-gate.sh   HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58   landing=37d964b   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 37d964b 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   37d964b (37d964b)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+  >   Looked for SUMMARY.txt and RUNNER.txt. A verdict that exists only in a terminal buffer is not
+  >   evidence. Re-run with VERIFY_OUT='/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty' so the summary is written to disk.
+  > land-gate: REFUSING — certify-head refused (above). Re-run the suite at 37d964b.
+  rc=1   HEAD after: 37d964bd6375baae6c4b17251ba7d748ab5abd58
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  lacks 'this checkout is not the commit being landed'
+    PASS  has   'HEAD is the commit being landed [step 0]'
+            | 4:land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+    PASS  has   'certify-head: REFUSING — no persisted suite summary'
+            | 7:certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM B3   gate=tools/land-gate.sh   HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58   landing=d196-fc-candidate   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=37d964bd6375baae6c4b17251ba7d748ab5abd58
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty d196-fc-candidate 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   d196-fc-candidate (37d964b)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+  >   Looked for SUMMARY.txt and RUNNER.txt. A verdict that exists only in a terminal buffer is not
+  >   evidence. Re-run with VERIFY_OUT='/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty' so the summary is written to disk.
+  > land-gate: REFUSING — certify-head refused (above). Re-run the suite at d196-fc-candidate.
+  rc=1   HEAD after: 37d964bd6375baae6c4b17251ba7d748ab5abd58
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  lacks 'this checkout is not the commit being landed'
+    PASS  has   'HEAD is the commit being landed [step 0]'
+            | 4:land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+    PASS  has   'certify-head: REFUSING — no persisted suite summary'
+            | 7:certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM C1   gate=tools/land-gate.pre-d196.sh   HEAD=19baacad244328faff58aa5d9dc139c641434b1f   landing=37d964bd6375baae6c4b17251ba7d748ab5abd58   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=19baacad244328faff58aa5d9dc139c641434b1f
+  $ bash tools/land-gate.pre-d196.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 37d964bd6375baae6c4b17251ba7d748ab5abd58 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   37d964bd6375baae6c4b17251ba7d748ab5abd58 (37d964b)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+  >   Looked for SUMMARY.txt and RUNNER.txt. A verdict that exists only in a terminal buffer is not
+  >   evidence. Re-run with VERIFY_OUT='/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty' so the summary is written to disk.
+  > land-gate: REFUSING — certify-head refused (above). Re-run the suite at 37d964bd6375baae6c4b17251ba7d748ab5abd58.
+  rc=1   HEAD after: 19baacad244328faff58aa5d9dc139c641434b1f
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  lacks 'this checkout is not the commit being landed'
+    PASS  has   'land-gate: landing'
+            | 1:land-gate: landing   37d964bd6375baae6c4b17251ba7d748ab5abd58 (37d964b)
+    PASS  has   'land-gate: [1/3] certify-head.sh'
+            | 5:land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+    PASS  has   'certify-head: REFUSING — no persisted suite summary'
+            | 6:certify-head: REFUSING — no persisted suite summary with a head= field under '/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty'.
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM D1   gate=tools/land-gate.sh   HEAD=23f7da1eabac09b2d96e9a88e440202834e339da   landing=23f7da1eabac09b2d96e9a88e440202834e339da   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   23f7da1eabac09b2d96e9a88e440202834e339da (23f7da1)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+  > 
+  > land-gate: [2/3] staleness.sh — has the base moved under this branch's files SINCE the suite ran?
+  >       branch 23f7da1eabac09b2d96e9a88e440202834e339da vs 9aa6968ec4290f067a69c8b1068b43fc19b0d757: STUB
+  >       COVERED: STUB staleness
+  > 
+  > land-gate: [3/3] prepush.sh — the CI-parity checks a green suite structurally cannot see.
+  > STUB prepush: would build HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  > 
+  > land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+  > land-gate:   suite names the commit · base is covered · CI-parity passes · tree unmoved throughout
+  > land-gate:   · built in the candidate's own checkout.
+  rc=0   HEAD after: 23f7da1eabac09b2d96e9a88e440202834e339da
+  predicates:
+    PASS  rc=0 (want 0)
+    PASS  has   'HEAD is the commit being landed [step 0]'
+            | 4:land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+    PASS  has   'STUB certify-head: OK'
+            | 7:STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+    PASS  has   'STUB prepush: would build HEAD=23f7da1eabac09b2d96e9a88e440202834e339da'
+            | 14:STUB prepush: would build HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+    PASS  has   'land-gate: OK — the evidence in'
+            | 16:land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+    PASS  lacks 'REFUSING'
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM D2   gate=tools/land-gate.pre-d196.sh   HEAD=971f04e0494109d7c729fc7cb4049d829bff4280   landing=23f7da1eabac09b2d96e9a88e440202834e339da   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=971f04e0494109d7c729fc7cb4049d829bff4280
+  $ bash tools/land-gate.pre-d196.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   23f7da1eabac09b2d96e9a88e440202834e339da (23f7da1)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+  > 
+  > land-gate: [2/3] staleness.sh — has the base moved under this branch's files SINCE the suite ran?
+  >       branch 23f7da1eabac09b2d96e9a88e440202834e339da vs 9aa6968ec4290f067a69c8b1068b43fc19b0d757: STUB
+  >       COVERED: STUB staleness
+  > 
+  > land-gate: [3/3] prepush.sh — the CI-parity checks a green suite structurally cannot see.
+  > STUB prepush: would build HEAD=971f04e0494109d7c729fc7cb4049d829bff4280
+  > 
+  > land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+  > land-gate:   suite names the commit · base is covered · CI-parity passes · tree unmoved throughout.
+  rc=0   HEAD after: 971f04e0494109d7c729fc7cb4049d829bff4280
+  predicates:
+    PASS  rc=0 (want 0)
+    PASS  has   'STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)'
+            | 6:STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+    PASS  has   'STUB prepush: would build HEAD=971f04e0494109d7c729fc7cb4049d829bff4280'
+            | 13:STUB prepush: would build HEAD=971f04e0494109d7c729fc7cb4049d829bff4280
+    PASS  has   'land-gate: OK — the evidence in'
+            | 15:land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM D3   gate=tools/land-gate.sh   HEAD=971f04e0494109d7c729fc7cb4049d829bff4280   landing=23f7da1eabac09b2d96e9a88e440202834e339da   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757 
+    PASS  precondition: clone clean at HEAD=971f04e0494109d7c729fc7cb4049d829bff4280
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: REFUSING — this checkout is not the commit being landed.
+  >   checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo
+  >   HEAD      971f04e0494109d7c729fc7cb4049d829bff4280  d196 fixture MS: S plus one commit
+  >   landing   23f7da1eabac09b2d96e9a88e440202834e339da  d196 fixture S: C with stubbed tools
+  >   Step 3 (prepush.sh) builds THIS checkout, so from here the gate would certify
+  >   971f04e, not 23f7da1.
+  >   Run it from the candidate's worktree, using the copy of this script INSIDE it (the gate
+  >   examines the checkout its own file lives in, not your cwd):
+  >     cd <candidate worktree> && bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  >   Find that worktree with: git worktree list | grep 23f7da1
+  rc=1   HEAD after: 971f04e0494109d7c729fc7cb4049d829bff4280
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  has   'land-gate: REFUSING — this checkout is not the commit being landed.'
+            | 1:land-gate: REFUSING — this checkout is not the commit being landed.
+    PASS  lacks 'STUB'
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM E1   gate=tools/land-gate.sh   HEAD=23f7da1eabac09b2d96e9a88e440202834e339da   landing=23f7da1eabac09b2d96e9a88e440202834e339da   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757   env: D196_FC_MOVE_HEAD_TO=971f04e0494109d7c729fc7cb4049d829bff4280
+    PASS  precondition: clone clean at HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  $ bash tools/land-gate.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   23f7da1eabac09b2d96e9a88e440202834e339da (23f7da1)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > land-gate: checkout  /private/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/d196fc.ywmx87/repo — HEAD is the commit being landed [step 0]
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+  > 
+  > land-gate: [2/3] staleness.sh — has the base moved under this branch's files SINCE the suite ran?
+  >       branch 23f7da1eabac09b2d96e9a88e440202834e339da vs 9aa6968ec4290f067a69c8b1068b43fc19b0d757: STUB
+  >       COVERED: STUB staleness
+  > 
+  > land-gate: [3/3] prepush.sh — the CI-parity checks a green suite structurally cannot see.
+  > STUB prepush: would build HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  > STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280
+  > 
+  > land-gate: REFUSING — HEAD moved during this gate: 23f7da1eabac09b2d96e9a88e440202834e339da -> 971f04e0494109d7c729fc7cb4049d829bff4280.
+  >   Step 3 built whatever was checked out while it ran, so nothing here says it built 23f7da1eabac09b2d96e9a88e440202834e339da. Re-run.
+  rc=1   HEAD after: 971f04e0494109d7c729fc7cb4049d829bff4280
+  predicates:
+    PASS  rc=1 (want 1)
+    PASS  has   'STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280'
+            | 15:STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280
+    PASS  has   'land-gate: REFUSING — HEAD moved during this gate: 23f7da1eabac09b2d96e9a88e440202834e339da -> 971f04e0494109d7c729fc7cb4049d829bff4280.'
+            | 17:land-gate: REFUSING — HEAD moved during this gate: 23f7da1eabac09b2d96e9a88e440202834e339da -> 971f04e0494109d7c729fc7cb4049d829bff4280.
+    PASS  lacks 'the tree became dirty'
+    PASS  lacks 'land-gate: OK'
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+ARM E2   gate=tools/land-gate.pre-d196.sh   HEAD=23f7da1eabac09b2d96e9a88e440202834e339da   landing=23f7da1eabac09b2d96e9a88e440202834e339da   base=9aa6968ec4290f067a69c8b1068b43fc19b0d757   env: D196_FC_MOVE_HEAD_TO=971f04e0494109d7c729fc7cb4049d829bff4280
+    PASS  precondition: clone clean at HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  $ bash tools/land-gate.pre-d196.sh /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty 23f7da1eabac09b2d96e9a88e440202834e339da 9aa6968ec4290f067a69c8b1068b43fc19b0d757
+  > land-gate: landing   23f7da1eabac09b2d96e9a88e440202834e339da (23f7da1)
+  > land-gate: onto base 9aa6968ec4290f067a69c8b1068b43fc19b0d757 (9aa6968)
+  > land-gate: evidence  /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty
+  > 
+  > land-gate: [1/3] certify-head.sh — does the verdict name the commit being landed?
+  > STUB certify-head: OK (dir=/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty want=23f7da1eabac09b2d96e9a88e440202834e339da)
+  > 
+  > land-gate: [2/3] staleness.sh — has the base moved under this branch's files SINCE the suite ran?
+  >       branch 23f7da1eabac09b2d96e9a88e440202834e339da vs 9aa6968ec4290f067a69c8b1068b43fc19b0d757: STUB
+  >       COVERED: STUB staleness
+  > 
+  > land-gate: [3/3] prepush.sh — the CI-parity checks a green suite structurally cannot see.
+  > STUB prepush: would build HEAD=23f7da1eabac09b2d96e9a88e440202834e339da
+  > STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280
+  > 
+  > land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+  > land-gate:   suite names the commit · base is covered · CI-parity passes · tree unmoved throughout.
+  rc=0   HEAD after: 971f04e0494109d7c729fc7cb4049d829bff4280
+  predicates:
+    PASS  rc=0 (want 0)
+    PASS  has   'STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280'
+            | 14:STUB prepush: moved HEAD to 971f04e0494109d7c729fc7cb4049d829bff4280
+    PASS  has   'land-gate: OK — the evidence in'
+            | 16:land-gate: OK — the evidence in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T//d196fc.ywmx87/verify-empty is about the tree that will ship.
+    PASS  cargo/rustup not reached (no sentinel)
+
+================================================================================
+arms run: 10 (registered 10)   predicates: 77   failed: 0
+VERDICT: PASS — every arm ran and every predicate held.
+# END d196_gate_firecheck rc=0
