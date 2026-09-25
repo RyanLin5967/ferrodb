@@ -12,7 +12,13 @@
 //! disposes of L's orphans (B2); a fresh fork + merge on L' to Applied (B3); integers C0 C1 C2 and
 //! leader/term changes (B4); restart the other survivor from its directory and time the replay (B5).
 //!
-//! Usage: r11_dist_fleet <N> <scratch-root> [arm order, e.g. HEAD,GC,ZK,M1]
+//! Proposal paths (PREREG A6): HEAD's sweep calls the seam's `propose` from the caller's thread,
+//! exactly as `NodeReplicator` does, sharing the node mutex with the driver. HEADQ, GC, growth and
+//! P7 instead hand commands to the node's OWN driver thread through a queue, which it proposes
+//! between polls (the single-event-loop shape of etcd's `Propose` channel and hashicorp/raft's
+//! `applyCh`): HEADQ one command per driver turn, GC up to 1,024 per turn with group commit on.
+//!
+//! Usage: r11_dist_fleet <N> <scratch-root> [arm order, e.g. HEAD,HEADQ,GC,ZK,M1]
 
 #[path = "r11_dist/arms.rs"]
 mod arms;
@@ -98,6 +104,7 @@ impl<L: Ledger + Send> Applier for LA<L> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Head,
+    HeadQ,
     Gc,
     Zk,
     M1,
@@ -107,6 +114,7 @@ impl Arm {
     fn name(self) -> &'static str {
         match self {
             Arm::Head => "HEAD",
+            Arm::HeadQ => "HEADQ",
             Arm::Gc => "GC",
             Arm::Zk => "ZK",
             Arm::M1 => "M1",
@@ -125,7 +133,7 @@ enum ArmL {
 impl ArmL {
     fn new(arm: Arm) -> ArmL {
         match arm {
-            Arm::Head | Arm::Gc => ArmL::Head(Arc::new(Mutex::new(BranchLedger::new()))),
+            Arm::Head | Arm::HeadQ | Arm::Gc => ArmL::Head(Arc::new(Mutex::new(BranchLedger::new()))),
             Arm::Zk => ArmL::Zk(Arc::new(Mutex::new(Zk::new())), Arc::default()),
             Arm::M1 => ArmL::M1(Arc::new(Mutex::new(HeadCopy::new(true))), Arc::default()),
         }
@@ -171,6 +179,64 @@ impl ArmL {
 struct Rep {
     id: NodeId,
     node: Mutex<Option<Node<Instr>>>,
+    /// Commands handed to this node's driver thread, proposed between its polls.
+    queue: Mutex<std::collections::VecDeque<Command>>,
+    /// Commands the driver takes per turn (HEADQ: 1; GC and growth: GROW_BATCH).
+    batch: std::sync::atomic::AtomicUsize,
+    /// Last round the driver's queued proposals reached, and how many it saw refused.
+    q_last_round: AtomicU64,
+    q_refused: AtomicU64,
+    /// Instrument: the longest interval between two driver turns (us), and turns taken.
+    max_gap_us: AtomicU64,
+    turns: AtomicU64,
+}
+
+impl Rep {
+    fn new(id: NodeId, node: Node<Instr>) -> Rep {
+        Rep {
+            id,
+            node: Mutex::new(Some(node)),
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            batch: std::sync::atomic::AtomicUsize::new(GROW_BATCH),
+            q_last_round: AtomicU64::new(0),
+            q_refused: AtomicU64::new(0),
+            max_gap_us: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+        }
+    }
+    fn enqueue(&self, cmds: impl IntoIterator<Item = Command>) {
+        lock(&self.queue).extend(cmds);
+    }
+    fn queue_len(&self) -> usize {
+        lock(&self.queue).len()
+    }
+    /// One driver turn's proposals: take up to `batch` queued commands and propose them in one drain.
+    fn drive_queue(&self) {
+        let k = self.batch.load(Ordering::Relaxed).max(1);
+        let cmds: Vec<Command> = {
+            let mut q = lock(&self.queue);
+            let k = k.min(q.len());
+            q.drain(..k).collect()
+        };
+        if cmds.is_empty() {
+            return;
+        }
+        let n = cmds.len() as u64;
+        let r = self.with(|node| {
+            let _ = node.take_refusals();
+            let r = node.propose_many(cmds);
+            (r, node.take_refusals().len() as u64)
+        });
+        match r {
+            Some((Ok(round), 0)) => self.q_last_round.store(round, Ordering::Release),
+            Some((Ok(_), refused)) => {
+                self.q_refused.fetch_add(refused.min(n), Ordering::Relaxed);
+            }
+            _ => {
+                self.q_refused.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl Rep {
@@ -234,12 +300,18 @@ fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) 
 fn spawn_driver(rep: Arc<Rep>, stop: Arc<AtomicBool>, errs: Arc<Mutex<Vec<String>>>) -> JoinHandle<u64> {
     std::thread::spawn(move || {
         let mut polls = 0u64;
+        let mut last = Instant::now();
         while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            rep.max_gap_us.fetch_max(now.duration_since(last).as_micros() as u64, Ordering::Relaxed);
+            last = now;
+            rep.drive_queue();
             if let Err(e) = rep.pump() {
                 lock(&errs).push(format!("{} driver: {e}", rep.id));
                 break;
             }
             polls += 1;
+            rep.turns.fetch_add(1, Ordering::Relaxed);
             std::thread::yield_now();
         }
         polls
@@ -271,7 +343,7 @@ impl Cluster {
             let ledger = ArmL::new(arm);
             let obs = Arc::new(Obs::default());
             let node = Node::start(id, cfg.clone(), l, opts(&dir, &addrs, id, i), ledger.applier(obs.clone())).unwrap();
-            let rep = Arc::new(Rep { id, node: Mutex::new(Some(node)) });
+            let rep = Arc::new(Rep::new(id, node));
             let stop = Arc::new(AtomicBool::new(false));
             c.threads.push(Some(spawn_driver(rep.clone(), stop.clone(), errs.clone())));
             c.reps.push(rep);
@@ -363,26 +435,30 @@ impl Cluster {
     }
 }
 
-/// Propose `cmds` on node `l` in batches through `propose_many`; returns the last round.
-fn propose_batched(c: &Cluster, l: usize, cmds: Vec<Command>) -> Result<Round, String> {
-    let mut last = 0;
-    let mut it = cmds.into_iter().peekable();
-    while it.peek().is_some() {
-        let batch: Vec<Command> = it.by_ref().take(GROW_BATCH).collect();
-        let r = c.reps[l]
-            .with(|n| {
-                let _ = n.take_refusals();
-                let r = n.propose_many(batch);
-                (r, n.take_refusals())
-            })
-            .ok_or("node stopped")?;
-        match r {
-            (Ok(round), refusals) if refusals.is_empty() => last = round,
-            (Ok(_), refusals) => return Err(format!("refused: {}", refusals[0])),
-            (Err(e), _) => return Err(format!("{e}")),
+/// Hand `cmds` to node `l`'s driver, `batch` per turn; wait until the queue is drained. Returns
+/// the last round its proposals reached, or why it could not.
+fn propose_queued(c: &Cluster, l: usize, cmds: Vec<Command>, batch: usize, bound: Duration) -> Result<Round, String> {
+    let r = &c.reps[l];
+    r.batch.store(batch, Ordering::Relaxed);
+    let refused0 = r.q_refused.load(Ordering::Relaxed);
+    r.enqueue(cmds);
+    let t0 = Instant::now();
+    while r.queue_len() > 0 {
+        if t0.elapsed() > bound {
+            return Err(format!("queue not drained in {bound:?}: {} left", r.queue_len()));
         }
+        std::thread::sleep(Duration::from_micros(200));
     }
-    Ok(last)
+    // The last batch may still be inside its drain; wait for the driver to finish the turn.
+    let turns = r.turns.load(Ordering::Relaxed);
+    while r.turns.load(Ordering::Relaxed) < turns + 2 && t0.elapsed() < bound {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let refused = r.q_refused.load(Ordering::Relaxed) - refused0;
+    if refused > 0 {
+        return Err(format!("{refused} queued proposals refused"));
+    }
+    Ok(r.q_last_round.load(Ordering::Acquire))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -426,7 +502,7 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     // GROW (fixture): N forks owned by L, group-committed.
     c.set_gc(true);
     let t0 = Instant::now();
-    let grow_last = match propose_batched(&c, l, (1..=n).map(|i| fork_c(cid(lid, i))).collect()) {
+    let grow_last = match propose_queued(&c, l, (1..=n).map(|i| fork_c(cid(lid, i))).collect(), GROW_BATCH, Duration::from_secs(900)) {
         Ok(r) => r,
         Err(e) => {
             println!("B {tag} VOID: growth refused: {e}");
@@ -456,26 +532,32 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
         let start_commit = c.reps[l].committed_head();
         let mut lags: Vec<u64> = Vec::new();
         let mut i = 0u64;
-        let mut refused = 0u64;
+        let refused0 = c.reps[l].q_refused.load(Ordering::Relaxed);
+        c.reps[l].batch.store(1, Ordering::Relaxed);
+        // Keep the driver's queue non-empty (saturation) without ever holding the node mutex here.
         while t0.elapsed() < Duration::from_secs(P7_SECS) {
-            i += 1;
-            if c.reps[l].propose(fork_c(cid(PHANTOM, i))).is_err() {
-                refused += 1;
+            if c.reps[l].queue_len() < 64 {
+                c.reps[l].enqueue((0..64).map(|k| fork_c(cid(PHANTOM, i + k + 1))));
+                i += 64;
             }
-            if i % 10 == 0 {
-                let head = c.reps[l].committed_head();
-                let fa = c.obs[f1].applied.load(Ordering::Acquire);
-                lags.push(head.saturating_sub(fa));
-            }
+            let head = c.reps[l].committed_head();
+            let fa = c.obs[f1].applied.load(Ordering::Acquire);
+            lags.push(head.saturating_sub(fa));
+            std::thread::sleep(Duration::from_millis(5));
         }
         let committed = c.reps[l].committed_head() - start_commit;
+        let left = { let mut q = lock(&c.reps[l].queue); let k = q.len() as u64; q.clear(); k };
+        i -= left;
+        let refused = c.reps[l].q_refused.load(Ordering::Relaxed) - refused0;
+        c.reps[l].batch.store(GROW_BATCH, Ordering::Relaxed);
         lags.sort_unstable();
         let p99 = lags.get(lags.len() * 99 / 100).copied().unwrap_or(0);
         println!(
-            "B {tag} P7 proposed={i} refused={refused} committed_in_{P7_SECS}s={committed} R_per_s={:.1} follower_apply_lag_p99_rounds={p99} lag_samples={}",
+            "B {tag} P7 path=driver-queue,1-per-turn,GC-off proposed={i} refused={refused} committed_in_{P7_SECS}s={committed} R_per_s={:.1} follower_apply_lag_p99_rounds={p99} lag_samples={}",
             committed as f64 / P7_SECS as f64,
             lags.len()
         );
+        std::thread::sleep(Duration::from_millis(50));
         let last = c.reps[l].with(|x| x.last_round()).unwrap_or(0);
         c.wait_applied(&all, last, Duration::from_secs(120));
     }
@@ -495,59 +577,45 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     let l2id = l2 as u32 + 1;
     let other = *survivors.iter().find(|i| **i != l2).unwrap();
     let term0 = c.reps[l2].with(|x| x.term()).unwrap_or(0);
+    let leader_before_serve = l2id;
 
     // DISPOSE (B2).
+    for i in [l2, other] {
+        c.reps[i].max_gap_us.store(0, Ordering::Relaxed);
+    }
     let t_disp = Instant::now();
     let (props, last_round, prefix) = match arm {
         Arm::Head => {
-            if n <= 100_000 {
-                let ledger = match &c.ledgers[l2] {
-                    ArmL::Head(x) => x.clone(),
-                    _ => unreachable!(),
-                };
-                let agents = ClusterAgents::new(NodeId(l2id), Arc::new(AgentRuntime::new()), c.reps[l2].clone(), ledger);
-                match agents.abandon_orphans_of(NodeId(lid)) {
-                    Ok(out) => (out.len() as u64, out.last().map(|x| x.1).unwrap_or(0), false),
-                    Err(e) => {
-                        println!("B {tag} abandon_orphans_of REFUSED after {} proposals: {e}", agents.cost().proposals);
-                        (agents.cost().proposals, 0, false)
-                    }
+            // The real sweep, on the seam NodeReplicator's shape gives it: proposals from this
+            // (the caller's) thread, sharing the node mutex with the driver.
+            let ledger = match &c.ledgers[l2] {
+                ArmL::Head(x) => x.clone(),
+                _ => unreachable!(),
+            };
+            let agents = ClusterAgents::new(NodeId(l2id), Arc::new(AgentRuntime::new()), c.reps[l2].clone(), ledger);
+            match agents.abandon_orphans_of(NodeId(lid)) {
+                Ok(out) => (out.len() as u64, out.last().map(|x| x.1).unwrap_or(0), false),
+                Err(e) => {
+                    println!("B {tag} abandon_orphans_of REFUSED after {} proposals: {e}", agents.cost().proposals);
+                    (agents.cost().proposals, 0, false)
                 }
-            } else {
-                // The sweep's first K proposals: the same loop body as abandon_orphans_of
-                // (cluster.rs :1239-1245), over the real orphans_of.
-                let orphans = match &c.ledgers[l2] {
-                    ArmL::Head(x) => lock(x).orphans_of(NodeId(lid)),
-                    _ => unreachable!(),
-                };
-                let mut last = 0;
-                let mut k = 0u64;
-                for id in orphans.into_iter().take(PREFIX_K) {
-                    match c.reps[l2].propose(abandon_c(id.0)) {
-                        Ok(r) => {
-                            last = r;
-                            k += 1;
-                        }
-                        Err(e) => {
-                            println!("B {tag} prefix proposal refused after {k}: {e}");
-                            break;
-                        }
-                    }
-                }
-                (k, last, true)
             }
         }
-        Arm::Gc => {
+        Arm::HeadQ | Arm::Gc => {
+            // HEAD's per-branch sweep (the real orphans_of, one Abandon per orphan), proposed by the
+            // driver: HEADQ one per turn with one fsync each; GC up to GROW_BATCH per turn, one fsync.
             let orphans = match &c.ledgers[l2] {
                 ArmL::Head(x) => lock(x).orphans_of(NodeId(lid)),
                 _ => unreachable!(),
             };
-            let k = orphans.len() as u64;
-            match propose_batched(&c, l2, orphans.into_iter().map(|id| abandon_c(id.0)).collect()) {
-                Ok(r) => (k, r, false),
+            let (batch, take) = if arm == Arm::HeadQ { (1, if n > 100_000 { PREFIX_K } else { orphans.len() }) } else { (GROW_BATCH, orphans.len()) };
+            let cmds: Vec<Command> = orphans.into_iter().take(take).map(|id| abandon_c(id.0)).collect();
+            let k = cmds.len() as u64;
+            match propose_queued(&c, l2, cmds, batch, Duration::from_secs(1100)) {
+                Ok(r) => (k, r, take < n as usize),
                 Err(e) => {
-                    println!("B {tag} GC sweep refused: {e}");
-                    (k, 0, false)
+                    println!("B {tag} queued sweep refused: {e}");
+                    (k, 0, take < n as usize)
                 }
             }
         }
@@ -565,15 +633,23 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     let term1 = c.reps[l2].with(|x| x.term()).unwrap_or(0);
     let leader_after = c.reps[other].leader();
     let max_apply_ns: Vec<u64> = [l2, other].iter().map(|i| c.obs[*i].max_apply_ns.load(Ordering::Relaxed)).collect();
+    let max_gap_ms: Vec<f64> = [l2, other].iter().map(|i| c.reps[*i].max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
     let syncs_after: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.persist_syncs()).unwrap_or(0)).collect();
     let sync_delta: Vec<u64> = syncs_after.iter().zip(&syncs_before).map(|(a, b)| a - b).collect();
     println!(
-        "B {tag} B1_t_elect_ms={t_elect_ms:.1} B2_dispose_ms={dispose_ms:.1} propose_ms={propose_ms:.1} C0_props={props} prefix={prefix} per_prop_ms={:.3} applied_all={applied} B4_term_before={term0} term_after={term1} leader_seen_by_other={leader_after:?} max_apply_ns_survivors={max_apply_ns:?} persist_syncs_since_failover_survivors={sync_delta:?}",
+        "B {tag} B1_t_elect_ms={t_elect_ms:.1} B2_dispose_ms={dispose_ms:.1} propose_ms={propose_ms:.1} C0_props={props} prefix={prefix} per_prop_ms={:.3} applied_all={applied} B4_term_before={term0} term_after={term1} leader_seen_by_other={leader_after:?} max_apply_ns_survivors={max_apply_ns:?} driver_max_gap_ms_survivors={max_gap_ms:?} persist_syncs_since_failover_survivors={sync_delta:?}",
         if props > 0 { dispose_ms / props as f64 } else { f64::NAN }
     );
 
-    // SERVE (B3): a fresh fork and merge on L' until the verdict is Applied.
+    // SERVE (B3): a fresh fork and merge on whoever leads now (L' unless the sweep deposed it).
     let t_serve = Instant::now();
+    let l2 = match c.elect(&survivors, Duration::from_secs(60)) {
+        Some((x, _)) => x,
+        None => l2,
+    };
+    let other = *survivors.iter().find(|i| **i != l2).unwrap();
+    let l2id = l2 as u32 + 1;
+    println!("B {tag} B3_leader_after_dispose=n{l2id} (changed={})", l2id != leader_before_serve);
     let fresh = cid(l2id, 1);
     let serve = (|| -> Result<(Round, Option<V>), String> {
         let fr = c.reps[l2].propose(fork_c(fresh)).map_err(|e| e.to_string())?;
@@ -597,7 +673,7 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     // Integers C1 (L's branches still live) and C2 (fresh fork wrongly not live before its merge:
     // checked through the merge verdict above; here the survivors' liveness of L's branches).
     let c1: Vec<usize> = [l2, other].iter().map(|i| c.ledgers[*i].live_count_of(lid)).collect();
-    println!("B {tag} C1_L_live_on_survivors={c1:?} (prefix run: expected N-K on HEAD) errs={:?}", lock(&c.errs));
+    println!("B {tag} C1_L_live_on_survivors={c1:?} (HEADQ prefix run at N>1e5: expected N-K) errs={:?}", lock(&c.errs));
 
     // B5: restart the non-leader survivor and time the replay to its last log round.
     let last_log = c.reps[other].with(|x| x.last_round()).unwrap_or(0);
@@ -635,6 +711,7 @@ fn main() {
         .split(',')
         .map(|a| match a {
             "HEAD" => Arm::Head,
+            "HEADQ" => Arm::HeadQ,
             "GC" => Arm::Gc,
             "ZK" => Arm::Zk,
             "M1" => Arm::M1,
