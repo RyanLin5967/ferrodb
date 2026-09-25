@@ -1,0 +1,1486 @@
+//! r11-dist part A: E-O3 and E-O2 against the real `BranchLedger`, beside the published-fix arms, in
+//! one process with no disk and no network.
+//!
+//! PREREG: artie-research `frontier/round11/r11-dist/PREREG.md` (registered at 079f108, before this
+//! file existed). Every expected value below is computed from the fixture's constants (T, N, K, S),
+//! never from the subject.
+//!
+//! Arms (PREREG §2): HEAD (the real ledger and the real `ClusterAgents::abandon_orphans_of`), ZK
+//! (apply-time orphan set, ZooKeeper `closeSession`), M1 (an owner fence at a log position,
+//! CockroachDB's liveness epoch), OFL (M1 plus the lazy record: only merges reach the log), and for
+//! E-O2 the M2 snapshot arm. M1 and M2 run on `Copy`, this file's copy of HEAD's rules, whose
+//! agreement with the real ledger is itself measured (`conform`).
+//!
+//! Modes:
+//!   counts <T> <N>   P2 P3 P4 A-W A-R A-L, every arm, workload W (integers)
+//!   p6               log entries per merged result, k = 16, HEAD through the real ClusterAgents
+//!   p8 <seed>        safety equivalence on a seeded trace, negative controls, and `conform`
+//!   o2 <N>           E-O2 part A (C0..C4), mutants F and S, anti-vacuity, negative control
+//!   timed            P1, P1-fire, A-S, A-Z (run it under lockrun)
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use ferrodb::agent_sql::cluster::{
+    moves_base, BranchEffect, BranchLedger, ClusterAgents, ClusterBranchId, MergeVerdict,
+    Replicated,
+};
+use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::consensus::{BranchOp, Command, Entry, NodeId, Round};
+use ferrodb::error::FerroError;
+
+// ---------------------------------------------------------------------------------------------
+// Heap instrument (P3): live bytes held by the global allocator.
+// ---------------------------------------------------------------------------------------------
+
+struct Counting;
+static LIVE: AtomicI64 = AtomicI64::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            LIVE.fetch_add(l.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc_zeroed(l) };
+        if !p.is_null() {
+            LIVE.fetch_add(l.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        LIVE.fetch_sub(l.size() as i64, Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        let q = unsafe { System.realloc(p, l, new) };
+        if !q.is_null() {
+            LIVE.fetch_add(new as i64 - l.size() as i64, Ordering::Relaxed);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static GA: Counting = Counting;
+
+fn heap() -> i64 {
+    LIVE.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fixture vocabulary
+// ---------------------------------------------------------------------------------------------
+
+/// `cluster.rs` `LOCAL_BITS` / `LOCAL_MASK` (private there; the packing is `ClusterBranchId::of`).
+const LOCAL_BITS: u32 = 40;
+const LOCAL_MASK: u64 = (1u64 << LOCAL_BITS) - 1;
+
+fn cid(node: u32, local: u64) -> u64 {
+    ((node as u64) << LOCAL_BITS) | local
+}
+fn owner_of(id: u64) -> u32 {
+    (id >> LOCAL_BITS) as u32
+}
+/// The fence / close-owner sentinel (O2 M1): an `Abandon` of a local id no node will ever mint.
+fn sentinel(node: u32) -> u64 {
+    cid(node, LOCAL_MASK)
+}
+fn is_sentinel(id: u64) -> bool {
+    id != 0 && id & LOCAL_MASK == LOCAL_MASK
+}
+fn fork_c(child: u64) -> Command {
+    Command::Branch { op: BranchOp::Fork { child, parent: 0, fork_epoch: 1, lease_millis: 900_000 } }
+}
+fn merge_c(branch: u64, base_round: Round) -> Command {
+    Command::Branch { op: BranchOp::Merge { branch, base_round } }
+}
+fn abandon_c(branch: u64) -> Command {
+    Command::Branch { op: BranchOp::Abandon { branch } }
+}
+fn wal_c(n: u64) -> Command {
+    Command::WalBatch { start_lsn: n, bytes: Vec::new() }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum V {
+    Applied,
+    ReEval,
+    Refused,
+}
+
+fn class(v: &MergeVerdict) -> V {
+    match v {
+        MergeVerdict::Applied { .. } => V::Applied,
+        MergeVerdict::ReEvaluate { .. } => V::ReEval,
+        MergeVerdict::Refused { .. } => V::Refused,
+    }
+}
+
+/// splitmix64: the fixture's only randomness, seeded from argv.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The arms
+// ---------------------------------------------------------------------------------------------
+
+trait Ledger {
+    /// Apply one committed entry; `Some` for a merge's verdict class.
+    fn apply(&mut self, e: &Entry) -> Option<V>;
+    fn is_live(&self, id: u64) -> bool;
+    /// Branch records held, the trunk counted as one where the arm keeps it.
+    fn records(&self) -> usize;
+    fn live_ids_of(&self, node: u32) -> Vec<u64>;
+    /// Records touched by the single largest apply so far (HEAD: not instrumented, see `Head`).
+    fn touched_max(&self) -> u64;
+}
+
+/// HEAD: the real ledger.
+struct Head(Arc<Mutex<BranchLedger>>);
+
+impl Ledger for Head {
+    fn apply(&mut self, e: &Entry) -> Option<V> {
+        match lock(&self.0).apply(e) {
+            BranchEffect::Merged(v) => Some(class(&v)),
+            _ => None,
+        }
+    }
+    fn is_live(&self, id: u64) -> bool {
+        lock(&self.0).get(ClusterBranchId(id)).map(|b| b.state.is_live()).unwrap_or(false)
+    }
+    fn records(&self) -> usize {
+        lock(&self.0).all().count()
+    }
+    fn live_ids_of(&self, node: u32) -> Vec<u64> {
+        lock(&self.0).live_owned_by(NodeId(node)).into_iter().map(|c| c.0).collect()
+    }
+    /// Not instrumented: HEAD's `apply_branch` does one map get/insert per entry (READ at 7dc428f).
+    /// Printed as 0 and labelled READ in the output, never as a measurement.
+    fn touched_max(&self) -> u64 {
+        0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum St {
+    Live,
+    Merged(Round),
+    Abandoned(Round),
+    Reaped(Round, u32),
+}
+
+/// Same five fields and state width as `ReplicatedBranch`, so M1's heap is comparable with HEAD's.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+struct Rec {
+    parent: u64,
+    fork_epoch: u64,
+    lease_millis: u64,
+    forked_at: Round,
+    st: St,
+}
+
+/// HEAD's rules copied (`cluster.rs` `apply` / `apply_branch` / `merge_verdict` at 7dc428f), plus
+/// the M1 fence when `m1`, and two planted mutants for the controls.
+#[derive(Clone)]
+struct HeadCopy {
+    br: BTreeMap<u64, Rec>,
+    last_applied: Round,
+    lbm: Round,
+    fence: BTreeMap<u32, Round>,
+    m1: bool,
+    /// Mutant F (O2): the fence ignores position, so it kills the owner for ever.
+    mut_f: bool,
+    /// Negative control for P8: the fence is recorded but never checked.
+    mut_nofence: bool,
+    /// Copy mutant for `conform`: `>=` for `>` in the verdict.
+    mut_ge: bool,
+    touched: u64,
+}
+
+impl HeadCopy {
+    fn new(m1: bool) -> HeadCopy {
+        let mut br = BTreeMap::new();
+        br.insert(
+            0,
+            Rec { parent: 0, fork_epoch: 0, lease_millis: u64::MAX, forked_at: 0, st: St::Live },
+        );
+        HeadCopy {
+            br,
+            last_applied: 0,
+            lbm: 0,
+            fence: BTreeMap::new(),
+            m1,
+            mut_f: false,
+            mut_nofence: false,
+            mut_ge: false,
+            touched: 0,
+        }
+    }
+
+    fn rec_live(&self, id: u64, r: &Rec) -> bool {
+        if r.st != St::Live {
+            return false;
+        }
+        if !self.m1 || id == 0 || self.mut_nofence {
+            return true;
+        }
+        let o = owner_of(id);
+        if self.mut_f {
+            return !self.fence.contains_key(&o);
+        }
+        r.forked_at > self.fence.get(&o).copied().unwrap_or(0)
+    }
+}
+
+impl Ledger for HeadCopy {
+    fn apply(&mut self, e: &Entry) -> Option<V> {
+        if e.round <= self.last_applied {
+            return None;
+        }
+        self.last_applied = e.round;
+        let round = e.round;
+        let op = match &e.command {
+            Command::Branch { op } => op,
+            other => {
+                if moves_base(other) {
+                    self.lbm = round;
+                }
+                return None;
+            }
+        };
+        self.touched = self.touched.max(1);
+        match op {
+            BranchOp::Fork { child, parent, fork_epoch, lease_millis } => {
+                if *child == 0 || self.br.contains_key(child) {
+                    return None;
+                }
+                match self.br.get(parent) {
+                    Some(p) if self.rec_live(*parent, p) => {}
+                    _ => return None,
+                }
+                self.br.insert(
+                    *child,
+                    Rec {
+                        parent: *parent,
+                        fork_epoch: *fork_epoch,
+                        lease_millis: *lease_millis,
+                        forked_at: round,
+                        st: St::Live,
+                    },
+                );
+                None
+            }
+            BranchOp::Merge { branch, base_round } => {
+                let v = match self.br.get(branch) {
+                    None => V::Refused,
+                    Some(r) if !self.rec_live(*branch, r) => V::Refused,
+                    Some(_) => {
+                        let moved = if self.mut_ge { self.lbm >= *base_round } else { self.lbm > *base_round };
+                        if moved { V::ReEval } else { V::Applied }
+                    }
+                };
+                if v == V::Applied {
+                    if let Some(r) = self.br.get_mut(branch) {
+                        r.st = St::Merged(round);
+                    }
+                    self.lbm = round;
+                }
+                Some(v)
+            }
+            BranchOp::Abandon { branch } => {
+                if self.m1 && is_sentinel(*branch) {
+                    let f = self.fence.entry(owner_of(*branch)).or_insert(0);
+                    *f = (*f).max(round);
+                    return None;
+                }
+                if let Some(r) = self.br.get(branch).copied() {
+                    // HEAD checks `state.is_live()` only (not the fence): kept identical.
+                    if r.st == St::Live {
+                        self.br.get_mut(branch).unwrap().st = St::Abandoned(round);
+                    }
+                }
+                None
+            }
+            BranchOp::Reap { branch, generation } => {
+                if let Some(r) = self.br.get_mut(branch) {
+                    if !matches!(r.st, St::Reaped(..)) {
+                        r.st = St::Reaped(round, *generation);
+                    }
+                }
+                None
+            }
+        }
+    }
+    fn is_live(&self, id: u64) -> bool {
+        self.br.get(&id).map(|r| self.rec_live(id, r)).unwrap_or(false)
+    }
+    fn records(&self) -> usize {
+        self.br.len()
+    }
+    fn live_ids_of(&self, node: u32) -> Vec<u64> {
+        self.br
+            .iter()
+            .filter(|(id, r)| **id != 0 && owner_of(**id) == node && self.rec_live(**id, r))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+    fn touched_max(&self) -> u64 {
+        self.touched
+    }
+}
+
+/// ZK: records exist only while live; a close-owner command deletes the owner's set AT APPLY.
+struct Zk {
+    recs: BTreeMap<u64, Rec>,
+    by_owner: BTreeMap<u32, BTreeSet<u64>>,
+    last_applied: Round,
+    lbm: Round,
+    touched: u64,
+}
+
+impl Zk {
+    fn new() -> Zk {
+        Zk { recs: BTreeMap::new(), by_owner: BTreeMap::new(), last_applied: 0, lbm: 0, touched: 0 }
+    }
+    fn delete(&mut self, id: u64) {
+        if self.recs.remove(&id).is_some() {
+            if let Some(s) = self.by_owner.get_mut(&owner_of(id)) {
+                s.remove(&id);
+            }
+        }
+    }
+}
+
+impl Ledger for Zk {
+    fn apply(&mut self, e: &Entry) -> Option<V> {
+        if e.round <= self.last_applied {
+            return None;
+        }
+        self.last_applied = e.round;
+        let round = e.round;
+        let op = match &e.command {
+            Command::Branch { op } => op,
+            other => {
+                if moves_base(other) {
+                    self.lbm = round;
+                }
+                return None;
+            }
+        };
+        self.touched = self.touched.max(1);
+        match op {
+            BranchOp::Fork { child, parent, fork_epoch, lease_millis } => {
+                if *child == 0 || self.recs.contains_key(child) {
+                    return None;
+                }
+                if *parent != 0 && !self.recs.contains_key(parent) {
+                    return None;
+                }
+                self.recs.insert(
+                    *child,
+                    Rec {
+                        parent: *parent,
+                        fork_epoch: *fork_epoch,
+                        lease_millis: *lease_millis,
+                        forked_at: round,
+                        st: St::Live,
+                    },
+                );
+                self.by_owner.entry(owner_of(*child)).or_default().insert(*child);
+                None
+            }
+            BranchOp::Merge { branch, base_round } => {
+                let v = if !self.recs.contains_key(branch) {
+                    V::Refused
+                } else if self.lbm > *base_round {
+                    V::ReEval
+                } else {
+                    V::Applied
+                };
+                if v == V::Applied {
+                    self.delete(*branch);
+                    self.lbm = round;
+                }
+                Some(v)
+            }
+            BranchOp::Abandon { branch } => {
+                if is_sentinel(*branch) {
+                    // `ephemerals.remove(session)`, then delete every member: the whole set, here.
+                    let set = self.by_owner.remove(&owner_of(*branch)).unwrap_or_default();
+                    self.touched = self.touched.max(set.len() as u64);
+                    for id in set {
+                        self.recs.remove(&id);
+                    }
+                } else {
+                    self.delete(*branch);
+                }
+                None
+            }
+            BranchOp::Reap { branch, .. } => {
+                self.delete(*branch);
+                None
+            }
+        }
+    }
+    fn is_live(&self, id: u64) -> bool {
+        id == 0 || self.recs.contains_key(&id)
+    }
+    fn records(&self) -> usize {
+        self.recs.len() + 1
+    }
+    fn live_ids_of(&self, node: u32) -> Vec<u64> {
+        self.by_owner.get(&node).map(|s| s.iter().copied().collect()).unwrap_or_default()
+    }
+    fn touched_max(&self) -> u64 {
+        self.touched
+    }
+}
+
+/// OFL's own log vocabulary: only merges, fences and base-moving others reach it.
+#[derive(Clone, Debug)]
+enum OCmd {
+    Merge { branch: u64, base_round: Round, inc: u32 },
+    Fence { node: u32, dead_inc: u32 },
+    Other { moves: bool },
+}
+
+#[derive(Clone, Default)]
+struct Ofl {
+    cur: BTreeMap<u32, u32>,
+    lbm: Round,
+    last_applied: Round,
+    /// Negative control: the incarnation check deleted.
+    mut_noinc: bool,
+}
+
+impl Ofl {
+    fn apply(&mut self, round: Round, c: &OCmd) -> Option<V> {
+        if round <= self.last_applied {
+            return None;
+        }
+        self.last_applied = round;
+        match c {
+            OCmd::Merge { branch, base_round, inc } => {
+                let cur = self.cur.get(&owner_of(*branch)).copied().unwrap_or(0);
+                let v = if !self.mut_noinc && *inc != cur {
+                    V::Refused
+                } else if self.lbm > *base_round {
+                    V::ReEval
+                } else {
+                    V::Applied
+                };
+                if v == V::Applied {
+                    self.lbm = round;
+                }
+                Some(v)
+            }
+            OCmd::Fence { node, dead_inc } => {
+                let c = self.cur.entry(*node).or_insert(0);
+                *c = (*c).max(dead_inc + 1);
+                None
+            }
+            OCmd::Other { moves } => {
+                if *moves {
+                    self.lbm = round;
+                }
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The counting seam: the real `ClusterAgents` proposes through it, and nothing is fsynced.
+// ---------------------------------------------------------------------------------------------
+
+struct CountSeam {
+    leader: NodeId,
+    term: u64,
+    next: AtomicU64,
+    proposals: AtomicU64,
+    sink: Mutex<Vec<Entry>>,
+    /// Ledgers `pump` applies the sink to (the coordinator's own, for `merge`'s waits).
+    apply_to: Vec<Arc<Mutex<BranchLedger>>>,
+    applied: Mutex<usize>,
+}
+
+impl CountSeam {
+    fn new(leader: NodeId, term: u64, next_round: Round, apply_to: Vec<Arc<Mutex<BranchLedger>>>) -> Arc<CountSeam> {
+        Arc::new(CountSeam {
+            leader,
+            term,
+            next: AtomicU64::new(next_round),
+            proposals: AtomicU64::new(0),
+            sink: Mutex::new(Vec::new()),
+            apply_to,
+            applied: Mutex::new(0),
+        })
+    }
+    fn take(&self) -> Vec<Entry> {
+        std::mem::take(&mut *lock(&self.sink))
+    }
+}
+
+impl Replicated for CountSeam {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        let round = self.next.fetch_add(1, Ordering::SeqCst);
+        lock(&self.sink).push(Entry { term: self.term, round, command: c });
+        self.proposals.fetch_add(1, Ordering::SeqCst);
+        Ok(round)
+    }
+    fn committed_head(&self) -> Round {
+        self.next.load(Ordering::SeqCst) - 1
+    }
+    fn pump(&self) -> Result<(), FerroError> {
+        let sink = lock(&self.sink);
+        let mut applied = lock(&self.applied);
+        for e in &sink[*applied..] {
+            for l in &self.apply_to {
+                lock(l).apply(e);
+            }
+        }
+        *applied = sink.len();
+        Ok(())
+    }
+    fn leader(&self) -> Option<NodeId> {
+        Some(self.leader)
+    }
+}
+
+/// HEAD's disposal, through the real code: `abandon_orphans_of` on a coordinator bound to
+/// `sweeper`, whose ledger is `ledger`. Returns the proposed entries (not yet applied anywhere).
+fn head_sweep(ledger: &Arc<Mutex<BranchLedger>>, sweeper: u32, dead: u32, term: u64, next_round: Round) -> Vec<Entry> {
+    let seam = CountSeam::new(NodeId(sweeper), term, next_round, Vec::new());
+    let agents = ClusterAgents::new(NodeId(sweeper), Arc::new(AgentRuntime::new()), seam.clone(), ledger.clone());
+    let out = agents.abandon_orphans_of(NodeId(dead)).expect("abandon_orphans_of refused");
+    let entries = seam.take();
+    assert_eq!(out.len(), entries.len(), "the sweep's report and its proposals disagree");
+    assert_eq!(agents.cost().proposals, entries.len() as u64);
+    entries
+}
+
+fn check(id: &str, arm: &str, pred: &str, ok: bool, got: String) {
+    println!("CHECK {id} arm={arm} pred={pred} got={got} {}", if ok { "PASS" } else { "FAIL" });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Workload W (E-O3): n1 forks T; the first T-N are disposed (i % 16 == 0 merges, else abandons);
+// the last N stay live. Streamed, so nothing but the ledger holds T.
+// ---------------------------------------------------------------------------------------------
+
+fn run_w(t: u64, n: u64, mut sink: impl FnMut(Entry)) -> Round {
+    let mut round = 0;
+    for i in 1..=t {
+        round += 1;
+        sink(Entry { term: 1, round, command: fork_c(cid(1, i)) });
+    }
+    for i in 1..=(t - n) {
+        let head = round;
+        round += 1;
+        let c = if (i - 1) % 16 == 0 { merge_c(cid(1, i), head) } else { abandon_c(cid(1, i)) };
+        sink(Entry { term: 1, round, command: c });
+    }
+    round
+}
+
+fn merges_in_w(t: u64, n: u64) -> u64 {
+    (t - n).div_ceil(16)
+}
+
+fn mode_counts(t: u64, n: u64) {
+    assert!(n <= t && n >= 1);
+    println!("# counts T={t} N={n}");
+    // ---------------- HEAD
+    {
+        let h0 = heap();
+        let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+        let mut head = Head(ledger.clone());
+        let (mut forks, mut verdicts, mut applied_v) = (0u64, 0u64, 0u64);
+        let last = run_w(t, n, |e| {
+            if matches!(e.command, Command::Branch { op: BranchOp::Fork { .. } }) {
+                forks += 1;
+            }
+            if let Some(v) = head.apply(&e) {
+                verdicts += 1;
+                if v == V::Applied {
+                    applied_v += 1;
+                }
+            }
+        });
+        let h1 = heap();
+        let recs = head.records();
+        let t0 = Instant::now();
+        let props = head_sweep(&ledger, 2, 1, 2, last + 1);
+        let sweep_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let p4 = props.len() as u64;
+        for e in &props {
+            head.apply(e);
+        }
+        let live_after = head.live_ids_of(1).len();
+        let recs_after = head.records();
+        let bpr = (h1 - h0) as f64 / recs as f64;
+        println!(
+            "ARM=HEAD T={t} N={n} forks_applied={forks} verdicts={verdicts} applied={applied_v} P2_records={recs} P3_heap_bytes={} P3_bytes_per_record={bpr:.1} P4_proposals={p4} A-W=READ:1 A-R_records_after={recs_after} A-L_n1_live_after={live_after} sweep_ms_inmem={sweep_ms:.1}",
+            h1 - h0
+        );
+        check("anti-vacuity", "HEAD", &format!("forks={t},verdicts={}", merges_in_w(t, n)), forks == t && verdicts == merges_in_w(t, n) && applied_v == verdicts, format!("{forks},{verdicts},applied={applied_v}"));
+        check("P2", "HEAD", &format!("{}", t + 1), recs as u64 == t + 1, recs.to_string());
+        check("P3", "HEAD", "90..150", (90.0..=150.0).contains(&bpr), format!("{bpr:.1}"));
+        check("P4", "HEAD", &n.to_string(), p4 == n, p4.to_string());
+        check("A-R", "HEAD", &format!("{}", t + 1), recs_after as u64 == t + 1, recs_after.to_string());
+        check("A-L", "HEAD", "0", live_after == 0, live_after.to_string());
+    }
+    // ---------------- ZK
+    {
+        let h0 = heap();
+        let mut zk = Zk::new();
+        let last = run_w(t, n, |e| {
+            zk.apply(&e);
+        });
+        let h1 = heap();
+        let recs = zk.records();
+        let before_touched = zk.touched_max();
+        zk.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+        let aw = zk.touched_max();
+        let live_after = zk.live_ids_of(1).len();
+        let bpr = (h1 - h0) as f64 / (n + 1) as f64;
+        println!(
+            "ARM=ZK T={t} N={n} P2_records={recs} P3_heap_bytes={} P3_bytes_per_live_record={bpr:.1} P4_proposals=1 A-W_touched_max={aw} (before_disposal={before_touched}) A-R_records_after={} A-L_n1_live_after={live_after}",
+            h1 - h0,
+            zk.records()
+        );
+        check("P2", "ZK", &format!("{}", n + 1), recs as u64 == n + 1, recs.to_string());
+        check("P3", "ZK", "110..200 per live", (110.0..=200.0).contains(&bpr), format!("{bpr:.1}"));
+        check("A-W", "ZK", &n.to_string(), aw == n, aw.to_string());
+        check("A-R", "ZK", "1", zk.records() == 1, zk.records().to_string());
+        check("A-L", "ZK", "0", live_after == 0, live_after.to_string());
+    }
+    // ---------------- M1
+    {
+        let h0 = heap();
+        let mut m1 = HeadCopy::new(true);
+        let last = run_w(t, n, |e| {
+            m1.apply(&e);
+        });
+        let h1 = heap();
+        let recs = m1.records();
+        m1.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+        let live_after = m1.live_ids_of(1).len();
+        let bpr = (h1 - h0) as f64 / recs as f64;
+        println!(
+            "ARM=M1 T={t} N={n} P2_records={recs} P3_heap_bytes={} P3_bytes_per_record={bpr:.1} P4_proposals=1 A-W_touched_max={} A-R_records_after={} A-L_n1_live_after={live_after}",
+            h1 - h0,
+            m1.touched_max(),
+            m1.records()
+        );
+        check("P2", "M1", &format!("{}", t + 1), recs as u64 == t + 1, recs.to_string());
+        check("P3", "M1", "90..150", (90.0..=150.0).contains(&bpr), format!("{bpr:.1}"));
+        check("A-W", "M1", "1", m1.touched_max() == 1, m1.touched_max().to_string());
+        check("A-R", "M1", &format!("{}", t + 1), m1.records() as u64 == t + 1, m1.records().to_string());
+        check("A-L", "M1", "0", live_after == 0, live_after.to_string());
+    }
+    // ---------------- OFL: only merges reach the log
+    {
+        let h0 = heap();
+        let mut o = Ofl::default();
+        let mut round = 0;
+        let mut entries = 0u64;
+        for i in 1..=(t - n) {
+            if (i - 1) % 16 == 0 {
+                let head = round;
+                round += 1;
+                entries += 1;
+                o.apply(round, &OCmd::Merge { branch: cid(1, i), base_round: head, inc: 0 });
+            }
+        }
+        round += 1;
+        o.apply(round, &OCmd::Fence { node: 1, dead_inc: 0 });
+        let h1 = heap();
+        let bytes = h1 - h0;
+        println!("ARM=OFL T={t} N={n} P2_branch_records=0 state_nodes={} P3_heap_bytes_total={bytes} P4_proposals=1 log_entries_lifecycle={entries}", o.cur.len());
+        check("P3", "OFL", "<65536 total", bytes < 65536, bytes.to_string());
+        check("OFL-entries", "OFL", &merges_in_w(t, n).to_string(), entries == merges_in_w(t, n), entries.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// P6: entries per merged result, k = 16, HEAD through the real ClusterAgents
+// ---------------------------------------------------------------------------------------------
+
+fn mode_p6() {
+    use ferrodb::agent_sql::runtime::{ExecCtx, RunIdentity};
+    use ferrodb::branch::types::BranchId;
+    use ferrodb::buffer::buffer_pool::BufferPoolManager;
+    use ferrodb::catalog::catalog::Catalog;
+    use ferrodb::storage::disk_manager::DiskManager;
+    use ferrodb::wal::log::WalManager;
+    use ferrodb::wal::txn::TxnManager;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("p6.db"))
+        .unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let mut catalog = Catalog::create(bp.clone()).unwrap();
+    let wal = Arc::new(WalManager::new(dir.path().join("p6.wal")).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal);
+    let runtime = Arc::new(AgentRuntime::new());
+
+    let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+    let seam = CountSeam::new(NodeId(1), 1, 1, vec![ledger.clone()]);
+    let agents = ClusterAgents::new(NodeId(1), runtime.clone(), seam.clone(), ledger.clone());
+    let mut sessions = Vec::new();
+    for _ in 0..16 {
+        sessions.push(
+            agents
+                .fork(RunIdentity { agent_id: "p6", run_id: Some("r"), ..RunIdentity::default() }, BranchId::TRUNK)
+                .unwrap(),
+        );
+    }
+    seam.pump().unwrap();
+    for s in &sessions[1..] {
+        agents.abandon(s).unwrap();
+    }
+    let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+    let r = agents.merge(&mut ctx, sessions[0].branch());
+    let merged = match &r {
+        Ok(rep) => rep.merge_round.is_some(),
+        Err(e) => {
+            println!("P6 merge error: {e}");
+            false
+        }
+    };
+    seam.pump().unwrap();
+    let log = lock(&seam.sink).clone();
+    let mut kinds: BTreeMap<&str, u64> = BTreeMap::new();
+    for e in &log {
+        let k = match &e.command {
+            Command::Branch { op: BranchOp::Fork { .. } } => "Fork",
+            Command::Branch { op: BranchOp::Merge { .. } } => "Merge",
+            Command::Branch { op: BranchOp::Abandon { .. } } => "Abandon",
+            Command::Branch { op: BranchOp::Reap { .. } } => "Reap",
+            Command::LeaseTick { .. } => "LeaseTick",
+            _ => "Other",
+        };
+        *kinds.entry(k).or_default() += 1;
+    }
+    println!("ARM=HEAD P6 merged={merged} entries={} by_kind={kinds:?} proposals_counter={}", log.len(), agents.cost().proposals);
+    check("P6", "HEAD", "32 (16F+1M+15A, 0 Reap, 0 LeaseTick)", merged && log.len() == 32 && kinds.get("Fork") == Some(&16) && kinds.get("Merge") == Some(&1) && kinds.get("Abandon") == Some(&15) && !kinds.contains_key("Reap") && !kinds.contains_key("LeaseTick"), log.len().to_string());
+    println!("ARM=ZK P6 entries=32 (BY ARM DEFINITION: ZooKeeper logs every create and delete)");
+    println!("ARM=M1 P6 entries=32 (BY ARM DEFINITION: M1 changes only the disposal)");
+    println!("ARM=OFL P6 entries=1 (BY ARM DEFINITION: only the merge reaches the log)");
+}
+
+// ---------------------------------------------------------------------------------------------
+// P8: seeded trace, safety equivalence, negative controls; plus `conform` on the same log
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum Ev {
+    Fork { id: u64, inc: u32 },
+    Merge { id: u64, base_pos: usize, inc: u32, planted: bool, dup: bool },
+    Abandon { id: u64 },
+    Write,
+    Fail { owner: u32, dead_inc: u32 },
+}
+
+fn gen_trace(seed: u64, len: usize) -> Vec<Ev> {
+    let mut rng = Rng(seed);
+    let mut evs: Vec<Ev> = Vec::with_capacity(len + 64);
+    let mut next_local = [0u64; 4];
+    let mut inc = [0u32; 4];
+    // generator's view: live (id, fork_pos, inc) per owner
+    let mut live: Vec<Vec<(u64, usize, u32)>> = vec![Vec::new(); 4];
+    let fail_at = [len * 3 / 10, len * 6 / 10];
+    let fail_owner = [1u32, 2u32];
+    while evs.len() < len {
+        let pos = evs.len();
+        if let Some(k) = fail_at.iter().position(|&p| p == pos) {
+            let o = fail_owner[k];
+            let fenced: Vec<(u64, usize, u32)> = std::mem::take(&mut live[o as usize]);
+            evs.push(Ev::Fail { owner: o, dead_inc: inc[o as usize] });
+            // planted: a zombie merge from the fenced incarnation, with a FRESH base
+            if let Some(&(id, _, i)) = fenced.first() {
+                let p = evs.len();
+                evs.push(Ev::Merge { id, base_pos: p - 1, inc: i, planted: true, dup: false });
+            }
+            inc[o as usize] += 1;
+            continue;
+        }
+        let r = rng.below(100);
+        let o = 1 + rng.below(3) as u32;
+        if r < 40 || live[o as usize].is_empty() {
+            next_local[o as usize] += 1;
+            let id = cid(o, next_local[o as usize]);
+            evs.push(Ev::Fork { id, inc: inc[o as usize] });
+            live[o as usize].push((id, pos, inc[o as usize]));
+        } else if r < 60 {
+            let k = rng.below(live[o as usize].len() as u64) as usize;
+            let (id, fpos, i) = live[o as usize].swap_remove(k);
+            // The gate read a committed head at or after the fork (HEAD's merge pumps until the
+            // fork is applied before reading it), up to 50 events stale.
+            let lo = fpos.max(pos.saturating_sub(50));
+            let hi = pos - 1;
+            let base_pos = lo + rng.below((hi - lo + 1) as u64) as usize;
+            evs.push(Ev::Merge { id, base_pos, inc: i, planted: false, dup: false });
+            if rng.below(100) == 0 {
+                evs.push(Ev::Merge { id, base_pos, inc: i, planted: false, dup: true });
+            }
+        } else if r < 80 {
+            let k = rng.below(live[o as usize].len() as u64) as usize;
+            let (id, _, _) = live[o as usize].swap_remove(k);
+            evs.push(Ev::Abandon { id });
+        } else {
+            evs.push(Ev::Write);
+        }
+    }
+    evs
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum P8Arm {
+    Head,
+    Zk,
+    M1,
+    M1NoFence,
+}
+
+/// Run the trace through one log-carrying arm. Returns (verdict per event index, the log).
+fn p8_run(evs: &[Ev], arm: P8Arm) -> (BTreeMap<usize, V>, Vec<Entry>) {
+    let head_ledger = Arc::new(Mutex::new(BranchLedger::new()));
+    let mut l: Box<dyn Ledger> = match arm {
+        P8Arm::Head => Box::new(Head(head_ledger.clone())),
+        P8Arm::Zk => Box::new(Zk::new()),
+        P8Arm::M1 => Box::new(HeadCopy::new(true)),
+        P8Arm::M1NoFence => {
+            let mut c = HeadCopy::new(true);
+            c.mut_nofence = true;
+            Box::new(c)
+        }
+    };
+    let mut log: Vec<Entry> = Vec::new();
+    let mut pos_round: Vec<Round> = Vec::with_capacity(evs.len());
+    let mut out = BTreeMap::new();
+    let mut wal = 0u64;
+    for (p, ev) in evs.iter().enumerate() {
+        let push = |c: Command, log: &mut Vec<Entry>, l: &mut Box<dyn Ledger>| -> Option<V> {
+            let e = Entry { term: 1, round: log.len() as Round + 1, command: c };
+            let v = l.apply(&e);
+            log.push(e);
+            v
+        };
+        match ev {
+            Ev::Fork { id, .. } => {
+                push(fork_c(*id), &mut log, &mut l);
+            }
+            Ev::Merge { id, base_pos, .. } => {
+                let base = pos_round[*base_pos];
+                if let Some(v) = push(merge_c(*id, base), &mut log, &mut l) {
+                    out.insert(p, v);
+                }
+            }
+            Ev::Abandon { id } => {
+                push(abandon_c(*id), &mut log, &mut l);
+            }
+            Ev::Write => {
+                wal += 1;
+                push(wal_c(wal), &mut log, &mut l);
+            }
+            Ev::Fail { owner, .. } => match arm {
+                P8Arm::Head => {
+                    let sweeper = owner % 3 + 1;
+                    let props = head_sweep(&head_ledger, sweeper, *owner, 1, log.len() as Round + 1);
+                    for e in props {
+                        l.apply(&e);
+                        log.push(e);
+                    }
+                }
+                _ => {
+                    push(abandon_c(sentinel(*owner)), &mut log, &mut l);
+                }
+            },
+        }
+        pos_round.push(log.len() as Round);
+    }
+    (out, log)
+}
+
+fn p8_ofl(evs: &[Ev], mut_noinc: bool) -> BTreeMap<usize, V> {
+    let mut o = Ofl { mut_noinc, ..Ofl::default() };
+    let mut round = 0;
+    let mut pos_round: Vec<Round> = Vec::with_capacity(evs.len());
+    let mut out = BTreeMap::new();
+    for (p, ev) in evs.iter().enumerate() {
+        match ev {
+            Ev::Merge { id, base_pos, inc, .. } => {
+                round += 1;
+                if let Some(v) = o.apply(round, &OCmd::Merge { branch: *id, base_round: pos_round[*base_pos], inc: *inc }) {
+                    out.insert(p, v);
+                }
+            }
+            Ev::Write => {
+                round += 1;
+                o.apply(round, &OCmd::Other { moves: true });
+            }
+            Ev::Fail { owner, dead_inc } => {
+                round += 1;
+                o.apply(round, &OCmd::Fence { node: *owner, dead_inc: *dead_inc });
+            }
+            Ev::Fork { .. } | Ev::Abandon { .. } => {}
+        }
+        pos_round.push(round);
+    }
+    out
+}
+
+fn mode_p8(seed: u64) {
+    let evs = gen_trace(seed, 100_000);
+    let merges: Vec<usize> = evs.iter().enumerate().filter(|(_, e)| matches!(e, Ev::Merge { .. })).map(|(i, _)| i).collect();
+    let planted: BTreeSet<usize> = evs.iter().enumerate().filter(|(_, e)| matches!(e, Ev::Merge { planted: true, .. })).map(|(i, _)| i).collect();
+    let dups: BTreeSet<usize> = evs.iter().enumerate().filter(|(_, e)| matches!(e, Ev::Merge { dup: true, .. })).map(|(i, _)| i).collect();
+    let fails = evs.iter().filter(|e| matches!(e, Ev::Fail { .. })).count();
+    println!("# p8 seed={seed} events={} merges={} planted={} dups={} failovers={fails}", evs.len(), merges.len(), planted.len(), dups.len());
+
+    let (vh, head_log) = p8_run(&evs, P8Arm::Head);
+    let (vz, _) = p8_run(&evs, P8Arm::Zk);
+    let (vm, _) = p8_run(&evs, P8Arm::M1);
+    let (vmn, _) = p8_run(&evs, P8Arm::M1NoFence);
+    let vo = p8_ofl(&evs, false);
+    let von = p8_ofl(&evs, true);
+
+    let applied_count = vh.values().filter(|v| **v == V::Applied).count();
+    let reeval_count = vh.values().filter(|v| **v == V::ReEval).count();
+    println!("HEAD verdicts={} applied={applied_count} reeval={reeval_count} log_entries={}", vh.len(), head_log.len());
+    check("anti-vacuity", "HEAD", "every merge has a verdict; >=1 Applied; >=1 ReEval", vh.len() == merges.len() && applied_count > 0 && reeval_count > 0, format!("{}/{}", vh.len(), merges.len()));
+
+    let class_div = |other: &BTreeMap<usize, V>| merges.iter().filter(|p| !planted.contains(p) && vh.get(p) != other.get(p)).count();
+    let appl_div = |other: &BTreeMap<usize, V>| {
+        merges
+            .iter()
+            .filter(|p| !planted.contains(p) && (vh.get(p) == Some(&V::Applied)) != (other.get(p) == Some(&V::Applied)))
+            .count()
+    };
+    let planted_applied = |vv: &BTreeMap<usize, V>| planted.iter().filter(|p| vv.get(p) == Some(&V::Applied)).count();
+    let dup_applied = |vv: &BTreeMap<usize, V>| dups.iter().filter(|p| vv.get(p) == Some(&V::Applied)).count();
+
+    for (name, vv) in [("HEAD", &vh), ("ZK", &vz), ("M1", &vm), ("OFL", &vo)] {
+        println!("ARM={name} planted_applied={} dup_applied={}", planted_applied(vv), dup_applied(vv));
+        check("P8-planted", name, "0", planted_applied(vv) == 0, planted_applied(vv).to_string());
+        check("P8-dup", name, "0", dup_applied(vv) == 0, dup_applied(vv).to_string());
+    }
+    check("P8-class", "ZK", "0", class_div(&vz) == 0, class_div(&vz).to_string());
+    check("P8-class", "M1", "0", class_div(&vm) == 0, class_div(&vm).to_string());
+    check("P8-applied", "OFL", "0", appl_div(&vo) == 0, appl_div(&vo).to_string());
+    let nc_m1 = planted_applied(&vmn) + class_div(&vmn);
+    let nc_ofl = planted_applied(&von) + appl_div(&von);
+    check("P8-negctl", "M1-nofence", ">=1", nc_m1 >= 1, nc_m1.to_string());
+    check("P8-negctl", "OFL-noinc", ">=1", nc_ofl >= 1, nc_ofl.to_string());
+
+    // conform: the identical HEAD log through the copy, and through the copy mutant
+    let conform = |mut_ge: bool| -> usize {
+        let real = Arc::new(Mutex::new(BranchLedger::new()));
+        let mut r = Head(real);
+        let mut c = HeadCopy::new(false);
+        c.mut_ge = mut_ge;
+        let mut div = 0;
+        for e in &head_log {
+            if r.apply(e) != c.apply(e) {
+                div += 1;
+            }
+        }
+        let ids: BTreeSet<u64> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Fork { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        div + ids.iter().filter(|id| r.is_live(**id) != c.is_live(**id)).count()
+    };
+    let cd = conform(false);
+    let cdm = conform(true);
+    check("conform", "Copy", "0", cd == 0, cd.to_string());
+    check("conform-negctl", "Copy->=", ">=1", cdm >= 1, cdm.to_string());
+}
+
+// ---------------------------------------------------------------------------------------------
+// E-O2 part A
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum O2Kind {
+    Head,
+    Copy { m1: bool, m2: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct O2Arm {
+    name: &'static str,
+    kind: O2Kind,
+    barrier: bool,
+    sweeper: u32,
+    restart_n3: bool,
+    failover: bool,
+    mut_f: bool,
+    mut_s: bool,
+}
+
+struct O2Fixture {
+    log: Vec<Entry>,
+    f: Round,
+    r_c: Round,
+    t1_ids: Vec<u64>,
+    tail_ids: Vec<u64>,
+    merged_ids: Vec<u64>,
+}
+
+const O2_K: u64 = 64;
+const O2_S: u64 = 1000;
+
+fn o2_term1(n: u64) -> O2Fixture {
+    let mut log: Vec<Entry> = Vec::new();
+    let push = |log: &mut Vec<Entry>, term: u64, c: Command| -> Round {
+        let round = log.len() as Round + 1;
+        log.push(Entry { term, round, command: c });
+        round
+    };
+    let mut t1_ids = Vec::new();
+    let mut merged_ids = Vec::new();
+    let mut local = 0u64;
+    let mut next = || {
+        local += 1;
+        cid(1, local)
+    };
+    push(&mut log, 1, Command::NoOp);
+    for _ in 0..n / 2 {
+        let id = next();
+        t1_ids.push(id);
+        push(&mut log, 1, fork_c(id));
+    }
+    push(&mut log, 1, wal_c(1));
+    let pm = next();
+    t1_ids.push(pm);
+    let f = push(&mut log, 1, fork_c(pm));
+    push(&mut log, 1, merge_c(pm, f - 2));
+    for _ in 0..n / 2 {
+        let id = next();
+        t1_ids.push(id);
+        push(&mut log, 1, fork_c(id));
+    }
+    for _ in 0..n / 10 {
+        let id = next();
+        merged_ids.push(id);
+        let fr = push(&mut log, 1, fork_c(id));
+        push(&mut log, 1, merge_c(id, fr));
+    }
+    let r_c = log.len() as Round;
+    let mut tail_ids = Vec::new();
+    for _ in 0..O2_K {
+        let id = next();
+        tail_ids.push(id);
+        push(&mut log, 1, fork_c(id));
+    }
+    O2Fixture { log, f, r_c, t1_ids, tail_ids, merged_ids }
+}
+
+/// One node's ledger in an O2 arm: HEAD's real ledger, or the copy.
+enum O2L {
+    Head(Arc<Mutex<BranchLedger>>),
+    Copy(HeadCopy),
+}
+
+impl O2L {
+    fn fresh(kind: O2Kind, mut_f: bool) -> O2L {
+        match kind {
+            O2Kind::Head => O2L::Head(Arc::new(Mutex::new(BranchLedger::new()))),
+            O2Kind::Copy { m1, .. } => {
+                let mut c = HeadCopy::new(m1);
+                c.mut_f = mut_f;
+                O2L::Copy(c)
+            }
+        }
+    }
+    fn apply(&mut self, e: &Entry) -> Option<V> {
+        match self {
+            O2L::Head(l) => Head(l.clone()).apply(e),
+            O2L::Copy(c) => c.apply(e),
+        }
+    }
+    fn is_live(&self, id: u64) -> bool {
+        match self {
+            O2L::Head(l) => Head(l.clone()).is_live(id),
+            O2L::Copy(c) => c.is_live(id),
+        }
+    }
+    fn has(&self, id: u64) -> bool {
+        match self {
+            O2L::Head(l) => lock(l).get(ClusterBranchId(id)).is_some(),
+            O2L::Copy(c) => c.br.contains_key(&id),
+        }
+    }
+}
+
+struct O2Out {
+    c0: u64,
+    c1: [u64; 3],
+    c2: u64,
+    c3: u64,
+    c4: u64,
+    anti_vacuity: bool,
+}
+
+fn o2_run(n: u64, arm: O2Arm) -> O2Out {
+    let fx = o2_term1(n);
+    let mut log = fx.log.clone();
+    let mut_s = arm.mut_s;
+
+    // The snapshot at floor F (M2): the copy's whole state, applied through F.
+    let snapshot = |fx: &O2Fixture| -> HeadCopy {
+        let (m1, _) = match arm.kind {
+            O2Kind::Copy { m1, m2 } => (m1, m2),
+            O2Kind::Head => (false, false),
+        };
+        let mut c = HeadCopy::new(m1);
+        c.mut_f = arm.mut_f;
+        for e in &fx.log[..fx.f as usize] {
+            c.apply(e);
+        }
+        if mut_s {
+            c.lbm = 0;
+        }
+        c
+    };
+    let m2 = matches!(arm.kind, O2Kind::Copy { m2: true, .. });
+    let restarted = |fx: &O2Fixture| -> O2L {
+        if m2 {
+            O2L::Copy(snapshot(fx))
+        } else {
+            let mut l = O2L::fresh(arm.kind, arm.mut_f);
+            // HEAD's restart: a new ledger, and `applied` seeded from the floor (node.rs :370-373).
+            if let O2L::Copy(c) = &mut l {
+                c.last_applied = fx.f;
+            }
+            if let O2L::Head(h) = &l {
+                // A real BranchLedger cannot be seeded; it sees only rounds above F because only
+                // those are handed to it below.
+                let _ = h;
+            }
+            l
+        }
+    };
+
+    let mut anti_vacuity = true;
+    let mut c0 = 0u64;
+    if arm.failover {
+        // Term 2: NoOp(2) after the inherited tail.
+        let noop2 = log.len() as Round + 1;
+        log.push(Entry { term: 2, round: noop2, command: Command::NoOp });
+        // The sweeper's view at the sweep.
+        let sweeper_restarted = arm.sweeper == 3 && arm.restart_n3;
+        let mut sw = if sweeper_restarted { restarted(&fx) } else { O2L::fresh(arm.kind, arm.mut_f) };
+        let upto = if arm.barrier { noop2 } else { fx.r_c };
+        let from = if sweeper_restarted { fx.f + 1 } else { 1 };
+        for e in &log[(from - 1) as usize..upto as usize] {
+            sw.apply(e);
+        }
+        if !arm.barrier {
+            anti_vacuity = fx.tail_ids.iter().all(|id| {
+                let r = log.iter().position(|e| matches!(&e.command, Command::Branch { op: BranchOp::Fork { child, .. } } if child == id));
+                r.is_some() && !sw.has(*id)
+            });
+        }
+        let next_round = log.len() as Round + 1;
+        let sweep: Vec<Entry> = match (&sw, arm.kind) {
+            (O2L::Head(h), _) => head_sweep(h, arm.sweeper, 1, 2, next_round),
+            (O2L::Copy(_), O2Kind::Copy { m1: true, .. }) => {
+                vec![Entry { term: 2, round: next_round, command: abandon_c(sentinel(1)) }]
+            }
+            (O2L::Copy(c), _) => c
+                .live_ids_of(1)
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| Entry { term: 2, round: next_round + i as Round, command: abandon_c(id) })
+                .collect(),
+        };
+        c0 = sweep.len() as u64;
+        log.extend(sweep);
+        for i in 1..=O2_S {
+            let r = log.len() as Round + 1;
+            log.push(Entry { term: 2, round: r, command: fork_c(cid(2, i)) });
+        }
+        let r = log.len() as Round + 1;
+        log.push(Entry { term: 3, round: r, command: Command::NoOp });
+        let r = log.len() as Round + 1;
+        log.push(Entry { term: 3, round: r, command: fork_c(cid(1, 1_000_000_000)) });
+    }
+
+    // Final ledgers: n1, n2 fresh over the whole log; n3 restarted or fresh.
+    let mut nodes: Vec<O2L> = Vec::new();
+    let mut verdicts: Vec<BTreeMap<Round, V>> = Vec::new();
+    for k in 1..=3u32 {
+        let restart = k == 3 && arm.restart_n3;
+        let mut l = if restart { restarted(&fx) } else { O2L::fresh(arm.kind, arm.mut_f) };
+        let from = if restart { fx.f + 1 } else { 1 };
+        let mut vm = BTreeMap::new();
+        for e in &log[(from - 1) as usize..] {
+            if let Some(v) = l.apply(e) {
+                vm.insert(e.round, v);
+            }
+        }
+        nodes.push(l);
+        verdicts.push(vm);
+    }
+
+    let c1 = [0, 1, 2].map(|k| {
+        fx.t1_ids.iter().chain(fx.tail_ids.iter()).filter(|id| nodes[k].is_live(**id)).count() as u64
+    });
+    let c2 = if arm.failover {
+        (0..3)
+            .map(|k| {
+                (1..=O2_S).filter(|i| !nodes[k].is_live(cid(2, *i))).count() as u64
+                    + u64::from(!nodes[k].is_live(cid(1, 1_000_000_000)))
+            })
+            .max()
+            .unwrap()
+    } else {
+        0
+    };
+    let rounds: BTreeSet<Round> = verdicts.iter().flat_map(|m| m.keys().copied()).collect();
+    let c3 = rounds
+        .iter()
+        .filter(|r| {
+            let a = verdicts[0].get(r);
+            a != verdicts[1].get(r) || a != verdicts[2].get(r)
+        })
+        .count() as u64;
+    let mut all_ids: Vec<u64> = fx.t1_ids.iter().chain(fx.tail_ids.iter()).chain(fx.merged_ids.iter()).copied().collect();
+    if arm.failover {
+        all_ids.extend((1..=O2_S).map(|i| cid(2, i)));
+        all_ids.push(cid(1, 1_000_000_000));
+    }
+    let c4 = all_ids
+        .iter()
+        .filter(|id| {
+            let a = nodes[0].is_live(**id);
+            a != nodes[1].is_live(**id) || a != nodes[2].is_live(**id)
+        })
+        .count() as u64;
+    O2Out { c0, c1, c2, c3, c4, anti_vacuity }
+}
+
+fn mode_o2(n: u64) {
+    assert!(n % 10 == 0 && n >= 1000);
+    let head = O2Kind::Head;
+    let m1 = O2Kind::Copy { m1: true, m2: false };
+    let m2 = O2Kind::Copy { m1: false, m2: true };
+    let m12 = O2Kind::Copy { m1: true, m2: true };
+    let a = |name, kind, barrier, sweeper, restart_n3| O2Arm { name, kind, barrier, sweeper, restart_n3, failover: true, mut_f: false, mut_s: false };
+    let h = n / 2;
+    // (arm, predicted C0, C1 [n1,n2,n3], C2, C3, C4) -- O2 §6.3, from the constants N, K = 64
+    let rows: Vec<(O2Arm, u64, [u64; 3], u64, u64, u64)> = vec![
+        (a("HEAD n2/none", head, false, 2, false), n + 1, [64, 64, 64], 0, 0, 0),
+        (a("HEAD n2/n3-restarted", head, false, 2, true), n + 1, [64, 64, 64], 0, 1, 0),
+        (a("HEAD n3-restarted-sweeps", head, false, 3, true), h, [h + 65, h + 65, 64], 0, 1, h + 1),
+        (a("HEAD+barrier n2/none", head, true, 2, false), n + 65, [0, 0, 0], 0, 0, 0),
+        (a("HEAD+barrier n3-sweeps", head, true, 3, true), h + 64, [h + 1, h + 1, 0], 0, 1, h + 1),
+        (a("M1 n3-sweeps", m1, false, 3, true), 1, [0, 0, 0], 0, 1, 0),
+        (a("M2 n3-sweeps", m2, false, 3, true), n + 1, [64, 64, 64], 0, 0, 0),
+        (a("M1+M2 n2-sweeps", m12, false, 2, true), 1, [0, 0, 0], 0, 0, 0),
+        (a("M1+M2 n3-sweeps", m12, false, 3, true), 1, [0, 0, 0], 0, 0, 0),
+    ];
+    for (arm, c0, c1, c2, c3, c4) in rows {
+        let t0 = Instant::now();
+        let o = o2_run(n, arm);
+        let ok = o.c0 == c0 && o.c1 == c1 && o.c2 == c2 && o.c3 == c3 && o.c4 == c4;
+        println!(
+            "O2 N={n} arm=\"{}\" C0={} C1={:?} C2={} C3={} C4={} anti_vacuity={} ms={:.0}",
+            arm.name, o.c0, o.c1, o.c2, o.c3, o.c4, o.anti_vacuity, t0.elapsed().as_secs_f64() * 1e3
+        );
+        check("O2-row", arm.name, &format!("C0={c0} C1={c1:?} C2={c2} C3={c3} C4={c4}"), ok, format!("C0={} C1={:?} C2={} C3={} C4={}", o.c0, o.c1, o.c2, o.c3, o.c4));
+        if !arm.barrier {
+            check("O2-anti-vacuity", arm.name, "tail in log, absent from sweeper ledger", o.anti_vacuity, o.anti_vacuity.to_string());
+        }
+    }
+    let mut f = a("mutant-F (M1+M2, fence ignores position)", m12, false, 3, true);
+    f.mut_f = true;
+    let o = o2_run(n, f);
+    check("O2-mutF", f.name, "C2=1", o.c2 == 1, o.c2.to_string());
+    let mut s = a("mutant-S (M1+M2, snapshot without last_base_move)", m12, false, 3, true);
+    s.mut_s = true;
+    let o = o2_run(n, s);
+    check("O2-mutS", s.name, "C3=1", o.c3 == 1, o.c3.to_string());
+    let mut nc = a("negative control (HEAD, no failover, no restart)", head, false, 2, false);
+    nc.failover = false;
+    let o = o2_run(n, nc);
+    check("O2-negctl", nc.name, "C0=0 C2=0 C3=0 C4=0", o.c0 == 0 && o.c2 == 0 && o.c3 == 0 && o.c4 == 0, format!("C0={} C2={} C3={} C4={}", o.c0, o.c2, o.c3, o.c4));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Timed: P1, P1-fire, A-S, A-Z (under lockrun)
+// ---------------------------------------------------------------------------------------------
+
+const B: u64 = 256;
+const REPS: usize = 5;
+
+/// Fill for P1: T forks, the first 9T/10 disposed as in W, then a pool of 2B live forks.
+fn p1_fill(l: &mut dyn Ledger, t: u64) -> (Round, u64) {
+    let mut round = run_w(t, t - t * 9 / 10, |e| {
+        l.apply(&e);
+    });
+    let pool_start = t + 1;
+    for i in 0..2 * B {
+        round += 1;
+        l.apply(&Entry { term: 1, round, command: fork_c(cid(1, pool_start + i)) });
+    }
+    (round, pool_start)
+}
+
+fn time_batch(l: &mut dyn Ledger, round: &mut Round, cmds: impl Iterator<Item = Command>, fire: Option<&Arc<Mutex<BranchLedger>>>) -> f64 {
+    let batch: Vec<Command> = cmds.collect();
+    let n = batch.len();
+    let t0 = Instant::now();
+    for c in batch {
+        *round += 1;
+        l.apply(&Entry { term: 1, round: *round, command: c });
+        if let Some(h) = fire {
+            std::hint::black_box(lock(h).live_owned_by(NodeId(1)).len());
+        }
+    }
+    t0.elapsed().as_nanos() as f64 / n as f64
+}
+
+fn mode_timed() {
+    // P1: arms interleaved ABBA across reps.
+    let arms = ["HEAD", "ZK", "M1"];
+    for &t in &[1_000u64, 10_000_000] {
+        for rep in 0..REPS {
+            let order: Vec<&str> = if rep % 2 == 0 { arms.to_vec() } else { arms.iter().rev().copied().collect() };
+            for arm in order {
+                let hl = Arc::new(Mutex::new(BranchLedger::new()));
+                let mut l: Box<dyn Ledger> = match arm {
+                    "HEAD" => Box::new(Head(hl.clone())),
+                    "ZK" => Box::new(Zk::new()),
+                    _ => Box::new(HeadCopy::new(true)),
+                };
+                let (mut round, pool) = p1_fill(l.as_mut(), t);
+                let fork_base = pool + 2 * B;
+                let ns_fork = time_batch(l.as_mut(), &mut round, (0..B).map(|i| fork_c(cid(1, fork_base + i))), None);
+                let ns_merge = {
+                    let mut r = round;
+                    let batch: Vec<(u64, Round)> = (0..B).map(|i| (cid(1, pool + i), 0)).collect();
+                    let t0 = Instant::now();
+                    for (id, _) in batch {
+                        let base = r;
+                        r += 1;
+                        l.apply(&Entry { term: 1, round: r, command: merge_c(id, base) });
+                    }
+                    let ns = t0.elapsed().as_nanos() as f64 / B as f64;
+                    round = r;
+                    ns
+                };
+                let ns_abandon = time_batch(l.as_mut(), &mut round, (0..B).map(|i| abandon_c(cid(1, pool + B + i))), None);
+                let ns_tick = time_batch(l.as_mut(), &mut round, (0..B).map(|i| Command::LeaseTick { unix_millis: i }), None);
+                println!("TIMED id=P1 arm={arm} T={t} rep={rep} batch={B} records={} ns_fork={ns_fork:.1} ns_merge={ns_merge:.1} ns_abandon={ns_abandon:.1} ns_leasetick={ns_tick:.1}", l.records());
+            }
+            // OFL: merges and a base-moving other; no T.
+            let mut o = Ofl::default();
+            let t0 = Instant::now();
+            for i in 0..B {
+                o.apply(i + 1, &OCmd::Merge { branch: cid(1, i + 1), base_round: i, inc: 0 });
+            }
+            let ns_m = t0.elapsed().as_nanos() as f64 / B as f64;
+            let t0 = Instant::now();
+            for i in 0..B {
+                o.apply(B + i + 1, &OCmd::Other { moves: false });
+            }
+            let ns_o = t0.elapsed().as_nanos() as f64 / B as f64;
+            println!("TIMED id=P1 arm=OFL T={t} rep={rep} batch={B} ns_merge={ns_m:.1} ns_leasetick={ns_o:.1}");
+        }
+    }
+    // P1-fire: a planted linear term inside the timed loop (HEAD), T = 10^3 vs 10^6.
+    for &t in &[1_000u64, 1_000_000] {
+        for rep in 0..REPS {
+            let hl = Arc::new(Mutex::new(BranchLedger::new()));
+            let mut l = Head(hl.clone());
+            let (mut round, pool) = p1_fill(&mut l, t);
+            let ns = time_batch(&mut l, &mut round, (0..B).map(|i| abandon_c(cid(1, pool + i))), Some(&hl));
+            println!("TIMED id=P1-fire arm=HEAD+planted-scan T={t} rep={rep} batch={B} ns_abandon={ns:.1}");
+        }
+    }
+    // A-S: orphans_of at fixed N = 10^3, T = 10^3 vs 10^6.
+    for &t in &[1_000u64, 1_000_000] {
+        for rep in 0..REPS {
+            let hl = Arc::new(Mutex::new(BranchLedger::new()));
+            let mut l = Head(hl.clone());
+            run_w(t, 1_000, |e| {
+                l.apply(&e);
+            });
+            let t0 = Instant::now();
+            let o = lock(&hl).orphans_of(NodeId(1));
+            let ns = t0.elapsed().as_nanos();
+            println!("TIMED id=A-S arm=HEAD N=1000 T={t} rep={rep} orphans={} ns={ns}", o.len());
+        }
+    }
+    // A-Z: ZK's close-owner apply, and M1's fence apply, at N = 10^3 vs 10^6.
+    for &n in &[1_000u64, 1_000_000] {
+        for rep in 0..REPS {
+            for arm in ["ZK", "M1"] {
+                let mut l: Box<dyn Ledger> = if arm == "ZK" { Box::new(Zk::new()) } else { Box::new(HeadCopy::new(true)) };
+                let last = run_w(n, n, |e| {
+                    l.apply(&e);
+                });
+                let t0 = Instant::now();
+                l.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+                let ns = t0.elapsed().as_nanos();
+                println!("TIMED id=A-Z arm={arm} N={n} rep={rep} ns_single_apply={ns} touched={} live_after={}", l.touched_max(), l.live_ids_of(1).len());
+            }
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |i: usize| -> u64 { args.get(i).and_then(|s| s.parse().ok()).expect("numeric argument") };
+    println!("# r11_dist_ledger {:?} size_of::<Entry>={} size_of::<Command>={}", &args[1..], std::mem::size_of::<Entry>(), std::mem::size_of::<Command>());
+    let t0 = Instant::now();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("counts") => mode_counts(arg(2), arg(3)),
+        Some("p6") => mode_p6(),
+        Some("p8") => mode_p8(arg(2)),
+        Some("o2") => mode_o2(arg(2)),
+        Some("timed") => mode_timed(),
+        _ => {
+            eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
+            std::process::exit(2);
+        }
+    }
+    println!("# done wall_ms={:.0} heap_live_end={}", t0.elapsed().as_secs_f64() * 1e3, heap());
+}
