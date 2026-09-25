@@ -28,6 +28,33 @@
 //! errors either, so counting them as unresolved would be equally wrong. They are recognised and
 //! counted in [`Decoded::internal`].
 //!
+//! **3. An UPDATE that outgrows its page is logged as a delete and an insert (D203).** When the new
+//! tuple does not fit its page, `HeapFileManager::update` frees the slot and inserts the row on
+//! another page, and it logs exactly that: a `HeapDelete` of the live row, then, as the
+//! transaction's next record, a `HeapInsert` of the new one. Decoded record by record, a consumer is
+//! told the row was deleted and a new one appeared, for what was one UPDATE. Postgres logs such an
+//! update as one record whatever page the new version lands on, and its logical decoding emits one
+//! UPDATE (RECALLED, not checked against its source here); physical placement is not a logical
+//! change. So the two records are read back as one:
+//!
+//! - **What identifies the pair**: a `HeapDelete` whose image is LIVE (`end_ts == 0`), followed by the
+//!   SAME transaction's next record — time-travel records aside, since they are not changes — being a
+//!   `HeapInsert` at the same `dir_root` (the table's identity; a name can be shared) with the same
+//!   primary key (column 0, which an UPDATE may not assign). It becomes one `Update { old, new }`.
+//!   "Next record of the transaction", not "next record in the log": other transactions interleave.
+//! - **Stamped with the `HeapDelete`'s LSN, and that is load-bearing.** [`Decoded::open_from`] is the
+//!   earliest STAGED LSN, and `FeedStreamer::pump` never moves its cursor past it. A pair still open
+//!   where a range ends must hold the cursor at its first half; stamped with the insert's LSN, the
+//!   next pump would start after the delete and ship a lone INSERT.
+//! - **Why a live `HeapDelete` is enough to mark**: no other production writer logs one. A SQL
+//!   `DELETE` is a `HeapUpdate` stamping `end_ts` (point 1), same length, so it never relocates.
+//!   `HeapFileManager::delete` is `#[cfg(test)]`, so no production code can call it, and an abort's
+//!   compensation is a `Clr` record in a transaction this decoder discards.
+//! - **A DELETE and an unrelated INSERT adjacent in one transaction stay two events.** A SQL DELETE
+//!   never marks, so `DELETE k; INSERT k` in one transaction is still `DELETE` + `INSERT`. A marked
+//!   delete followed by any other record, or by an insert of another key or table, is left exactly
+//!   as it decodes without this rule.
+//!
 //! # The property that makes a feed usable
 //!
 //! **Only committed transactions are emitted, and they are emitted in commit order.**
@@ -229,7 +256,9 @@ pub fn sql_type_of(ty: &DataType) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeEvent {
     pub txn_id: u64,
-    /// LSN of the record that produced this change — where it sits in the log.
+    /// LSN of the record that produced this change — where it sits in the log. For an UPDATE whose
+    /// row relocated, which the log holds as a `HeapDelete` then a `HeapInsert` (module doc point 3),
+    /// it is the `HeapDelete`'s: the first of the two, and the one `Decoded::open_from` must not pass.
     pub lsn: u64,
     /// LSN of the `Commit` that made it visible. Events are ordered by this.
     pub commit_lsn: u64,
@@ -813,6 +842,10 @@ impl LogicalDecoder {
         // from the log, not handed in: see `RecKind::RunIdentity`.
         let mut runs: HashMap<u32, Arc<RunEntity>> = HashMap::new();
         let mut bound: HashMap<u64, Arc<RunEntity>> = HashMap::new();
+        // Transactions whose previous record was a live `HeapDelete`, and the `dir_root` it was at:
+        // possibly the first half of a relocating UPDATE, decided by the transaction's next record.
+        // Point 3 of the module doc.
+        let mut relocating: BTreeMap<u64, u32> = BTreeMap::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -838,14 +871,32 @@ impl LogicalDecoder {
                 lsn = next;
                 continue;
             }
+            // Taken AFTER the time-travel skip above, so bookkeeping between the two halves of a
+            // relocation does not separate them; any other record of this transaction does.
+            let relocation_half = relocating.remove(&txn);
 
             match &rec.kind {
                 RecKind::HeapInsert { dir_root, tuple, .. } => {
                     match Self::row_in(&tables, *dir_root, tuple) {
-                        RowResult::Row(table, columns, new) => staged
-                            .entry(txn)
-                            .or_default()
-                            .push((lsn, table, columns, ChangeOp::Insert { new })),
+                        RowResult::Row(table, columns, new) => {
+                            let changes = staged.entry(txn).or_default();
+                            // Point 3: if this completes a relocating UPDATE, its first half is this
+                            // transaction's last staged change, and the pair becomes one UPDATE at the
+                            // first half's LSN. Anything else is put back as it was.
+                            let same_root = relocation_half == Some(*dir_root);
+                            let event = match same_root.then(|| changes.pop()).flatten() {
+                                Some((at, t, cols, ChangeOp::Delete { old }))
+                                    if old.first() == new.first() =>
+                                {
+                                    (at, t, cols, ChangeOp::Update { old, new })
+                                }
+                                popped => {
+                                    changes.extend(popped);
+                                    (lsn, table, columns, ChangeOp::Insert { new })
+                                }
+                            };
+                            changes.push(event);
+                        }
                         RowResult::UnknownTable => {
                             *out.unresolved.entry(*dir_root).or_insert(0) += 1
                         }
@@ -855,10 +906,17 @@ impl LogicalDecoder {
                     }
                 }
                 RecKind::HeapDelete { dir_root, old, .. } => match Self::row_in(&tables, *dir_root, old) {
-                    RowResult::Row(table, columns, old) => staged
-                        .entry(txn)
-                        .or_default()
-                        .push((lsn, table, columns, ChangeOp::Delete { old })),
+                    RowResult::Row(table, columns, decoded) => {
+                        staged
+                            .entry(txn)
+                            .or_default()
+                            .push((lsn, table, columns, ChangeOp::Delete { old: decoded }));
+                        // Point 3: a LIVE row leaving its slot is the first half of a relocating
+                        // UPDATE; the transaction's next record decides whether it is paired.
+                        if !Self::is_dead(old) {
+                            relocating.insert(txn, *dir_root);
+                        }
+                    }
                     RowResult::UnknownTable => *out.unresolved.entry(*dir_root).or_insert(0) += 1,
                     RowResult::Undecodable => *out.undecodable.entry(*dir_root).or_insert(0) += 1,
                 },
@@ -1704,5 +1762,238 @@ mod tests {
             .expect("a well-formed alteration record was refused");
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.events[0].op.name(), "ADD_COLUMN");
+    }
+
+    // ---- D203: a relocating UPDATE's two records are one UPDATE ------------------------------------
+    //
+    // `HeapFileManager::update`'s relocation arm logs a `HeapDelete` of the live row and then, as the
+    // transaction's next record, a `HeapInsert` of the new row on another page. These build that
+    // shape by hand and every shape that must NOT be read as it. Pre-registered, with the mutant that
+    // kills each one, in `bench/d203_cdc_relocating_update/prereg.md`.
+
+    fn heap_delete(w: &WalManager, txn: u64, dir_root: u32, old: Vec<u8>) {
+        w.append(txn, 0, &RecKind::HeapDelete { dir_root, page_id: 1, slot: 0, old }).unwrap();
+    }
+
+    fn heap_insert(w: &WalManager, txn: u64, dir_root: u32, tuple: Vec<u8>) {
+        w.append(txn, 0, &RecKind::HeapInsert { dir_root, page_id: 2, slot: 0, tuple }).unwrap();
+    }
+
+    fn row(id: i32, qty: i32) -> Vec<Value> {
+        vec![Value::Integer(id), Value::Integer(qty)]
+    }
+
+    fn names(out: &Decoded) -> Vec<&'static str> {
+        out.events.iter().map(|e| e.op.name()).collect()
+    }
+
+    /// U1. The relocation arm's own shape: one UPDATE, carrying the row before and after.
+    #[test]
+    fn a_live_heap_delete_then_the_same_row_inserted_decodes_as_one_update() {
+        let (_d, w) = wal("relocated");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"], "a relocated row reached the feed as {:?}", names(&out));
+        assert_eq!(out.events[0].op, ChangeOp::Update { old: row(5, 50), new: row(5, 55) });
+    }
+
+    /// U2. An insert of ANOTHER key is not the relocated row. No production writer logs this after a
+    /// live `HeapDelete`; the rule must not assume that, and it does not.
+    #[test]
+    fn a_live_heap_delete_then_another_key_inserted_is_not_paired() {
+        let (_d, w) = wal("other_key");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(6, Some(60)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"]);
+    }
+
+    /// U3. An insert into ANOTHER table is not the relocated row either, even with the same key.
+    #[test]
+    fn a_live_heap_delete_then_an_insert_into_another_table_is_not_paired() {
+        let mut d = decoder();
+        d.tables.insert(
+            11u32,
+            ("other".to_string(), schema(), Arc::new(vec!["id".to_string(), "qty".to_string()])),
+        );
+        let (_d, w) = wal("other_table");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 11, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&d, &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"]);
+        assert_eq!(out.events[1].table, "other");
+    }
+
+    /// U4. The pair is the transaction's NEXT record, so a change between the halves breaks it.
+    #[test]
+    fn a_record_between_the_halves_breaks_the_pair() {
+        let (_d, w) = wal("between");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 1,
+                old: tuple_bytes(6, Some(60)),
+                new: tuple_bytes(6, Some(61)),
+            },
+        )
+        .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["DELETE", "UPDATE", "INSERT"]);
+    }
+
+    /// U5. A `HeapDelete` of a DEAD image is never the first half of an UPDATE. Asserted as "no UPDATE,
+    /// and the insert is an INSERT of the new row" so that it holds both before and after
+    /// `delete-insert-lookup`, which turns a dead-image `HeapDelete` into bookkeeping.
+    #[test]
+    fn a_heap_delete_of_a_dead_image_is_never_paired() {
+        let (_d, w) = wal("dead");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, dead_tuple_bytes(5, 50));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert!(!names(&out).contains(&"UPDATE"), "a dead version was paired: {:?}", names(&out));
+        assert_eq!(out.events.last().map(|e| e.op.clone()), Some(ChangeOp::Insert { new: row(5, 55) }));
+    }
+
+    /// U6. Time-travel records are MVCC bookkeeping and not changes, so one between the halves does
+    /// not break the pair (the relocation arm writes none there today; the rule does not depend on it).
+    #[test]
+    fn a_time_travel_record_between_the_halves_does_not_break_the_pair() {
+        let (_d, w) = wal("tt_between");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 8, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"]);
+        assert_eq!(out.internal, 1);
+    }
+
+    /// U7. Other transactions' records interleave in the physical log; pairing is per transaction.
+    #[test]
+    fn pairing_is_per_transaction_across_interleaved_records() {
+        let (_d, w) = wal("interleaved");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 2, 7, tuple_bytes(7, Some(70)));
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        let by_txn = |t: u64| -> Vec<ChangeOp> {
+            out.events.iter().filter(|e| e.txn_id == t).map(|e| e.op.clone()).collect()
+        };
+        assert_eq!(by_txn(2), vec![ChangeOp::Insert { new: row(7, 70) }]);
+        assert_eq!(by_txn(1), vec![ChangeOp::Update { old: row(5, 50), new: row(5, 55) }]);
+    }
+
+    /// U8 (review C1). The mark lasts exactly one record. A live `HeapDelete`, then a SQL DELETE of
+    /// row 6 (a killed `HeapUpdate`), then an INSERT of row 6 (an E63 reuse): the INSERT's
+    /// predecessor is a `Delete` of the same table and key, so only the mark's clearing stands
+    /// between it and a false UPDATE. U4 cannot see that, because its middle record is an `Update`,
+    /// which the fused path rejects by itself.
+    #[test]
+    fn a_mark_does_not_outlive_the_next_record() {
+        let (_d, w) = wal("mark_lifetime");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        w.append(
+            1,
+            0,
+            &RecKind::HeapUpdate {
+                dir_root: 7,
+                page_id: 1,
+                slot: 1,
+                old: tuple_bytes(6, Some(60)),
+                new: dead_tuple_bytes(6, 60),
+            },
+        )
+        .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(6, Some(66)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        let ops: Vec<ChangeOp> = out.events.iter().map(|e| e.op.clone()).collect();
+        assert_eq!(
+            ops,
+            vec![
+                ChangeOp::Delete { old: row(5, 50) },
+                ChangeOp::Delete { old: row(6, 60) },
+                ChangeOp::Insert { new: row(6, 66) },
+            ],
+            "a mark outlived the record after it and fused a reuse into an UPDATE"
+        );
+    }
+
+    /// U9 (review C2). The fused UPDATE is stamped with the `HeapDelete`'s LSN, and that is
+    /// load-bearing: `open_from` is the minimum staged LSN, and `FeedStreamer::pump` never moves its
+    /// cursor past it. For a transaction still open where a range ends — a pump boundary — the
+    /// cursor must stay at the delete, or the next pump starts after it and ships a lone INSERT.
+    #[test]
+    fn a_pair_open_at_the_end_of_a_range_holds_the_cursor_at_the_delete() {
+        let (_d, w) = wal("open_pair");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let delete_lsn = w
+            .append(1, 0, &RecKind::HeapDelete { dir_root: 7, page_id: 1, slot: 0, old: tuple_bytes(5, Some(50)) })
+            .unwrap();
+        heap_insert(&w, 1, 7, tuple_bytes(5, Some(55)));
+
+        // No Commit yet: the range ends with the transaction open, as at a pump boundary.
+        let out = decode_all(&decoder(), &w);
+        assert!(out.events.is_empty(), "an open transaction's change was emitted: {:?}", out.events);
+        assert_eq!(
+            out.open_from,
+            Some(delete_lsn),
+            "the cursor would be clamped past the relocation's first half"
+        );
+
+        // Committed, the one UPDATE carries the same LSN.
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(names(&out), vec!["UPDATE"]);
+        assert_eq!(out.events[0].lsn, delete_lsn, "the UPDATE is not stamped where its first half sits");
+    }
+
+    /// U10 (review C4). A table is its `dir_root`; a name can be shared. Two roots under one name:
+    /// a live delete at one and an insert of the same key at the other are two different rows.
+    #[test]
+    fn a_same_named_table_at_another_dir_root_is_not_paired() {
+        let mut d = decoder();
+        d.tables.insert(
+            12u32,
+            ("inventory".to_string(), schema(), Arc::new(vec!["id".to_string(), "qty".to_string()])),
+        );
+        let (_d, w) = wal("same_name");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        heap_delete(&w, 1, 7, tuple_bytes(5, Some(50)));
+        heap_insert(&w, 1, 12, tuple_bytes(5, Some(55)));
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&d, &w);
+        assert_eq!(names(&out), vec!["DELETE", "INSERT"], "rows in two tables were fused by name");
     }
 }

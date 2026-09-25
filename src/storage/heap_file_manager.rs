@@ -269,6 +269,15 @@ impl HeapFileManager {
     }
 
     // fetches page, mark slot dead, unpin
+    //
+    // **Test-only, by construction (D203).** A physical delete logs a `HeapDelete` of whatever the
+    // slot holds, and the logical decoder reads a `HeapDelete` of a LIVE row as the first half of a
+    // relocating UPDATE (`replication::logical`, module doc point 3): the relocation arm of
+    // `update` above is the only production writer of one. A production caller of this function
+    // that deleted a live row and then inserted the same key in one transaction would be reported
+    // to every change-feed consumer as an UPDATE. So it does not compile outside this crate's unit
+    // tests; a production need for a physical delete has to be classified against the decoder first.
+    #[cfg(test)]
     pub fn delete(&self, record_id: RecordId) -> Result<(), FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
