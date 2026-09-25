@@ -528,6 +528,10 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     // P7 (HEAD cluster only, N in {10^3, 10^6}): a single-proposal fork stream, owner PHANTOM.
     if arm == Arm::Head && (n == 1_000 || n == 1_000_000) {
         let f1 = (l + 1) % 3;
+        for r in &c.reps {
+            r.max_gap_us.store(0, Ordering::Relaxed);
+        }
+        let term_p7 = c.reps[l].with(|x| x.term()).unwrap_or(0);
         let t0 = Instant::now();
         let start_commit = c.reps[l].committed_head();
         let mut lags: Vec<u64> = Vec::new();
@@ -560,6 +564,14 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
         std::thread::sleep(Duration::from_millis(50));
         let last = c.reps[l].with(|x| x.last_round()).unwrap_or(0);
         c.wait_applied(&all, last, Duration::from_secs(120));
+        let gaps: Vec<f64> = c.reps.iter().map(|r| r.max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
+        let leaders: Vec<Option<NodeId>> = c.reps.iter().map(|r| r.leader()).collect();
+        let terms: Vec<u64> = c.reps.iter().map(|r| r.with(|x| x.term()).unwrap_or(0)).collect();
+        let moved = c.reps[l].leader() != Some(NodeId(lid));
+        println!(
+            "B {tag} P7_after term_at_start={term_p7} terms={terms:?} leaders={leaders:?} driver_max_gap_ms_per_node={gaps:?} leadership_moved={moved}{}",
+            if moved { " => B1 for this arm is VOID (the node stopped below is no longer the leader)" } else { "" }
+        );
     }
 
     // FAILOVER: stop L; time the election among the survivors (B1).
