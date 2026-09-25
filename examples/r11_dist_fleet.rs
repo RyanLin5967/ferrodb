@@ -1,0 +1,654 @@
+//! r11-dist part B: failover and orphan disposal on three real `Node`s (loopback TCP, real fsync),
+//! against the number of live branches N, for HEAD and three published-fix arms.
+//!
+//! PREREG: artie-research `frontier/round11/r11-dist/PREREG.md` §5 (079f108). One invocation is one
+//! N with all four arms; it runs under the fleet lock. Every number printed is labelled with its
+//! instrument: `Instant` wall time (ms), or an integer counter.
+//!
+//! Per arm: start 3 nodes, each driven by its own thread (as a server's driver would be); elect a
+//! stable leader L; grow N forks owned by L (fixture: batched proposals with group commit on, then
+//! group commit off for HEAD/ZK/M1); [P7 at N in {10^3, 10^6}, HEAD cluster only, forks owned by a
+//! phantom node 9 so L's orphan set is untouched]; stop L; time the election (B1); the new leader L'
+//! disposes of L's orphans (B2); a fresh fork + merge on L' to Applied (B3); integers C0 C1 C2 and
+//! leader/term changes (B4); restart the other survivor from its directory and time the replay (B5).
+//!
+//! Usage: r11_dist_fleet <N> <scratch-root> [arm order, e.g. HEAD,GC,ZK,M1]
+
+#[path = "r11_dist/arms.rs"]
+mod arms;
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use arms::{abandon_c, cid, fork_c, merge_c, sentinel, HeadCopy, Ledger, Zk, V};
+use ferrodb::agent_sql::cluster::{BranchApplier, BranchLedger, ClusterAgents, ClusterBranchId, MergeVerdict, Replicated};
+use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::consensus::config::Config;
+use ferrodb::consensus::node::{Applier, Node, NodeOptions};
+use ferrodb::consensus::{Command, Entry, NodeId, Round};
+use ferrodb::error::FerroError;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
+
+/// Growth batch (fixture): proposals queued per drain with group commit on.
+const GROW_BATCH: usize = 1024;
+/// HEAD at N = 10^6: the sweep's first K proposals are timed; the whole sweep is extrapolated.
+const PREFIX_K: usize = 10_000;
+/// Phantom owner of P7's fork stream, so the dead leader's orphan set is untouched by it.
+const PHANTOM: u32 = 9;
+const P7_SECS: u64 = 20;
+const POLL: Duration = Duration::from_millis(1);
+
+// ---------------------------------------------------------------------------------------------
+// Appliers
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Obs {
+    applied: AtomicU64,
+    max_apply_ns: AtomicU64,
+    applies: AtomicU64,
+}
+
+/// Times every apply and publishes the applied round; wraps each arm's real applier.
+struct Instr {
+    inner: Box<dyn Applier + Send>,
+    obs: Arc<Obs>,
+}
+
+impl Applier for Instr {
+    fn apply(&mut self, e: &Entry) -> Result<(), FerroError> {
+        let t0 = Instant::now();
+        let r = self.inner.apply(e);
+        let ns = t0.elapsed().as_nanos() as u64;
+        self.obs.max_apply_ns.fetch_max(ns, Ordering::Relaxed);
+        self.obs.applies.fetch_add(1, Ordering::Relaxed);
+        self.obs.applied.store(e.round, Ordering::Release);
+        r
+    }
+}
+
+/// ZK or M1 as an `Applier`: the part-A ledger, with each merge verdict kept.
+struct LA<L: Ledger + Send> {
+    l: Arc<Mutex<L>>,
+    verdicts: Arc<Mutex<BTreeMap<Round, V>>>,
+}
+
+impl<L: Ledger + Send> Applier for LA<L> {
+    fn apply(&mut self, e: &Entry) -> Result<(), FerroError> {
+        if let Some(v) = lock(&self.l).apply(e) {
+            lock(&self.verdicts).insert(e.round, v);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arm {
+    Head,
+    Gc,
+    Zk,
+    M1,
+}
+
+impl Arm {
+    fn name(self) -> &'static str {
+        match self {
+            Arm::Head => "HEAD",
+            Arm::Gc => "GC",
+            Arm::Zk => "ZK",
+            Arm::M1 => "M1",
+        }
+    }
+}
+
+/// One node's ledger, whichever arm.
+#[derive(Clone)]
+enum ArmL {
+    Head(Arc<Mutex<BranchLedger>>),
+    Zk(Arc<Mutex<Zk>>, Arc<Mutex<BTreeMap<Round, V>>>),
+    M1(Arc<Mutex<HeadCopy>>, Arc<Mutex<BTreeMap<Round, V>>>),
+}
+
+impl ArmL {
+    fn new(arm: Arm) -> ArmL {
+        match arm {
+            Arm::Head | Arm::Gc => ArmL::Head(Arc::new(Mutex::new(BranchLedger::new()))),
+            Arm::Zk => ArmL::Zk(Arc::new(Mutex::new(Zk::new())), Arc::default()),
+            Arm::M1 => ArmL::M1(Arc::new(Mutex::new(HeadCopy::new(true))), Arc::default()),
+        }
+    }
+    fn applier(&self, obs: Arc<Obs>) -> Instr {
+        let inner: Box<dyn Applier + Send> = match self {
+            ArmL::Head(l) => Box::new(BranchApplier::new(l.clone())),
+            ArmL::Zk(l, v) => Box::new(LA { l: l.clone(), verdicts: v.clone() }),
+            ArmL::M1(l, v) => Box::new(LA { l: l.clone(), verdicts: v.clone() }),
+        };
+        Instr { inner, obs }
+    }
+    fn is_live(&self, id: u64) -> bool {
+        match self {
+            ArmL::Head(l) => lock(l).get(ClusterBranchId(id)).map(|b| b.state.is_live()).unwrap_or(false),
+            ArmL::Zk(l, _) => lock(l).is_live(id),
+            ArmL::M1(l, _) => lock(l).is_live(id),
+        }
+    }
+    fn live_count_of(&self, node: u32) -> usize {
+        match self {
+            ArmL::Head(l) => lock(l).live_owned_by(NodeId(node)).len(),
+            ArmL::Zk(l, _) => lock(l).live_ids_of(node).len(),
+            ArmL::M1(l, _) => lock(l).live_ids_of(node).len(),
+        }
+    }
+    fn verdict(&self, round: Round) -> Option<V> {
+        match self {
+            ArmL::Head(l) => lock(l).verdict_at(round).map(|v| match v {
+                MergeVerdict::Applied { .. } => V::Applied,
+                MergeVerdict::ReEvaluate { .. } => V::ReEval,
+                MergeVerdict::Refused { .. } => V::Refused,
+            }),
+            ArmL::Zk(_, v) | ArmL::M1(_, v) => lock(v).get(&round).copied(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The seam: NodeReplicator's `propose` logic (cluster.rs :746-767 at 7dc428f), over `Node<Instr>`
+// ---------------------------------------------------------------------------------------------
+
+struct Rep {
+    id: NodeId,
+    node: Mutex<Option<Node<Instr>>>,
+}
+
+impl Rep {
+    fn with<R>(&self, f: impl FnOnce(&mut Node<Instr>) -> R) -> Option<R> {
+        lock(&self.node).as_mut().map(f)
+    }
+}
+
+impl Replicated for Rep {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        let mut g = lock(&self.node);
+        let n = g.as_mut().ok_or_else(|| FerroError::Internal("node stopped".into()))?;
+        let _ = n.take_refusals();
+        let before = n.last_round();
+        let round = n.propose(c)?;
+        if let Some(why) = n.take_refusals().into_iter().next() {
+            return Err(why);
+        }
+        if round <= before {
+            return Err(FerroError::Internal("no round assigned and no refusal".into()));
+        }
+        Ok(round)
+    }
+    fn committed_head(&self) -> Round {
+        self.with(|n| n.commit_round()).unwrap_or(0)
+    }
+    fn pump(&self) -> Result<(), FerroError> {
+        match lock(&self.node).as_mut() {
+            Some(n) => n.poll(POLL),
+            None => Ok(()),
+        }
+    }
+    fn leader(&self) -> Option<NodeId> {
+        self.with(|n| n.leader()).flatten()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cluster
+// ---------------------------------------------------------------------------------------------
+
+struct Cluster {
+    arm: Arm,
+    reps: Vec<Arc<Rep>>,
+    ledgers: Vec<ArmL>,
+    obs: Vec<Arc<Obs>>,
+    stops: Vec<Arc<AtomicBool>>,
+    threads: Vec<Option<JoinHandle<u64>>>,
+    addrs: BTreeMap<NodeId, SocketAddr>,
+    dirs: Vec<PathBuf>,
+    cfg: Config,
+    errs: Arc<Mutex<Vec<String>>>,
+}
+
+fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) -> NodeOptions {
+    let peers: BTreeMap<NodeId, SocketAddr> = addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
+    // NodeOptions::new's own default tick (50 ms) is kept: the production timing.
+    NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9))
+}
+
+fn spawn_driver(rep: Arc<Rep>, stop: Arc<AtomicBool>, errs: Arc<Mutex<Vec<String>>>) -> JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut polls = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            if let Err(e) = rep.pump() {
+                lock(&errs).push(format!("{} driver: {e}", rep.id));
+                break;
+            }
+            polls += 1;
+            std::thread::yield_now();
+        }
+        polls
+    })
+}
+
+impl Cluster {
+    fn start(arm: Arm, root: &Path) -> Cluster {
+        let listeners: Vec<TcpListener> = (0..3).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let addrs: BTreeMap<NodeId, SocketAddr> =
+            listeners.iter().enumerate().map(|(i, l)| (NodeId(i as u32 + 1), l.local_addr().unwrap())).collect();
+        let cfg = Config::new((1..=3).map(NodeId), 1, 0);
+        let errs = Arc::new(Mutex::new(Vec::new()));
+        let mut c = Cluster {
+            arm,
+            reps: Vec::new(),
+            ledgers: Vec::new(),
+            obs: Vec::new(),
+            stops: Vec::new(),
+            threads: Vec::new(),
+            addrs: addrs.clone(),
+            dirs: Vec::new(),
+            cfg: cfg.clone(),
+            errs: errs.clone(),
+        };
+        for (i, l) in listeners.into_iter().enumerate() {
+            let id = NodeId(i as u32 + 1);
+            let dir = root.join(format!("n{}", i + 1));
+            let ledger = ArmL::new(arm);
+            let obs = Arc::new(Obs::default());
+            let node = Node::start(id, cfg.clone(), l, opts(&dir, &addrs, id, i), ledger.applier(obs.clone())).unwrap();
+            let rep = Arc::new(Rep { id, node: Mutex::new(Some(node)) });
+            let stop = Arc::new(AtomicBool::new(false));
+            c.threads.push(Some(spawn_driver(rep.clone(), stop.clone(), errs.clone())));
+            c.reps.push(rep);
+            c.ledgers.push(ledger);
+            c.obs.push(obs);
+            c.stops.push(stop);
+            c.dirs.push(dir);
+        }
+        c
+    }
+
+    fn set_gc(&self, on: bool) {
+        for r in &self.reps {
+            r.with(|n| n.set_group_commit(on));
+        }
+    }
+
+    /// One node claims office, every live node agrees, and its own round is committed; held 50 ms.
+    fn elect(&self, alive: &[usize], bound: Duration) -> Option<(usize, Round)> {
+        let t0 = Instant::now();
+        let mut who: Option<usize> = None;
+        let mut since = Instant::now();
+        while t0.elapsed() < bound {
+            let claiming: Vec<usize> = alive.iter().copied().filter(|i| self.reps[*i].leader() == Some(NodeId(*i as u32 + 1))).collect();
+            let settled = claiming.len() == 1 && {
+                let l = claiming[0];
+                let last = self.reps[l].with(|n| n.last_round()).unwrap_or(0);
+                alive.iter().all(|i| self.reps[*i].leader() == Some(NodeId(l as u32 + 1))) && self.reps[l].committed_head() >= last
+            };
+            if settled {
+                if who != Some(claiming[0]) {
+                    who = Some(claiming[0]);
+                    since = Instant::now();
+                } else if since.elapsed() >= Duration::from_millis(50) {
+                    let l = claiming[0];
+                    return Some((l, self.reps[l].committed_head()));
+                }
+            } else {
+                who = None;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        None
+    }
+
+    fn wait_applied(&self, nodes: &[usize], round: Round, bound: Duration) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < bound {
+            if nodes.iter().all(|i| self.obs[*i].applied.load(Ordering::Acquire) >= round) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        false
+    }
+
+    /// Stop a node's driver, shut its transport and drop it (so its files and port are released).
+    fn stop_node(&mut self, i: usize) -> u64 {
+        self.stops[i].store(true, Ordering::Relaxed);
+        let polls = self.threads[i].take().map(|t| t.join().unwrap_or(0)).unwrap_or(0);
+        if let Some(n) = lock(&self.reps[i].node).take() {
+            n.shutdown();
+            drop(n);
+        }
+        polls
+    }
+
+    /// B5: start node `i` again on its own directory and address, with a fresh ledger.
+    fn restart(&mut self, i: usize) -> Result<(), String> {
+        let id = NodeId(i as u32 + 1);
+        let l = TcpListener::bind(self.addrs[&id]).map_err(|e| format!("rebind {}: {e}", self.addrs[&id]))?;
+        let ledger = ArmL::new(self.arm);
+        let obs = Arc::new(Obs::default());
+        let node = Node::start(id, self.cfg.clone(), l, opts(&self.dirs[i], &self.addrs, id, i), ledger.applier(obs.clone()))
+            .map_err(|e| format!("Node::start: {e}"))?;
+        *lock(&self.reps[i].node) = Some(node);
+        self.ledgers[i] = ledger;
+        self.obs[i] = obs;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.threads[i] = Some(spawn_driver(self.reps[i].clone(), stop.clone(), self.errs.clone()));
+        self.stops[i] = stop;
+        Ok(())
+    }
+
+    fn shutdown_all(&mut self) {
+        for i in 0..3 {
+            self.stop_node(i);
+        }
+    }
+}
+
+/// Propose `cmds` on node `l` in batches through `propose_many`; returns the last round.
+fn propose_batched(c: &Cluster, l: usize, cmds: Vec<Command>) -> Result<Round, String> {
+    let mut last = 0;
+    let mut it = cmds.into_iter().peekable();
+    while it.peek().is_some() {
+        let batch: Vec<Command> = it.by_ref().take(GROW_BATCH).collect();
+        let r = c.reps[l]
+            .with(|n| {
+                let _ = n.take_refusals();
+                let r = n.propose_many(batch);
+                (r, n.take_refusals())
+            })
+            .ok_or("node stopped")?;
+        match r {
+            (Ok(round), refusals) if refusals.is_empty() => last = round,
+            (Ok(_), refusals) => return Err(format!("refused: {}", refusals[0])),
+            (Err(e), _) => return Err(format!("{e}")),
+        }
+    }
+    Ok(last)
+}
+
+// ---------------------------------------------------------------------------------------------
+// B0: fsync on this volume
+// ---------------------------------------------------------------------------------------------
+
+fn b0(root: &Path) -> (f64, f64) {
+    let p = root.join("b0.sync");
+    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&p).unwrap();
+    let mut v = Vec::new();
+    for _ in 0..2000 {
+        f.write_all(&[7u8; 64]).unwrap();
+        let t0 = Instant::now();
+        f.sync_data().unwrap();
+        v.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let _ = std::fs::remove_file(&p);
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (v[v.len() / 2], v[v.len() * 99 / 100])
+}
+
+// ---------------------------------------------------------------------------------------------
+// One arm at one N
+// ---------------------------------------------------------------------------------------------
+
+fn run_arm(arm: Arm, n: u64, root: &Path) {
+    let tag = format!("arm={} N={n}", arm.name());
+    let dir = root.join(format!("{}_{n}", arm.name()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut c = Cluster::start(arm, &dir);
+    let all = [0usize, 1, 2];
+    let Some((l, _)) = c.elect(&all, Duration::from_secs(60)) else {
+        println!("B {tag} VOID: no stable leader in 60 s; errs={:?}", lock(&c.errs));
+        c.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let lid = l as u32 + 1;
+
+    // GROW (fixture): N forks owned by L, group-committed.
+    c.set_gc(true);
+    let t0 = Instant::now();
+    let grow_last = match propose_batched(&c, l, (1..=n).map(|i| fork_c(cid(lid, i))).collect()) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("B {tag} VOID: growth refused: {e}");
+            c.shutdown_all();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    let grown = c.wait_applied(&all, grow_last, Duration::from_secs(900));
+    let grow_ms = ms(t0);
+    if arm != Arm::Gc {
+        c.set_gc(false);
+    }
+    let live_before: Vec<usize> = c.ledgers.iter().map(|x| x.live_count_of(lid)).collect();
+    println!("B {tag} grow_ms={grow_ms:.0} grown={grown} grow_last_round={grow_last} live_of_L_per_node={live_before:?} (fixture phase, group-committed)");
+    if !grown || live_before.iter().any(|x| *x as u64 != n) {
+        println!("B {tag} VOID: growth did not reach every node");
+        c.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // P7 (HEAD cluster only, N in {10^3, 10^6}): a single-proposal fork stream, owner PHANTOM.
+    if arm == Arm::Head && (n == 1_000 || n == 1_000_000) {
+        let f1 = (l + 1) % 3;
+        let t0 = Instant::now();
+        let start_commit = c.reps[l].committed_head();
+        let mut lags: Vec<u64> = Vec::new();
+        let mut i = 0u64;
+        let mut refused = 0u64;
+        while t0.elapsed() < Duration::from_secs(P7_SECS) {
+            i += 1;
+            if c.reps[l].propose(fork_c(cid(PHANTOM, i))).is_err() {
+                refused += 1;
+            }
+            if i % 10 == 0 {
+                let head = c.reps[l].committed_head();
+                let fa = c.obs[f1].applied.load(Ordering::Acquire);
+                lags.push(head.saturating_sub(fa));
+            }
+        }
+        let committed = c.reps[l].committed_head() - start_commit;
+        lags.sort_unstable();
+        let p99 = lags.get(lags.len() * 99 / 100).copied().unwrap_or(0);
+        println!(
+            "B {tag} P7 proposed={i} refused={refused} committed_in_{P7_SECS}s={committed} R_per_s={:.1} follower_apply_lag_p99_rounds={p99} lag_samples={}",
+            committed as f64 / P7_SECS as f64,
+            lags.len()
+        );
+        let last = c.reps[l].with(|x| x.last_round()).unwrap_or(0);
+        c.wait_applied(&all, last, Duration::from_secs(120));
+    }
+
+    // FAILOVER: stop L; time the election among the survivors (B1).
+    let survivors: Vec<usize> = all.iter().copied().filter(|i| *i != l).collect();
+    let syncs_before: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.persist_syncs()).unwrap_or(0)).collect();
+    let t_fail = Instant::now();
+    c.stop_node(l);
+    let Some((l2, _)) = c.elect(&survivors, Duration::from_secs(120)) else {
+        println!("B {tag} VOID: no leader among survivors in 120 s; errs={:?}", lock(&c.errs));
+        c.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let t_elect_ms = ms(t_fail);
+    let l2id = l2 as u32 + 1;
+    let other = *survivors.iter().find(|i| **i != l2).unwrap();
+    let term0 = c.reps[l2].with(|x| x.term()).unwrap_or(0);
+
+    // DISPOSE (B2).
+    let t_disp = Instant::now();
+    let (props, last_round, prefix) = match arm {
+        Arm::Head => {
+            if n <= 100_000 {
+                let ledger = match &c.ledgers[l2] {
+                    ArmL::Head(x) => x.clone(),
+                    _ => unreachable!(),
+                };
+                let agents = ClusterAgents::new(NodeId(l2id), Arc::new(AgentRuntime::new()), c.reps[l2].clone(), ledger);
+                match agents.abandon_orphans_of(NodeId(lid)) {
+                    Ok(out) => (out.len() as u64, out.last().map(|x| x.1).unwrap_or(0), false),
+                    Err(e) => {
+                        println!("B {tag} abandon_orphans_of REFUSED after {} proposals: {e}", agents.cost().proposals);
+                        (agents.cost().proposals, 0, false)
+                    }
+                }
+            } else {
+                // The sweep's first K proposals: the same loop body as abandon_orphans_of
+                // (cluster.rs :1239-1245), over the real orphans_of.
+                let orphans = match &c.ledgers[l2] {
+                    ArmL::Head(x) => lock(x).orphans_of(NodeId(lid)),
+                    _ => unreachable!(),
+                };
+                let mut last = 0;
+                let mut k = 0u64;
+                for id in orphans.into_iter().take(PREFIX_K) {
+                    match c.reps[l2].propose(abandon_c(id.0)) {
+                        Ok(r) => {
+                            last = r;
+                            k += 1;
+                        }
+                        Err(e) => {
+                            println!("B {tag} prefix proposal refused after {k}: {e}");
+                            break;
+                        }
+                    }
+                }
+                (k, last, true)
+            }
+        }
+        Arm::Gc => {
+            let orphans = match &c.ledgers[l2] {
+                ArmL::Head(x) => lock(x).orphans_of(NodeId(lid)),
+                _ => unreachable!(),
+            };
+            let k = orphans.len() as u64;
+            match propose_batched(&c, l2, orphans.into_iter().map(|id| abandon_c(id.0)).collect()) {
+                Ok(r) => (k, r, false),
+                Err(e) => {
+                    println!("B {tag} GC sweep refused: {e}");
+                    (k, 0, false)
+                }
+            }
+        }
+        Arm::Zk | Arm::M1 => match c.reps[l2].propose(abandon_c(sentinel(lid))) {
+            Ok(r) => (1, r, false),
+            Err(e) => {
+                println!("B {tag} fence refused: {e}");
+                (0, 0, false)
+            }
+        },
+    };
+    let propose_ms = ms(t_disp);
+    let applied = last_round > 0 && c.wait_applied(&[l2, other], last_round, Duration::from_secs(1200));
+    let dispose_ms = ms(t_disp);
+    let term1 = c.reps[l2].with(|x| x.term()).unwrap_or(0);
+    let leader_after = c.reps[other].leader();
+    let max_apply_ns: Vec<u64> = [l2, other].iter().map(|i| c.obs[*i].max_apply_ns.load(Ordering::Relaxed)).collect();
+    let syncs_after: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.persist_syncs()).unwrap_or(0)).collect();
+    let sync_delta: Vec<u64> = syncs_after.iter().zip(&syncs_before).map(|(a, b)| a - b).collect();
+    println!(
+        "B {tag} B1_t_elect_ms={t_elect_ms:.1} B2_dispose_ms={dispose_ms:.1} propose_ms={propose_ms:.1} C0_props={props} prefix={prefix} per_prop_ms={:.3} applied_all={applied} B4_term_before={term0} term_after={term1} leader_seen_by_other={leader_after:?} max_apply_ns_survivors={max_apply_ns:?} persist_syncs_since_failover_survivors={sync_delta:?}",
+        if props > 0 { dispose_ms / props as f64 } else { f64::NAN }
+    );
+
+    // SERVE (B3): a fresh fork and merge on L' until the verdict is Applied.
+    let t_serve = Instant::now();
+    let fresh = cid(l2id, 1);
+    let serve = (|| -> Result<(Round, Option<V>), String> {
+        let fr = c.reps[l2].propose(fork_c(fresh)).map_err(|e| e.to_string())?;
+        if !c.wait_applied(&[l2], fr, Duration::from_secs(60)) {
+            return Err("fork not applied".into());
+        }
+        let base = c.reps[l2].committed_head();
+        let mr = c.reps[l2].propose(merge_c(fresh, base)).map_err(|e| e.to_string())?;
+        if !c.wait_applied(&[l2, other], mr, Duration::from_secs(60)) {
+            return Err("merge not applied".into());
+        }
+        Ok((mr, c.ledgers[l2].verdict(mr)))
+    })();
+    let serve_ms = ms(t_serve);
+    let b3 = t_elect_ms + dispose_ms + serve_ms;
+    match &serve {
+        Ok((mr, v)) => println!("B {tag} B3_serve_tail_ms={serve_ms:.1} B3_t_serve_ms={b3:.1} merge_round={mr} verdict={v:?}"),
+        Err(e) => println!("B {tag} B3 FAILED: {e}"),
+    }
+
+    // Integers C1 (L's branches still live) and C2 (fresh fork wrongly not live before its merge:
+    // checked through the merge verdict above; here the survivors' liveness of L's branches).
+    let c1: Vec<usize> = [l2, other].iter().map(|i| c.ledgers[*i].live_count_of(lid)).collect();
+    println!("B {tag} C1_L_live_on_survivors={c1:?} (prefix run: expected N-K on HEAD) errs={:?}", lock(&c.errs));
+
+    // B5: restart the non-leader survivor and time the replay to its last log round.
+    let last_log = c.reps[other].with(|x| x.last_round()).unwrap_or(0);
+    c.stop_node(other);
+    let t_rs = Instant::now();
+    match c.restart(other) {
+        Ok(()) => {
+            let start_ms = ms(t_rs);
+            let ok = c.wait_applied(&[other], last_log, Duration::from_secs(600));
+            println!(
+                "B {tag} B5_restart_ms={:.1} node_start_ms={start_ms:.1} replayed_to={} last_log_round={last_log} ok={ok} applies={}",
+                ms(t_rs),
+                c.obs[other].applied.load(Ordering::Acquire),
+                c.obs[other].applies.load(Ordering::Relaxed)
+            );
+            let c1r = c.ledgers[other].live_count_of(lid);
+            println!("B {tag} C1_after_restart={c1r}");
+        }
+        Err(e) => println!("B {tag} B5 SKIPPED: {e}"),
+    }
+    c.shutdown_all();
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: u64 = args.get(1).and_then(|s| s.parse().ok()).expect("usage: r11_dist_fleet <N> <scratch-root> [HEAD,GC,ZK,M1]");
+    let root = PathBuf::from(args.get(2).expect("scratch root"));
+    std::fs::create_dir_all(&root).unwrap();
+    let order: Vec<Arm> = args
+        .get(3)
+        .map(|s| s.as_str())
+        .unwrap_or("HEAD,GC,ZK,M1")
+        .split(',')
+        .map(|a| match a {
+            "HEAD" => Arm::Head,
+            "GC" => Arm::Gc,
+            "ZK" => Arm::Zk,
+            "M1" => Arm::M1,
+            other => panic!("unknown arm {other}"),
+        })
+        .collect();
+    println!("# r11_dist_fleet N={n} root={} order={:?} size_of::<Entry>={}", root.display(), order, std::mem::size_of::<Entry>());
+    let (med, p99) = b0(&root);
+    println!("B0 sync_data_ms median={med:.3} p99={p99:.3} samples=2000");
+    let t0 = Instant::now();
+    for arm in order {
+        let ta = Instant::now();
+        run_arm(arm, n, &root);
+        println!("# arm {} wall_ms={:.0}", arm.name(), ms(ta));
+    }
+    println!("# done wall_ms={:.0}", ms(t0));
+}
