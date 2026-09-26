@@ -189,6 +189,13 @@ struct Rep {
     /// Instrument: the longest interval between two driver turns (us), and turns taken.
     max_gap_us: AtomicU64,
     turns: AtomicU64,
+    /// A11b: a one-shot stall of this node's driver, in ms (0 = none). The driver sleeps without the
+    /// node mutex, so the node takes no tick and reads no message for that long.
+    stall_ms: AtomicU64,
+    /// A11b flow-control arm: the driver proposes nothing while this node's uncommitted backlog
+    /// (last_round - commit_round) exceeds this (0 = no cap). The harness form of etcd raft's
+    /// MaxUncommittedEntriesSize.
+    max_uncommitted: AtomicU64,
 }
 
 impl Rep {
@@ -202,6 +209,8 @@ impl Rep {
             q_refused: AtomicU64::new(0),
             max_gap_us: AtomicU64::new(0),
             turns: AtomicU64::new(0),
+            stall_ms: AtomicU64::new(0),
+            max_uncommitted: AtomicU64::new(0),
         }
     }
     fn enqueue(&self, cmds: impl IntoIterator<Item = Command>) {
@@ -212,6 +221,13 @@ impl Rep {
     }
     /// One driver turn's proposals: take up to `batch` queued commands and propose them in one drain.
     fn drive_queue(&self) {
+        let cap = self.max_uncommitted.load(Ordering::Relaxed);
+        if cap > 0 {
+            let backlog = self.with(|n| n.last_round().saturating_sub(n.commit_round())).unwrap_or(0);
+            if backlog > cap {
+                return;
+            }
+        }
         let k = self.batch.load(Ordering::Relaxed).max(1);
         let cmds: Vec<Command> = {
             let mut q = lock(&self.queue);
@@ -319,6 +335,10 @@ fn spawn_driver(rep: Arc<Rep>, stop: Arc<AtomicBool>, errs: Arc<Mutex<Vec<String
             let now = Instant::now();
             rep.max_gap_us.fetch_max(now.duration_since(last).as_micros() as u64, Ordering::Relaxed);
             last = now;
+            let st = rep.stall_ms.swap(0, Ordering::Relaxed);
+            if st > 0 {
+                std::thread::sleep(Duration::from_millis(st));
+            }
             rep.drive_queue();
             if let Err(e) = rep.pump() {
                 lock(&errs).push(format!("{} driver: {e}", rep.id));
@@ -977,6 +997,16 @@ fn run_growmon(n: u64, seed: u64, root: &Path) {
         r.max_gap_us.store(0, Ordering::Relaxed);
         let _ = r.with(|n| n.take_transitions());
     }
+    // A11b: R11_MAX_UNCOMMITTED caps the leader's uncommitted backlog; R11_STALL=<leader|follower>:
+    // <backlog>:<ms> stalls one driver once, the first second the leader's queue is empty and its
+    // uncommitted backlog is at least <backlog>.
+    let cap: u64 = std::env::var("R11_MAX_UNCOMMITTED").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
+    reps[l].max_uncommitted.store(cap, Ordering::Relaxed);
+    let stall: Option<(bool, u64, u64)> = std::env::var("R11_STALL").ok().and_then(|x| {
+        let f: Vec<&str> = x.split(':').collect();
+        Some((f.first()? == &"leader", f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
+    });
+    println!("GM config max_uncommitted={cap} stall={stall:?}");
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
     // The sampler: one line per second; resets each driver's gap so each line is that second's max.
@@ -988,6 +1018,7 @@ fn run_growmon(n: u64, seed: u64, root: &Path) {
             let mut last_commit = 0u64;
             let mut still = 0u32;
             let mut dumped = false;
+            let mut stalled = false;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(1));
                 let mut cols = Vec::new();
@@ -1008,6 +1039,14 @@ fn run_growmon(n: u64, seed: u64, root: &Path) {
                 }
                 let lc = reps[l].committed_head();
                 let ll = reps[l].with(|x| x.last_round()).unwrap_or(0);
+                if let Some((on_leader, backlog, ms)) = stall {
+                    if !stalled && reps[l].queue_len() == 0 && ll.saturating_sub(lc) >= backlog {
+                        stalled = true;
+                        let target = if on_leader { l } else { (l + 1) % 3 };
+                        reps[target].stall_ms.store(ms, Ordering::Relaxed);
+                        println!("GM STALL-INJECTED t={:.0}s node=n{} ms={ms} leader_last={ll} commit={lc} backlog={}", t0.elapsed().as_secs_f64(), target + 1, ll - lc);
+                    }
+                }
                 println!("GM t={:.0}s {}", t0.elapsed().as_secs_f64(), cols.join(" | "));
                 if lc == last_commit && ll > lc {
                     still += 1;
