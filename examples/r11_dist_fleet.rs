@@ -293,6 +293,10 @@ struct Cluster {
 
 /// A10: a per-run seed salt. 0 (the default) gives every earlier run's seeds exactly.
 static SEED_SALT: AtomicU64 = AtomicU64::new(0);
+/// A12: per-sample transport idle deadline in seconds (0 = the transport's default).
+static IDLE_DEADLINE_S: AtomicU64 = AtomicU64::new(0);
+/// A12: per-sample idle wait before the failover, in seconds.
+static PRE_FAIL_SLEEP_S: AtomicU64 = AtomicU64::new(0);
 
 fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) -> NodeOptions {
     let peers: BTreeMap<NodeId, SocketAddr> = addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
@@ -300,8 +304,9 @@ fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) 
     let salt = SEED_SALT.load(Ordering::Relaxed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
     let mut o = NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt);
     // A12 control: the transport's idle close (default 60 s), overridable per run.
-    if let Some(s) = std::env::var("R11_IDLE_DEADLINE_S").ok().and_then(|x| x.parse::<u64>().ok()) {
-        o.transport.idle_deadline = Duration::from_secs(s);
+    let d = std::env::var("R11_IDLE_DEADLINE_S").ok().and_then(|x| x.parse::<u64>().ok()).unwrap_or(IDLE_DEADLINE_S.load(Ordering::Relaxed));
+    if d > 0 {
+        o.transport.idle_deadline = Duration::from_secs(d);
     }
     o
 }
@@ -867,8 +872,9 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
     }
     let survivors: Vec<usize> = all.iter().copied().filter(|i| *i != l).collect();
     // A12 control: idle the cluster (no proposals) before the failover.
-    if let Some(s) = std::env::var("R11_PRE_FAIL_SLEEP_S").ok().and_then(|x| x.parse::<u64>().ok()) {
-        std::thread::sleep(Duration::from_secs(s));
+    let sl = std::env::var("R11_PRE_FAIL_SLEEP_S").ok().and_then(|x| x.parse::<u64>().ok()).unwrap_or(PRE_FAIL_SLEEP_S.load(Ordering::Relaxed));
+    if sl > 0 {
+        std::thread::sleep(Duration::from_secs(sl));
     }
     let tc_before: Vec<Option<(u64, u64, u64, u64, u64, usize, u64, u64)>> = survivors.iter().map(|i| c.reps[*i].with(|n| n.transport_counters())).collect();
     let timers_at_stop: Vec<(u32, u32)> = survivors.iter().map(|i| c.reps[*i].with(|n| n.election_timer()).unwrap_or((0, 0))).collect();
@@ -921,7 +927,7 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
         })
         .collect();
     let idle_closed_total: Vec<Option<u64>> = tc_after.iter().map(|a| a.map(|a| a.6)).collect();
-    println!("FF {tag} transport election_delta(idle_closed,lost_in_flight,connect_failures,dropped,inbound_dropped)={tdelta:?} idle_closed_total_at_end={idle_closed_total:?} idle_deadline_s={:?} pre_fail_sleep_s={:?}", std::env::var("R11_IDLE_DEADLINE_S").ok(), std::env::var("R11_PRE_FAIL_SLEEP_S").ok());
+    println!("FF {tag} transport election_delta(idle_closed,lost_in_flight,connect_failures,dropped,inbound_dropped)={tdelta:?} idle_closed_total_at_end={idle_closed_total:?} idle_deadline_s={} pre_fail_sleep_s={}", IDLE_DEADLINE_S.load(Ordering::Relaxed), PRE_FAIL_SLEEP_S.load(Ordering::Relaxed));
     println!(
         "FF {tag} election winner={:?} B1_ms={b1:.1} stop_join_ms={join_ms:.1} stop_drop_ms={drop_ms:.1} claim_ms={:?} noop_ms={:?} elect_ms={elect_ms:.1} survivors={:?} timers_at_stop(timeout,since_heard)={timers_at_stop:?} timeouts_seen_during_election={draws:?} election_transitions={:?} terms_after={term_after:?} survivor_driver_max_gap_ms={egaps:?}",
         elected.map(|(x, _)| format!("n{}", x + 1)),
@@ -1054,13 +1060,14 @@ fn main() {
         // r11_dist_fleet firstfail <scratch-root> <N:seed,N:seed,...> <hold-budget-s>
         let root = PathBuf::from(args.get(2).expect("scratch root"));
         std::fs::create_dir_all(&root).unwrap();
-        let samples: Vec<(u64, u64)> = args
+        // N:seed[:pre-fail-sleep-s[:idle-deadline-s]]
+        let samples: Vec<(u64, u64, u64, u64)> = args
             .get(3)
             .expect("samples")
             .split(',')
             .map(|x| {
-                let (a, b) = x.split_once(':').expect("N:seed");
-                (a.parse().unwrap(), b.parse().unwrap())
+                let f: Vec<u64> = x.split(':').map(|v| v.parse().unwrap()).collect();
+                (f[0], f[1], f.get(2).copied().unwrap_or(0), f.get(3).copied().unwrap_or(0))
             })
             .collect();
         let budget = Duration::from_secs(args.get(4).and_then(|x| x.parse().ok()).unwrap_or(1000));
@@ -1068,9 +1075,11 @@ fn main() {
         let (med, p99) = b0(&root);
         println!("B0 sync_data_ms median={med:.3} p99={p99:.3} samples=2000");
         let t0 = Instant::now();
-        for (n, seed) in samples {
+        for (n, seed, sleep_s, deadline_s) in samples {
+            PRE_FAIL_SLEEP_S.store(sleep_s, Ordering::Relaxed);
+            IDLE_DEADLINE_S.store(deadline_s, Ordering::Relaxed);
             // A 10^6 sample needs about 3 min; do not start one that could overrun the hold.
-            let need = if n >= 1_000_000 { Duration::from_secs(240) } else { Duration::from_secs(20) };
+            let need = if n >= 1_000_000 { Duration::from_secs(240) } else { Duration::from_secs(20 + sleep_s) };
             if t0.elapsed() + need > budget {
                 println!("FF N={n} seed={seed} SKIPPED: hold budget ({} s used)", t0.elapsed().as_secs());
                 continue;
