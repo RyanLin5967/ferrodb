@@ -411,6 +411,42 @@ impl Cluster {
         polls
     }
 
+    /// `stop_node`, timed in its two halves: joining the driver, then shutting and dropping the node.
+    fn stop_node_timed(&mut self, i: usize) -> (f64, f64) {
+        let t0 = Instant::now();
+        self.stops[i].store(true, Ordering::Relaxed);
+        let _ = self.threads[i].take().map(|t| t.join().unwrap_or(0));
+        let join_ms = ms(t0);
+        let t1 = Instant::now();
+        if let Some(n) = lock(&self.reps[i].node).take() {
+            n.shutdown();
+            drop(n);
+        }
+        (join_ms, ms(t1))
+    }
+
+    /// B1 decomposed (PREREG A9): after `i` is stopped, when does a survivor first claim office,
+    /// and when has that claimant committed the round it held at its claim (its NoOp)?
+    fn election_phases(&self, survivors: &[usize], bound: Duration) -> (Option<f64>, Option<f64>) {
+        let t0 = Instant::now();
+        let mut claim: Option<(usize, Round, f64)> = None;
+        while t0.elapsed() < bound {
+            if claim.is_none() {
+                if let Some(x) = survivors.iter().copied().find(|x| self.reps[*x].leader() == Some(NodeId(*x as u32 + 1))) {
+                    let last = self.reps[x].with(|n| n.last_round()).unwrap_or(0);
+                    claim = Some((x, last, ms(t0)));
+                }
+            }
+            if let Some((x, last, c_ms)) = claim {
+                if self.reps[x].committed_head() >= last {
+                    return (Some(c_ms), Some(ms(t0)));
+                }
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        (claim.map(|c| c.2), None)
+    }
+
     /// B5: start node `i` again on its own directory and address, with a fresh ledger.
     fn restart(&mut self, i: usize) -> Result<(), String> {
         let id = NodeId(i as u32 + 1);
@@ -577,8 +613,13 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     // FAILOVER: stop L; time the election among the survivors (B1).
     let survivors: Vec<usize> = all.iter().copied().filter(|i| *i != l).collect();
     let syncs_before: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.persist_syncs()).unwrap_or(0)).collect();
+    for r in &c.reps {
+        r.max_gap_us.store(0, Ordering::Relaxed);
+    }
     let t_fail = Instant::now();
-    c.stop_node(l);
+    let (join_ms, drop_ms) = c.stop_node_timed(l);
+    let t_after_stop = Instant::now();
+    let (claim_ms, noop_ms) = c.election_phases(&survivors, Duration::from_secs(120));
     let Some((l2, _)) = c.elect(&survivors, Duration::from_secs(120)) else {
         println!("B {tag} VOID: no leader among survivors in 120 s; errs={:?}", lock(&c.errs));
         c.shutdown_all();
@@ -586,6 +627,11 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
         return;
     };
     let t_elect_ms = ms(t_fail);
+    let elect_after_stop_ms = ms(t_after_stop);
+    let egaps: Vec<f64> = survivors.iter().map(|i| c.reps[*i].max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
+    println!(
+        "B {tag} B1_parts stop_join_ms={join_ms:.1} stop_drop_ms={drop_ms:.1} claim_ms_after_stop={claim_ms:?} noop_committed_ms_after_stop={noop_ms:?} elect_ms_after_stop={elect_after_stop_ms:.1} survivor_driver_max_gap_ms={egaps:?}"
+    );
     let l2id = l2 as u32 + 1;
     let other = *survivors.iter().find(|i| **i != l2).unwrap();
     let term0 = c.reps[l2].with(|x| x.term()).unwrap_or(0);
@@ -705,6 +751,43 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
             println!("B {tag} C1_after_restart={c1r}");
         }
         Err(e) => println!("B {tag} B5 SKIPPED: {e}"),
+    }
+    // A9: repeated failovers at this N, without re-growing: restart every stopped node, let it
+    // catch up, then stop whoever leads and time the phases. R11_B1_REPS (default 0).
+    let reps: usize = std::env::var("R11_B1_REPS").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
+    for rep in 0..reps {
+        for i in 0..3 {
+            if lock(&c.reps[i].node).is_none() {
+                if let Err(e) = c.restart(i) {
+                    println!("B {tag} B1R rep={rep} VOID: restart n{}: {e}", i + 1);
+                }
+            }
+        }
+        let Some((x, _)) = c.elect(&all, Duration::from_secs(120)) else {
+            println!("B {tag} B1R rep={rep} VOID: no stable leader");
+            break;
+        };
+        let last = c.reps[x].with(|n| n.last_round()).unwrap_or(0);
+        if !c.wait_applied(&all, last, Duration::from_secs(600)) {
+            println!("B {tag} B1R rep={rep} VOID: a restarted node did not catch up to {last}");
+            break;
+        }
+        let rest: Vec<usize> = all.iter().copied().filter(|i| *i != x).collect();
+        for r in &c.reps {
+            r.max_gap_us.store(0, Ordering::Relaxed);
+        }
+        let t0 = Instant::now();
+        let (j, d) = c.stop_node_timed(x);
+        let ta = Instant::now();
+        let (cl, nc) = c.election_phases(&rest, Duration::from_secs(120));
+        let ok = c.elect(&rest, Duration::from_secs(120)).is_some();
+        let gaps: Vec<f64> = rest.iter().map(|i| c.reps[*i].max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
+        println!(
+            "B {tag} B1R rep={rep} stopped=n{} last_round={last} stop_join_ms={j:.1} stop_drop_ms={d:.1} claim_ms_after_stop={cl:?} noop_committed_ms_after_stop={nc:?} elect_ms_after_stop={:.1} B1_total_ms={:.1} elected={ok} survivor_driver_max_gap_ms={gaps:?}",
+            x + 1,
+            ms(ta),
+            ms(t0)
+        );
     }
     c.shutdown_all();
     drop(c);
