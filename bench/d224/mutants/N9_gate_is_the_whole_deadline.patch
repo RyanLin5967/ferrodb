@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2153,7 +2153,7 @@
+ /// when the peer restarts mid-election, when campaign frames go out under a second apart. A rebooted
+ /// host sends nothing to find until this side writes.
+ fn idle_probe_gap(opts: &TransportOptions) -> Duration {
+-    opts.idle_deadline / 2
++    opts.idle_deadline
+ }
+ 
+ /// Whether the peer has closed this connection: asked without blocking and without consuming

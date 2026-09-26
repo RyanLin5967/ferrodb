@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 use super::config::Config;
 use super::log::{LogError, RoundLog};
 use super::signing::Key;
-use super::transport::{Transport, TransportOptions};
+use super::transport::{Transport, TransportCounters, TransportOptions};
 use super::{Action, Command, Consensus, Entry, Event, HardState, NodeId, Role, Round, Term};
 use crate::error::FerroError;
 use crate::storage::atomic_file::{replace_atomically, OsFileOps};
@@ -414,6 +414,10 @@ impl<A: Applier> Node<A> {
     pub fn applied(&self) -> Round { self.applied }
     pub fn applier(&self) -> &A { &self.applier }
     pub fn local_addr(&self) -> SocketAddr { self.net.local_addr() }
+    /// A copy of the transport's meters (D223 review F3). The node discards every send the
+    /// transport refuses (see `perform`), so these counts are the only trace such a send leaves. A
+    /// copy, not the transport itself, which would also let the caller send on it or stop it.
+    pub fn transport_counters(&self) -> TransportCounters { self.net.counters() }
     pub fn take_refusals(&mut self) -> Vec<FerroError> { std::mem::take(&mut self.refusals) }
     /// Where this node's log begins. Everything at or below it is covered by a snapshot.
     pub fn snapshot_round(&self) -> Round { self.log.snapshot_round() }
@@ -446,20 +450,6 @@ impl<A: Applier> Node<A> {
             .map(|(n, p)| (*n, p.next, p.matched, p.silent, p.needs_snapshot, p.diverged.clone()))
             .collect()
     }
-    /// Instrument (r11-dist A11): transport counters, as (sent, dropped, received, inbound_dropped,
-    /// lost_in_flight, inbox_bytes, idle_closed, connect_failures). Read-only.
-    pub fn transport_counters(&self) -> (u64, u64, u64, u64, u64, usize, u64, u64) {
-        (
-            self.net.sent(),
-            self.net.dropped(),
-            self.net.received(),
-            self.net.inbound_dropped(),
-            self.net.lost_in_flight(),
-            self.net.inbox_bytes(),
-            self.net.idle_closed(),
-            self.net.connect_failures(),
-        )
-    }
     /// r11-dist GC arm: queue every command, then drain once. Returns the log's last round.
     pub fn propose_many(&mut self, cs: Vec<Command>) -> Result<Round, FerroError> {
         let before = self.log.last_round();
@@ -474,7 +464,10 @@ impl<A: Applier> Node<A> {
     }
 
     /// Ask for a command to be committed. Only meaningful on a leader; anywhere else the state
-    /// machine produces a `NotLeader` refusal, which lands in [`Node::take_refusals`].
+    /// machine produces a `NotLeader` refusal, which lands in [`Node::take_refusals`]. A leader also
+    /// refuses a command the wire could never carry (D223's admission check), and that refusal
+    /// lands there too. Either way the round returned is the previous last round, not a new one, so
+    /// a caller must read the refusals; `NodeReplicator::propose` does.
     ///
     /// Returns the round the leader assigned. **That is not an acknowledgement** — the round is
     /// acknowledged when [`Node::commit_round`] reaches it, which is the only moment a quorum has
@@ -823,6 +816,18 @@ impl<A: Applier> Node<A> {
                 // A send that cannot be delivered is dropped and counted by the transport, not an
                 // error here: consensus is designed for a lossy network, and treating one
                 // undeliverable heartbeat as a node failure would take a healthy node down.
+                //
+                // "Counted" is literal for every `Err` this discards (D223): `refused_after_stop`,
+                // `unaddressable` or `unencodable`, readable through `transport_counters`.
+                //
+                // After a send is queued, the transport counts what IT drops: the oldest frames when
+                // a peer falls behind (`dropped`), and the one frame whose write fails
+                // (`lost_in_flight`). It cannot count what TCP loses after a write succeeded, frames
+                // still queued when it shuts down, or a push that loses a race with a shutdown;
+                // `transport.rs`'s module header lists them (narrowed after the D223 review, F4).
+                //
+                // A leader's own entries are admitted at proposal by the encoder's own measure, so
+                // `unencodable` climbing means a bug, not a load.
                 let _ = self.net.send(&m);
             }
 

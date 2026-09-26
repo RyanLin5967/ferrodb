@@ -1,0 +1,12 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1261,8 +1261,7 @@
+         // Both bounds, whichever binds first. The loop stops at an empty queue whatever the bytes
+         // say, so a frame larger than the whole byte bound is still admitted, alone: no message is
+         // made permanently unsendable by the bound that exists to keep sending possible.
+-        while !st.queue.is_empty()
+-            && (st.queue.len() >= self.depth
++        while (st.queue.len() >= self.depth
+                 || st.bytes.saturating_add(frame.len()) > self.max_bytes)
+         {
+             if let Some(old) = st.queue.pop_front() {

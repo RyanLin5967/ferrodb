@@ -1,0 +1,9 @@
+--- a/src/consensus/config.rs
++++ b/src/consensus/config.rs
+@@ -145,5 +145,5 @@
+         sorted.windows(2).all(|w| w[0] < w[1]),
+         "retain_absent needs a strictly ascending reference list"
+     );
+-    items.retain(|n| sorted.binary_search(n).is_err());
++    items.retain(|n| sorted.binary_search(n).is_ok());
+ }

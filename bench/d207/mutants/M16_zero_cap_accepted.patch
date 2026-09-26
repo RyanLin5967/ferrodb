@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1471,7 +1471,7 @@
+                     .to_string(),
+             ));
+         }
+-        if opts.max_inbound_conns == 0 {
++        if false && opts.max_inbound_conns == 0 {
+             return Err(FerroError::Internal(
+                 "`max_inbound_conns` is zero, so every inbound connection would be refused at the \
+                  cap: a node deaf to the whole cluster while its outbound meters read healthy"

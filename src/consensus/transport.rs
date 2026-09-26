@@ -40,13 +40,33 @@
 //! partitioned follower would stop heartbeating the healthy majority, turning one node's failure
 //! into the cluster's.
 //!
-//! **Every way a message can be lost here has its own counter**, because an invisible drop is
-//! indistinguishable from a protocol bug, and because the three causes call for different actions:
+//! **Every loss this transport decides on has its own counter**, because an invisible drop is
+//! indistinguishable from a protocol bug, and because the causes call for different actions:
 //! [`Transport::dropped`] means a peer is too slow to keep up,
 //! [`Transport::lost_in_flight`] means a connection broke mid-frame, and
 //! [`Transport::inbound_dropped`] means *this* node is not draining its own inbox. A send after
-//! shutdown is **refused** rather than counted, because a caller still producing `Action::Send`
-//! after stopping its transport has a bug rather than a slow peer.
+//! shutdown is **refused** rather than dropped, because a caller still producing `Action::Send`
+//! after stopping its transport has a bug rather than a slow peer. Every refused send is counted too
+//! (D223): after shutdown, misaddressed, or unencodable, in [`Transport::refused_after_stop`],
+//! [`Transport::unaddressable`] and [`Transport::unencodable`]. The caller in `node.rs` discards the
+//! error, so the count is the only trace a refusal leaves.
+//!
+//! **What is not counted, because it cannot be.** This used to say *every* way a message could be
+//! lost had a counter, and that was never true. A frame handed to the kernel is not tracked any
+//! further: TCP gives no delivery receipt. When a connection dies, whatever sat in its buffers is
+//! lost with no number attached, and only the frame whose own write failed reaches `lost_in_flight`.
+//! That includes the first frame written after the peer closed its end, which is exactly what the
+//! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
+//! the next write that fails. Since D224 a sender probes a link it has left idle before writing to
+//! it, and redials if the peer closed it ([`Transport::idle_probes`], [`Transport::idle_redials`]).
+//! So an idle close costs frames (at least two: every write before the peer's reset arrives is lost
+//! uncounted, and the first after it is counted) only in the cases `idle_probe_gap` lists: the narrow race at the peer's close, the band of gaps a violated deadline premise leaves
+//! unprobed, and a redial that lands on a peer shutting down mid-handshake. The same is
+//! true of the receiving side. A connection closed on a frame with an
+//! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
+//! whatever the peer sends after it; of those closes, only the idle one is counted
+//! ([`Transport::idle_closed`]). Consensus re-sends, so none of these is a correctness loss; they
+//! are why `sent()` minus a peer's `received()` is not fully accounted for by the counters here.
 //!
 //! # The wire format
 //!
@@ -124,17 +144,24 @@ const B_REAP: u8 = 3;
 
 /// Most voters, and most learners, a configuration may carry **on the wire**.
 ///
-/// Not a limit on what a cluster may be — a limit on what a *frame* may claim it is. One 8 MiB
-/// frame holds 2,097,152 `u32` node ids, and both the disjointness check below and
-/// `Config::with_learners` compare each learner against every member, so two million ids cost on
-/// the order of 10^12 comparisons: one frame, one CPU, hours. The frame limit bounds the *bytes* a
-/// peer can make this process hold and says nothing about the *work* it can make this process do,
-/// which is the hole this closes.
+/// Not a limit on what a cluster may be — a limit on what a *frame* may claim it is. 1024 is far
+/// above anything real: membership changes here are single-node by construction (`membership.rs`),
+/// and quorum arithmetic makes a cluster of even fifty voters unusable, so a configuration naming a
+/// thousand is already not a configuration but a malformed or hostile frame. Both halves of the
+/// codec enforce it, so a sender is refused where the cause is visible rather than emitting a frame
+/// every peer refuses.
 ///
-/// 1024 is far above anything real and far below anything measurable. Membership changes here are
-/// single-node by construction (`membership.rs`) and quorum arithmetic makes a cluster of even
-/// fifty voters unusable, so a configuration naming a thousand is already not a configuration; at
-/// 1024 the quadratic term is about a million comparisons, which is microseconds.
+/// **It is no longer what bounds the work a frame can buy, and why it once was is worth keeping.**
+/// `Config::with_learners` used to drop voters from the learner list with a `Vec::contains` per
+/// learner, O(learners x members): one 8 MiB frame of two million ids was on the order of 10^12
+/// comparisons, and this cap was the first fix. It bounded one configuration and nothing bounded
+/// how many a frame carried, so an `Append` of about 1018 maximal configurations still cost about
+/// 1.07e9.
+/// D207 removed the quadratic at its source instead (`config::retain_absent`, one binary search per
+/// learner): a configuration now decodes in O(n log n), and a frame's decode work is linear in its
+/// bytes up to that log, which [`MAX_FRAME_BYTES`] bounds. A per-frame budget on node ids was tried
+/// in between and removed: it bounded one frame's latency rather than a peer's work, and it refused
+/// catch-up `Append`s the leader has no way to split.
 pub const MAX_CONFIG_NODES: usize = 1024;
 
 /// `RecKind::Ddl`'s tag in `wal::log`. Named here because [`Command::Catalog`] is carried *as* one
@@ -170,6 +197,22 @@ pub fn encode(m: &Message) -> Result<Vec<u8>, FerroError> {
 /// term being in there is the point of the row: a tag over anything less would leave the one field
 /// an attacker wants to change outside it.
 pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroError> {
+    let body = message_body(m)?;
+    let body = match key {
+        Some(k) => signing::sign_frame(k, &body)?,
+        None => body,
+    };
+
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.push(CONSENSUS_TAG);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// The unsigned frame body for `m` — `from | to | term | kind | fields` — refused over the frame
+/// limit. Everything [`encode_signed`] frames, and what [`append_entries_budget`] measures.
+fn message_body(m: &Message) -> Result<Vec<u8>, FerroError> {
     let mut body = Vec::new();
     put_u32(&mut body, m.from.0);
     put_u32(&mut body, m.to.0);
@@ -181,17 +224,72 @@ pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroErr
     if body.len() > MAX_FRAME_BYTES {
         return Err(too_big(body.len()));
     }
+    Ok(body)
+}
 
-    let body = match key {
-        Some(k) => signing::sign_frame(k, &body)?,
-        None => body,
+/// How many bytes of entries one `Append` may carry and still be framed, **signed or not**.
+///
+/// For the leader's batching (D220). An `Append` used to be capped by entry count alone, while one
+/// entry may be up to `log::MAX_ENTRY_BYTES`, so 64 large entries made an `Append` this encoder
+/// refused on every heartbeat — and `node.rs` discards a refused send, so that follower was stuck
+/// with no meter moving.
+///
+/// Taken from the encoder rather than recomputed beside it: the frame limit, less the body of an
+/// `Append` that carries no entries (encoded here to measure it), less the MAC a signing transport
+/// adds. The state machine that builds a batch cannot know whether its transport signs, so it
+/// always leaves room for one.
+pub(crate) fn append_entries_budget() -> usize {
+    let empty = Message {
+        from: NodeId(0),
+        to: NodeId(0),
+        term: 0,
+        body: Body::Append { prev_round: 0, prev_term: 0, entries: Vec::new(), commit: 0 },
     };
+    // Every field around the entries is fixed-width, so these values do not change the length.
+    // An empty `Append` cannot fail to encode; if it somehow did, a zero budget still sends one
+    // entry per `Append` (see `replicate.rs`), which degrades rather than stalls.
+    message_body(&empty)
+        .map_or(0, |b| MAX_FRAME_BYTES.saturating_sub(b.len() + signing::MAC_LEN))
+}
 
-    let mut out = Vec::with_capacity(body.len() + 5);
-    out.push(CONSENSUS_TAG);
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
+/// The bytes the encoder writes for one entry inside an `Append`, measured by writing it.
+///
+/// Measured rather than computed so that it cannot drift from [`encode_entry`]. An entry the encoder
+/// cannot write at all reports `usize::MAX`: it fits nothing, which is the truth.
+pub(crate) fn entry_wire_len(e: &Entry) -> usize {
+    let mut b = Vec::new();
+    match encode_entry(&mut b, e) {
+        Ok(()) => b.len(),
+        Err(_) => usize::MAX,
+    }
+}
+
+/// **The one admission check** (D223): whether an entry can ever be carried, decided before it
+/// reaches the leader's log, in memory or on disk.
+///
+/// Every limit here is the encoder's own, applied by running it rather than restated. An entry the
+/// encoder cannot write at all — a configuration over [`MAX_CONFIG_NODES`], a name longer than its
+/// u16 prefix — is refused with the encoder's own error. An entry it can write, but longer than
+/// [`append_entries_budget`], is refused because it would not fit one signed `Append` alone.
+///
+/// Why at proposal. A round the wire cannot carry is a round no follower can ever receive, so it
+/// never commits, and it blocks every round after it. Before this, `on_propose` appended any command,
+/// and the only refusals came later and silently: from the disk, after the in-memory tail already
+/// held the round, or from the encoder on every heartbeat, discarded by `node.rs`.
+pub(crate) fn admit_entry(e: &Entry) -> Result<(), FerroError> {
+    let mut b = Vec::new();
+    encode_entry(&mut b, e)?;
+    let budget = append_entries_budget();
+    if b.len() > budget {
+        return Err(FerroError::Wal(format!(
+            "an entry of {} bytes on the wire cannot fit one Append frame, which carries at most \
+             {budget} bytes of entries once its envelope and a signature are paid for. Refused at \
+             proposal, before it reached the log: a round no frame can carry is a round no follower \
+             can ever receive, and it would block every round after it",
+            b.len()
+        )));
+    }
+    Ok(())
 }
 
 fn too_big(n: usize) -> FerroError {
@@ -725,9 +823,9 @@ fn decode_node_list(bytes: &[u8], at: &mut usize, what: &str) -> Result<Vec<Node
     // bytes a peer can make this process hold, not the work it can make this process do.
     if count > MAX_CONFIG_NODES {
         return Err(FerroError::Wal(format!(
-            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. A frame is \
-             allowed to be large; the comparisons a configuration costs are quadratic in its two \
-             list lengths, so a large one is a request for this node's CPU rather than a cluster"
+            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. No cluster \
+             that large can form a usable quorum, so a configuration this size is a malformed or \
+             hostile frame rather than a cluster, and it is refused before a single id is read"
         )));
     }
     // Not pre-allocated from `count`, for the reason given in `decode_append`.
@@ -1008,14 +1106,25 @@ fn send_handshake(stream: &mut TcpStream) -> Result<(), FerroError> {
 
 /// Knobs, all of them with a defensible default.
 ///
-/// Every one is a real parameter rather than a tuning guess: `queue_depth` is how much a peer may
-/// fall behind before this node starts dropping to it, `poll_interval` is how long a thread may
-/// stay blocked in `read` after a shutdown has been asked for, and `reconnect_delay` is how hard
-/// this node retries a peer that is down.
+/// Every one is a real parameter rather than a tuning guess: `queue_depth` and `queue_bytes` are how
+/// far a peer may fall behind, in messages and in bytes, before this node starts dropping to it,
+/// `poll_interval` is how long a thread may stay blocked in `read` after a shutdown has been asked
+/// for, and `reconnect_delay` is how hard this node retries a peer that is down.
 #[derive(Debug, Clone)]
 pub struct TransportOptions {
     /// Messages held for one peer before the **oldest** is dropped. See [`Transport::send`].
     pub queue_depth: usize,
+    /// Bytes of queued frames held for one peer before the **oldest** is dropped.
+    ///
+    /// A depth in messages is not a bound on memory: a message is anything from 18 bytes to 8 MiB, so
+    /// `queue_depth` alone let one peer's queue hold 1024 x 8 MiB = 8.6 GB (D207, ported from
+    /// F3-transport's `207d362`, which never merged). Both bounds apply and whichever binds first
+    /// wins: the depth stops a flood of tiny heartbeats, and this stops a run of maximal `Append`s.
+    ///
+    /// A frame larger than the whole bound is still queued, alone — the oldest are dropped until
+    /// the queue is empty and then it goes in — so no message is ever unsendable because of this
+    /// knob, however small it is set.
+    pub queue_bytes: usize,
     /// Socket read timeout, and the listener's accept poll. Bounds shutdown latency.
     pub poll_interval: Duration,
     /// How long a sender thread waits after a failed dial before trying that peer again.
@@ -1037,8 +1146,19 @@ pub struct TransportOptions {
     ///
     /// A peer whose host vanishes without sending a FIN leaves a connection that is never readable
     /// and never errors, so its thread and descriptors are pinned for the life of the process.
-    /// Consensus heartbeats every few ticks, so a genuinely live peer is never silent for long, and
-    /// closing costs only a reconnect.
+    ///
+    /// **What closing a live peer costs.** The leader heartbeats its followers, and they answer it,
+    /// so those connections are never silent for long. **Followers send each other nothing** while
+    /// a leader holds, so each follower's connection *to* another is closed by the receiver after
+    /// this long. The sender does not read its socket, so it does not see the close.
+    ///
+    /// Until D224, a surviving follower's first campaign frame after the leader died went into that
+    /// closed connection and was lost uncounted. Its second failed and was counted. Failover after a
+    /// long stable term took an election round or two longer.
+    ///
+    /// Now the sender probes a link idle for half of this before its next write, and redials first
+    /// if the link is closed (`idle_probe_gap`). For that to hold, no node's value may be below half
+    /// of another's. Nothing enforces it; every node in this repo runs this default.
     pub idle_deadline: Duration,
     /// Most bytes of undelivered inbound messages held before further ones are refused.
     ///
@@ -1054,6 +1174,7 @@ impl Default for TransportOptions {
     fn default() -> Self {
         TransportOptions {
             queue_depth: 1024,
+            queue_bytes: 64 * 1024 * 1024,
             poll_interval: Duration::from_millis(50),
             reconnect_delay: Duration::from_millis(100),
             handshake_deadline: Duration::from_secs(5),
@@ -1064,9 +1185,10 @@ impl Default for TransportOptions {
     }
 }
 
-/// Everything this transport has counted. **Drops and refusals are counted, never silent** — a
-/// message that vanished without a number attached is indistinguishable from a protocol bug, and
-/// this transport is allowed to drop.
+/// Everything this transport has counted. **Every drop and refusal it decides on is counted, never
+/// silent** — a message that vanished without a number attached is indistinguishable from a protocol
+/// bug, and this transport is allowed to drop. What TCP loses after a frame left this process is
+/// not, and cannot be; the module header lists those cases.
 #[derive(Debug, Default)]
 struct Counters {
     sent: AtomicU64,
@@ -1082,12 +1204,28 @@ struct Counters {
     lost_in_flight: AtomicU64,
     /// Bytes of decoded messages sitting in the inbox, undelivered.
     inbox_bytes: AtomicUsize,
-    /// Connections closed immediately because `max_inbound_conns` were already established.
+    /// Connections closed without being served: because `max_inbound_conns` were already
+    /// established, because the accepted socket could not be duplicated or configured (D207), or
+    /// because no thread could be started for it.
     refused_conns: AtomicU64,
     /// Connections closed for going silent longer than `idle_deadline`.
     idle_closed: AtomicU64,
     /// Outbound messages refused because the transport is stopped.
     refused_after_stop: AtomicU64,
+    /// Outbound messages refused because the encoder cannot frame them (D223). After admission at
+    /// proposal, a leader's own traffic should never land here, so a climbing number is a bug that
+    /// this is the only meter able to show: `node.rs` discards the error by design.
+    unencodable: AtomicU64,
+    /// Outbound messages refused because they were addressed to this node itself, or to a node this
+    /// transport holds no address for: configuration mistakes that are otherwise a silent partition.
+    unaddressable: AtomicU64,
+    /// Times a sender probed its link before the first write after an idle gap (D224). A link that
+    /// consensus keeps busy never reaches the gate, so this should move only on links it leaves
+    /// silent: follower to follower during a stable term.
+    idle_probes: AtomicU64,
+    /// Probes that found the peer had closed the link, so the sender redialled before writing
+    /// instead of losing the frame to the closed connection (D224).
+    idle_redials: AtomicU64,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1104,11 +1242,16 @@ struct Outbox {
     state: Mutex<OutboxState>,
     woken: Condvar,
     depth: usize,
+    /// `TransportOptions::queue_bytes`.
+    max_bytes: usize,
     dropped: AtomicU64,
 }
 
 struct OutboxState {
     queue: VecDeque<Vec<u8>>,
+    /// The sum of `queue`'s frame lengths, kept beside it so the byte bound costs no walk. Every
+    /// push, drop and pop of a frame moves it by that frame's length, under the same lock.
+    bytes: usize,
     /// A clone of the live socket, held **only** so that [`Transport::shutdown`] can call
     /// `shutdown(Both)` on it. A sender thread parked in `write_all` against a peer whose receive
     /// window is full is otherwise unreachable, and joining it would hang for ever.
@@ -1117,7 +1260,8 @@ struct OutboxState {
 }
 
 impl Outbox {
-    /// Enqueue, dropping the **oldest** if this peer is already `depth` behind.
+    /// Enqueue, dropping the **oldest** while this peer is already `depth` frames behind, or while
+    /// this frame would take it past `max_bytes`.
     ///
     /// Oldest and not newest, deliberately. Consensus messages are cumulative: a later `Append`
     /// carries a higher `commit` and later entries, and a later heartbeat supersedes an earlier
@@ -1128,12 +1272,40 @@ impl Outbox {
         if st.stopped {
             return;
         }
-        while st.queue.len() >= self.depth {
-            st.queue.pop_front();
-            self.dropped.fetch_add(1, Ordering::SeqCst);
+        // Both bounds, whichever binds first. The loop stops at an empty queue whatever the bytes
+        // say, so a frame larger than the whole byte bound is still admitted, alone: no message is
+        // made permanently unsendable by the bound that exists to keep sending possible.
+        while !st.queue.is_empty()
+            && (st.queue.len() >= self.depth
+                || st.bytes.saturating_add(frame.len()) > self.max_bytes)
+        {
+            if let Some(old) = st.queue.pop_front() {
+                st.bytes -= old.len();
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
+        st.bytes += frame.len();
         st.queue.push_back(frame);
         self.woken.notify_all();
+    }
+
+    /// Wait up to `delay` before the sender redials, returning early if woken — or at once if the
+    /// transport is already stopping, in which case the sender's loop head sees the stop flag and
+    /// leaves. (`stopped` is only ever set after the stop flag, so that check suffices; a returned
+    /// flag here would be a second guard on the same exit, and nothing could tell if it broke.)
+    ///
+    /// **The stop flags are read under the lock BEFORE waiting.** `shutdown` notifies once, and a
+    /// notify that lands while the sender is still inside `dial` finds nobody waiting; a wait begun
+    /// after it used to sleep out the whole delay before anything looked at the flags again — the
+    /// lost wakeup (D207, from F3-transport's `207d362`). `stopped` is set under this same lock, so
+    /// it lands either before this check or while the wait below is parked, never between them.
+    /// Both redial waits in `sender_loop` go through here, so there is one copy to get right.
+    fn wait_before_redial(&self, stop: &AtomicBool, delay: Duration) {
+        let st = self.state.lock().unwrap();
+        if st.stopped || stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.woken.wait_timeout(st, delay);
     }
 }
 
@@ -1180,11 +1352,19 @@ pub struct Transport {
     key: Option<Arc<Key>>,
 }
 
-/// Removes a connection from the live registry however its thread leaves — including the early
-/// return on a refused handshake.
+/// Removes a connection from the live registry however it leaves — including the early return on a
+/// refused handshake, and a connection that never got a thread at all.
 ///
 /// A `Drop` guard rather than a call at the end of `conn_loop`, because "every exit path also
 /// deregisters" is exactly the invariant a later edit breaks by adding one more `return`.
+///
+/// **Made in the same critical section that reserves the slot**, and moved into the connection
+/// thread from there. It used to be made at the top of `conn_loop`, which left the two exits in
+/// `accept_loop` between the reservation and the spawn outside it: the spawn failure released the
+/// slot by hand, and the failed socket setup did not — so each failed setup leaked a slot and a
+/// descriptor, and `max_inbound_conns` of them made the node refuse every real peer (D207, ported
+/// from F3-transport's `207d362`, which never merged). With the guard owning the slot from the
+/// moment it exists, no exit can be added that forgets it.
 struct ConnRegistration {
     id: u64,
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
@@ -1293,6 +1473,25 @@ impl Transport {
                 )));
             }
         }
+        // Two more knobs whose zero is a partition that reads as health, not a smaller setting
+        // (D207, ported from F3-transport's `207d362`). Not folded into the loop above: its message
+        // blames std's socket calls, and neither of these ever reaches one.
+        if opts.idle_deadline.is_zero() {
+            return Err(FerroError::Internal(
+                "`idle_deadline` is zero. It does not mean \"never idle\": a connection is closed \
+                 once it has been silent longer than this, which a zero makes true on the first \
+                 poll after the handshake — a node that accepts every peer and at once hangs up on \
+                 each"
+                    .to_string(),
+            ));
+        }
+        if opts.max_inbound_conns == 0 {
+            return Err(FerroError::Internal(
+                "`max_inbound_conns` is zero, so every inbound connection would be refused at the \
+                 cap: a node deaf to the whole cluster while its outbound meters read healthy"
+                    .to_string(),
+            ));
+        }
         if opts.queue_depth == 0 {
             return Err(FerroError::Internal(
                 "a queue depth of 0 would drop every message on the way out, which is a \
@@ -1328,11 +1527,13 @@ impl Transport {
                 addr,
                 state: Mutex::new(OutboxState {
                     queue: VecDeque::new(),
+                    bytes: 0,
                     live: None,
                     stopped: false,
                 }),
                 woken: Condvar::new(),
                 depth: opts.queue_depth,
+                max_bytes: opts.queue_bytes,
                 dropped: AtomicU64::new(0),
             });
             outboxes.insert(peer, Arc::clone(&ob));
@@ -1416,6 +1617,10 @@ impl Transport {
     /// network conditions: a message to this node itself, and a message to a node with no address.
     /// Both are silent partitions if they are dropped, and a silent partition is the failure this
     /// whole layer exists to make impossible.
+    ///
+    /// **Every refusal is also counted** (D223): [`Transport::refused_after_stop`],
+    /// [`Transport::unaddressable`] and [`Transport::unencodable`]. The caller in `node.rs` discards
+    /// the error by design, so the count is the only trace a refused send leaves.
     pub fn send(&self, m: &Message) -> Result<(), FerroError> {
         // A stopped transport discards, and a discard with no error and no counter is the silent
         // loss this module claims not to have. Refused, because a caller still stepping its state
@@ -1430,6 +1635,7 @@ impl Transport {
             )));
         }
         if m.to == self.self_id {
+            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
             return Err(FerroError::Internal(format!(
                 "{} tried to send a consensus message to itself; the state machine addresses peers \
                  only, and a self-addressed message means a handler used the wrong id",
@@ -1437,16 +1643,21 @@ impl Transport {
             )));
         }
         let ob = self.outboxes.get(&m.to).ok_or_else(|| {
+            self.counters.unaddressable.fetch_add(1, Ordering::SeqCst);
             FerroError::Internal(format!(
                 "no address is configured for {}, so a message to it cannot be sent. This node \
                  holds addresses for {:?}. A configuration that names a node the transport cannot \
-                 reach is a node permanently unreachable while every meter reads healthy — add it \
-                 to the peer map",
+                 reach is a node permanently unreachable, whose only meter is `unaddressable` — add \
+                 it to the peer map",
                 m.to,
                 self.outboxes.keys().collect::<Vec<_>>()
             ))
         })?;
-        let frame = encode_signed(m, self.key.as_deref())?;
+        // Counted as well as returned: `node.rs` discards this error by design, so without the count
+        // a message the encoder refuses vanishes with no number attached (D223).
+        let frame = encode_signed(m, self.key.as_deref()).inspect_err(|_| {
+            self.counters.unencodable.fetch_add(1, Ordering::SeqCst);
+        })?;
         ob.push(frame);
         self.counters.sent.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1483,7 +1694,8 @@ impl Transport {
     pub fn sent(&self) -> u64 {
         self.counters.sent.load(Ordering::SeqCst)
     }
-    /// Messages dropped because a peer was `queue_depth` behind. See [`Transport::send`].
+    /// Messages dropped because a peer was `queue_depth` messages or `queue_bytes` bytes behind.
+    /// See [`Transport::send`].
     pub fn dropped(&self) -> u64 {
         self.outboxes.values().map(|o| o.dropped.load(Ordering::SeqCst)).sum()
     }
@@ -1552,7 +1764,11 @@ impl Transport {
     pub fn signs_its_traffic(&self) -> bool {
         self.key.is_some()
     }
-    /// Connections closed immediately because `max_inbound_conns` were already established.
+    /// Inbound connections closed without being served: the cap was full, the accepted socket could
+    /// not be duplicated or configured, or no thread could be started for it. F3-transport's
+    /// `207d362` recorded a failed configuration as what a peer that connects and resets before
+    /// `accept` leaves behind on macOS (D207), so on that platform this meter climbing while
+    /// `live_inbound_conns` stays low reads as resets, not as a busy node.
     pub fn refused_conns(&self) -> u64 {
         self.counters.refused_conns.load(Ordering::SeqCst)
     }
@@ -1563,6 +1779,22 @@ impl Transport {
     /// Sends refused because the transport is stopped.
     pub fn refused_after_stop(&self) -> u64 {
         self.counters.refused_after_stop.load(Ordering::SeqCst)
+    }
+    /// Sends refused because the encoder could not frame the message. See `Counters::unencodable`.
+    pub fn unencodable(&self) -> u64 {
+        self.counters.unencodable.load(Ordering::SeqCst)
+    }
+    /// Sends refused because they were addressed to this node or to a node with no address.
+    pub fn unaddressable(&self) -> u64 {
+        self.counters.unaddressable.load(Ordering::SeqCst)
+    }
+    /// Links probed before the first write after an idle gap. See `Counters::idle_probes`.
+    pub fn idle_probes(&self) -> u64 {
+        self.counters.idle_probes.load(Ordering::SeqCst)
+    }
+    /// Probes that found the link closed by the peer and redialled first.
+    pub fn idle_redials(&self) -> u64 {
+        self.counters.idle_redials.load(Ordering::SeqCst)
     }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
@@ -1594,6 +1826,7 @@ impl Transport {
             let mut st = ob.state.lock().unwrap();
             st.stopped = true;
             st.queue.clear();
+            st.bytes = 0;
             if let Some(s) = st.live.take() {
                 let _ = s.shutdown(Shutdown::Both);
             }
@@ -1620,6 +1853,7 @@ fn stop_started(stop: &Arc<AtomicBool>, outboxes: &[Arc<Outbox>], threads: Vec<J
         let mut st = ob.state.lock().unwrap();
         st.stopped = true;
         st.queue.clear();
+        st.bytes = 0;
         if let Some(s) = st.live.take() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -1633,6 +1867,60 @@ fn stop_started(stop: &Arc<AtomicBool>, outboxes: &[Arc<Outbox>], threads: Vec<J
 impl Drop for Transport {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Every meter a transport keeps, as one read-only copy (D223 review F3).
+///
+/// A value rather than `&Transport`: [`Transport::send`] and [`Transport::shutdown`] take `&self`,
+/// so a reference handed out for reading meters would also let its holder send on, or stop, the
+/// node's transport. `Node::transport_counters` hands this out, so the meters that are the only
+/// trace of a refused send can be read from a running node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransportCounters {
+    pub sent: u64,
+    pub received: u64,
+    pub dropped: u64,
+    pub lost_in_flight: u64,
+    pub inbound_dropped: u64,
+    pub misrouted: u64,
+    pub refused_handshakes: u64,
+    pub refused_conns: u64,
+    pub idle_closed: u64,
+    pub refused_after_stop: u64,
+    pub connect_failures: u64,
+    pub unauthenticated: u64,
+    pub unencodable: u64,
+    pub unaddressable: u64,
+    pub idle_probes: u64,
+    pub idle_redials: u64,
+    pub live_inbound_conns: usize,
+    pub inbox_bytes: usize,
+}
+
+impl Transport {
+    /// A copy of every meter, taken now. See [`TransportCounters`].
+    pub fn counters(&self) -> TransportCounters {
+        TransportCounters {
+            sent: self.sent(),
+            received: self.received(),
+            dropped: self.dropped(),
+            lost_in_flight: self.lost_in_flight(),
+            inbound_dropped: self.inbound_dropped(),
+            misrouted: self.misrouted(),
+            refused_handshakes: self.refused_handshakes(),
+            refused_conns: self.refused_conns(),
+            idle_closed: self.idle_closed(),
+            refused_after_stop: self.refused_after_stop(),
+            connect_failures: self.connect_failures(),
+            unauthenticated: self.unauthenticated(),
+            unencodable: self.unencodable(),
+            unaddressable: self.unaddressable(),
+            idle_probes: self.idle_probes(),
+            idle_redials: self.idle_redials(),
+            live_inbound_conns: self.live_inbound_conns(),
+            inbox_bytes: self.inbox_bytes(),
+        }
     }
 }
 
@@ -1654,6 +1942,11 @@ impl std::fmt::Debug for Transport {
             .field("inbound_dropped", &self.inbound_dropped())
             .field("lost_in_flight", &self.lost_in_flight())
             .field("connect_failures", &self.connect_failures())
+            .field("refused_after_stop", &self.refused_after_stop())
+            .field("unencodable", &self.unencodable())
+            .field("unaddressable", &self.unaddressable())
+            .field("idle_probes", &self.idle_probes())
+            .field("idle_redials", &self.idle_redials())
             // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
             // reports only whether there is one.
             .field("signed", &self.signs_its_traffic())
@@ -1671,6 +1964,19 @@ fn sender_loop(
     opts: TransportOptions,
 ) {
     let mut conn: Option<TcpStream> = None;
+    // When the current connection last carried a frame, or was dialled. The gap since then decides
+    // whether the link is probed before the next write (D224; the gate is just before the write).
+    let mut last_used = Instant::now();
+    // A frame already taken from the queue whose link the probe found closed. It is written first on
+    // the next connection, so finding the close does not itself lose the frame. The dial resets
+    // `last_used`, though, so the carried frame goes out unprobed, and a redial that lands on a peer
+    // shutting down mid-handshake still loses it (`idle_probe_gap`, "a redial onto a refusal").
+    // It sits outside the queue's drop-oldest bound while the peer is down, so on return the
+    // stalest frame goes first, against `push`'s policy. Consensus refuses a stale term, so one such
+    // frame is harmless.
+    let mut carried: Option<Vec<u8>> = None;
+    // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
+    let probe_gap = idle_probe_gap(&opts);
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -1692,26 +1998,28 @@ fn sender_loop(
                             // immediately is a 100%-CPU loop and a connection storm against a peer
                             // that has done nothing wrong.
                             counters.connect_failures.fetch_add(1, Ordering::SeqCst);
-                            let st = ob.state.lock().unwrap();
-                            let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
+                            ob.wait_before_redial(&stop, opts.reconnect_delay);
                             continue;
                         }
                     }
                     conn = Some(s);
+                    last_used = Instant::now();
                 }
                 Err(_) => {
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
                     // Wait on the condvar rather than sleeping, so a shutdown does not have to
                     // wait out a reconnect delay it has already made pointless.
-                    let st = ob.state.lock().unwrap();
-                    let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
+                    ob.wait_before_redial(&stop, opts.reconnect_delay);
                     continue;
                 }
             }
         }
 
-        // Take one frame, waiting a bounded time so the stop flag is checked regularly.
-        let frame = {
+        // Take one frame — the one a probe carried over, if there is one — waiting a bounded time so
+        // the stop flag is checked regularly.
+        let frame = if let Some(f) = carried.take() {
+            Some(f)
+        } else {
             let mut st = ob.state.lock().unwrap();
             while st.queue.is_empty() && !st.stopped && !stop.load(Ordering::SeqCst) {
                 let (g, timed_out) = ob.woken.wait_timeout(st, opts.poll_interval).unwrap();
@@ -1723,11 +2031,43 @@ fn sender_loop(
             if st.stopped {
                 break;
             }
-            st.queue.pop_front()
+            let taken = st.queue.pop_front();
+            if let Some(f) = taken.as_ref() {
+                st.bytes -= f.len();
+            }
+            taken
         };
         let Some(frame) = frame else { continue };
 
         let s = conn.as_mut().expect("connected above");
+        // **Probe a link that has been idle before writing to it** (D224). The receiver closes a
+        // connection silent past its `idle_deadline`, and this thread never reads its socket, so it
+        // would not know: the frame would go into the closed connection and be lost with no number
+        // attached, and only the next write would fail. Consensus leaves follower-to-follower links
+        // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
+        // leader died. A link consensus keeps busy never reaches this gate, so all it pays is two clock
+        // reads per frame: this one and the refresh after the write.
+        if last_used.elapsed() >= probe_gap {
+            counters.idle_probes.fetch_add(1, Ordering::SeqCst);
+            if peer_has_closed(s) {
+                // A shutdown closes `st.live`, which shares this socket, so the probe sees its close
+                // too. Both shutdown paths set `stop` before they close it, so that close is always
+                // seen here with `stop` set: it is not a redial, and it is not counted as one. The
+                // frame is dropped uncounted, as the queue is at shutdown.
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                counters.idle_redials.fetch_add(1, Ordering::SeqCst);
+                let mut st = ob.state.lock().unwrap();
+                if let Some(old) = st.live.take() {
+                    let _ = old.shutdown(Shutdown::Both);
+                }
+                drop(st);
+                conn = None;
+                carried = Some(frame);
+                continue;
+            }
+        }
         // A write that fails part way through has left a partial frame on the wire, and there is no
         // way to resume it — the peer's reader is now inside a frame that will never finish. So the
         // connection is dropped, which is what makes the peer's reader see EOF and reset. The frame
@@ -1745,6 +2085,8 @@ fn sender_loop(
             }
             drop(st);
             conn = None;
+        } else {
+            last_used = Instant::now();
         }
     }
 
@@ -1754,6 +2096,93 @@ fn sender_loop(
     }
     drop(st);
     drop(conn);
+}
+
+/// The idle gap after which a sender probes its link before writing (D224): half `idle_deadline`.
+///
+/// **Above the longest gap on any link consensus keeps busy.** A leader heartbeats every
+/// `heartbeat` ticks (3, at a 50 ms `NodeOptions::tick`: 150 ms), and every heartbeat is an `Append`
+/// each follower answers at once. So leader↔follower links see gaps of about one heartbeat, and at
+/// the default deadline this gate is 200 heartbeats away. A link that missed that many has lost its
+/// leader several election timeouts ago.
+///
+/// **At most the peer's `idle_deadline`, so every link the peer may have closed is probed.** The peer
+/// closes a link only after hearing nothing for longer than its `idle_deadline`, counted from the
+/// last complete frame it read, which began no earlier than this sender's last write. So a gap under
+/// this cannot have been closed, as long as the peer's deadline is at least this gate. The refresh
+/// after a write comes a scheduling delay after the write itself; that slack sits inside the residual
+/// race below.
+///
+/// **Premise, stated and not enforced: no node's `idle_deadline` is below half of another's.** That
+/// is the receiver's `D_r ≥ D_s / 2`, where `D_s` is this sender's; equal deadlines are not needed.
+/// The handshake carries no options, so nothing checks it, and in this repo every node runs the
+/// default. If it is violated, gaps between `D_r` and this gate are closed but never probed, and the
+/// pre-D224 loss returns for that band only. There is no new failure mode.
+///
+/// **Why half: tolerance, not a narrower race.** Half is what lets a peer's deadline be as low as half
+/// this one's. It does not narrow the race below, which sits at the peer's close wherever the gate
+/// is.
+///
+/// **The residual race.** A gap that lands within about one `poll_interval` and a round trip of the
+/// peer's close can be probed just before the close. The write then succeeds locally and is lost
+/// uncounted. It also refreshes the gap, so the next frame is not probed: it fails against the reset
+/// and is counted. That is at least two frames, the whole pre-D224 cost, at a small probability:
+/// every write made before the peer's reset reaches this socket is lost uncounted, and only the
+/// first one after it is counted. A follower-to-follower link idle for a whole term is far outside
+/// that window.
+///
+/// **A redial onto a refusal** (D224 review 2, G2). A dial resets the gap, so the frame the probe
+/// carried, and any queued behind it, goes out unprobed. If the redial lands on a peer that is
+/// shutting down mid-handshake, `dial` succeeds with that peer's `Error` frame and FIN waiting. The
+/// carried frame, and any written behind it before the reset arrives, is lost uncounted, and the
+/// next one fails and is counted: the same cost, at least two frames.
+/// A peek at the end of `dial` would catch only an `Error` that arrived with the handshake; closing
+/// this fully needs the acceptor to send a verdict, which is a protocol change.
+///
+/// **What bounds every one of these losses is consensus retransmission, not this transport.** A
+/// pre-candidate re-campaigns each time its countdown reaches `election_timeout`, **but only while
+/// `may_campaign()` holds** (not behind, not unjoined, a voter in its own configuration), and a
+/// campaign restarts the countdown (`election.rs`, `voter_tick` and `start_precampaign`). When
+/// `may_campaign()` is false the countdown restarts and nothing is sent: no campaign was due, so no
+/// lost campaign frame goes unresent. A leader re-sends from each peer's `next` on every heartbeat
+/// (`leader_tick`, then `bcast_append` in `replicate.rs`). So a lost frame costs one retransmission
+/// interval, never a round.
+///
+/// **A restarted peer is caught only across a gap of at least this**, which in practice means an idle
+/// follower-to-follower link. It is not caught on a busy link, where it costs two heartbeats, nor
+/// when the peer restarts mid-election, when campaign frames go out under a second apart. A rebooted
+/// host sends nothing to find until this side writes.
+fn idle_probe_gap(opts: &TransportOptions) -> Duration {
+    opts.idle_deadline / 2
+}
+
+/// Whether the peer has closed this connection: asked without blocking and without consuming
+/// anything (D224).
+///
+/// This side only ever writes to the link. The accepting side writes after the handshake on one
+/// path only: a refused handshake sends its own handshake, then an `Error` frame, then closes
+/// (`conn_loop`). `dial` reads just the six handshake bytes, so that frame stays unread for good, in
+/// front of the FIN. So every readable state means the link is closed or closing: a FIN (`peek`
+/// returns 0), a reset (an error), or unread bytes. Reading unread bytes as "alive" left the probe
+/// blind on such a link for good (the D224 review's F4). Nothing to read means the link is up. A
+/// socket that cannot be put back into blocking mode is treated as closed too: the sender redials
+/// rather than write through a socket in the wrong mode.
+fn peer_has_closed(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let closed = match s.peek(&mut probe) {
+        Ok(0) => true,
+        // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
+        // link. Either way the frame is carried to a redial rather than written into a closed link.
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    s.set_nonblocking(false).is_err() || closed
 }
 
 /// Dial a peer and complete the handshake as the **connecting** side: write ours, then read theirs.
@@ -1830,47 +2259,75 @@ fn accept_loop(
                 // register them.
                 let id = ids.fetch_add(1, Ordering::SeqCst);
                 let Ok(mine) = stream.try_clone() else {
+                    // Before any slot is reserved, so there is nothing to release; but it is still
+                    // a connection closed unserved, and a failed `dup` is usually EMFILE — the
+                    // descriptor exhaustion these meters exist to show. Counted with the others.
+                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 };
-                {
+                // The reservation and the guard that releases it are made together, so from here on
+                // EVERY way out — the two `continue`s below, a panic, and every return from
+                // `conn_loop` — gives the slot back. See [`ConnRegistration`] for the exit that did
+                // not (D207).
+                let registration = {
                     let mut map = conns.lock().unwrap();
                     if map.len() >= opts.max_inbound_conns {
                         counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                         drop(map);
                         let _ = stream.shutdown(Shutdown::Both);
+                        // **Paced.** Refused back to back, a peer looping `connect()` against a
+                        // full cap had this thread spin accept-refuse-accept, a core of this process
+                        // for free. One poll per refusal bounds that, and delays a stop by at most
+                        // the poll the stop flag is already allowed (D207, from `207d362`).
+                        std::thread::sleep(opts.poll_interval);
                         continue;
                     }
                     map.insert(id, mine);
-                }
+                    ConnRegistration { id, conns: Arc::clone(&conns) }
+                };
                 // An accepted socket's blocking mode is not portably inherited from its listener,
                 // so it is set explicitly rather than assumed. The read timeout is what lets the
                 // connection thread notice a shutdown.
                 if stream.set_nonblocking(false).is_err()
                     || stream.set_read_timeout(Some(opts.poll_interval)).is_err()
                 {
+                    // Not hypothetical: F3-transport's `207d362` recorded that on macOS a peer which
+                    // connects and resets before `accept` leaves a socket on which `SO_RCVTIMEO`
+                    // fails with EINVAL. `registration` is dropped by this `continue`, which
+                    // releases the slot; the refusal is counted, because an unserved connection
+                    // with no number attached is the silent loss this module does not allow.
+                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
                 let tx_c = tx.clone();
                 let stop_c = Arc::clone(&stop);
                 let counters_c = Arc::clone(&counters);
-                let conns_c = Arc::clone(&conns);
                 let opts_c = opts.clone();
                 let key_c = key.clone();
                 match std::thread::Builder::new()
                     .name(format!("consensus-in-{self_id}"))
                     .spawn(move || {
                         conn_loop(
-                            stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c, key_c,
+                            stream,
+                            registration,
+                            self_id,
+                            tx_c,
+                            stop_c,
+                            counters_c,
+                            opts_c,
+                            key_c,
                         )
                     }) {
                     Ok(h) => conn_threads.push(h),
                     Err(_) => {
-                        // The slot was reserved above and no thread will release it, so it is
-                        // released here. Without this a run of spawn failures would fill the cap
-                        // with connections that do not exist and refuse every real peer after.
-                        conns.lock().unwrap().remove(&id);
+                        // A failed spawn drops the closure it was given, and `registration` with
+                        // it, so the slot is already released: no thread will ever run for it, and
+                        // no second release is needed here. Counted like the failed setup above,
+                        // for the same reason — it is a connection this node closed unserved.
+                        counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                 }
@@ -1894,20 +2351,19 @@ fn accept_loop(
 #[allow(clippy::too_many_arguments)]
 fn conn_loop(
     mut stream: TcpStream,
-    id: u64,
+    // Held, never read: dropping it at any return below is what releases the slot.
+    _registration: ConnRegistration,
     self_id: NodeId,
     tx: mpsc::Sender<(Message, usize)>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     opts: TransportOptions,
     key: Option<Arc<Key>>,
 ) {
     // The accept thread already reserved this connection's slot and registered its socket, so
-    // `shutdown` can reach a peer that connects and then goes silent. All this thread owns is the
-    // guard that releases the slot again, on every exit path including the refused-handshake
-    // return below.
-    let _registration = ConnRegistration { id, conns: Arc::clone(&conns) };
+    // `shutdown` can reach a peer that connects and then goes silent, and it handed over the guard
+    // that releases the slot. Owning it here is what makes every exit path below release it,
+    // including the refused-handshake return.
 
     let verdict = recv_handshake(&mut stream, &stop, opts.handshake_deadline);
 
@@ -1941,8 +2397,14 @@ fn conn_loop(
         }
         // A peer whose host vanished without a FIN leaves a socket that never becomes readable and
         // never errors. Without this, its thread and both its descriptors are held for the life of
-        // the process. Consensus heartbeats every few ticks, so silence past this deadline is not a
-        // slow peer — it is a gone one.
+        // the process.
+        //
+        // **Silence is not proof the peer is gone.** This used to say it was, because consensus
+        // heartbeats every few ticks. That is true of a leader's links and false of
+        // follower-to-follower links, which carry nothing for a whole stable term. Those are closed
+        // here too. The cost is paid by the sender, which probes a link it has left idle before
+        // writing to it, and redials if the link is closed (`idle_probe_gap`, `peer_has_closed`;
+        // D224).
         if last_heard.elapsed() > opts.idle_deadline {
             counters.idle_closed.fetch_add(1, Ordering::SeqCst);
             break;

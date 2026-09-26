@@ -1,0 +1,13 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1641,9 +1641,7 @@
+         })?;
+         // Counted as well as returned: `node.rs` discards this error by design, so without the count
+         // a message the encoder refuses vanishes with no number attached (D223).
+-        let frame = encode_signed(m, self.key.as_deref()).inspect_err(|_| {
+-            self.counters.unencodable.fetch_add(1, Ordering::SeqCst);
+-        })?;
++        let frame = encode_signed(m, self.key.as_deref())?;
+         ob.push(frame);
+         self.counters.sent.fetch_add(1, Ordering::SeqCst);
+         Ok(())

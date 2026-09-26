@@ -1,0 +1,20 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -986,8 +986,15 @@
+     /// BEFORE that frame is written, so no crash can leave it under a header an older build
+     /// accepts.
+     fn raise_version(&mut self) -> Result<(), LogError> {
+-        let all = self.index.clone();
+-        self.switch(all, self.snapshot_round, self.snapshot_term, VERSION, "format upgrade")
++        let h = Header {
++            version: VERSION,
++            generation: self.generation,
++            snapshot_round: self.snapshot_round,
++            snapshot_term: self.snapshot_term,
++        };
++        write_at(&*self.files[self.live], &h.encode(), 0)?;
++        self.version = VERSION;
++        Ok(())
+     }
+ 
+     // -- internals ----------------------------------------------------------------------------

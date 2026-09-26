@@ -1,0 +1,62 @@
+2026-09-24T21:48:58Z d207 acquiring (5s poll), pid 71114
+2026-09-24T22:02:06Z d207 ACQUIRED: 71114 d207 2026-09-24T22:02:06Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d224-idle-failover.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.99s
+  Executable unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+  Executable tests/d154_length_prefix_refusal.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d154_length_prefix_refusal-20e5687817a52249)
+  Executable tests/integration_cluster_agents.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_agents-3b12af37878b8d8b)
+  Executable tests/integration_cluster_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_snapshot-350a4148b9c71550)
+  Executable tests/integration_consensus_failover.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_consensus_failover-a060b5a25175e6bb)
+  Executable tests/integration_server_stdout.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_server_stdout-9259fddcd1538fdb)
+2026-09-24T22:02:33Z d207 rc=0
+2026-09-24T22:02:33Z d207 released (owner matched)
