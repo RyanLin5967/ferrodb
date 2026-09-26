@@ -298,7 +298,12 @@ fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) 
     let peers: BTreeMap<NodeId, SocketAddr> = addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
     // NodeOptions::new's own default tick (50 ms) is kept: the production timing.
     let salt = SEED_SALT.load(Ordering::Relaxed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt)
+    let mut o = NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt);
+    // A12 control: the transport's idle close (default 60 s), overridable per run.
+    if let Some(s) = std::env::var("R11_IDLE_DEADLINE_S").ok().and_then(|x| x.parse::<u64>().ok()) {
+        o.transport.idle_deadline = Duration::from_secs(s);
+    }
+    o
 }
 
 fn spawn_driver(rep: Arc<Rep>, stop: Arc<AtomicBool>, errs: Arc<Mutex<Vec<String>>>) -> JoinHandle<u64> {
@@ -861,6 +866,11 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
         return;
     }
     let survivors: Vec<usize> = all.iter().copied().filter(|i| *i != l).collect();
+    // A12 control: idle the cluster (no proposals) before the failover.
+    if let Some(s) = std::env::var("R11_PRE_FAIL_SLEEP_S").ok().and_then(|x| x.parse::<u64>().ok()) {
+        std::thread::sleep(Duration::from_secs(s));
+    }
+    let tc_before: Vec<Option<(u64, u64, u64, u64, u64, usize, u64, u64)>> = survivors.iter().map(|i| c.reps[*i].with(|n| n.transport_counters())).collect();
     let timers_at_stop: Vec<(u32, u32)> = survivors.iter().map(|i| c.reps[*i].with(|n| n.election_timer()).unwrap_or((0, 0))).collect();
     for r in &c.reps {
         r.max_gap_us.store(0, Ordering::Relaxed);
@@ -900,6 +910,18 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
     let el = take_all(&c);
     let egaps: Vec<f64> = survivors.iter().map(|i| c.reps[*i].max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
     let term_after: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.term()).unwrap_or(0)).collect();
+    let tc_after: Vec<Option<(u64, u64, u64, u64, u64, usize, u64, u64)>> = survivors.iter().map(|i| c.reps[*i].with(|n| n.transport_counters())).collect();
+    // (idle_closed, lost_in_flight, connect_failures, dropped, inbound_dropped) deltas over the election.
+    let tdelta: Vec<Option<(u64, u64, u64, u64, u64)>> = tc_before
+        .iter()
+        .zip(&tc_after)
+        .map(|(b, a)| match (b, a) {
+            (Some(b), Some(a)) => Some((a.6 - b.6, a.4 - b.4, a.7 - b.7, a.1 - b.1, a.3 - b.3)),
+            _ => None,
+        })
+        .collect();
+    let idle_closed_total: Vec<Option<u64>> = tc_after.iter().map(|a| a.map(|a| a.6)).collect();
+    println!("FF {tag} transport election_delta(idle_closed,lost_in_flight,connect_failures,dropped,inbound_dropped)={tdelta:?} idle_closed_total_at_end={idle_closed_total:?} idle_deadline_s={:?} pre_fail_sleep_s={:?}", std::env::var("R11_IDLE_DEADLINE_S").ok(), std::env::var("R11_PRE_FAIL_SLEEP_S").ok());
     println!(
         "FF {tag} election winner={:?} B1_ms={b1:.1} stop_join_ms={join_ms:.1} stop_drop_ms={drop_ms:.1} claim_ms={:?} noop_ms={:?} elect_ms={elect_ms:.1} survivors={:?} timers_at_stop(timeout,since_heard)={timers_at_stop:?} timeouts_seen_during_election={draws:?} election_transitions={:?} terms_after={term_after:?} survivor_driver_max_gap_ms={egaps:?}",
         elected.map(|(x, _)| format!("n{}", x + 1)),
