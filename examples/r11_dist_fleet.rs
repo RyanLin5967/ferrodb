@@ -913,8 +913,121 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A11: one group-committed growth to N (the fixture every part-B arm used), with a sample of
+/// every node each second, and a full dump if the leader's commit index stops while its log is ahead.
+fn run_growmon(n: u64, seed: u64, root: &Path) {
+    SEED_SALT.store(seed, Ordering::Relaxed);
+    let dir = root.join(format!("gm_{n}_{seed}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = Arc::new(std::sync::Mutex::new(Cluster::start(Arm::Gc, &dir)));
+    let all = [0usize, 1, 2];
+    let l = {
+        let g = lock(&c);
+        match g.elect(&all, Duration::from_secs(60)) {
+            Some((l, _)) => l,
+            None => {
+                println!("GM VOID: no stable leader");
+                return;
+            }
+        }
+    };
+    let lid = l as u32 + 1;
+    let reps: Vec<Arc<Rep>> = lock(&c).reps.clone();
+    let obs: Vec<Arc<Obs>> = lock(&c).obs.clone();
+    for r in &reps {
+        r.with(|n| n.set_group_commit(true));
+        r.max_gap_us.store(0, Ordering::Relaxed);
+        let _ = r.with(|n| n.take_transitions());
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let t0 = Instant::now();
+    // The sampler: one line per second; resets each driver's gap so each line is that second's max.
+    let sampler = {
+        let reps = reps.clone();
+        let obs = obs.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut last_commit = 0u64;
+            let mut still = 0u32;
+            let mut dumped = false;
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                let mut cols = Vec::new();
+                for (i, r) in reps.iter().enumerate() {
+                    let gap = r.max_gap_us.swap(0, Ordering::Relaxed) as f64 / 1e3;
+                    let v = r.with(|x| {
+                        (x.commit_round(), x.last_round(), x.term(), x.role(), x.leader(), x.election_timer(), x.persist_syncs(), x.take_transitions().len())
+                    });
+                    if let Some((cm, lr, term, role, ld, (to, sh), syncs, tr)) = v {
+                        cols.push(format!(
+                            "n{}:{role:?}/t{term}/ld{:?} commit={cm} last={lr} applied={} timer={to}/{sh} syncs={syncs} transitions={tr} gap_ms={gap:.0} q={}",
+                            i + 1,
+                            ld.map(|x| x.0),
+                            obs[i].applied.load(Ordering::Acquire),
+                            r.queue_len()
+                        ));
+                    }
+                }
+                let lc = reps[l].committed_head();
+                let ll = reps[l].with(|x| x.last_round()).unwrap_or(0);
+                println!("GM t={:.0}s {}", t0.elapsed().as_secs_f64(), cols.join(" | "));
+                if lc == last_commit && ll > lc {
+                    still += 1;
+                } else {
+                    still = 0;
+                }
+                last_commit = lc;
+                if still >= 30 && !dumped {
+                    dumped = true;
+                    println!("GM STALL: leader n{} commit {lc} unchanged for {still} s with last {ll}", l + 1);
+                    for (i, r) in reps.iter().enumerate() {
+                        let d = r.with(|x| (x.peer_progress(), x.transport_counters()));
+                        println!("GM STALL-DUMP n{} progress(peer,next,matched,silent,needs_snapshot,diverged)={:?} transport(sent,dropped,received,inbound_dropped,lost_in_flight,inbox_bytes,idle_closed,connect_failures)={:?}", i + 1, d.as_ref().map(|x| &x.0), d.as_ref().map(|x| x.1));
+                    }
+                }
+            }
+        })
+    };
+    let res = {
+        let g = lock(&c);
+        let r = propose_queued(&g, l, (1..=n).map(|i| fork_c(cid(lid, i))).collect(), GROW_BATCH, Duration::from_secs(600));
+        let ok = match &r {
+            Ok(last) => g.wait_applied(&all, *last, Duration::from_secs(420)),
+            Err(_) => false,
+        };
+        (r, ok)
+    };
+    stop.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+    let g = lock(&c);
+    for (i, r) in g.reps.iter().enumerate() {
+        let d = r.with(|x| (x.peer_progress(), x.transport_counters(), x.commit_round(), x.last_round()));
+        println!("GM END n{} applied={} (progress, transport, commit, last)={:?}", i + 1, g.obs[i].applied.load(Ordering::Acquire), d);
+    }
+    println!("GM RESULT N={n} seed={seed} leader=n{lid} proposed={:?} grown={} grow_ms={:.0}", res.0, res.1, ms(t0));
+    drop(g);
+    if let Ok(m) = Arc::try_unwrap(c) {
+        let mut cl = m.into_inner().unwrap_or_else(PoisonError::into_inner);
+        cl.shutdown_all();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("growmon") {
+        // r11_dist_fleet growmon <scratch-root> <N> <seed>: one group-committed growth, sampled each second.
+        let root = PathBuf::from(args.get(2).expect("scratch root"));
+        let n: u64 = args.get(3).and_then(|x| x.parse().ok()).expect("N");
+        let seed: u64 = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(0);
+        std::fs::create_dir_all(&root).unwrap();
+        println!("# r11_dist_fleet growmon N={n} seed={seed}");
+        let (med, p99) = b0(&root);
+        println!("B0 sync_data_ms median={med:.3} p99={p99:.3} samples=2000");
+        run_growmon(n, seed, &root);
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) == Some("firstfail") {
         // r11_dist_fleet firstfail <scratch-root> <N:seed,N:seed,...> <hold-budget-s>
         let root = PathBuf::from(args.get(2).expect("scratch root"));

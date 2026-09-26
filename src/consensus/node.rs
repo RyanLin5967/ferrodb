@@ -435,6 +435,31 @@ impl<A: Applier> Node<A> {
     pub fn election_timer(&self) -> (u32, u32) {
         (self.sm.election_timeout, self.sm.since_heard)
     }
+    /// Instrument (r11-dist A11): the leader's view of each peer, as (peer, next, matched, silent
+    /// ticks, needs_snapshot, diverged). Empty on a node that has never led. Read-only.
+    pub fn peer_progress(&self) -> Vec<(NodeId, Round, Round, u32, bool, Option<String>)> {
+        let me = self.sm.id();
+        self.sm
+            .progress
+            .iter()
+            .filter(|(n, _)| **n != me)
+            .map(|(n, p)| (*n, p.next, p.matched, p.silent, p.needs_snapshot, p.diverged.clone()))
+            .collect()
+    }
+    /// Instrument (r11-dist A11): transport counters, as (sent, dropped, received, inbound_dropped,
+    /// lost_in_flight, inbox_bytes, idle_closed, connect_failures). Read-only.
+    pub fn transport_counters(&self) -> (u64, u64, u64, u64, u64, usize, u64, u64) {
+        (
+            self.net.sent(),
+            self.net.dropped(),
+            self.net.received(),
+            self.net.inbound_dropped(),
+            self.net.lost_in_flight(),
+            self.net.inbox_bytes(),
+            self.net.idle_closed(),
+            self.net.connect_failures(),
+        )
+    }
     /// r11-dist GC arm: queue every command, then drain once. Returns the log's last round.
     pub fn propose_many(&mut self, cs: Vec<Command>) -> Result<Round, FerroError> {
         let before = self.log.last_round();
