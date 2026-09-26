@@ -18,6 +18,10 @@
 //!   o2 <N>           E-O2 part A (C0..C4), mutants F and S, anti-vacuity, negative control
 //!   timed            P1, P1-fire, A-S, A-Z (run it under lockrun)
 //!   adm              admitted merges per commit batch: HEAD's scalar rule vs per-key certification
+//!   retire <T> <N> <N2>   item 3: M1 retire-at-snapshot, records and heap before/after, then a tail
+//!   s6 <N> <budget>       item 3: a snapshot that drops the fence map must be caught
+//!   conformwide <seed>    HEAD vs the copy on a trace that reaches every apply path; M1 with and
+//!                         without snapshots on the same trace
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet};
@@ -219,6 +223,12 @@ struct HeadCopy {
     /// Copy mutant for `conform`: `>=` for `>` in the verdict.
     mut_ge: bool,
     touched: u64,
+    /// Item 3 (retire-at-snapshot): per owner, the highest local id a snapshot has retired. A later
+    /// fork of an id at or below it is refused, as HEAD refuses a fork of any id it ever recorded.
+    /// Assumes per-owner ids are minted in increasing order (the owner's catalog `next_id`).
+    retired_hwm: BTreeMap<u32, u64>,
+    /// Branch ops this copy refused, counted where HEAD returns `BranchEffect::Rejected`.
+    rejected: u64,
 }
 
 impl HeadCopy {
@@ -238,7 +248,43 @@ impl HeadCopy {
             mut_nofence: false,
             mut_ge: false,
             touched: 0,
+            retired_hwm: BTreeMap::new(),
+            rejected: 0,
         }
+    }
+
+    /// Item 3: a snapshot of this ledger at its `last_applied`, retiring at most `budget` records
+    /// (in id order) that can never be live again: Merged, Abandoned, Reaped, or fenced. Keeps the
+    /// fence map, `lbm`, `last_applied` and the retired high-water marks. A snapshot writer walks the
+    /// records once (O(records)) and the result holds O(live + unretired + nodes).
+    /// `drop_fence` is S6's mutant (r11-dist-refute-proof): a snapshot that loses the fence map.
+    fn snapshot_retire(&self, budget: u64, drop_fence: bool) -> (HeadCopy, u64) {
+        let mut br = BTreeMap::new();
+        let mut hwm = self.retired_hwm.clone();
+        let mut retired = 0u64;
+        for (id, r) in &self.br {
+            if *id != 0 && retired < budget && !self.rec_live(*id, r) {
+                retired += 1;
+                let h = hwm.entry(owner_of(*id)).or_insert(0);
+                *h = (*h).max(*id & LOCAL_MASK);
+                continue;
+            }
+            br.insert(*id, *r);
+        }
+        let snap = HeadCopy {
+            br,
+            last_applied: self.last_applied,
+            lbm: self.lbm,
+            fence: if drop_fence { BTreeMap::new() } else { self.fence.clone() },
+            m1: self.m1,
+            mut_f: self.mut_f,
+            mut_nofence: self.mut_nofence,
+            mut_ge: self.mut_ge,
+            touched: 0,
+            retired_hwm: hwm,
+            rejected: self.rejected,
+        };
+        (snap, retired)
     }
 
     fn rec_live(&self, id: u64, r: &Rec) -> bool {
@@ -276,11 +322,20 @@ impl Ledger for HeadCopy {
         match op {
             BranchOp::Fork { child, parent, fork_epoch, lease_millis } => {
                 if *child == 0 || self.br.contains_key(child) {
+                    self.rejected += 1;
+                    return None;
+                }
+                if self.retired_hwm.get(&owner_of(*child)).is_some_and(|h| *child & LOCAL_MASK <= *h) {
+                    // A retired id: HEAD still holds its record and refuses the fork as a collision.
+                    self.rejected += 1;
                     return None;
                 }
                 match self.br.get(parent) {
                     Some(p) if self.rec_live(*parent, p) => {}
-                    _ => return None,
+                    _ => {
+                        self.rejected += 1;
+                        return None;
+                    }
                 }
                 self.br.insert(
                     *child,
@@ -317,19 +372,21 @@ impl Ledger for HeadCopy {
                     *f = (*f).max(round);
                     return None;
                 }
-                if let Some(r) = self.br.get(branch).copied() {
+                match self.br.get(branch).copied() {
                     // HEAD checks `state.is_live()` only (not the fence): kept identical.
-                    if r.st == St::Live {
+                    Some(r) if r.st == St::Live => {
                         self.br.get_mut(branch).unwrap().st = St::Abandoned(round);
                     }
+                    _ => self.rejected += 1,
                 }
                 None
             }
             BranchOp::Reap { branch, generation } => {
-                if let Some(r) = self.br.get_mut(branch) {
-                    if !matches!(r.st, St::Reaped(..)) {
+                match self.br.get_mut(branch) {
+                    Some(r) if !matches!(r.st, St::Reaped(..)) => {
                         r.st = St::Reaped(round, *generation);
                     }
+                    _ => self.rejected += 1,
                 }
                 None
             }
@@ -1528,6 +1585,259 @@ fn mode_adm() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Item 3: retire-at-snapshot for M1 (Raft ch. 5 compaction plus retirement of dead records),
+// with the fence map persisted. PREREG A13.
+// ---------------------------------------------------------------------------------------------
+
+fn mode_retire(t: u64, n: u64, n2: u64) {
+    assert!(n <= t);
+    println!("# retire T={t} N={n} N2={n2}");
+    let h0 = heap();
+    let mut m1 = HeadCopy::new(true);
+    let mut round = run_w(t, n, |e| {
+        m1.apply(&e);
+    });
+    for i in 1..=n2 {
+        round += 1;
+        m1.apply(&Entry { term: 1, round, command: fork_c(cid(2, i)) });
+    }
+    round += 1;
+    m1.apply(&Entry { term: 2, round, command: abandon_c(sentinel(1)) });
+    let h1 = heap();
+    let before = m1.records();
+    let live1_before = m1.live_ids_of(1).len();
+    let live2_before = m1.live_ids_of(2).len();
+    let (snap, retired) = m1.snapshot_retire(u64::MAX, false);
+    let h2 = heap();
+    println!(
+        "RETIRE T={t} N={n} N2={n2} records_before={before} records_after={} retired={retired} heap_ledger_bytes={} heap_snapshot_bytes={} live_n1={live1_before}->{} live_n2={live2_before}->{}",
+        snap.records(),
+        h1 - h0,
+        h2 - h1,
+        snap.live_ids_of(1).len(),
+        snap.live_ids_of(2).len()
+    );
+    check("R-records-before", "M1", &format!("{}", t + n2 + 1), before as u64 == t + n2 + 1, before.to_string());
+    check("R-records-after", "M1+retire", &format!("{}", n2 + 1), snap.records() as u64 == n2 + 1, snap.records().to_string());
+    check("R-retired", "M1+retire", &t.to_string(), retired == t, retired.to_string());
+    check("R-live", "M1+retire", &format!("n1 0, n2 {n2}"), snap.live_ids_of(1).is_empty() && snap.live_ids_of(2).len() as u64 == n2, format!("{} {}", snap.live_ids_of(1).len(), snap.live_ids_of(2).len()));
+    let ratio = (h2 - h1) as f64 / (h1 - h0) as f64;
+    let pred = (n2 + 1) as f64 / (t + n2 + 1) as f64;
+    check("R-heap", "M1+retire", &format!("snapshot/ledger within 20% of {pred:.4}"), (ratio / pred - 1.0).abs() <= 0.2, format!("{ratio:.4}"));
+    // The same tail through the unretired ledger and the restored snapshot must agree exactly.
+    let mut a = m1;
+    let mut b = snap;
+    let mut tail = Vec::new();
+    let base = round;
+    for i in 1..=100u64 {
+        tail.push(merge_c(cid(2, i), base)); // the first applies, the rest re-evaluate
+    }
+    tail.push(merge_c(cid(1, t), base)); // a zombie merge of a fenced n1 branch
+    tail.push(merge_c(cid(1, 1), base)); // a merge of a merged or abandoned n1 branch
+    tail.push(fork_c(cid(1, 2))); // a fork of a retired id: HEAD refuses it as a collision
+    tail.push(fork_c(cid(1, t + 1))); // n1's new work after the fence: live
+    tail.push(merge_c(cid(1, t + 1), base + 104)); // and its merge
+    tail.push(abandon_c(cid(1, 3))); // an abandon of a retired id: refused
+    let mut div = 0u64;
+    for c in tail {
+        round += 1;
+        let e = Entry { term: 3, round, command: c };
+        let (ra, rb) = (a.rejected, b.rejected);
+        let (va, vb) = (a.apply(&e), b.apply(&e));
+        if va != vb || (a.rejected - ra) != (b.rejected - rb) {
+            div += 1;
+        }
+    }
+    let ids: Vec<u64> = (1..=100).map(|i| cid(2, i)).chain([cid(1, 1), cid(1, 2), cid(1, 3), cid(1, t), cid(1, t + 1)]).collect();
+    div += ids.iter().filter(|id| a.is_live(**id) != b.is_live(**id)).count() as u64;
+    check("R-tail", "M1 vs M1+retire", "0 divergences", div == 0, div.to_string());
+}
+
+fn mode_s6(n: u64, budget: u64) {
+    println!("# s6 N={n} budget={budget}");
+    let mut m1 = HeadCopy::new(true);
+    let mut round = 0;
+    for i in 1..=n {
+        round += 1;
+        m1.apply(&Entry { term: 1, round, command: fork_c(cid(1, i)) });
+    }
+    round += 1;
+    m1.apply(&Entry { term: 2, round, command: abandon_c(sentinel(1)) });
+    // The floor is ABOVE the fence (the case O2's fixture never reached).
+    for arm in ["correct", "mutant-drop-fence"] {
+        for b in [budget, u64::MAX] {
+            let (snap, retired) = m1.snapshot_retire(b, arm != "correct");
+            let live = snap.live_ids_of(1).len() as u64;
+            let bs = if b == u64::MAX { "all".to_string() } else { b.to_string() };
+            println!("S6 arm={arm} budget={bs} retired={retired} n1_live_after_restore={live}");
+            match (arm, b == u64::MAX) {
+                ("correct", _) => check("S6-correct", arm, "0", live == 0, live.to_string()),
+                (_, false) => check("S6-mutant-caught", arm, &format!("{}", n - budget.min(n)), live == n - budget.min(n), live.to_string()),
+                (_, true) => println!("S6 note: after a FULL retire the mutant leaves {live} live; the fence map is redundant only when every fenced record was retired"),
+            }
+        }
+    }
+}
+
+/// A HEAD-protocol log that reaches every apply path, including the refusals.
+fn gen_wide(seed: u64, len: usize) -> Vec<Command> {
+    let mut rng = Rng(seed ^ 0x51DE);
+    let mut next = [0u64; 4];
+    let mut known: Vec<u64> = Vec::new();
+    let mut out = Vec::with_capacity(len);
+    let mut wal = 0u64;
+    while out.len() < len {
+        let r = rng.below(1000);
+        let o = 1 + rng.below(3) as u32;
+        let pick = |rng: &mut Rng, known: &Vec<u64>| -> u64 { if known.is_empty() { 0 } else { known[rng.below(known.len() as u64) as usize] } };
+        let c = if r < 350 || known.is_empty() {
+            next[o as usize] += 1;
+            let id = cid(o, next[o as usize]);
+            let parent = if rng.below(5) == 0 { pick(&mut rng, &known) } else { 0 };
+            known.push(id);
+            Command::Branch { op: BranchOp::Fork { child: id, parent, fork_epoch: 1, lease_millis: 900_000 } }
+        } else if r < 500 {
+            let head = out.len() as Round;
+            merge_c(pick(&mut rng, &known), head.saturating_sub(rng.below(20)))
+        } else if r < 620 {
+            abandon_c(pick(&mut rng, &known))
+        } else if r < 660 {
+            Command::Branch { op: BranchOp::Reap { branch: pick(&mut rng, &known), generation: 1 } }
+        } else if r < 800 {
+            wal += 1;
+            wal_c(wal)
+        } else if r < 815 {
+            abandon_c(sentinel(o))
+        } else if r < 825 {
+            fork_c(0) // a fork whose child is the trunk
+        } else if r < 840 {
+            fork_c(pick(&mut rng, &known)) // a collision with a recorded id
+        } else if r < 850 {
+            Command::Branch { op: BranchOp::Fork { child: cid(o, 900_000_000 + rng.below(1 << 20)), parent: cid(3, 800_000_000), fork_epoch: 1, lease_millis: 1 } } // unknown parent
+        } else if r < 860 {
+            abandon_c(cid(o, 700_000_000 + rng.below(1 << 20))) // unknown
+        } else if r < 870 {
+            Command::Branch { op: BranchOp::Reap { branch: cid(o, 600_000_000 + rng.below(1 << 20)), generation: 1 } } // unknown
+        } else if r < 885 {
+            merge_c(cid(o, 500_000_000 + rng.below(1 << 20)), out.len() as Round) // unknown
+        } else if r < 930 {
+            Command::LeaseTick { unix_millis: out.len() as u64 }
+        } else if r < 960 {
+            Command::NoOp
+        } else {
+            Command::Checkpoint
+        };
+        out.push(c);
+    }
+    out
+}
+
+fn head_category(e: &BranchEffect) -> String {
+    match e {
+        BranchEffect::Other { base_moved } => format!("Other(base_moved={base_moved})"),
+        BranchEffect::AlreadyApplied => "AlreadyApplied".into(),
+        BranchEffect::Forked(_) => "Forked".into(),
+        BranchEffect::Merged(MergeVerdict::Applied { .. }) => "Merged(Applied)".into(),
+        BranchEffect::Merged(MergeVerdict::ReEvaluate { .. }) => "Merged(ReEvaluate)".into(),
+        BranchEffect::Merged(MergeVerdict::Refused { why, .. }) => {
+            if why.contains("no committed round created") { "Merged(Refused:unknown)".into() } else { "Merged(Refused:not-live)".into() }
+        }
+        BranchEffect::Abandoned(_) => "Abandoned".into(),
+        BranchEffect::Reaped { .. } => "Reaped".into(),
+        BranchEffect::Rejected { why } => {
+            let k = if why.contains("child is the trunk") {
+                "fork-trunk"
+            } else if why.contains("already created") {
+                "fork-collision"
+            } else if why.contains("forks") && why.contains("which is") {
+                "fork-parent-not-live"
+            } else if why.contains("forks") {
+                "fork-parent-unknown"
+            } else if why.contains("abandons") && why.contains("which is") {
+                "abandon-not-live"
+            } else if why.contains("abandons") {
+                "abandon-unknown"
+            } else if why.contains("again") {
+                "reap-twice"
+            } else {
+                "reap-unknown"
+            };
+            format!("Rejected({k})")
+        }
+    }
+}
+
+fn mode_conformwide(seed: u64) {
+    let log: Vec<Entry> = gen_wide(seed, 200_000)
+        .into_iter()
+        .enumerate()
+        .map(|(i, command)| Entry { term: 1, round: i as Round + 1, command })
+        .collect();
+    // CW1: the real ledger against the copy, entry by entry.
+    let real = Arc::new(Mutex::new(BranchLedger::new()));
+    let mut copy = HeadCopy::new(false);
+    let mut cats: BTreeMap<String, u64> = BTreeMap::new();
+    let mut div = 0u64;
+    for (i, e) in log.iter().enumerate() {
+        // Every 9,973rd entry is delivered twice, so the AlreadyApplied path is reached too.
+        let times = if i % 9973 == 0 { 2 } else { 1 };
+        for _ in 0..times {
+            let eff = lock(&real).apply(e);
+            *cats.entry(head_category(&eff)).or_default() += 1;
+            let hv = match &eff {
+                BranchEffect::Merged(v) => Some(class(v)),
+                _ => None,
+            };
+            let hr = matches!(eff, BranchEffect::Rejected { .. });
+            let r0 = copy.rejected;
+            let cv = copy.apply(e);
+            if hv != cv || hr != (copy.rejected > r0) {
+                div += 1;
+            }
+        }
+    }
+    let ids: BTreeSet<u64> = lock(&real).all().map(|b| b.id.0).collect();
+    let head = Head(real);
+    div += ids.iter().filter(|id| head.is_live(**id) != copy.is_live(**id)).count() as u64;
+    println!("CW1 seed={seed} entries={} HEAD_categories={} {:?}", log.len(), cats.len(), cats);
+    check("CW1", "Copy", "0 divergences", div == 0, div.to_string());
+    check("CW1-coverage", "trace", "18 of HEAD's 18 effect categories", cats.len() == 18, cats.len().to_string());
+    // CW2: M1 with no snapshot against M1 restored from snapshots every 2,000 rounds (budget all,
+    // and budget 50), on the same log. The drop-fence mutant (budget 50) must diverge.
+    for (label, budget, drop) in [("all", u64::MAX, false), ("b50", 50, false), ("b50-drop-fence", 50, true)] {
+        let mut plain = HeadCopy::new(true);
+        let mut snapped = HeadCopy::new(true);
+        // Divergences that matter: a merge verdict, a fork accepted by one and refused by the other,
+        // or liveness. Refusals of an abandon or reap of a DEAD id may differ and are counted apart:
+        // retirement discards the terminal state (Merged vs Reaped) that decides them.
+        let mut d = 0u64;
+        let mut refusal_only = 0u64;
+        for (i, e) in log.iter().enumerate() {
+            let (pr, sr) = (plain.rejected, snapped.rejected);
+            let (pv, sv) = (plain.apply(e), snapped.apply(e));
+            let (pd, sd) = (plain.rejected - pr, snapped.rejected - sr);
+            let is_fork = matches!(&e.command, Command::Branch { op: BranchOp::Fork { .. } });
+            if pv != sv || (is_fork && pd != sd) {
+                d += 1;
+            } else if pd != sd {
+                refusal_only += 1;
+            }
+            if (i + 1) % 2000 == 0 {
+                snapped = snapped.snapshot_retire(budget, drop).0;
+            }
+        }
+        let all: BTreeSet<u64> = plain.br.keys().copied().collect();
+        d += all.iter().filter(|id| plain.is_live(**id) != snapped.is_live(**id)).count() as u64;
+        println!("CW2 seed={seed} arm={label} divergences={d} refusal_only_differences={refusal_only} records_plain={} records_snapped={}", plain.records(), snapped.records());
+        if drop {
+            check("CW2-negctl", label, ">=1", d >= 1, d.to_string());
+        } else {
+            check("CW2", label, "0 divergences", d == 0, d.to_string());
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| -> u64 { args.get(i).and_then(|s| s.parse().ok()).expect("numeric argument") };
@@ -1540,6 +1850,9 @@ fn main() {
         Some("o2") => mode_o2(arg(2)),
         Some("timed") => mode_timed(),
         Some("adm") => mode_adm(),
+        Some("retire") => mode_retire(arg(2), arg(3), arg(4)),
+        Some("s6") => mode_s6(arg(2), arg(3)),
+        Some("conformwide") => mode_conformwide(arg(2)),
         _ => {
             eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
             std::process::exit(2);
