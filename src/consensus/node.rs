@@ -430,6 +430,11 @@ impl<A: Applier> Node<A> {
     pub fn persist_syncs(&self) -> u64 {
         self.persist_syncs
     }
+    /// Instrument (r11-dist A10): this node's current election timeout and ticks since it last
+    /// heard a leader, both in ticks. Read-only.
+    pub fn election_timer(&self) -> (u32, u32) {
+        (self.sm.election_timeout, self.sm.since_heard)
+    }
     /// r11-dist GC arm: queue every command, then drain once. Returns the log's last round.
     pub fn propose_many(&mut self, cs: Vec<Command>) -> Result<Round, FerroError> {
         let before = self.log.last_round();

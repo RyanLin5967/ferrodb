@@ -291,10 +291,14 @@ struct Cluster {
     errs: Arc<Mutex<Vec<String>>>,
 }
 
+/// A10: a per-run seed salt. 0 (the default) gives every earlier run's seeds exactly.
+static SEED_SALT: AtomicU64 = AtomicU64::new(0);
+
 fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) -> NodeOptions {
     let peers: BTreeMap<NodeId, SocketAddr> = addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
     // NodeOptions::new's own default tick (50 ms) is kept: the production timing.
-    NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9))
+    let salt = SEED_SALT.load(Ordering::Relaxed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
 fn spawn_driver(rep: Arc<Rep>, stop: Arc<AtomicBool>, errs: Arc<Mutex<Vec<String>>>) -> JoinHandle<u64> {
@@ -794,8 +798,155 @@ fn run_arm(arm: Arm, n: u64, root: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------------------------
+// A10: first failovers after growth, one per seed, M1 arm. Records each node's role transitions
+// during growth and during the election, the election timers, the stop/claim/noop split and the
+// survivors' driver gaps.
+// ---------------------------------------------------------------------------------------------
+
+fn role_counts(t: &[(ferrodb::consensus::Role, u64, Option<NodeId>)]) -> String {
+    use ferrodb::consensus::Role;
+    let c = |r: Role| t.iter().filter(|x| x.0 == r).count();
+    format!("F{}/P{}/C{}/L{}", c(Role::Follower), c(Role::PreCandidate), c(Role::Candidate), c(Role::Leader))
+}
+
+fn take_all(c: &Cluster) -> Vec<Vec<(ferrodb::consensus::Role, u64, Option<NodeId>)>> {
+    c.reps.iter().map(|r| r.with(|n| n.take_transitions()).unwrap_or_default()).collect()
+}
+
+fn run_firstfail(n: u64, seed: u64, root: &Path) {
+    SEED_SALT.store(seed, Ordering::Relaxed);
+    let tag = format!("N={n} seed={seed}");
+    let dir = root.join(format!("ff_{n}_{seed}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut c = Cluster::start(Arm::M1, &dir);
+    let all = [0usize, 1, 2];
+    let Some((l, _)) = c.elect(&all, Duration::from_secs(60)) else {
+        println!("FF {tag} VOID: no stable leader");
+        c.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let lid = l as u32 + 1;
+    let init = take_all(&c);
+    let timers_init: Vec<(u32, u32)> = c.reps.iter().map(|r| r.with(|n| n.election_timer()).unwrap_or((0, 0))).collect();
+    c.set_gc(true);
+    for r in &c.reps {
+        r.max_gap_us.store(0, Ordering::Relaxed);
+    }
+    let t0 = Instant::now();
+    let grow = propose_queued(&c, l, (1..=n).map(|i| fork_c(cid(lid, i))).collect(), GROW_BATCH, Duration::from_secs(600));
+    let grown = match &grow {
+        Ok(last) => c.wait_applied(&all, *last, Duration::from_secs(600)),
+        Err(_) => false,
+    };
+    let grow_ms = ms(t0);
+    c.set_gc(false);
+    let growth = take_all(&c);
+    let grow_gaps: Vec<f64> = c.reps.iter().map(|r| r.max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
+    let terms: Vec<u64> = c.reps.iter().map(|r| r.with(|x| x.term()).unwrap_or(0)).collect();
+    let leaders: Vec<Option<NodeId>> = c.reps.iter().map(|r| r.leader()).collect();
+    println!(
+        "FF {tag} growth grow_ms={grow_ms:.0} grown={grown} grow_err={:?} leader=n{lid} init_transitions={:?} growth_transitions={:?} growth_driver_max_gap_ms={grow_gaps:?} terms_after_growth={terms:?} leaders_after_growth={leaders:?} timers_after_initial_election={timers_init:?}",
+        grow.as_ref().err(),
+        init.iter().map(|t| role_counts(t)).collect::<Vec<_>>(),
+        growth.iter().map(|t| role_counts(t)).collect::<Vec<_>>()
+    );
+    if !grown || c.reps[l].leader() != Some(NodeId(lid)) {
+        println!("FF {tag} VOID: growth did not complete under the same leader");
+        c.shutdown_all();
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let survivors: Vec<usize> = all.iter().copied().filter(|i| *i != l).collect();
+    let timers_at_stop: Vec<(u32, u32)> = survivors.iter().map(|i| c.reps[*i].with(|n| n.election_timer()).unwrap_or((0, 0))).collect();
+    for r in &c.reps {
+        r.max_gap_us.store(0, Ordering::Relaxed);
+    }
+    let t_fail = Instant::now();
+    let (join_ms, drop_ms) = c.stop_node_timed(l);
+    // Sample each survivor's timer every ms until one of them leads with its round committed.
+    let ta = Instant::now();
+    let mut draws: Vec<Vec<u32>> = vec![Vec::new(); survivors.len()];
+    let mut claim: Option<(usize, Round, f64)> = None;
+    let mut noop: Option<f64> = None;
+    while ta.elapsed() < Duration::from_secs(60) {
+        for (k, i) in survivors.iter().enumerate() {
+            if let Some((to, _)) = c.reps[*i].with(|n| n.election_timer()) {
+                if draws[k].last() != Some(&to) {
+                    draws[k].push(to);
+                }
+            }
+        }
+        if claim.is_none() {
+            if let Some(x) = survivors.iter().copied().find(|x| c.reps[*x].leader() == Some(NodeId(*x as u32 + 1))) {
+                let last = c.reps[x].with(|n| n.last_round()).unwrap_or(0);
+                claim = Some((x, last, ms(ta)));
+            }
+        }
+        if let Some((x, last, _)) = claim {
+            if c.reps[x].committed_head() >= last {
+                noop = Some(ms(ta));
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let elected = c.elect(&survivors, Duration::from_secs(60));
+    let elect_ms = ms(ta);
+    let b1 = ms(t_fail);
+    let el = take_all(&c);
+    let egaps: Vec<f64> = survivors.iter().map(|i| c.reps[*i].max_gap_us.load(Ordering::Relaxed) as f64 / 1e3).collect();
+    let term_after: Vec<u64> = survivors.iter().map(|i| c.reps[*i].with(|x| x.term()).unwrap_or(0)).collect();
+    println!(
+        "FF {tag} election winner={:?} B1_ms={b1:.1} stop_join_ms={join_ms:.1} stop_drop_ms={drop_ms:.1} claim_ms={:?} noop_ms={:?} elect_ms={elect_ms:.1} survivors={:?} timers_at_stop(timeout,since_heard)={timers_at_stop:?} timeouts_seen_during_election={draws:?} election_transitions={:?} terms_after={term_after:?} survivor_driver_max_gap_ms={egaps:?}",
+        elected.map(|(x, _)| format!("n{}", x + 1)),
+        claim.map(|c| c.2),
+        noop,
+        survivors.iter().map(|i| format!("n{}", i + 1)).collect::<Vec<_>>(),
+        survivors.iter().map(|i| role_counts(&el[*i])).collect::<Vec<_>>()
+    );
+    c.shutdown_all();
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("firstfail") {
+        // r11_dist_fleet firstfail <scratch-root> <N:seed,N:seed,...> <hold-budget-s>
+        let root = PathBuf::from(args.get(2).expect("scratch root"));
+        std::fs::create_dir_all(&root).unwrap();
+        let samples: Vec<(u64, u64)> = args
+            .get(3)
+            .expect("samples")
+            .split(',')
+            .map(|x| {
+                let (a, b) = x.split_once(':').expect("N:seed");
+                (a.parse().unwrap(), b.parse().unwrap())
+            })
+            .collect();
+        let budget = Duration::from_secs(args.get(4).and_then(|x| x.parse().ok()).unwrap_or(1000));
+        println!("# r11_dist_fleet firstfail samples={samples:?} budget_s={}", budget.as_secs());
+        let (med, p99) = b0(&root);
+        println!("B0 sync_data_ms median={med:.3} p99={p99:.3} samples=2000");
+        let t0 = Instant::now();
+        for (n, seed) in samples {
+            // A 10^6 sample needs about 3 min; do not start one that could overrun the hold.
+            let need = if n >= 1_000_000 { Duration::from_secs(240) } else { Duration::from_secs(20) };
+            if t0.elapsed() + need > budget {
+                println!("FF N={n} seed={seed} SKIPPED: hold budget ({} s used)", t0.elapsed().as_secs());
+                continue;
+            }
+            let ts = Instant::now();
+            run_firstfail(n, seed, &root);
+            println!("# sample N={n} seed={seed} wall_ms={:.0}", ms(ts));
+        }
+        println!("# done wall_ms={:.0}", ms(t0));
+        return;
+    }
     let n: u64 = args.get(1).and_then(|s| s.parse().ok()).expect("usage: r11_dist_fleet <N> <scratch-root> [HEAD,GC,ZK,M1]");
     let root = PathBuf::from(args.get(2).expect("scratch root"));
     std::fs::create_dir_all(&root).unwrap();
