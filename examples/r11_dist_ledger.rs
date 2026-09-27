@@ -1678,11 +1678,31 @@ fn mode_adm() {
 // with the fence map persisted. PREREG A13.
 // ---------------------------------------------------------------------------------------------
 
-fn mode_retire(t: u64, n: u64, n2: u64) {
+fn mode_retire(t: u64, n: u64, n2: u64, wm: bool) {
     assert!(n <= t);
-    println!("# retire T={t} N={n} N2={n2}");
+    println!("# retire T={t} N={n} N2={n2} wm={wm}");
+    if wm {
+        // A18 (R): the real HEAD ledger over the same trace, measured, so its figure is not inferred.
+        let h0 = heap();
+        let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+        let mut head = Head(ledger);
+        let mut round = run_w(t, n, |e| {
+            head.apply(&e);
+        });
+        for i in 1..=n2 {
+            round += 1;
+            head.apply(&Entry { term: 1, round, command: fork_c(cid(2, i)) });
+        }
+        round += 1;
+        head.apply(&Entry { term: 2, round, command: abandon_c(sentinel(1)) });
+        let h1 = heap();
+        let recs = head.records();
+        println!("RETIRE-HEAD T={t} N={n} N2={n2} records={recs} heap_bytes={} bytes_per_record={:.1}", h1 - h0, (h1 - h0) as f64 / recs as f64);
+        check("R-HEAD-heap", "HEAD", "1.25e9..1.45e9 bytes", (1.25e9..=1.45e9).contains(&((h1 - h0) as f64)), (h1 - h0).to_string());
+    }
     let h0 = heap();
     let mut m1 = HeadCopy::new(true);
+    m1.use_wm = wm;
     let mut round = run_w(t, n, |e| {
         m1.apply(&e);
     });
@@ -1742,9 +1762,10 @@ fn mode_retire(t: u64, n: u64, n2: u64) {
     check("R-tail", "M1 vs M1+retire", "0 divergences", div == 0, div.to_string());
 }
 
-fn mode_s6(n: u64, budget: u64) {
-    println!("# s6 N={n} budget={budget}");
+fn mode_s6(n: u64, budget: u64, wm: bool) {
+    println!("# s6 N={n} budget={budget} wm={wm}");
     let mut m1 = HeadCopy::new(true);
+    m1.use_wm = wm;
     let mut round = 0;
     for i in 1..=n {
         round += 1;
@@ -2034,37 +2055,80 @@ fn minflt() -> i64 {
     u.minflt
 }
 
-fn mode_fz(reps: u64) {
-    println!("# fz reps={reps} (A17 (1)); arms BASE, PRE, REPEAT; N in 1e3..1e6");
+/// A18 (F): the A-Z heap history, exactly as 72fa4b8:1452-1465 ran it: ZK over run_w(N, N), ZK's close applied, ZK dropped;
+/// then M1 over run_w(N, N), boxed as `dyn Ledger`. `pre` puts a no-op fence (owner 9, round 0) in before the build.
+fn az_build(n: u64, pre: bool) -> (Box<dyn Ledger>, Round) {
+    {
+        let mut z: Box<dyn Ledger> = Box::new(Zk::new());
+        let last = run_w(n, n, |e| {
+            z.apply(&e);
+        });
+        z.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+        std::hint::black_box(z.live_ids_of(1).len());
+    }
+    let mut m = HeadCopy::new(true);
+    if pre {
+        m.fence.insert(9, 0);
+    }
+    let mut l: Box<dyn Ledger> = Box::new(m);
+    let last = run_w(n, n, |e| {
+        l.apply(&e);
+    });
+    (l, last)
+}
+
+/// The size of a `BTreeMap<u32, Round>` leaf: parent pointer 8, parent index 2, length 2, 11 keys of 4 (padded to 56), 11
+/// values of 8. ALLOC allocates and first-writes exactly this, with no fence apply.
+const FENCE_LEAF_BYTES: usize = 144;
+
+/// A18 (F). `timed` prints ns per arm (run in one lockrun hold); otherwise the same sequences print allocator-call and
+/// minor-fault deltas around the operation, with no timer (unlocked).
+fn mode_fz(reps: u64, timed: bool) {
+    println!("# fz reps={reps} timed={timed} (A18 (F)); arms AZ, PRE, ALLOC rotated per rep; N in 1e3..1e6");
+    let arms = ["AZ", "PRE", "ALLOC"];
     for &n in &[1_000u64, 10_000, 100_000, 1_000_000] {
         for rep in 0..reps {
-            for arm in ["BASE", "PRE", "REPEAT"] {
-                let mut l = HeadCopy::new(true);
-                if arm == "PRE" {
-                    l.fence.insert(9, 0);
+            for k in 0..3 {
+                let arm = arms[(k + rep as usize) % 3];
+                let (mut l, last) = az_build(n, arm == "PRE");
+                if timed {
+                    let ns = if arm == "ALLOC" {
+                        let lay = Layout::from_size_align(FENCE_LEAF_BYTES, 8).unwrap();
+                        let t0 = Instant::now();
+                        // SAFETY: a non-zero-size layout; the block is written in full and freed below.
+                        let p = unsafe { std::alloc::alloc(lay) };
+                        unsafe { std::ptr::write_bytes(p, 0, FENCE_LEAF_BYTES) };
+                        let ns = t0.elapsed().as_nanos();
+                        std::hint::black_box(p);
+                        unsafe { std::alloc::dealloc(p, lay) };
+                        ns
+                    } else {
+                        let t0 = Instant::now();
+                        l.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+                        t0.elapsed().as_nanos()
+                    };
+                    println!("FZ arm={arm} N={n} rep={rep} ns={ns} live_after={}", l.live_ids_of(1).len());
+                } else {
+                    let e = Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) };
+                    let lay = Layout::from_size_align(FENCE_LEAF_BYTES, 8).unwrap();
+                    let f0 = minflt();
+                    let a0 = ALLOCS.load(Ordering::Relaxed);
+                    if arm == "ALLOC" {
+                        // SAFETY: as above.
+                        let p = unsafe { std::alloc::alloc(lay) };
+                        unsafe { std::ptr::write_bytes(p, 0, FENCE_LEAF_BYTES) };
+                        std::hint::black_box(p);
+                        let a1 = ALLOCS.load(Ordering::Relaxed);
+                        let f1 = minflt();
+                        unsafe { std::alloc::dealloc(p, lay) };
+                        println!("FZC arm={arm} N={n} rep={rep} allocs={} minflt={}", a1 - a0, f1 - f0);
+                    } else {
+                        l.apply(&e);
+                        let a1 = ALLOCS.load(Ordering::Relaxed);
+                        let f1 = minflt();
+                        println!("FZC arm={arm} N={n} rep={rep} allocs={} minflt={} live_after={}", a1 - a0, f1 - f0, l.live_ids_of(1).len());
+                    }
                 }
-                let mut last = run_w(n, n, |e| {
-                    l.apply(&e);
-                });
-                if arm == "REPEAT" {
-                    last += 1;
-                    l.apply(&Entry { term: 2, round: last, command: abandon_c(sentinel(1)) });
-                }
-                let e = Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) };
-                let f0 = minflt();
-                let a0 = ALLOCS.load(Ordering::Relaxed);
-                let t0 = Instant::now();
-                l.apply(&e);
-                let ns = t0.elapsed().as_nanos();
-                let a1 = ALLOCS.load(Ordering::Relaxed);
-                let f1 = minflt();
-                println!(
-                    "FZ arm={arm} N={n} rep={rep} ns_single_apply={ns} allocs={} minflt={} fence_entries={} live_after={}",
-                    a1 - a0,
-                    f1 - f0,
-                    l.fence.len(),
-                    l.live_ids_of(1).len()
-                );
             }
         }
     }
@@ -2146,6 +2210,17 @@ fn hb_scenario(scen: &str, hb: bool, skew: u64, muts: (bool, bool, bool)) -> HbO
         }
         // Worst moment: the fence at true time 3999, one unit before the next heartbeat was due.
         "L4" => cmds.push(fence(3_999 + skew)),
+        // A18 (H) L5: a driver stall. n1 is silent from its last heartbeat (t = 3000) for S = `skew` units, and the fence
+        // comes at the end of the stall.
+        "L5" => cmds.push(fence(3_000 + skew)),
+        // A18 (H) L3m: L3 with a second fence right after the zombie's stale heartbeat. Correct: it applies (n1 never
+        // heartbeated in epoch 2, expiration 7500 + 500 < 9600). Under HB-m2 the stale heartbeat extended the expiration to
+        // 13500, so it is refused: caught by the fence OUTCOME, not by the counter the mutant disables.
+        "L3m" => {
+            cmds.push(fence(8_001));
+            cmds.push(hb_c(1, 1, 9_000 + HB_TTL));
+            cmds.push(fence_ie_c(1, 2, 9_600));
+        }
         other => panic!("unknown scenario {other}"),
     }
     for (i, c) in cmds.into_iter().enumerate() {
@@ -2217,6 +2292,28 @@ fn mode_hb() {
     let x = hb_scenario("L3", true, 0, (false, false, true));
     hb_line("L3", "HB-m3", 0, &x);
     check("HB-m3-caught", "HB-m3 fork ignores epoch", "zombie fork live", x.zombie_live, x.zombie_live.to_string());
+    // A18 (H): L5 stalls, and the outcome-based HB-m2 check.
+    for s in [2_000u64, 4_000, 6_000] {
+        let h = hb_scenario("L5", true, s, none);
+        hb_line("L5", "HB", s, &h);
+        let fenced = s > HB_TTL + HB_MO;
+        check(
+            &format!("HB-L5-s{s}"),
+            "HB",
+            if fenced { "fence applied, 0 live" } else { "fence refused, 10000 live" },
+            if fenced { h.fence_applied == 1 && h.live_n1 == 0 } else { h.fence_refused == 1 && h.live_n1 == HB_K },
+            format!("applied={} refused={} live={}", h.fence_applied, h.fence_refused, h.live_n1),
+        );
+    }
+    let m = hb_scenario("L5", false, 2_000, none);
+    hb_line("L5", "M1", 2_000, &m);
+    check("HB-L5-M1-harm", "M1", "0 live (a 2000-unit stall costs the live node its branches)", m.live_n1 == 0, m.live_n1.to_string());
+    let h = hb_scenario("L3m", true, 0, none);
+    hb_line("L3m", "HB", 0, &h);
+    check("HB-L3m", "HB", "second fence applied (2 applied)", h.fence_applied == 2, h.fence_applied.to_string());
+    let x = hb_scenario("L3m", true, 0, (false, true, false));
+    hb_line("L3m", "HB-m2", 0, &x);
+    check("HB-m2-caught-by-outcome", "HB-m2 heartbeat ignores epoch", "second fence refused (1 applied)", x.fence_applied == 1, x.fence_applied.to_string());
 }
 
 fn main() {
@@ -2231,10 +2328,10 @@ fn main() {
         Some("o2") => mode_o2(arg(2)),
         Some("timed") => mode_timed(),
         Some("adm") => mode_adm(),
-        Some("retire") => mode_retire(arg(2), arg(3), arg(4)),
-        Some("s6") => mode_s6(arg(2), arg(3)),
+        Some("retire") => mode_retire(arg(2), arg(3), arg(4), args.get(5).map(|x| x == "wm").unwrap_or(false)),
+        Some("s6") => mode_s6(arg(2), arg(3), args.get(4).map(|x| x == "wm").unwrap_or(false)),
         Some("conformwide") => mode_conformwide(arg(2)),
-        Some("fz") => mode_fz(arg(2)),
+        Some("fz") => mode_fz(arg(2), args.get(3).map(|x| x == "timed").unwrap_or(false)),
         Some("hb") => mode_hb(),
         _ => {
             eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
