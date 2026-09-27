@@ -131,3 +131,57 @@ FAN-QUEUE row; engineering, not an invention lane. Lead-authorised 2026-09-27. L
   - M3 survived because the check saves a thread spawn and is not load-bearing.
 - Not run here, by the lead's scope: the full suite, including `tests/integration_consensus_failover.rs` and the cluster
   integration targets that start and stop transports. It runs at landing, through lockrun.
+
+## Amendment 2 (2026-09-27T09:18:02Z): F1 is judged on the REAL transport, not DC2. Registered before any instrument is built or run.
+The lead's ruling after the DC2 adversary (r11-dist-refute-measure, artie-research 32604b84; REPORT c12bf4e1):
+- DC2 confirms the real `Consensus` split condition: a split happens iff the first-frame latency L exceeds the survivors'
+  expiry gap delta.
+- DC2's 14.96 and 0.21 per 100 are production-MODEL estimates.
+- F1's "< 1 per 100" holds only if the first-frame latency after an immediate accept, thread spawn included, is under
+  about 1.65 ms at the box's load.
+- The red test and mutants M1-M3 above stand as they are.
+
+**Where it runs.**
+- The r11-dist harness worktree (`r11-dist.noindex`) with this branch merged, plus ONE measurement-only commit that is never
+  landed.
+  - A runtime arm switch: the lib static `R11_ACCEPT_POLL` makes `start` leave the listener nonblocking. That is exactly
+    M1, which is the base accept path: the failed-accept arm sleeps `poll_interval` on WouldBlock, as base's WouldBlock arm
+    did.
+  - A bounded per-transport event trace, with instants on one process clock:
+    - accept-loop wakes from a sleep;
+    - accepted connections;
+    - each connection's first frame delivered to the inbox, with its sender's id;
+    - the sender side: redial found, dial start, dial done, first write;
+    - a Node log of role transitions with instants, and the tick grid (`next_tick`).
+- So base and F1 are the SAME binary. They are interleaved per salt: even salt indexes run base first, odd ones F1 first.
+
+**Failover design (instrument 6).**
+- `firstfail`, N = 10, the production idle deadline (60 s), a 62-s idle before the stop, and the 50-ms tick.
+- Random per-node phases: the three `Node::start`s run in a salted random order, each at T0 + U(0, 50 ms). Each node's accept
+  grid and tick grid keep their production relation: the transport starts inside `Node::start`, just before `next_tick` is
+  set.
+- 30 salts from DC1, each with a winner at least 2 ticks below both survivors, so that start offsets cannot change the winner:
+  - gap 0: 2, 3, 5, 10, 21, 37, 66, 91, 98, 106, 123, 129;
+  - gap 1: 7, 27, 28, 42, 46, 48, 52, 64, 65, 70, 82, 84;
+  - gap >= 2: 1, 4, 6, 8, 9, 14.
+- 60 failovers in 4 lockrun holds of 15, each under run.sh's 1200-s timeout, with the 2-s process monitor.
+- No load gate: the question is latency AT this box's load. Every hold is scored under A16's refined rule, and its load is
+  printed beside every number. Pairing makes the base/F1 contrast robust to load drift.
+- Gap classes are taken post hoc from `timers_at_stop`.
+
+**Predictions** (INFERRED unless stated).
+- (3) L3 = first frame delivered at the receiver minus dial start at the sender, per redial, 2 per failover:
+  - base: spread over about 0-55 ms, median 15-35 ms, at most 10% under 1.65 ms;
+  - F1: median AND p90 under 1.65 ms.
+  - If F1's median is 1.65 ms or more, F1's "< 1 per 100" is REFUTED at this load.
+  - Reported beside it: dial to first write (sender side) and the accept wait (accepted minus dial start).
+- (1) base arm: the accept phase at each redial, psi = (accepted_at_receiver - receiver's tick grid) mod 50 ms, pooled
+  (about 60 values). Predicted: a KS test against U(0, 50) is not rejected at 0.05.
+  - The adversary's correlated-start concern predicts the opposite: clustering. Either way this settles item (1).
+- (6) splits, where a split means both survivors became Candidate in one term:
+  - base: gap 0 about 8/12 (registered range 5-11); gap 1 about 2/12 (0-5); gap >= 2 0/6.
+  - F1: gap 0 at most 2/12; gap 1 0/12; gap >= 2 0/6.
+- The mechanism, per failover: take E = the survivor that pre-campaigned first, delta = t_pc(other) - t_pc(E), and
+  L_E = E's PreVote first frame at the other minus t_pc(E). Predicted: split iff L_E > delta, in at least 95% of the
+  failovers where both are measured.
+- Phases: over gap-0 failovers, delta is spread over [0, 50) ms, with no 10-ms bin holding more than half the values.
