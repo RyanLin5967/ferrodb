@@ -43,10 +43,13 @@ use ferrodb::error::FerroError;
 
 struct Counting;
 static LIVE: AtomicI64 = AtomicI64::new(0);
+/// A17 (1): allocator calls (alloc, alloc_zeroed, realloc), for the fence-apply attribution.
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(l) };
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
         if !p.is_null() {
             LIVE.fetch_add(l.size() as i64, Ordering::Relaxed);
         }
@@ -54,6 +57,7 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc_zeroed(l) };
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
         if !p.is_null() {
             LIVE.fetch_add(l.size() as i64, Ordering::Relaxed);
         }
@@ -65,6 +69,7 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         let q = unsafe { System.realloc(p, l, new) };
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
         if !q.is_null() {
             LIVE.fetch_add(new as i64 - l.size() as i64, Ordering::Relaxed);
         }
@@ -234,6 +239,27 @@ struct HeadCopy {
     /// alone, never on when a node took a snapshot. Replaces the snapshot-time `retired_hwm` rule.
     use_wm: bool,
     fork_wm: BTreeMap<u32, u64>,
+    /// A17 (2): CockroachDB node liveness in the model. `None` is every earlier arm, unchanged.
+    hb: Option<Hb>,
+}
+
+/// A17 (2): per-node liveness records and what the rules refused. Encodings are model-internal sentinels,
+/// as the M1 fence already is: HEARTBEAT(n, e, x) is a Fork of `cid(n, LOCAL_MASK - 1)` with
+/// `fork_epoch = e` and `lease_millis = x`; FENCE(n, e, t) is a Merge of `sentinel(n)` with
+/// `base_round = t << 16 | e` (t is the proposer's clock).
+#[derive(Clone, Default)]
+struct Hb {
+    /// node -> (epoch, expiration)
+    live: BTreeMap<u32, (u64, u64)>,
+    max_offset: u64,
+    fence_applied: u64,
+    fence_refused: u64,
+    hb_refused: u64,
+    fork_epoch_refused: u64,
+    /// HB-m1: the fence ignores liveness. HB-m2: the heartbeat ignores the epoch. HB-m3: the fork ignores the epoch.
+    mut_fence_ignores_liveness: bool,
+    mut_hb_ignores_epoch: bool,
+    mut_fork_ignores_epoch: bool,
 }
 
 impl HeadCopy {
@@ -257,6 +283,7 @@ impl HeadCopy {
             rejected: 0,
             use_wm: false,
             fork_wm: BTreeMap::new(),
+            hb: None,
         }
     }
 
@@ -297,6 +324,7 @@ impl HeadCopy {
             rejected: self.rejected,
             use_wm: self.use_wm,
             fork_wm: if drop_wm { BTreeMap::new() } else { self.fork_wm.clone() },
+            hb: self.hb.clone(),
         };
         (snap, retired)
     }
@@ -335,6 +363,25 @@ impl Ledger for HeadCopy {
         self.touched = self.touched.max(1);
         match op {
             BranchOp::Fork { child, parent, fork_epoch, lease_millis } => {
+                if let Some(hb) = self.hb.as_mut() {
+                    if *child != 0 && *child & LOCAL_MASK == LOCAL_MASK - 1 {
+                        // HEARTBEAT(n, e, x): applies only at the node's current epoch.
+                        let rec = hb.live.entry(owner_of(*child)).or_insert((*fork_epoch, 0));
+                        if rec.0 == *fork_epoch || hb.mut_hb_ignores_epoch {
+                            rec.1 = rec.1.max(*lease_millis);
+                        } else {
+                            hb.hb_refused += 1;
+                        }
+                        return None;
+                    }
+                    // A fork carries its owner's epoch (CockroachDB's lease-epoch check).
+                    let cur = hb.live.get(&owner_of(*child)).map(|r| r.0);
+                    if cur != Some(*fork_epoch) && !hb.mut_fork_ignores_epoch {
+                        hb.fork_epoch_refused += 1;
+                        self.rejected += 1;
+                        return None;
+                    }
+                }
                 if *child == 0 || self.br.contains_key(child) {
                     self.rejected += 1;
                     return None;
@@ -373,6 +420,24 @@ impl Ledger for HeadCopy {
                 None
             }
             BranchOp::Merge { branch, base_round } => {
+                if let Some(hb) = self.hb.as_mut() {
+                    if is_sentinel(*branch) {
+                        // FENCE(n, e, t): IncrementEpoch, only if the epoch matches and the record expired.
+                        let n = owner_of(*branch);
+                        let (e, t) = (*base_round & 0xFFFF, *base_round >> 16);
+                        let rec = hb.live.get(&n).copied().unwrap_or((e, 0));
+                        let expired = rec.1 + hb.max_offset < t;
+                        if rec.0 == e && (expired || hb.mut_fence_ignores_liveness) {
+                            hb.live.insert(n, (e + 1, rec.1));
+                            hb.fence_applied += 1;
+                            let f = self.fence.entry(n).or_insert(0);
+                            *f = (*f).max(round);
+                        } else {
+                            hb.fence_refused += 1;
+                        }
+                        return None;
+                    }
+                }
                 let v = match self.br.get(branch) {
                     None => V::Refused,
                     Some(r) if !self.rec_live(*branch, r) => V::Refused,
@@ -1930,6 +1995,230 @@ fn mode_conformwide(seed: u64) {
     println!("CW3 seed={seed} forks_HEAD_accepts_that_M1+wm_refuses={changed} (the stated protocol change; includes forks M1's fence refuses)");
 }
 
+// ---------------------------------------------------------------------------------------------
+// A17 (1): what makes one M1 fence apply cost more at larger N? Counters (allocator calls, minor
+// faults) and two arms that remove the first-leaf allocation: PRE (the fence map already holds a
+// no-op entry for node 9) and REPEAT (a second fence for the same owner).
+// ---------------------------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Default)]
+struct RUsage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    maxrss: i64,
+    ixrss: i64,
+    idrss: i64,
+    isrss: i64,
+    minflt: i64,
+    majflt: i64,
+    nswap: i64,
+    inblock: i64,
+    oublock: i64,
+    msgsnd: i64,
+    msgrcv: i64,
+    nsignals: i64,
+    nvcsw: i64,
+    nivcsw: i64,
+}
+
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+}
+
+fn minflt() -> i64 {
+    let mut u = RUsage::default();
+    // SAFETY: `u` is a live, correctly sized `struct rusage` for the duration of the call; RUSAGE_SELF = 0.
+    let rc = unsafe { getrusage(0, &mut u) };
+    assert_eq!(rc, 0, "getrusage failed");
+    u.minflt
+}
+
+fn mode_fz(reps: u64) {
+    println!("# fz reps={reps} (A17 (1)); arms BASE, PRE, REPEAT; N in 1e3..1e6");
+    for &n in &[1_000u64, 10_000, 100_000, 1_000_000] {
+        for rep in 0..reps {
+            for arm in ["BASE", "PRE", "REPEAT"] {
+                let mut l = HeadCopy::new(true);
+                if arm == "PRE" {
+                    l.fence.insert(9, 0);
+                }
+                let mut last = run_w(n, n, |e| {
+                    l.apply(&e);
+                });
+                if arm == "REPEAT" {
+                    last += 1;
+                    l.apply(&Entry { term: 2, round: last, command: abandon_c(sentinel(1)) });
+                }
+                let e = Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) };
+                let f0 = minflt();
+                let a0 = ALLOCS.load(Ordering::Relaxed);
+                let t0 = Instant::now();
+                l.apply(&e);
+                let ns = t0.elapsed().as_nanos();
+                let a1 = ALLOCS.load(Ordering::Relaxed);
+                let f1 = minflt();
+                println!(
+                    "FZ arm={arm} N={n} rep={rep} ns_single_apply={ns} allocs={} minflt={} fence_entries={} live_after={}",
+                    a1 - a0,
+                    f1 - f0,
+                    l.fence.len(),
+                    l.live_ids_of(1).len()
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A17 (2): the liveness heartbeat in the model (CockroachDB node liveness), against plain M1.
+// ---------------------------------------------------------------------------------------------
+
+const HB_K: u64 = 10_000;
+const HB_H: u64 = 1_000;
+const HB_TTL: u64 = 4_500;
+const HB_MO: u64 = 500;
+
+fn hb_c(n: u32, e: u64, exp: u64) -> Command {
+    Command::Branch { op: BranchOp::Fork { child: cid(n, LOCAL_MASK - 1), parent: 0, fork_epoch: e, lease_millis: exp } }
+}
+fn fence_ie_c(n: u32, e: u64, t: u64) -> Command {
+    Command::Branch { op: BranchOp::Merge { branch: sentinel(n), base_round: (t << 16) | e } }
+}
+fn fork_e(child: u64, e: u64) -> Command {
+    Command::Branch { op: BranchOp::Fork { child, parent: 0, fork_epoch: e, lease_millis: 900_000 } }
+}
+
+struct HbOut {
+    live_n1: u64,
+    fence_applied: u64,
+    fence_refused: u64,
+    hb_refused: u64,
+    fork_refused: u64,
+    zombie_live: bool,
+    rejoin_live: bool,
+}
+
+/// One scenario on one arm. `hb` false = plain M1 (its fence is the Abandon sentinel, and it has no
+/// heartbeats). Times are model units; the heartbeat interval is HB_H and a record lives HB_TTL.
+fn hb_scenario(scen: &str, hb: bool, skew: u64, muts: (bool, bool, bool)) -> HbOut {
+    let mut l = HeadCopy::new(true);
+    if hb {
+        l.hb = Some(Hb {
+            max_offset: HB_MO,
+            mut_fence_ignores_liveness: muts.0,
+            mut_hb_ignores_epoch: muts.1,
+            mut_fork_ignores_epoch: muts.2,
+            ..Hb::default()
+        });
+    }
+    let mut cmds: Vec<Command> = Vec::new();
+    if hb {
+        cmds.push(hb_c(1, 1, HB_TTL));
+    }
+    for i in 1..=HB_K {
+        cmds.push(fork_e(cid(1, i), 1));
+    }
+    // n1 heartbeats at t = 1000, 2000, 3000 (then, in L2/L3, it stops).
+    if hb {
+        for t in [HB_H, 2 * HB_H, 3 * HB_H] {
+            cmds.push(hb_c(1, 1, t + HB_TTL));
+        }
+    }
+    let fence = |t: u64| if hb { fence_ie_c(1, 1, t) } else { abandon_c(sentinel(1)) };
+    match scen {
+        // Live: its record (expiration 7500) is far ahead of the fence's clock.
+        "L1" => cmds.push(fence(3_500 + skew)),
+        // Dead since t = 3000: expiration 7500 + max_offset 500 < 8001.
+        "L2" => cmds.push(fence(8_001 + skew)),
+        "L3" => {
+            cmds.push(fence(8_001 + skew));
+            // The zombie resumes at t = 9000 with its OLD epoch: a heartbeat and a fork.
+            if hb {
+                cmds.push(hb_c(1, 1, 9_000 + HB_TTL));
+            }
+            cmds.push(fork_e(cid(1, HB_K + 1), 1));
+            // It reads its record, learns epoch 2, heartbeats and forks again.
+            if hb {
+                cmds.push(hb_c(1, 2, 9_500 + HB_TTL));
+            }
+            cmds.push(fork_e(cid(1, HB_K + 2), 2));
+        }
+        // Worst moment: the fence at true time 3999, one unit before the next heartbeat was due.
+        "L4" => cmds.push(fence(3_999 + skew)),
+        other => panic!("unknown scenario {other}"),
+    }
+    for (i, c) in cmds.into_iter().enumerate() {
+        l.apply(&Entry { term: 1, round: i as u64 + 1, command: c });
+    }
+    let h = l.hb.clone().unwrap_or_default();
+    HbOut {
+        live_n1: l.live_ids_of(1).iter().filter(|id| **id & LOCAL_MASK <= HB_K).count() as u64,
+        fence_applied: h.fence_applied,
+        fence_refused: h.fence_refused,
+        hb_refused: h.hb_refused,
+        fork_refused: h.fork_epoch_refused,
+        zombie_live: l.is_live(cid(1, HB_K + 1)),
+        rejoin_live: l.is_live(cid(1, HB_K + 2)),
+    }
+}
+
+fn hb_line(scen: &str, arm: &str, skew: u64, o: &HbOut) {
+    println!(
+        "HB scen={scen} arm={arm} skew={skew} pre_fence_live_n1={} fence_applied={} fence_refused={} hb_refused={} fork_epoch_refused={} zombie_fork_live={} rejoin_fork_live={}",
+        o.live_n1, o.fence_applied, o.fence_refused, o.hb_refused, o.fork_refused, o.zombie_live, o.rejoin_live
+    );
+}
+
+fn mode_hb() {
+    println!("# hb (A17 (2), A17a): K={HB_K} H={HB_H} TTL={HB_TTL} max_offset={HB_MO}");
+    let none = (false, false, false);
+    // L1: a live node loses office.
+    let h = hb_scenario("L1", true, 0, none);
+    hb_line("L1", "HB", 0, &h);
+    check("HB-L1", "HB", "fence refused, 10000 live", h.fence_refused == 1 && h.fence_applied == 0 && h.live_n1 == HB_K, format!("refused={} live={}", h.fence_refused, h.live_n1));
+    let m = hb_scenario("L1", false, 0, none);
+    hb_line("L1", "M1", 0, &m);
+    check("HB-L1-M1-harm", "M1", "0 live (10000 live branches discarded)", m.live_n1 == 0, m.live_n1.to_string());
+    // L2: a dead node.
+    let h = hb_scenario("L2", true, 0, none);
+    hb_line("L2", "HB", 0, &h);
+    check("HB-L2", "HB", "fence applied, 0 live", h.fence_applied == 1 && h.live_n1 == 0, format!("applied={} live={}", h.fence_applied, h.live_n1));
+    let m = hb_scenario("L2", false, 0, none);
+    hb_line("L2", "M1", 0, &m);
+    check("HB-L2-M1", "M1", "0 live", m.live_n1 == 0, m.live_n1.to_string());
+    // L3: the zombie.
+    let h = hb_scenario("L3", true, 0, none);
+    hb_line("L3", "HB", 0, &h);
+    check(
+        "HB-L3",
+        "HB",
+        "stale hb refused 1, old-epoch fork refused 1, zombie dead, rejoin live, pre-fence 0 live",
+        h.hb_refused == 1 && h.fork_refused == 1 && !h.zombie_live && h.rejoin_live && h.live_n1 == 0,
+        format!("hb_refused={} fork_refused={} zombie={} rejoin={} pre={}", h.hb_refused, h.fork_refused, h.zombie_live, h.rejoin_live, h.live_n1),
+    );
+    let m = hb_scenario("L3", false, 0, none);
+    hb_line("L3", "M1", 0, &m);
+    check("HB-L3-M1", "M1", "zombie fork live (M1 accepts it after the fence)", m.zombie_live && m.rejoin_live && m.live_n1 == 0, format!("zombie={} rejoin={} pre={}", m.zombie_live, m.rejoin_live, m.live_n1));
+    // L4: skew.
+    for s in [0u64, 500, 1_000, 4_001, 4_002, 5_000] {
+        let h = hb_scenario("L4", true, s, none);
+        hb_line("L4", "HB", s, &h);
+        let want = u64::from(s >= 4_002);
+        check(&format!("HB-L4-s{s}"), "HB", &format!("live nodes fenced = {want}"), h.fence_applied == want, h.fence_applied.to_string());
+    }
+    // Mutants: each must be caught.
+    let x = hb_scenario("L1", true, 0, (true, false, false));
+    hb_line("L1", "HB-m1", 0, &x);
+    check("HB-m1-caught", "HB-m1 fence ignores liveness", "0 live (the live node is fenced)", x.live_n1 == 0, x.live_n1.to_string());
+    let x = hb_scenario("L3", true, 0, (false, true, false));
+    hb_line("L3", "HB-m2", 0, &x);
+    check("HB-m2-caught", "HB-m2 heartbeat ignores epoch", "stale hb refused 0", x.hb_refused == 0, x.hb_refused.to_string());
+    let x = hb_scenario("L3", true, 0, (false, false, true));
+    hb_line("L3", "HB-m3", 0, &x);
+    check("HB-m3-caught", "HB-m3 fork ignores epoch", "zombie fork live", x.zombie_live, x.zombie_live.to_string());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| -> u64 { args.get(i).and_then(|s| s.parse().ok()).expect("numeric argument") };
@@ -1945,6 +2234,8 @@ fn main() {
         Some("retire") => mode_retire(arg(2), arg(3), arg(4)),
         Some("s6") => mode_s6(arg(2), arg(3)),
         Some("conformwide") => mode_conformwide(arg(2)),
+        Some("fz") => mode_fz(arg(2)),
+        Some("hb") => mode_hb(),
         _ => {
             eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
             std::process::exit(2);
