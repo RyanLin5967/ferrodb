@@ -3108,3 +3108,59 @@ fn a_link_the_peer_reset_is_redialled_after_an_idle_gap() {
     assert_eq!(a.idle_redials() - redials, 1, "the frame arrived, but not through the probe's redial");
     assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
 }
+
+#[test]
+fn a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll() {
+    // **F1.** After an idle close, D224 redials before it writes, and `dial` blocks until the peer's
+    // accept thread answers its handshake. That thread polled a nonblocking listener and slept
+    // `poll_interval` whenever nothing was pending: 50 ms by default, one whole election tick. So
+    // the redial, and the campaign frame it carries, waited up to one poll to be accepted.
+    //
+    // Election timeouts are drawn in whole ticks. Two survivors whose timers expire within a tick
+    // of each other therefore both pre-campaign before either one's PreVote arrives, and the vote
+    // splits. r11-dist DC2, on the real `Consensus` in virtual time: 14.96 splits per 100 first
+    // failovers at the 50 ms poll, against 0.21 when the accept answers at once.
+    //
+    // `accepts_after_sleep` counts every connection taken on the first `accept` after the accept
+    // thread slept, which is every connection that waited out a sleep. With no accept failing and
+    // the cap not full, nothing may wait there. Both sides are read: A accepts B's dial at startup,
+    // and B accepts A's redial.
+    let mut opts = fast();
+    opts.poll_interval = TransportOptions::default().poll_interval;
+    opts.idle_deadline = Duration::from_millis(300);
+    let (a, b) = pair(opts);
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::PreVote { last_term: 1, last_round: 1 },
+    };
+    a.send(&msg(1)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 1, "the link never carried its first frame");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && (b.idle_closed() == 0 || b.live_inbound_conns() > 0) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        b.idle_closed() >= 1 && b.live_inbound_conns() == 0,
+        "B never closed A's idle link, so this test exercises nothing"
+    );
+    // B has sent its FIN; let A's kernel process it (the D224 review's F2).
+    std::thread::sleep(Duration::from_millis(200));
+
+    let redials = a.idle_redials();
+    a.send(&msg(2)).unwrap();
+    assert_eq!(expect_recv(&b, Duration::from_secs(10)).term, 2, "the campaign frame never arrived");
+    // The premise: the frame needed a NEW connection, so it went through B's accept.
+    assert_eq!(a.idle_redials() - redials, 1, "the frame did not go through a redial, so no accept was on its path");
+    assert_eq!(a.lost_in_flight(), 0, "a frame was lost on the way");
+
+    assert_eq!(
+        (a.accepts_after_sleep(), b.accepts_after_sleep()),
+        (0, 0),
+        "connections were accepted only after the accept thread had slept (A, B), so each one \
+         waited up to a {:?} poll for its handshake answer: a redial's campaign frame waits a tick",
+        TransportOptions::default().poll_interval
+    );
+}

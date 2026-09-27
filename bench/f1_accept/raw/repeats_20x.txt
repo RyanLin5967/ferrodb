@@ -1,0 +1,84 @@
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435490540) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435491483) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435492417) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435493026) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435493977) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435495162) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435495951) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435496683) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435497433) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435498263) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435498843) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435499598) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435500246) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435501139) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435502576) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435503202) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435503754) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435504284) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435504816) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 1)
+     right: (0, 0)
+    thread 'consensus::transport::tests::a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll' (435505356) panicked at src/consensus/tests_transport.rs:3159:5:
+    assertion `left == right` failed: connections were accepted only after the accept thread had slept (A, B), so each one waited up to a 50ms poll for its handshake answer: a redial's campaign frame waits a tick
+      left: (1, 2)
+     right: (0, 0)
+REPEAT binary=red_323c965 test=a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll pass=0 fail=20
+REPEAT binary=green_ca771fb test=a_redial_after_an_idle_close_is_accepted_without_waiting_for_an_accept_poll pass=20 fail=0
+REPEAT binary=green_ca771fb test=a_peer_that_resets_before_accept_cannot_fill_the_connection_cap pass=20 fail=0
+# end 2026-09-27T09:08:44Z
