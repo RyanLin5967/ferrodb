@@ -185,3 +185,50 @@ The lead's ruling after the DC2 adversary (r11-dist-refute-measure, artie-resear
   L_E = E's PreVote first frame at the other minus t_pc(E). Predicted: split iff L_E > delta, in at least 95% of the
   failovers where both are measured.
 - Phases: over gap-0 failovers, delta is spread over [0, 50) ms, with no 10-ms bin holding more than half the values.
+
+## RESULT 2 (2026-09-27T11:09:36Z): amendment 2 on the real transport, holds 1-4 (56 of 60 failovers; hold 5 is queued in lockrun)
+- Raw is in artie-research `frontier/round11/r11-dist/raw/`, banked unread: f1i_h1 98e752df, h2 2cd46583, h3 b6652c42,
+  h4 a728319f, each with its .procs.txt.
+- Analysis at 7056c947, by `f1i_analyze.py` (c4d04c32), which was committed before the data.
+- Binary: r11-dist.noindex 85d4401 (this branch merged at 8db6416, plus measurement-only instruments).
+
+**(3) L3, from dial start to the first frame delivered at the receiver, spawn included (56 redials per arm):**
+
+| | Base | F1 |
+|---|---|---|
+| median | 29.4 ms | 0.215 ms |
+| p90 | 49.3 ms | 0.315 ms |
+| p99 | 59.3 ms | 0.342 ms |
+| max | 60.0 ms | 0.345 ms |
+| redials under 1.65 ms | 1/56 | 56/56 |
+
+- Base HELD. F1 median and p90 under 1.65 ms HELD.
+- Load: 8.2-72.0 across the holds.
+
+**(1) Base accept phase against the receiver's tick grid:** KS D = 0.134, p = 0.246 (n = 56); 10-ms bins
+[10, 11, 6, 13, 16]. Not rejected. HELD.
+
+**(6) Splits:**
+
+| gap | Base | F1 |
+|---|---|---|
+| 0 | 9/11 | 0/11 |
+| 1 | 2/11 | 0/11 |
+| >= 2 | 0/6 | 0/6 |
+
+- All six bands HELD.
+- Mechanism: split == (L_E > delta) in 28/28 failovers per arm. HELD.
+
+**FAILED: "no 10-ms bin of gap-0 delta holds more than half" on the base arm.**
+- Bins [7, 1, 1, 1, 1] (F1: [5, 2, 2, 0, 2]).
+- The salted start offsets fell close together for most gap-0 salts: survivor offset differences 2.2-34.3 ms, 7 of 11 below
+  13 ms. The arms share offsets per salt.
+- The base gap-0 rate 9/11 sits above 2/3 because delta skews small, which is consistent with the 28/28 mechanism result.
+
+**Load verdict:** every hold is VOID under A16's refined rule, and under the strict rule, from other lanes' rustc, dolt and node
+processes. There was no load gate by registration. The arms are paired within each hold. Load can only lengthen F1's latency,
+so its measured maximum is an upper bound for this box.
+
+**Standing:** F1's "< 1 per 100" is now backed by measured real-transport latency (at most 0.345 ms, against the 1.65-ms bound)
+and by 0 splits in 28 real failovers, 11 of them equal-draw pairs, where the paired base split 9. The production base rate
+(DC2's 14.96 per 100) is still model-only.
