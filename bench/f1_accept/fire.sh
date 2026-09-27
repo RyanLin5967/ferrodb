@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # F1 mutant fire-check: apply one patch to the fix commit, build the lib test binary, restore transport.rs FROM GIT
 # before running anything, then run every consensus:: test against the mutant's copied binary.
-# Usage: bash bench/f1_accept/fire.sh <fix-sha> <mutant-name>...   (refuses unless HEAD is <fix-sha> and the tree is clean)
+# Usage: bash bench/f1_accept/fire.sh <fix-sha> <mutant-name>...   (refuses unless src at HEAD equals <fix-sha>'s and is clean)
 set -u
 export PATH="$HOME/.cargo/bin:$PATH"
 WT=/Users/idide/wt/ferrodb-d224-f1-accept.noindex
 S=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/r11-dist/f1
 FIX=${1:?fix sha}; shift
 cd "$WT" || exit 2
-[ "$(git rev-parse --short HEAD)" = "$FIX" ] || { echo "REFUSED: HEAD is not $FIX"; exit 2; }
+git diff --quiet "$FIX" HEAD -- src || { echo "REFUSED: src at HEAD differs from $FIX"; exit 2; }
 trap 'git checkout -- src/consensus/transport.rs' EXIT
 for m in "$@"; do
   out=bench/f1_accept/raw/${m}_$FIX.txt
