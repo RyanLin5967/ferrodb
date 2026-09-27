@@ -232,3 +232,30 @@ so its measured maximum is an upper bound for this box.
 **Standing:** F1's "< 1 per 100" is now backed by measured real-transport latency (at most 0.345 ms, against the 1.65-ms bound)
 and by 0 splits in 28 real failovers, 11 of them equal-draw pairs, where the paired base split 9. The production base rate
 (DC2's 14.96 per 100) is still model-only.
+
+## RESULT 2 addendum (2026-09-27T14:56:42Z): hold 5 landed, all 60 failovers
+- Hold 5: raw artie-research b876c043 (monitor 5b5a06e9). Its first attempt was killed in the lockrun queue by my own
+  3000-s timeout; that attempt never ran and is in raw/aborted.
+- Rerun in the lead's quiet window #4: start load 8.81.
+- Analysis over all five holds: 78e9ed69.
+
+**Totals, 30 failovers per arm:**
+
+| | Base | F1 |
+|---|---|---|
+| L3 median | 30.2 ms | 0.213 ms |
+| L3 p90 | 52.4 ms | 0.314 ms |
+| L3 max | 60.0 ms | 0.345 ms |
+| redials under 1.65 ms | 1/60 | 60/60 |
+| splits, gap 0 | 10/12 | 0/12 |
+| splits, gap 1 | 3/12 | 0/12 |
+| splits, gap >= 2 | 0/6 | 0/6 |
+| mechanism split == (L_E > delta) | 30/30 | 30/30 |
+
+- (1) Base accept phase: KS D = 0.120, p = 0.328 (n = 60); 10-ms bins [11, 11, 9, 13, 16].
+- Every registered band HOLDS, as it did for holds 1-4.
+- The base gap-0 delta-spread prediction stays FAILED: bins [8, 1, 1, 1, 1]. The cause is as stated in RESULT 2, and it
+  is not re-scored.
+
+**Hold 5 load:** VOID under (ii), from other lanes' rustc (14:51:50-14:53:11 and 14:55:16-14:55:49) and a node process for 8 s.
+Holds 1-4 are VOID as before. The paired contrast stands as an upper bound on F1's latency.
