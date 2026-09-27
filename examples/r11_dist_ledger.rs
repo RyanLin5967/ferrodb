@@ -229,6 +229,11 @@ struct HeadCopy {
     retired_hwm: BTreeMap<u32, u64>,
     /// Branch ops this copy refused, counted where HEAD returns `BranchEffect::Rejected`.
     rejected: u64,
+    /// A14 F-wm: when set (M1 only), a fork is refused unless its local id exceeds the highest local
+    /// id its owner ever had ACCEPTED. Maintained at apply time, so fork acceptance depends on the log
+    /// alone, never on when a node took a snapshot. Replaces the snapshot-time `retired_hwm` rule.
+    use_wm: bool,
+    fork_wm: BTreeMap<u32, u64>,
 }
 
 impl HeadCopy {
@@ -250,6 +255,8 @@ impl HeadCopy {
             touched: 0,
             retired_hwm: BTreeMap::new(),
             rejected: 0,
+            use_wm: false,
+            fork_wm: BTreeMap::new(),
         }
     }
 
@@ -259,6 +266,11 @@ impl HeadCopy {
     /// records once (O(records)) and the result holds O(live + unretired + nodes).
     /// `drop_fence` is S6's mutant (r11-dist-refute-proof): a snapshot that loses the fence map.
     fn snapshot_retire(&self, budget: u64, drop_fence: bool) -> (HeadCopy, u64) {
+        self.snapshot_retire2(budget, drop_fence, false)
+    }
+
+    /// `drop_wm` is F-wm's own negative control: a snapshot that loses the watermark map.
+    fn snapshot_retire2(&self, budget: u64, drop_fence: bool, drop_wm: bool) -> (HeadCopy, u64) {
         let mut br = BTreeMap::new();
         let mut hwm = self.retired_hwm.clone();
         let mut retired = 0u64;
@@ -283,6 +295,8 @@ impl HeadCopy {
             touched: 0,
             retired_hwm: hwm,
             rejected: self.rejected,
+            use_wm: self.use_wm,
+            fork_wm: if drop_wm { BTreeMap::new() } else { self.fork_wm.clone() },
         };
         (snap, retired)
     }
@@ -325,7 +339,12 @@ impl Ledger for HeadCopy {
                     self.rejected += 1;
                     return None;
                 }
-                if self.retired_hwm.get(&owner_of(*child)).is_some_and(|h| *child & LOCAL_MASK <= *h) {
+                if self.use_wm {
+                    if self.fork_wm.get(&owner_of(*child)).is_some_and(|w| *child & LOCAL_MASK <= *w) {
+                        self.rejected += 1;
+                        return None;
+                    }
+                } else if self.retired_hwm.get(&owner_of(*child)).is_some_and(|h| *child & LOCAL_MASK <= *h) {
                     // A retired id: HEAD still holds its record and refuses the fork as a collision.
                     self.rejected += 1;
                     return None;
@@ -347,6 +366,10 @@ impl Ledger for HeadCopy {
                         st: St::Live,
                     },
                 );
+                if self.use_wm {
+                    let w = self.fork_wm.entry(owner_of(*child)).or_insert(0);
+                    *w = (*w).max(*child & LOCAL_MASK);
+                }
                 None
             }
             BranchOp::Merge { branch, base_round } => {
@@ -1808,9 +1831,61 @@ fn mode_conformwide(seed: u64) {
     for (label, budget, drop) in [("all", u64::MAX, false), ("b50", 50, false), ("b50-drop-fence", 50, true)] {
         let mut plain = HeadCopy::new(true);
         let mut snapped = HeadCopy::new(true);
+        // A14 diagnostic: the kind of every divergence, and for a fork, whether the id existed in the
+        // plain ledger before it and whether its local id was at or below the snapped hwm.
+        let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
         // Divergences that matter: a merge verdict, a fork accepted by one and refused by the other,
         // or liveness. Refusals of an abandon or reap of a DEAD id may differ and are counted apart:
         // retirement discards the terminal state (Merged vs Reaped) that decides them.
+        let mut d = 0u64;
+        let mut refusal_only = 0u64;
+        for (i, e) in log.iter().enumerate() {
+            let fork_child = match &e.command {
+                Command::Branch { op: BranchOp::Fork { child, .. } } => Some(*child),
+                _ => None,
+            };
+            let existed = fork_child.map(|c| plain.br.contains_key(&c));
+            let under_hwm = fork_child.map(|c| snapped.retired_hwm.get(&owner_of(c)).is_some_and(|h| c & LOCAL_MASK <= *h));
+            let (pr, sr) = (plain.rejected, snapped.rejected);
+            let (pv, sv) = (plain.apply(e), snapped.apply(e));
+            let (pd, sd) = (plain.rejected - pr, snapped.rejected - sr);
+            let is_fork = fork_child.is_some();
+            if pv != sv || (is_fork && pd != sd) {
+                d += 1;
+                let k = if is_fork {
+                    format!("fork(existed_in_plain={:?},local_le_snapped_hwm={:?},plain_refused={})", existed, under_hwm, pd > 0)
+                } else {
+                    format!("verdict(plain={pv:?},snapped={sv:?})")
+                };
+                *kinds.entry(k).or_default() += 1;
+            } else if pd != sd {
+                refusal_only += 1;
+            }
+            if (i + 1) % 2000 == 0 {
+                snapped = snapped.snapshot_retire(budget, drop).0;
+            }
+        }
+        println!("CW2-diag seed={seed} arm={label} divergence_kinds={kinds:?}");
+        let all: BTreeSet<u64> = plain.br.keys().copied().collect();
+        d += all.iter().filter(|id| plain.is_live(**id) != snapped.is_live(**id)).count() as u64;
+        println!("CW2 seed={seed} arm={label} divergences={d} refusal_only_differences={refusal_only} records_plain={} records_snapped={}", plain.records(), snapped.records());
+        if drop {
+            check("CW2-negctl", label, ">=1", d >= 1, d.to_string());
+        } else {
+            check("CW2", label, "0 divergences", d == 0, d.to_string());
+        }
+    }
+    // CW3 (A14 F-wm): the same comparison with the apply-time fork watermark in both ledgers.
+    for (label, budget, drop_fence, drop_wm) in [
+        ("wm-all", u64::MAX, false, false),
+        ("wm-b50", 50, false, false),
+        ("wm-b50-drop-fence", 50, true, false),
+        ("wm-all-drop-wm", u64::MAX, false, true),
+    ] {
+        let mut plain = HeadCopy::new(true);
+        plain.use_wm = true;
+        let mut snapped = HeadCopy::new(true);
+        snapped.use_wm = true;
         let mut d = 0u64;
         let mut refusal_only = 0u64;
         for (i, e) in log.iter().enumerate() {
@@ -1824,18 +1899,35 @@ fn mode_conformwide(seed: u64) {
                 refusal_only += 1;
             }
             if (i + 1) % 2000 == 0 {
-                snapped = snapped.snapshot_retire(budget, drop).0;
+                snapped = snapped.snapshot_retire2(budget, drop_fence, drop_wm).0;
             }
         }
         let all: BTreeSet<u64> = plain.br.keys().copied().collect();
         d += all.iter().filter(|id| plain.is_live(**id) != snapped.is_live(**id)).count() as u64;
-        println!("CW2 seed={seed} arm={label} divergences={d} refusal_only_differences={refusal_only} records_plain={} records_snapped={}", plain.records(), snapped.records());
-        if drop {
-            check("CW2-negctl", label, ">=1", d >= 1, d.to_string());
+        println!("CW3 seed={seed} arm={label} divergences={d} refusal_only_differences={refusal_only} records_plain={} records_snapped={}", plain.records(), snapped.records());
+        if drop_fence || drop_wm {
+            check("CW3-negctl", label, ">=1", d >= 1, d.to_string());
         } else {
-            check("CW2", label, "0 divergences", d == 0, d.to_string());
+            check("CW3", label, "0 divergences", d == 0, d.to_string());
         }
     }
+    // The protocol change F-wm makes, stated: forks HEAD accepts that M1+wm refuses.
+    let real = Arc::new(Mutex::new(BranchLedger::new()));
+    let mut wm = HeadCopy::new(true);
+    wm.use_wm = true;
+    let mut changed = 0u64;
+    for e in &log {
+        let is_fork = matches!(&e.command, Command::Branch { op: BranchOp::Fork { .. } });
+        let head_ok = matches!(lock(&real).apply(e), BranchEffect::Forked(_));
+        let r0 = wm.rejected;
+        let before = wm.br.len();
+        wm.apply(e);
+        let wm_ok = is_fork && wm.rejected == r0 && wm.br.len() > before;
+        if is_fork && head_ok && !wm_ok {
+            changed += 1;
+        }
+    }
+    println!("CW3 seed={seed} forks_HEAD_accepts_that_M1+wm_refuses={changed} (the stated protocol change; includes forks M1's fence refuses)");
 }
 
 fn main() {
