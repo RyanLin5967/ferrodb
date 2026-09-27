@@ -87,3 +87,18 @@ FAN-QUEUE row; engineering, not an invention lane. Lead-authorised 2026-09-27. L
 - R: **380 passed, 1 failed** (the new test). G: **381 passed, 0 failed**.
 - A failure of any OTHER test at R belongs to the base, not to F1. It is re-run alone, and reported with its panic line.
 - Registered 2026-09-27T09:03:43Z.
+
+## Amendment 1 (2026-09-27T09:07:39Z; after R and G, before any mutant or repeat run)
+- R held: 380 passed, 1 failed (the new test, final assertion, (A, B) = (1, 2)). Raw 4eac4f2.
+- G held: 381 passed, 0 failed, the reset test included. Raw 2cd07b4.
+- Mutants: the three patches in `mutants/`, each against the fix commit ca771fb, run by `fire.sh` over all 381
+  `consensus::` tests. transport.rs is restored from git before each run.
+  - M1: killed by the new test only.
+  - M2: killed by `shutdown_joins_every_thread_and_closes_the_listener`. Other tests may also fail, since every shutdown
+    now detaches its accept thread after 5 s; the run is slower.
+  - M3: survives (381 passed).
+- Repeats, to separate a race from a result (one binary each, the single test, 20 runs):
+  - the new test on the RED binary: 0 of 20 pass;
+  - the new test on the GREEN binary: 20 of 20 pass;
+  - `a_peer_that_resets_before_accept_cannot_fill_the_connection_cap` on the GREEN binary: 20 of 20 pass (the named
+    F1 risk). Any failure there is reported with its panic line, as a fixture question for the lead, and not edited.

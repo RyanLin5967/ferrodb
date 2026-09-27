@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2315,7 +2315,7 @@
+         if left.is_zero() {
+             return false;
+         }
+-        if TcpStream::connect_timeout(&wake, left).is_ok() {
++        if false && TcpStream::connect_timeout(&wake, left).is_ok() {
+             return true;
+         }
+         std::thread::sleep(retry.min(until.saturating_duration_since(Instant::now())));

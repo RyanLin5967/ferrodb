@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1527,7 +1527,7 @@
+         // wait). Set explicitly, because a caller's listener may arrive nonblocking. A blocking
+         // `accept` does not see the stop flag, so `shutdown` wakes it: see `wake_accept`.
+         listener
+-            .set_nonblocking(false)
++            .set_nonblocking(true)
+             .map_err(|e| FerroError::Io(e.to_string()))?;
+ 
+         let stop = Arc::new(AtomicBool::new(false));
