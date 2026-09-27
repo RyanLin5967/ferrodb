@@ -22,6 +22,8 @@
 
 #[path = "r11_dist/arms.rs"]
 mod arms;
+#[path = "r11_dist/splitsim.rs"]
+mod splitsim;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -314,11 +316,15 @@ static IDLE_DEADLINE_S: AtomicU64 = AtomicU64::new(0);
 /// A12: per-sample idle wait before the failover, in seconds.
 static PRE_FAIL_SLEEP_S: AtomicU64 = AtomicU64::new(0);
 
+/// Node `i`'s seed under a salt: the one expression `opts()` and the DC1/DC2 modes share (A16a).
+fn node_seed_for(salt: u64, i: usize) -> u64 {
+    0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+}
+
 fn opts(dir: &Path, addrs: &BTreeMap<NodeId, SocketAddr>, id: NodeId, i: usize) -> NodeOptions {
     let peers: BTreeMap<NodeId, SocketAddr> = addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
     // NodeOptions::new's own default tick (50 ms) is kept: the production timing.
-    let salt = SEED_SALT.load(Ordering::Relaxed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    let mut o = NodeOptions::new(dir, peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9) ^ salt);
+    let mut o = NodeOptions::new(dir, peers, node_seed_for(SEED_SALT.load(Ordering::Relaxed), i));
     // A12 control: the transport's idle close (default 60 s), overridable per run.
     let d = std::env::var("R11_IDLE_DEADLINE_S").ok().and_then(|x| x.parse::<u64>().ok()).unwrap_or(IDLE_DEADLINE_S.load(Ordering::Relaxed));
     if d > 0 {
@@ -1092,6 +1098,115 @@ fn run_growmon(n: u64, seed: u64, root: &Path) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("drawcensus") {
+        // r11_dist_fleet drawcensus <salt-lo> <salt-hi> [shared]: DC1 (PREREG A16, A16a).
+        let lo: u64 = args.get(2).and_then(|x| x.parse().ok()).expect("salt-lo");
+        let hi: u64 = args.get(3).and_then(|x| x.parse().ok()).expect("salt-hi");
+        let shared = args.get(4).map(|s| s == "shared").unwrap_or(false);
+        println!("# r11_dist_fleet drawcensus salts={lo}..={hi} shared={shared}");
+        let (mut ties, mut all_equal) = (0u64, 0u64);
+        let mut gaps: BTreeMap<u32, u64> = BTreeMap::new();
+        for salt in lo..=hi {
+            let d: Vec<u32> =
+                (0..3).map(|i| splitsim::first_draw(NodeId(i as u32 + 1), node_seed_for(salt, if shared { 0 } else { i }))).collect();
+            if salt <= 6 {
+                println!("DC1 salt={salt} first_draws={d:?}");
+            }
+            let m = *d.iter().min().unwrap();
+            if d.iter().all(|&x| x == d[0]) {
+                all_equal += 1;
+            }
+            if d.iter().filter(|&&x| x == m).count() > 1 {
+                ties += 1;
+                continue;
+            }
+            let s: Vec<u32> = d.iter().copied().filter(|&x| x != m).collect();
+            *gaps.entry(s[0].abs_diff(s[1])).or_insert(0) += 1;
+        }
+        println!("DC1 RESULT salts={} min_ties={ties} all_three_equal={all_equal} survivor_gap_counts={gaps:?}", hi - lo + 1);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("splitsim") {
+        // r11_dist_fleet splitsim <salt-lo> <salt-hi> <poll|zero|open> [shared]: DC2 (PREREG A16a).
+        let lo: u64 = args.get(2).and_then(|x| x.parse().ok()).expect("salt-lo");
+        let hi: u64 = args.get(3).and_then(|x| x.parse().ok()).expect("salt-hi");
+        let accept = match args.get(4).map(|s| s.as_str()) {
+            Some("poll") => splitsim::Accept::Poll,
+            Some("zero") => splitsim::Accept::Zero,
+            Some("open") => splitsim::Accept::Open,
+            other => panic!("arm must be poll, zero or open, got {other:?}"),
+        };
+        let shared = args.get(5).map(|s| s == "shared").unwrap_or(false);
+        println!("# r11_dist_fleet splitsim salts={lo}..={hi} arm={accept:?} shared={shared}");
+        // class -> [salts, splits, precands, cands, elect_us]
+        let mut tally: BTreeMap<String, [u64; 5]> = BTreeMap::new();
+        let (mut no_init, mut no_new, mut winner_not_min, mut dc1_tie_but_first) = (0u64, 0u64, 0u64, 0u64);
+        for salt in lo..=hi {
+            let seeds: [u64; 3] = [0usize, 1, 2].map(|i| node_seed_for(salt, if shared { 0 } else { i }));
+            let fd: [u32; 3] = [0usize, 1, 2].map(|i| splitsim::first_draw(NodeId(i as u32 + 1), seeds[i]));
+            let o = splitsim::failover(seeds, salt.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x7068_6173_6573, accept);
+            let Some(l) = o.init_leader else {
+                no_init += 1;
+                println!("DC2 salt={salt} NO INITIAL LEADER in 60 s");
+                continue;
+            };
+            if o.new_leader.is_none() {
+                no_new += 1;
+                println!("DC2 salt={salt} NO NEW LEADER in 60 s after the stop");
+                continue;
+            }
+            let m = *fd.iter().min().unwrap();
+            let tie = fd.iter().filter(|&&x| x == m).count() > 1;
+            if !tie && fd[l] != m {
+                winner_not_min += 1;
+            }
+            if tie && o.survivors_first_draw {
+                dc1_tie_but_first += 1;
+            }
+            let surv: Vec<usize> = (0..3).filter(|&k| k != l).collect();
+            let class = if tie || !o.survivors_first_draw {
+                "tie".to_string()
+            } else {
+                match fd[surv[0]].abs_diff(fd[surv[1]]) {
+                    0 => "gap0".to_string(),
+                    1 => "gap1".to_string(),
+                    _ => "gap2+".to_string(),
+                }
+            };
+            let t = tally.entry(class.clone()).or_insert([0; 5]);
+            t[0] += 1;
+            t[1] += o.split as u64;
+            t[2] += o.precands.iter().map(|&x| x as u64).sum::<u64>();
+            t[3] += o.cands.iter().map(|&x| x as u64).sum::<u64>();
+            t[4] += o.elect_us;
+            if salt <= 20 || (o.split && class == "gap2+") {
+                println!(
+                    "DC2 salt={salt} first_draws={fd:?} init_leader=n{} class={class} split={} precands={:?} cands={:?} elect_us={}",
+                    l + 1,
+                    o.split,
+                    o.precands,
+                    o.cands,
+                    o.elect_us
+                );
+            }
+        }
+        let (mut nt_salts, mut nt_splits) = (0u64, 0u64);
+        for (class, t) in &tally {
+            println!(
+                "DC2 RESULT arm={accept:?} shared={shared} class={class} salts={} splits={} precands={} cands={} elect_us_sum={}",
+                t[0], t[1], t[2], t[3], t[4]
+            );
+            if class != "tie" {
+                nt_salts += t[0];
+                nt_splits += t[1];
+            }
+        }
+        println!(
+            "DC2 RESULT arm={accept:?} shared={shared} non_tie_salts={nt_salts} non_tie_splits={nt_splits} splits_per_10000={} no_init={no_init} no_new={no_new} winner_not_min={winner_not_min} dc1_tie_but_first_draw={dc1_tie_but_first}",
+            if nt_salts > 0 { nt_splits * 10_000 / nt_salts } else { 0 }
+        );
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) == Some("growmon") {
         // r11_dist_fleet growmon <scratch-root> <N> <seed>: one group-committed growth, sampled each second.
         let root = PathBuf::from(args.get(2).expect("scratch root"));
