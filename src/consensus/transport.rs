@@ -1187,6 +1187,11 @@ impl Default for TransportOptions {
     }
 }
 
+/// r11-dist MEASUREMENT ONLY, never landed: when set, `start` leaves the listener nonblocking, which is
+/// F1's mutant M1 and exactly the pre-F1 accept path (the failed-accept arm sleeps `poll_interval` on
+/// WouldBlock). One binary then carries both arms of the F1 instrument runs.
+pub static R11_ACCEPT_POLL: AtomicBool = AtomicBool::new(false);
+
 /// Everything this transport has counted. **Every drop and refusal it decides on is counted, never
 /// silent** — a message that vanished without a number attached is indistinguishable from a protocol
 /// bug, and this transport is allowed to drop. What TCP loses after a frame left this process is
@@ -1233,6 +1238,11 @@ struct Counters {
     /// was answered, and `dial` blocks on that answer. With no accept failing and the cap not full,
     /// nothing should ever wait there: a redial after an idle close carries a campaign frame.
     accepts_after_sleep: AtomicU64,
+    /// r11-dist MEASUREMENT ONLY: a bounded trace of transport events on the process clock.
+    /// Kinds: 1 accept-loop wake from a sleep, 2 connection accepted, 3 a connection's first frame
+    /// delivered to the inbox (arg = sender id), 4 dial start, 5 dial done, 6 first frame written on a
+    /// new connection, 7 probe found the link closed (4-7: arg = the peer's port).
+    r11_events: Mutex<VecDeque<(Instant, u8, u64)>>,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1241,6 +1251,16 @@ struct Counters {
     /// or somebody who should not be talking to this port at all. An operator seeing this number
     /// move is being told something no other counter here can tell them.
     unauthenticated: AtomicU64,
+}
+
+impl Counters {
+    fn r11_trace(&self, kind: u8, arg: u64) {
+        let mut t = self.r11_events.lock().unwrap_or_else(|e| e.into_inner());
+        if t.len() >= 16384 {
+            t.pop_front();
+        }
+        t.push_back((Instant::now(), kind, arg));
+    }
 }
 
 /// One peer's queue and its current connection.
@@ -1527,7 +1547,7 @@ impl Transport {
         // wait). Set explicitly, because a caller's listener may arrive nonblocking. A blocking
         // `accept` does not see the stop flag, so `shutdown` wakes it: see `wake_accept`.
         listener
-            .set_nonblocking(false)
+            .set_nonblocking(R11_ACCEPT_POLL.load(Ordering::SeqCst))
             .map_err(|e| FerroError::Io(e.to_string()))?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1829,6 +1849,10 @@ impl Transport {
     pub fn accepts_after_sleep(&self) -> u64 {
         self.counters.accepts_after_sleep.load(Ordering::SeqCst)
     }
+    /// r11-dist MEASUREMENT ONLY: the event trace. See `Counters::r11_events`.
+    pub fn r11_trace(&self) -> Vec<(Instant, u8, u64)> {
+        self.counters.r11_events.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect()
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -2023,6 +2047,7 @@ fn sender_loop(
     // stalest frame goes first, against `push`'s policy. Consensus refuses a stale term, so one such
     // frame is harmless.
     let mut carried: Option<Vec<u8>> = None;
+    let mut r11_fresh = false;
     // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
     let probe_gap = idle_probe_gap(&opts);
     loop {
@@ -2031,6 +2056,7 @@ fn sender_loop(
         }
 
         if conn.is_none() {
+            counters.r11_trace(4, ob.addr.port() as u64);
             match dial(ob.addr, &stop, &opts) {
                 Ok(s) => {
                     match s.try_clone() {
@@ -2052,6 +2078,8 @@ fn sender_loop(
                     }
                     conn = Some(s);
                     last_used = Instant::now();
+                    counters.r11_trace(5, ob.addr.port() as u64);
+                    r11_fresh = true;
                 }
                 Err(_) => {
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
@@ -2106,6 +2134,7 @@ fn sender_loop(
                     break;
                 }
                 counters.idle_redials.fetch_add(1, Ordering::SeqCst);
+                counters.r11_trace(7, ob.addr.port() as u64);
                 let mut st = ob.state.lock().unwrap();
                 if let Some(old) = st.live.take() {
                     let _ = old.shutdown(Shutdown::Both);
@@ -2135,6 +2164,9 @@ fn sender_loop(
             conn = None;
         } else {
             last_used = Instant::now();
+            if std::mem::take(&mut r11_fresh) {
+                counters.r11_trace(6, ob.addr.port() as u64);
+            }
         }
     }
 
@@ -2348,6 +2380,7 @@ fn accept_loop(
                     let _ = stream.shutdown(Shutdown::Both);
                     break;
                 }
+                counters.r11_trace(2, 0);
                 if std::mem::take(&mut slept) {
                     counters.accepts_after_sleep.fetch_add(1, Ordering::SeqCst);
                 }
@@ -2386,6 +2419,7 @@ fn accept_loop(
                         // the poll the stop flag is already allowed (D207, from `207d362`).
                         std::thread::sleep(opts.poll_interval);
                         slept = true;
+                        counters.r11_trace(1, 0);
                         continue;
                     }
                     map.insert(id, mine);
@@ -2448,6 +2482,7 @@ fn accept_loop(
             Err(_) => {
                 std::thread::sleep(opts.poll_interval);
                 slept = true;
+                counters.r11_trace(1, 0);
             }
         }
     }
@@ -2476,6 +2511,7 @@ fn conn_loop(
     // including the refused-handshake return.
 
     let verdict = recv_handshake(&mut stream, &stop, opts.handshake_deadline);
+    let mut r11_first = true;
 
     // **Our handshake is written whatever the verdict, and that is the point of the version bump.**
     // A v1 peer is mid-`read_handshake` right now; giving it our six bytes is what makes its own
@@ -2574,9 +2610,13 @@ fn conn_loop(
                             continue;
                         }
                         counters.received.fetch_add(1, Ordering::SeqCst);
+                        let r11_from = m.from.0 as u64;
                         if tx.send((m, charge)).is_err() {
                             counters.inbox_bytes.fetch_sub(charge, Ordering::SeqCst);
                             break;
+                        }
+                        if std::mem::take(&mut r11_first) {
+                            counters.r11_trace(3, r11_from);
                         }
                     }
                     Err(_) => break,

@@ -377,7 +377,31 @@ impl Cluster {
             cfg: cfg.clone(),
             errs: errs.clone(),
         };
-        for (i, l) in listeners.into_iter().enumerate() {
+        // F1 amendment 2 (instrument 6): with R11_PHASE_JITTER=1 the three nodes start in a salted random order,
+        // each at T0 + U(0, 50 ms), so their tick grids (fixed from `Node::start`, node.rs:378) have random
+        // phases, as independent machines would. Unset, nodes start back to back in index order, as before.
+        let jitter = std::env::var("R11_PHASE_JITTER").map(|v| v == "1").unwrap_or(false);
+        let mut order: Vec<usize> = (0..3).collect();
+        let mut offs_us = [0u64; 3];
+        if jitter {
+            let mut g = ferrodb::consensus::Rng::new(SEED_SALT.load(Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0FF5_E7);
+            for o in offs_us.iter_mut() {
+                *o = g.next_u64() % 50_000;
+            }
+            order.sort_by_key(|&i| offs_us[i]);
+        }
+        let t0 = Instant::now() + Duration::from_millis(20);
+        let mut slots: Vec<Option<TcpListener>> = listeners.into_iter().map(Some).collect();
+        let mut built: Vec<Option<(Arc<Rep>, ArmL, Arc<Obs>, Arc<AtomicBool>, JoinHandle<u64>, PathBuf)>> = (0..3).map(|_| None).collect();
+        for &i in &order {
+            if jitter {
+                let at = t0 + Duration::from_micros(offs_us[i]);
+                let now = Instant::now();
+                if at > now {
+                    std::thread::sleep(at - now);
+                }
+            }
+            let l = slots[i].take().unwrap();
             let id = NodeId(i as u32 + 1);
             let dir = root.join(format!("n{}", i + 1));
             let ledger = ArmL::new(arm);
@@ -385,7 +409,15 @@ impl Cluster {
             let node = Node::start(id, cfg.clone(), l, opts(&dir, &addrs, id, i), ledger.applier(obs.clone())).unwrap();
             let rep = Arc::new(Rep::new(id, node));
             let stop = Arc::new(AtomicBool::new(false));
-            c.threads.push(Some(spawn_driver(rep.clone(), stop.clone(), errs.clone())));
+            let h = spawn_driver(rep.clone(), stop.clone(), errs.clone());
+            built[i] = Some((rep, ledger, obs, stop, h, dir));
+        }
+        if jitter {
+            println!("# phase jitter: start order {:?} offsets_us {:?}", order.iter().map(|i| i + 1).collect::<Vec<_>>(), offs_us);
+        }
+        for b in built {
+            let (rep, ledger, obs, stop, h, dir) = b.unwrap();
+            c.threads.push(Some(h));
             c.reps.push(rep);
             c.ledgers.push(ledger);
             c.obs.push(obs);
@@ -850,6 +882,90 @@ fn take_all(c: &Cluster) -> Vec<Vec<(ferrodb::consensus::Role, u64, Option<NodeI
     c.reps.iter().map(|r| r.with(|n| n.take_transitions()).unwrap_or_default()).collect()
 }
 
+/// F1 amendment 2: instruments (1), (3) and (6) for one failover, from the survivors' role logs and transport traces.
+/// Every instant is printed in microseconds after the stop (t_fail); None = not observed.
+fn f1_instruments(c: &Cluster, tag: &str, surv: &[usize], grids: &[Option<Instant>], t_fail: Instant, timers: &[(u32, u32)]) {
+    use ferrodb::consensus::Role;
+    let us = |t: Instant| -> i64 {
+        if t >= t_fail { (t - t_fail).as_micros() as i64 } else { -((t_fail - t).as_micros() as i64) }
+    };
+    let logs: Vec<Vec<(Instant, Role, u64)>> = surv.iter().map(|i| c.reps[*i].with(|n| n.take_r11_role_log()).unwrap_or_default()).collect();
+    let traces: Vec<Vec<(Instant, u8, u64)>> = surv.iter().map(|i| c.reps[*i].with(|n| n.r11_transport_trace()).unwrap_or_default()).collect();
+    let port = |i: usize| c.addrs[&NodeId(i as u32 + 1)].port() as u64;
+    let first_pc: Vec<Option<Instant>> = logs.iter().map(|l| l.iter().find(|e| e.1 == Role::PreCandidate).map(|e| e.0)).collect();
+    let cand_terms: Vec<Vec<u64>> = logs.iter().map(|l| l.iter().filter(|e| e.1 == Role::Candidate).map(|e| e.2).collect()).collect();
+    let split = cand_terms[0].iter().any(|t| cand_terms[1].contains(t));
+    // Per direction x -> y (k = x's index in surv, j = y's).
+    let mut dirs = Vec::new();
+    let mut l_from: [Option<Instant>; 2] = [None, None]; // first frame from surv[k] delivered at the other
+    for k in 0..2 {
+        let j = 1 - k;
+        let (x, y) = (surv[k], surv[j]);
+        let tx = &traces[k];
+        let ty = &traces[j];
+        let after = |v: &Vec<(Instant, u8, u64)>, from: Instant, kind: u8, arg: Option<u64>| {
+            v.iter().find(|e| e.0 >= from && e.1 == kind && arg.map_or(true, |a| e.2 == a)).map(|e| e.0)
+        };
+        let redial = after(tx, t_fail, 7, Some(port(y)));
+        let ds = redial.and_then(|r| after(tx, r, 4, Some(port(y))));
+        let dd = ds.and_then(|d| after(tx, d, 5, Some(port(y))));
+        let fw = dd.and_then(|d| after(tx, d, 6, Some(port(y))));
+        let acc = ds.and_then(|d| after(ty, d, 2, None));
+        let ff = ds.and_then(|d| after(ty, d, 3, Some(x as u64 + 1)));
+        l_from[k] = ff;
+        // (1): the receiver's accept phase against its own tick grid, and its last accept-loop wake before the accept.
+        let psi = match (acc, grids[j]) {
+            (Some(a), Some(g)) => {
+                let d = if a >= g { (a - g).as_micros() as i64 } else { -((g - a).as_micros() as i64) };
+                Some(d.rem_euclid(50_000))
+            }
+            _ => None,
+        };
+        let wakes = ty.iter().filter(|e| e.1 == 1 && e.0 >= t_fail).count();
+        dirs.push(format!(
+            "n{}->n{}: redial={:?} dial_start={:?} dial_done={:?} first_write={:?} accepted={:?} first_frame={:?} L3_us={:?} accept_wait_us={:?} dial_to_write_us={:?} psi_us={:?} receiver_wakes_after_stop={}",
+            x + 1,
+            y + 1,
+            redial.map(us),
+            ds.map(us),
+            dd.map(us),
+            fw.map(us),
+            acc.map(us),
+            ff.map(us),
+            ds.zip(ff).map(|(d, f)| us(f) - us(d)),
+            ds.zip(acc).map(|(d, a)| us(a) - us(d)),
+            ds.zip(fw).map(|(d, w)| us(w) - us(d)),
+            psi,
+            wakes
+        ));
+    }
+    // (6): E = the survivor that pre-campaigned first; delta = t_pc(other) - t_pc(E); L_E = E's first frame at the other - t_pc(E).
+    let (e, o) = match (first_pc[0], first_pc[1]) {
+        (Some(a), Some(b)) => if a <= b { (0, 1) } else { (1, 0) },
+        (Some(_), None) => (0, 1),
+        (None, Some(_)) => (1, 0),
+        (None, None) => (0, 1),
+    };
+    let delta = first_pc[e].zip(first_pc[o]).map(|(a, b)| us(b) - us(a));
+    let l_e = first_pc[e].zip(l_from[e]).map(|(p, f)| us(f) - us(p));
+    let predicted = match (l_e, delta) {
+        (Some(l), Some(d)) => Some(l > d),
+        (Some(_), None) => Some(false),
+        _ => None,
+    };
+    let grid_phase: Vec<Option<i64>> = grids.iter().map(|g| g.map(|g| us(g).rem_euclid(50_000))).collect();
+    println!(
+        "FFX {tag} arm={} survivors={:?} timers_at_stop={timers:?} gap={} grid_phase_us={grid_phase:?} t_pc_us={:?} cand_terms={cand_terms:?} split={split} E=n{} delta_us={delta:?} L_E_us={l_e:?} predicted_split={predicted:?} | {} | {}",
+        if ferrodb::consensus::transport::R11_ACCEPT_POLL.load(Ordering::SeqCst) { "poll(base)" } else { "F1" },
+        surv.iter().map(|i| format!("n{}", i + 1)).collect::<Vec<_>>(),
+        timers[0].0.abs_diff(timers[1].0),
+        first_pc.iter().map(|p| p.map(us)).collect::<Vec<_>>(),
+        surv[e] + 1,
+        dirs[0],
+        dirs[1]
+    );
+}
+
 fn run_firstfail(n: u64, seed: u64, root: &Path) {
     SEED_SALT.store(seed, Ordering::Relaxed);
     let tag = format!("N={n} seed={seed}");
@@ -907,6 +1023,11 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
     for r in &c.reps {
         r.max_gap_us.store(0, Ordering::Relaxed);
     }
+    // F1 amendment 2: each survivor's tick grid and a clean role log from here on.
+    let grids: Vec<Option<Instant>> = survivors.iter().map(|i| c.reps[*i].with(|n| n.r11_next_tick())).collect();
+    for i in &survivors {
+        let _ = c.reps[*i].with(|n| n.take_r11_role_log());
+    }
     let t_fail = Instant::now();
     let (join_ms, drop_ms) = c.stop_node_timed(l);
     // Sample each survivor's timer every ms until one of them leads with its round committed.
@@ -962,6 +1083,7 @@ fn run_firstfail(n: u64, seed: u64, root: &Path) {
         })
         .collect();
     let idle_closed_total: Vec<Option<u64>> = tc_after.iter().map(|a| a.as_ref().map(|a| a.idle_closed)).collect();
+    f1_instruments(&c, &tag, &survivors, &grids, t_fail, &timers_at_stop);
     println!("FF {tag} transport election_delta(idle_closed,lost_in_flight,connect_failures,dropped,inbound_dropped,idle_probes,idle_redials)={tdelta:?} idle_closed_total_at_end={idle_closed_total:?} idle_deadline_s={} pre_fail_sleep_s={}", IDLE_DEADLINE_S.load(Ordering::Relaxed), PRE_FAIL_SLEEP_S.load(Ordering::Relaxed));
     println!(
         "FF {tag} election winner={:?} B1_ms={b1:.1} stop_join_ms={join_ms:.1} stop_drop_ms={drop_ms:.1} claim_ms={:?} noop_ms={:?} elect_ms={elect_ms:.1} survivors={:?} timers_at_stop(timeout,since_heard)={timers_at_stop:?} timeouts_seen_during_election={draws:?} election_transitions={:?} terms_after={term_after:?} survivor_driver_max_gap_ms={egaps:?}",
@@ -1223,14 +1345,14 @@ fn main() {
         // r11_dist_fleet firstfail <scratch-root> <N:seed,N:seed,...> <hold-budget-s>
         let root = PathBuf::from(args.get(2).expect("scratch root"));
         std::fs::create_dir_all(&root).unwrap();
-        // N:seed[:pre-fail-sleep-s[:idle-deadline-s]]
-        let samples: Vec<(u64, u64, u64, u64)> = args
+        // N:seed[:pre-fail-sleep-s[:idle-deadline-s[:accept-arm]]]; accept-arm 2 = the pre-F1 poll, else F1
+        let samples: Vec<(u64, u64, u64, u64, u64)> = args
             .get(3)
             .expect("samples")
             .split(',')
             .map(|x| {
                 let f: Vec<u64> = x.split(':').map(|v| v.parse().unwrap()).collect();
-                (f[0], f[1], f.get(2).copied().unwrap_or(0), f.get(3).copied().unwrap_or(0))
+                (f[0], f[1], f.get(2).copied().unwrap_or(0), f.get(3).copied().unwrap_or(0), f.get(4).copied().unwrap_or(1))
             })
             .collect();
         let budget = Duration::from_secs(args.get(4).and_then(|x| x.parse().ok()).unwrap_or(1000));
@@ -1238,7 +1360,9 @@ fn main() {
         let (med, p99) = b0(&root);
         println!("B0 sync_data_ms median={med:.3} p99={p99:.3} samples=2000");
         let t0 = Instant::now();
-        for (n, seed, sleep_s, deadline_s) in samples {
+        for (n, seed, sleep_s, deadline_s, accept_arm) in samples {
+            ferrodb::consensus::transport::R11_ACCEPT_POLL.store(accept_arm == 2, Ordering::SeqCst);
+            println!("# sample N={n} seed={seed} accept_arm={}", if accept_arm == 2 { "poll(base)" } else { "F1" });
             PRE_FAIL_SLEEP_S.store(sleep_s, Ordering::Relaxed);
             IDLE_DEADLINE_S.store(deadline_s, Ordering::Relaxed);
             // A 10^6 sample needs about 3 min; do not start one that could overrun the hold.

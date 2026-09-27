@@ -216,6 +216,8 @@ pub struct Node<A: Applier> {
     refusals: Vec<FerroError>,
     /// Role transitions since the last drain, for a caller that wants them without polling.
     transitions: Vec<(Role, Term, Option<NodeId>)>,
+    /// r11-dist MEASUREMENT ONLY: every role change with its instant.
+    r11_role_log: Vec<(Instant, Role, Term)>,
     /// F6. See the module header.
     snapshots: Option<Box<dyn super::snapshot::SnapshotStore>>,
     retain_rounds: Option<u64>,
@@ -383,6 +385,7 @@ impl<A: Applier> Node<A> {
             pending: VecDeque::new(),
             refusals: Vec::new(),
             transitions: Vec::new(),
+            r11_role_log: Vec::new(),
             snapshots: opts.snapshots,
             retain_rounds: opts.retain_rounds,
             spooled: 0,
@@ -461,6 +464,18 @@ impl<A: Applier> Node<A> {
     }
     pub fn take_transitions(&mut self) -> Vec<(Role, Term, Option<NodeId>)> {
         std::mem::take(&mut self.transitions)
+    }
+    /// r11-dist MEASUREMENT ONLY: role changes with their instants since the last take.
+    pub fn take_r11_role_log(&mut self) -> Vec<(Instant, Role, Term)> {
+        std::mem::take(&mut self.r11_role_log)
+    }
+    /// r11-dist MEASUREMENT ONLY: the next tick's due instant; the tick grid never moves (see `poll`).
+    pub fn r11_next_tick(&self) -> Instant {
+        self.next_tick
+    }
+    /// r11-dist MEASUREMENT ONLY: the transport's event trace.
+    pub fn r11_transport_trace(&self) -> Vec<(Instant, u8, u64)> {
+        self.net.r11_trace()
     }
 
     /// Ask for a command to be committed. Only meaningful on a leader; anywhere else the state
@@ -888,6 +903,7 @@ impl<A: Applier> Node<A> {
 
             Action::RoleChanged { role, term, leader } => {
                 self.transitions.push((role, term, leader));
+                self.r11_role_log.push((Instant::now(), role, term));
             }
 
             Action::Refuse { why } => self.refusals.push(why),
