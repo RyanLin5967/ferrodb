@@ -102,3 +102,32 @@ FAN-QUEUE row; engineering, not an invention lane. Lead-authorised 2026-09-27. L
   - the new test on the GREEN binary: 20 of 20 pass;
   - `a_peer_that_resets_before_accept_cannot_fill_the_connection_cap` on the GREEN binary: 20 of 20 pass (the named
     F1 risk). Any failure there is reported with its panic line, as a fixture question for the lead, and not edited.
+
+## RESULT (2026-09-27T09:13:07Z)
+- R (raw 4eac4f2): 380 passed, 1 failed. The new test failed on its final assertion with (1, 2). **As registered.**
+- G (raw 2cd07b4): 381 passed, 0 failed, every named risk included. **As registered.**
+- Repeats (raw 2722963):
+
+  | Test | Binary | Result |
+  |---|---|---|
+  | new test | red | 0/20 pass; all 20 fail at :3159, (1,1) x6 and (1,2) x14 |
+  | new test | green | 20/20 pass |
+  | reset test (macOS) | green | 20/20 pass |
+
+  **As registered.**
+- Mutants (raw 36d5c04; five distinct binaries by sha256; transport.rs restored from git before each run, tree clean after):
+
+  | Mutant | Tests | Result | Registered |
+  |---|---|---|---|
+  | M1 `listener_polled_again` | 380 passed, 1 failed | **KILLED** by the new test alone, at :3159 with (1, 1) | as registered |
+  | M2 `shutdown_never_connects` | 379 passed, 2 failed | **KILLED** | as registered |
+  | M3 `stop_not_checked_after_accept` | 381 passed | **SURVIVED** | the stated survivor |
+
+  - M2 was killed by `shutdown_joins_every_thread_and_closes_the_listener` (:1095, "the listener was still accepting
+    after shutdown").
+  - M2 also failed `a_shutdown_during_a_dial_does_not_wait_out_the_reconnect_delay`: shutdown took 60.2 s. That test
+    sets `handshake_deadline` = 60 s, which is the wake's bound, so the fix's bounded detach is measured. (That test's
+    own message blames the reconnect delay; under M2 the cause is the wake.)
+  - M3 survived because the check saves a thread spawn and is not load-bearing.
+- Not run here, by the lead's scope: the full suite, including `tests/integration_consensus_failover.rs` and the cluster
+  integration targets that start and stop transports. It runs at landing, through lockrun.
