@@ -259,3 +259,43 @@ and by 0 splits in 28 real failovers, 11 of them equal-draw pairs, where the pai
 
 **Hold 5 load:** VOID under (ii), from other lanes' rustc (14:51:50-14:53:11 and 14:55:16-14:55:49) and a node process for 8 s.
 Holds 1-4 are VOID as before. The paired contrast stands as an upper bound on F1's latency.
+
+## Amendment 3 (2026-09-27T16:02:37Z; append-only; Rule One BATCH3 dist-f1h5 @ 398ce949, both lenses STANDS-WITH-CORRECTIONS)
+Every number reproduces from 78e9ed69/b876c043. Corrections:
+1. "Every registered band HOLDS" is FALSE as written. The registered phases prediction FAILED:
+   - base [8,1,1,1,1,0];
+   - F1 passes only at exactly 6/12;
+   - pooled over both arms, 14/24 fall in the 0-10 ms bin, a FAIL.
+2. Base L3 exceeds the registered "about 0-55 ms" spread in 3/60 redials (55.2, 58.7, 60.0 ms). That band did not hold
+   either. The median band and the under-1.65-ms band held.
+3. The F1 split and mechanism rows cannot discriminate.
+   - Every F1 delta is >= 3.55 ms and every F1 L_E <= 0.378 ms, so the F1 mechanism check has no positive case.
+   - The 0/30 F1 splits bound the F1 rate only at about 9.5 per 100 (95%).
+   - ONLY the latency result carries F1.
+   - The analysis's "mechanism" line counts predicted == split, which equals (L_E > delta) here.
+4. The arms are not matched on delta, because since_heard at the stop differs between arms. At most 11 of the 13 base splits
+   are attributable to the accept path: salts 106 and 123 would not have split at their F1 partner's delta.
+5. The gap class is the timeout draw only; since_heard is ignored. 2 of the 3 base gap-1 splits (salts 52, 84) had equal
+   remaining ticks at the stop, so they are equal-expiry splits.
+6. The cause given for the delta-spread failure is incomplete.
+   - The offsets do not determine delta: salt 21 has a 9.8-ms offset gap but delta 42.1/40.6 ms; salt 106 has 15.1 ms but
+     delta 9.1/41.0; salt 10 has 11.9 ms but delta 3.6/6.5.
+   - Under independent U(0,50) offsets, P(>= 7 of 11 below 13 ms) = 0.18, so the uniform-spread premise was wrong by
+     construction, not unlucky.
+   - A since_heard flip (phi versus 50 - phi) plus driver lateness is not excluded.
+7. "Upper bound on F1" is UNTESTED: load's direction on F1's latency was never measured (per-hold F1 medians are flat,
+   176-225 us). The scope is loopback (127.0.0.1) at N = 10. On real hosts  pays a connect plus a handshake round trip
+   before the first write, so L3 >= about 2.5 RTT. For multi-host deployments the measured value is a LOWER bound.
+8. The change in hold structure was not recorded, and is recorded now.
+   - Registered: "60 failovers in 4 lockrun holds of 15". Run: 4 holds of 14, plus 1 of 4.
+   - The fifth hold ran about 4 h later (the driver stopped on its disk gate), at load 4.7-15 against 8-72.
+9. KS: the exact one-sample p is 0.322 (0.328 was Stephens' asymptotic value). One per failover, n = 30: p = 0.109. Not
+   rejected either way.
+10. The load account missed node pid 35936 (14:54:50-58). The in-window load was min 8.81 / median 11.91 / max 15.06. The
+    analysis's 4.7/8.2/15.1 included 5.5 min of queue wait.
+
+**Hold 5 is VOID and re-queued** (lead ruling: builds compiled inside the 14:51:42Z hold).
+- It re-runs as f1i_h5b: the same 4 samples (salts 129, 84; both arms, order as registered), binary 85d4401.
+- It runs under the polled start bar (r11-dist PREREG A18 (P)): load + 5 <= 18, polled every 10 s for up to 300 s inside
+  the lock, refusing if the bar is not met.
+- The earlier hold-5 rows stay in raw and are labelled VOID. The 60-failover totals are re-reported with h5b in place of h5.
