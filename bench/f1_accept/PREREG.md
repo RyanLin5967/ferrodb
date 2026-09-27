@@ -301,3 +301,28 @@ Every number reproduces from 78e9ed69/b876c043. Corrections:
 - The earlier hold-5 rows stay in raw and are labelled VOID. The 60-failover totals are re-reported with h5b in place of h5.
 - Erratum to item 7 above: the unquoted heredoc that wrote it swallowed a backticked word. The sentence reads "On real
   hosts `dial` pays a connect plus a handshake round trip before the first write" (transport.rs `dial`).
+
+## RESULT 3 (2026-09-27T16:51:56Z): hold 5 re-run (f1i_h5b), and the totals with it in place of the VOID hold 5
+- Raw: artie-research 8a17fce1 (monitor e346dd77). Scored by score_a18.py; window 16:06:31-16:10:55Z from ACQUIRED.
+  - Start rule: 5.86 + 5 = 10.86, OK.
+  - (ii): VALID (no foreign process above 1 core for >= 10 s).
+  - (ii-b): VALID (5.20 + 5 = 10.20).
+  - Strict letter: VOID (230 foreign starts).
+  - This is the first F1 instrument hold that is VALID under the refined rule.
+- Rows: salt 129 (gap 0) base split (L_E 46.5 ms > delta 2.9 ms), F1 did not (L_E 0.363 ms). Salt 84 (gap 1) base split
+  (L_E 34.7 > delta 25.8 ms), F1 did not (L_E 0.380 ms). The outcomes are the same as the VOID hold 5.
+- Totals with h5b in place of h5 (analysis 67a0f6f2):
+
+  | | Base | F1 |
+  |---|---|---|
+  | L3 median | 30.2 ms | 0.216 ms |
+  | L3 max | 60.0 ms | 0.345 ms |
+  | redials under 1.65 ms | 2/60 | 60/60 |
+  | splits, gap 0 | 10/12 | 0/12 |
+  | splits, gap 1 | 3/12 | 0/12 |
+  | splits, gap >= 2 | 0/6 | 0/6 |
+
+  - The new base under-1.65 ms redial is h5b salt 129 n2->n1 at 0.445 ms, an accept that landed on the loop's wake.
+  - KS p = 0.322 (asymptotic formula, n = 60).
+- Amendment 3's corrections all still apply (the phases prediction failed; the F1 split rows cannot discriminate; loopback at
+  N = 10 only).
