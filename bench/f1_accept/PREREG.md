@@ -299,3 +299,5 @@ Every number reproduces from 78e9ed69/b876c043. Corrections:
 - It runs under the polled start bar (r11-dist PREREG A18 (P)): load + 5 <= 18, polled every 10 s for up to 300 s inside
   the lock, refusing if the bar is not met.
 - The earlier hold-5 rows stay in raw and are labelled VOID. The 60-failover totals are re-reported with h5b in place of h5.
+- Erratum to item 7 above: the unquoted heredoc that wrote it swallowed a backticked word. The sentence reads "On real
+  hosts `dial` pays a connect plus a handshake round trip before the first write" (transport.rs `dial`).
