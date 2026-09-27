@@ -1226,6 +1226,11 @@ struct Counters {
     /// Probes that found the peer had closed the link, so the sender redialled before writing
     /// instead of losing the frame to the closed connection (D224).
     idle_redials: AtomicU64,
+    /// Connections this listener took on its first `accept` after the accept thread SLEPT (F1). Each
+    /// one became pending while the thread slept and waited for the sleep to end before its handshake
+    /// was answered, and `dial` blocks on that answer. With no accept failing and the cap not full,
+    /// nothing should ever wait there: a redial after an idle close carries a campaign frame.
+    accepts_after_sleep: AtomicU64,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1796,6 +1801,10 @@ impl Transport {
     pub fn idle_redials(&self) -> u64 {
         self.counters.idle_redials.load(Ordering::SeqCst)
     }
+    /// Connections accepted only after the accept thread had slept. See `Counters::accepts_after_sleep`.
+    pub fn accepts_after_sleep(&self) -> u64 {
+        self.counters.accepts_after_sleep.load(Ordering::SeqCst)
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -1894,6 +1903,7 @@ pub struct TransportCounters {
     pub unaddressable: u64,
     pub idle_probes: u64,
     pub idle_redials: u64,
+    pub accepts_after_sleep: u64,
     pub live_inbound_conns: usize,
     pub inbox_bytes: usize,
 }
@@ -1918,6 +1928,7 @@ impl Transport {
             unaddressable: self.unaddressable(),
             idle_probes: self.idle_probes(),
             idle_redials: self.idle_redials(),
+            accepts_after_sleep: self.accepts_after_sleep(),
             live_inbound_conns: self.live_inbound_conns(),
             inbox_bytes: self.inbox_bytes(),
         }
@@ -1947,6 +1958,7 @@ impl std::fmt::Debug for Transport {
             .field("unaddressable", &self.unaddressable())
             .field("idle_probes", &self.idle_probes())
             .field("idle_redials", &self.idle_redials())
+            .field("accepts_after_sleep", &self.accepts_after_sleep())
             // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
             // reports only whether there is one.
             .field("signed", &self.signs_its_traffic())
@@ -2244,9 +2256,15 @@ fn accept_loop(
     key: Option<Arc<Key>>,
 ) {
     let mut conn_threads: Vec<JoinHandle<()>> = Vec::new();
+    // Set by every sleep below and taken by the next accepted connection, which is the one that may
+    // have waited out that sleep (F1, `Counters::accepts_after_sleep`).
+    let mut slept = false;
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if std::mem::take(&mut slept) {
+                    counters.accepts_after_sleep.fetch_add(1, Ordering::SeqCst);
+                }
                 // **Refused before a thread is spawned for it.** This transport does not
                 // authenticate, so an unbounded accept loop is an unauthenticated peer choosing how
                 // many threads this process runs.
@@ -2281,6 +2299,7 @@ fn accept_loop(
                         // for free. One poll per refusal bounds that, and delays a stop by at most
                         // the poll the stop flag is already allowed (D207, from `207d362`).
                         std::thread::sleep(opts.poll_interval);
+                        slept = true;
                         continue;
                     }
                     map.insert(id, mine);
@@ -2337,8 +2356,12 @@ fn accept_loop(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(opts.poll_interval);
+                slept = true;
             }
-            Err(_) => std::thread::sleep(opts.poll_interval),
+            Err(_) => {
+                std::thread::sleep(opts.poll_interval);
+                slept = true;
+            }
         }
     }
     // Joined, not detached: `Transport::shutdown` joins this thread, and it must not return while
