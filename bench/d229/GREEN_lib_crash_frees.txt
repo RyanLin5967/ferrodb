@@ -1,0 +1,5 @@
+# 2026-09-24T22:34:30Z HEAD=449ceab dirty=0
+# cmd: lockrun d229 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex FERRODB_D229_STRIDE=1 timeout 3600 cargo test --no-fail-fast --lib -- wal::recovery::tests_crash_frees::
+2026-09-24T22:34:30Z d229 acquiring (5s poll), pid 66712
+2026-09-24T23:08:43Z d229 ABORTED by signal (every descendant ran its own exit)
+# rc=143 end=2026-09-24T23:08:43Z
