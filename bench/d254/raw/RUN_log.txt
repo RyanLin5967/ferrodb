@@ -1,0 +1,3 @@
+2026-09-24T23:08:42Z d207 acquiring (5s poll), pid 7779
+Terminated: 15
+2026-09-24T23:09:02Z d207 ABORTED by signal (every descendant ran its own exit)
