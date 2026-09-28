@@ -1,0 +1,15 @@
+label=tip-a6901eb head=a6901eb12f59b0eaa8095c686e51d6c74a104950 start=2026-09-24T22:51:11Z
+cmd: env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d271_create_index_refused_leaves_nothing -- --nocapture
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d271.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.97s
+     Running tests/d271_create_index_refused_leaves_nothing.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d271_create_index_refused_leaves_nothing-2b13c84df720a7e4)
+
+running 4 tests
+test a_create_index_whose_persist_fails_after_writing_the_catalog_keeps_the_tree_it_names ... ok
+test a_create_fulltext_index_whose_persist_fails_after_writing_the_catalog_keeps_the_tree_it_names ... ok
+test a_create_index_refused_for_another_sessions_transaction_leaves_no_index_and_no_pages ... ok
+test a_create_fulltext_index_refused_for_another_sessions_transaction_leaves_no_index_and_no_pages ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.53s
+
+rc=0 end=2026-09-24T22:51:26Z

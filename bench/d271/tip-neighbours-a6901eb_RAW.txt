@@ -1,0 +1,76 @@
+label=tip-neighbours-a6901eb head=a6901eb12f59b0eaa8095c686e51d6c74a104950 start=2026-09-24T22:51:27Z
+cmd: env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d178_dml_index_correctness --test d178_dml_index_counters --test d179_secondary_strict_lower --test d179_secondary_strict_lower_counters --test d181_conjunct_order_independence --test d181_tie_break --test d187_null_index_scan --test d187_null_skip_is_counted --test d222_index_root_after_backfill --test d56_statsless_point_lookup --test integration_alter_column --test integration_capability_envelope --test integration_error_surface --test integration_fulltext_retrieval --test integration_merge_ddl_atomicity --test integration_secondary_index_debt --test integration_system_views --test reused_key_old_snapshot --test rollback_index_undo --test root_cell_is_per_index --test sim_durability
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d271.noindex)
+warning: unused import: `std::path::Path`
+  --> tests/integration_system_views.rs:26:5
+   |
+26 | use std::path::Path;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_system_views") generated 1 warning (run `cargo fix --test "integration_system_views" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.85s
+     Running tests/d178_dml_index_correctness.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d178_dml_index_correctness-341c02005efd970a)
+
+running 13 tests
+test delete_on_a_primary_key_equality_removes_exactly_one_row ... ok
+test updating_the_indexed_column_itself_is_not_a_moving_target ... ok
+test update_on_a_primary_key_range_changes_exactly_the_rows_above_the_bound ... ok
+test update_on_a_primary_key_equality_changes_exactly_one_row ... ok
+test delete_on_a_secondary_index_equality_removes_exactly_one_row ... ok
+test the_fixture_is_what_this_file_thinks_it_is ... ok
+test update_on_a_secondary_index_equality_changes_exactly_one_row ... ok
+test update_with_no_where_clause_changes_every_row ... ok
+test delete_on_a_primary_key_range_removes_exactly_the_rows_above_the_bound ... ok
+test a_predicate_the_optimizer_cannot_index_at_all_still_answers ... ok
+test update_on_an_unindexed_column_still_changes_exactly_the_matching_rows ... ok
+test an_unlowerable_conjunct_does_not_cost_the_statement_its_other_index ... ok
+test a_strict_lower_bound_on_a_secondary_index_answers_rather_than_erroring ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.79s
+
+     Running tests/d178_dml_index_counters.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d178_dml_index_counters-cdb5db4b265478f8)
+
+running 1 test
+test dml_reaches_the_index_and_plans_it_the_way_select_does ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.45s
+
+     Running tests/d179_secondary_strict_lower.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d179_secondary_strict_lower-c5a472972bdcbbb6)
+
+running 7 tests
+test lower_refuses_a_column_with_no_index ... ok
+test boundary_below_the_minimum ... ok
+test every_row_shares_the_boundary_value ... ok
+test boundary_at_the_maximum ... ok
+test strict_lower_with_an_upper_bound ... ok
+test no_row_holds_the_boundary_value ... ok
+test many_rows_share_the_boundary_value ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.14s
+
+     Running tests/d179_secondary_strict_lower_counters.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d179_secondary_strict_lower_counters-83fe904f6658df46)
+
+running 1 test
+test a_strict_lower_bound_on_a_secondary_column_reaches_the_index ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.87s
+
+     Running tests/d181_conjunct_order_independence.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d181_conjunct_order_independence-46355786aeeef3e9)
+
+running 1 test
+test the_two_typing_orders_of_one_predicate_examine_the_same_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.08s
+
+     Running tests/d181_tie_break.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d181_tie_break-8ae73f4de4e9ac12)
+
+running 3 tests
+test a_cost_tie_is_broken_the_same_way_whichever_order_it_is_typed ... ok
+test the_fixture_really_is_a_tie ... ok
+test both_candidates_beat_the_sequential_scan ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.43s
+
+     Running tests/d187_null_index_scan.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d187_null_index_scan-f29c698420d20646)
