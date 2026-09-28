@@ -1,0 +1,5 @@
+# 2026-09-24T22:37:23Z tree=/Users/idide/wt/ferrodb-d258-red.noindex HEAD=34880d4974e34b3f61c180748c3dab6071c9009c
+# cmd: lockrun d258 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d258_stage_atomic
+2026-09-24T22:37:23Z d258 acquiring (5s poll), pid 88437
+Terminated: 15
+2026-09-24T23:08:39Z d258 ABORTED by signal (every descendant ran its own exit)
