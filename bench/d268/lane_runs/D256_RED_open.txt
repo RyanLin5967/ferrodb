@@ -1,0 +1,44 @@
+# 2026-09-24T22:06:19Z HEAD=1f1d422 dirty=0
+# cmd: cargo test --no-fail-fast --test d256_malformed_heap_page_at_open
+2026-09-24T22:06:19Z d256 acquiring (5s poll), pid 94928
+2026-09-24T22:06:19Z d256 ACQUIRED: 94928 d256 2026-09-24T22:06:19Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.57s
+     Running tests/d256_malformed_heap_page_at_open.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d256_malformed_heap_page_at_open-d996421422945338)
+
+running 2 tests
+test an_open_whose_redo_meets_a_malformed_page_refuses_naming_it ... FAILED
+test an_open_whose_rebuild_meets_a_zero_page_refuses_naming_it_and_so_does_the_next ... FAILED
+
+failures:
+
+---- an_open_whose_redo_meets_a_malformed_page_refuses_naming_it stdout ----
+
+thread 'an_open_whose_redo_meets_a_malformed_page_refuses_naming_it' (357570341) panicked at src/storage/heap_page.rs:106:34:
+slice index starts at 23 but ends at 19
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'an_open_whose_redo_meets_a_malformed_page_refuses_naming_it' (357570341) panicked at tests/d256_malformed_heap_page_at_open.rs:101:19:
+the open PANICKED (slice index starts at 23 but ends at 19) on heap page 5 instead of refusing
+
+---- an_open_whose_rebuild_meets_a_zero_page_refuses_naming_it_and_so_does_the_next stdout ----
+
+thread 'an_open_whose_rebuild_meets_a_zero_page_refuses_naming_it_and_so_does_the_next' (357570340) panicked at src/storage/heap_page.rs:106:34:
+slice index starts at 23 but ends at 0
+
+thread 'an_open_whose_rebuild_meets_a_zero_page_refuses_naming_it_and_so_does_the_next' (357570340) panicked at tests/d256_malformed_heap_page_at_open.rs:101:19:
+open #1 PANICKED (slice index starts at 23 but ends at 0) on heap page 5 instead of refusing
+
+
+failures:
+    an_open_whose_rebuild_meets_a_zero_page_refuses_naming_it_and_so_does_the_next
+    an_open_whose_redo_meets_a_malformed_page_refuses_naming_it
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+error: test failed, to rerun pass `--test d256_malformed_heap_page_at_open`
+error: 1 target failed:
+    `--test d256_malformed_heap_page_at_open`
+2026-09-24T22:06:32Z d256 rc=101
+2026-09-24T22:06:32Z d256 released (owner matched)
+# rc=101 end=2026-09-24T22:06:32Z
