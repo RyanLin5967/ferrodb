@@ -1,0 +1,35 @@
+2026-09-24T23:03:21Z d216-d_red252-d252 acquiring (5s poll), pid 34324
+2026-09-24T23:03:21Z d216-d_red252-d252 ACQUIRED: 34324 d216-d_red252-d252 2026-09-24T23:03:21Z
+2026-09-24T23:03:21Z d216-d_red252-d252 pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 536 files, 565.5MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.55s
+     Running tests/d252_caught_up_subscription_lets_the_log_truncate.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d252_caught_up_subscription_lets_the_log_truncate-91fea13c2dc44a53)
+
+running 2 tests
+test a_subscription_passes_a_durable_rollback_after_the_last_commit ... FAILED
+test a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate ... FAILED
+
+failures:
+
+---- a_subscription_passes_a_durable_rollback_after_the_last_commit stdout ----
+
+thread 'a_subscription_passes_a_durable_rollback_after_the_last_commit' (363703380) panicked at tests/d252_caught_up_subscription_lets_the_log_truncate.rs:178:5:
+a subscription that had delivered every commit kept the log because a rolled-back transaction followed it: cursor 150, log end 429
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate stdout ----
+
+thread 'a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate' (363703381) panicked at tests/d252_caught_up_subscription_lets_the_log_truncate.rs:135:5:
+a subscription that had delivered every commit kept the log through a checkpoint: its cursor 332 stopped below the log's end 365 (base still 1)
+
+
+failures:
+    a_subscription_passes_a_durable_rollback_after_the_last_commit
+    a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--test d252_caught_up_subscription_lets_the_log_truncate`
+2026-09-24T23:03:31Z d216-d_red252-d252 rc=101
+2026-09-24T23:03:31Z d216-d_red252-d252 released (owner matched)
+rc=101
