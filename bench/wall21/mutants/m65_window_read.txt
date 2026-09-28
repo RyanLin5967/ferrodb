@@ -1,0 +1,40 @@
+mutant=m65_window_read applied= window_read base=30f247f713d5c5f3f41fcdd1ab1ee8ff316dee8f
+cmd=cargo test --test d200_reap_releases_id_slots -- a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal --nocapture
+2026-09-24T23:02:49Z
+diff --git a/src/branch/arena.rs b/src/branch/arena.rs
+index f0e6918..c735197 100644
+--- a/src/branch/arena.rs
++++ b/src/branch/arena.rs
+@@ -1099,11 +1099,7 @@ impl ArenaPageStore {
+                 // The reclamation rule as an index question rather than an array walk: is
+                 // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
+                 // structure that can answer it without holding every child resident.
+-                if !read(
+-                    slot,
+-                    "the live children in a page's epoch window",
+-                    self.catalog.live_child_in_epoch_range(slot, birth, free_epoch),
+-                )? {
++                if !self.catalog.live_child_in_epoch_range(slot, birth, free_epoch)? {
+                     self.release_page(page_id, arena);
+                     released += 1;
+                 } else {
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-mutants.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.11s
+     Running tests/d200_reap_releases_id_slots.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d200_reap_releases_id_slots-afa85a8f8f13df19)
+
+running 1 test
+
+thread 'a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal' (363658819) panicked at tests/d200_reap_releases_id_slots.rs:956:53:
+E1: a failed read on a resumed reap's slow path failed the whole open; it must be that reap's refusal: Io("injected persistent I/O error: live_child_in_epoch_range of slot 3")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal ... FAILED
+
+failures:
+
+failures:
+    a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--test d200_reap_releases_id_slots`
+rc=101

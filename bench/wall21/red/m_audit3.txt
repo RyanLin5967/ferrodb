@@ -1,0 +1,99 @@
+step=m_audit3 sha=fa21775181e7ac860a91389b91056565befeb1f9
+cmd=cargo test --lib --test d200_reap_releases_id_slots -- branch::table_catalog::tests::a_failed_free_list_write_keys_a_keyless_slot branch::table_catalog::tests::a_release_that_cannot_read_its_record_keys_the_slot branch::table_catalog::tests::an_unreadable_record_at_open_is_a_refusal_not_a_failed_open branch::table_catalog::tests::an_unreadable_reaped_record_does_not_stop_the_one_time_build branch::table_catalog::tests::a_release_whose_liveness_read_fails_keeps_the_slot_keyed branch::table_catalog::tests::a_failed_free_list_write_leaves_the_slot_keyed a_resumed_reap_that_errs_does_not_fail_the_open
+2026-09-24T23:01:52Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2471:17
+     |
+2471 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2643 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2471:17
+     |
+2471 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2643 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2471:17
+     |
+2471 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2644 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2471:17
+     |
+2471 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2644 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.40s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 6 tests
+test branch::table_catalog::tests::an_unreadable_reaped_record_does_not_stop_the_one_time_build ... FAILED
+test branch::table_catalog::tests::an_unreadable_record_at_open_is_a_refusal_not_a_failed_open ... FAILED
+test branch::table_catalog::tests::a_release_that_cannot_read_its_record_keys_the_slot ... FAILED
+test branch::table_catalog::tests::a_failed_free_list_write_leaves_the_slot_keyed ... ok
+test branch::table_catalog::tests::a_failed_free_list_write_keys_a_keyless_slot ... FAILED
+test branch::table_catalog::tests::a_release_whose_liveness_read_fails_keeps_the_slot_keyed ... ok
+
+failures:
+
+---- branch::table_catalog::tests::an_unreadable_reaped_record_does_not_stop_the_one_time_build stdout ----
+
+thread 'branch::table_catalog::tests::an_unreadable_reaped_record_does_not_stop_the_one_time_build' (363576414) panicked at src/branch/table_catalog.rs:3589:14:
+W3: one undecodable Reaped record failed the one-time build, and so the open: Branch("corrupt branch metadata: core branch record must be 54 bytes (or 51 from a build before the depth field widened), got 4")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- branch::table_catalog::tests::an_unreadable_record_at_open_is_a_refusal_not_a_failed_open stdout ----
+
+thread 'branch::table_catalog::tests::an_unreadable_record_at_open_is_a_refusal_not_a_failed_open' (363576415) panicked at src/branch/table_catalog.rs:3549:14:
+W3: one undecodable record failed the whole open: Branch("corrupt branch metadata: core branch record must be 54 bytes (or 51 from a build before the depth field widened), got 4")
+
+---- branch::table_catalog::tests::a_release_that_cannot_read_its_record_keys_the_slot stdout ----
+
+thread 'branch::table_catalog::tests::a_release_that_cannot_read_its_record_keys_the_slot' (363576412) panicked at src/branch/table_catalog.rs:3501:9:
+W2: a slot whose own record could not be read was left keyless and not free
+
+---- branch::table_catalog::tests::a_failed_free_list_write_keys_a_keyless_slot stdout ----
+
+thread 'branch::table_catalog::tests::a_failed_free_list_write_keys_a_keyless_slot' (363576410) panicked at src/branch/table_catalog.rs:3478:9:
+W1: a keyless slot whose FREE_ID write failed is still keyless and not free: stranded
+
+
+failures:
+    branch::table_catalog::tests::a_failed_free_list_write_keys_a_keyless_slot
+    branch::table_catalog::tests::a_release_that_cannot_read_its_record_keys_the_slot
+    branch::table_catalog::tests::an_unreadable_reaped_record_does_not_stop_the_one_time_build
+    branch::table_catalog::tests::an_unreadable_record_at_open_is_a_refusal_not_a_failed_open
+
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 1670 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `--lib`
+rc=101

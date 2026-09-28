@@ -1,0 +1,37 @@
+step=f_d200_d201 sha=372515f120f8259730505a2c6ca17f270852372b
+cmd=cargo test --test d200_reap_releases_id_slots --test d201_reaperless_seal_keeps_the_pin -- --nocapture
+2026-09-24T23:01:11Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.38s
+     Running tests/d200_reap_releases_id_slots.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d200_reap_releases_id_slots-afa85a8f8f13df19)
+
+running 3 tests
+
+thread 'a_recycled_slot_leaves_the_reaped_span' (363488695) panicked at tests/d200_reap_releases_id_slots.rs:198:5:
+in_state(Reaped) returned a record that is not Reaped: [(BranchId { id: 1, generation: 1 }, Live)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_recycled_slot_leaves_the_reaped_span ... FAILED
+
+thread 'the_open_sweep_gives_back_leaked_slots_and_nothing_else' (363488696) panicked at tests/d200_reap_releases_id_slots.rs:166:5:
+assertion `left == right` failed: D200: the open-time sweep did not give back exactly the leaked slots (L, Q, X, Y, Z) plus the one already free (F), with P kept
+  left: [8]
+ right: [1, 2, 3, 4, 5, 8]
+test the_open_sweep_gives_back_leaked_slots_and_nothing_else ... FAILED
+
+thread 'a_reaped_chain_gives_back_every_id_slot_it_held' (363488694) panicked at tests/d200_reap_releases_id_slots.rs:104:5:
+assertion `left == right` failed: D200: only these slots came back. Every pruned interior's slot is gone for good: the cascade detached it and nothing released it
+  left: [8]
+ right: [1, 2, 3, 4, 5, 6, 7, 8]
+test a_reaped_chain_gives_back_every_id_slot_it_held ... FAILED
+
+failures:
+
+failures:
+    a_reaped_chain_gives_back_every_id_slot_it_held
+    a_recycled_slot_leaves_the_reaped_span
+    the_open_sweep_gives_back_leaked_slots_and_nothing_else
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+error: test failed, to rerun pass `--test d200_reap_releases_id_slots`
+rc=101
