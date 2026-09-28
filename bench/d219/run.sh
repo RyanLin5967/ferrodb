@@ -26,7 +26,8 @@ ONEFLUSH=b875ab3 # ONE flush after all the rewrites (eff03e8) + the two-table re
 ALTERRED=789d1da # catalog::alter tests 1-2 on 6f22427's code (flush before finish, unconditional)
 POISONRED=33e3d67 # catalog::alter test 3 on 77bddcb's code (stamps still written inside the rewrite loop)
 A1RED=e60c5be    # PREREG A1's red: test 3 expects the poisoned-store ALTER refused (on f513a37's code)
-FIX=49c852f      # the whole fix (src as at 50e175b, PREREG A1's probe) + PREREG A2's tests and texts
+A3RED=438192b    # PREREG A3's red: P1 and P2 on 1dfe13f's code (the MERGE does not probe the store)
+FIX=2513758      # the whole fix + A1's probe + A2's tests and texts + A3's MERGE probe
 EX=d219_merge_sync_curve
 T=d219_one_provenance_sync_per_merge
 export CARGO_TARGET_DIR=$WT/target
@@ -94,6 +95,10 @@ step b6_red_$POISONRED timeout 3600 cargo test --lib catalog::alter::tests
 git -C "$FIRE" checkout --detach -q "$A1RED" || exit 3
 step b7_red_$A1RED timeout 3600 cargo test --lib catalog::alter::tests
 
+# ---- (b8) PREREG A3's red: P1 FAILS at its column count (3, not 2); P2 passes ------------------
+git -C "$FIRE" checkout --detach -q "$A3RED" || exit 3
+step b8_red_$A3RED timeout 3600 cargo test --lib agent_sql::runtime::tests::a_merge_
+
 # ---- (c) AFTER: the fix --------------------------------------------------------------------------
 git -C "$FIRE" checkout --detach -q "$FIX" || exit 3
 step c_build_after timeout 3600 cargo build --release --example "$EX"
@@ -102,6 +107,7 @@ step c_curve_after_$FIX timeout 7200 "$WT/target/d219_after_bin"
 step c_green_$FIX timeout 3600 cargo test --test "$T"
 step c_lib_provenance_$FIX timeout 3600 cargo test --lib provenance::
 step c_lib_alter_$FIX timeout 3600 cargo test --lib catalog::alter::tests
+step c_lib_merge_probe_$FIX timeout 3600 cargo test --lib agent_sql::runtime::tests::a_merge_
 step c_lib_list_$FIX timeout 3600 cargo test --lib provenance:: -- --list
 git -C "$FIRE" checkout --detach -q "$BASE" || exit 3
 step c_lib_list_$BASE timeout 3600 cargo test --lib provenance:: -- --list
@@ -153,6 +159,9 @@ mutant M26_more_than_one_moved_row catalog::alter::tests::a_rewrite_that_moves_o
 mutant M27_epoch_bump_after_provenance catalog::alter::tests::a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered
 mutant M28_no_writable_probe catalog::alter::tests::a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered
 mutant M29_probe_without_attribution catalog::alter::tests::an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store
+# PREREG A3
+mutant M30_no_merge_writable_probe agent_sql::runtime::tests::a_merge_that_will_stamp_on_a_poisoned_store_is_refused_before_its_schema_installs
+mutant M31_merge_probe_unconditional agent_sql::runtime::tests::a_merge_that_publishes_nothing_on_a_poisoned_store_is_not_refused
 
 git -C "$FIRE" checkout --detach -f -q "$FIX"
 git -C "$WT" worktree remove --force "$FIRE"
