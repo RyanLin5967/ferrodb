@@ -2058,6 +2058,13 @@ fn minflt() -> i64 {
 /// A18 (F): the A-Z heap history, exactly as 72fa4b8:1452-1465 ran it: ZK over run_w(N, N), ZK's close applied, ZK dropped;
 /// then M1 over run_w(N, N), boxed as `dyn Ledger`. `pre` puts a no-op fence (owner 9, round 0) in before the build.
 fn az_build(n: u64, pre: bool) -> (Box<dyn Ledger>, Round) {
+    az_build_owner(n, if pre { Some(9) } else { None })
+}
+
+/// The A-Z history with an optional fence record pre-inserted at round 0 before the build: owner 9 is A18's PRE (an
+/// allocation-free proxy); owner 1 is A19's OWN (CockroachDB's layout: the dead owner's own record exists and the fence
+/// updates it in place). A fence at round 0 fences nothing, since every fork is at round >= 1.
+fn az_build_owner(n: u64, pre_owner: Option<u32>) -> (Box<dyn Ledger>, Round) {
     {
         let mut z: Box<dyn Ledger> = Box::new(Zk::new());
         let last = run_w(n, n, |e| {
@@ -2067,8 +2074,8 @@ fn az_build(n: u64, pre: bool) -> (Box<dyn Ledger>, Round) {
         std::hint::black_box(z.live_ids_of(1).len());
     }
     let mut m = HeadCopy::new(true);
-    if pre {
-        m.fence.insert(9, 0);
+    if let Some(o) = pre_owner {
+        m.fence.insert(o, 0);
     }
     let mut l: Box<dyn Ledger> = Box::new(m);
     let last = run_w(n, n, |e| {
@@ -2128,6 +2135,85 @@ fn mode_fz(reps: u64, timed: bool) {
                         let f1 = minflt();
                         println!("FZC arm={arm} N={n} rep={rep} allocs={} minflt={} live_after={}", a1 - a0, f1 - f0, l.live_ids_of(1).len());
                     }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A19 (X), PREREG.md (registered 2026-10-01T05:22:22Z, before any A18 (F) data): the fence apply on the SOTA layout (OWN)
+// from 10^4 to 10^7, with a forced-cold bound, a TLB-cold arm, and two planted controls. A closing arm: it cannot yield SURV.
+// ---------------------------------------------------------------------------------------------
+
+/// 512 MiB, above the 16 MiB L2 and the SLC (sysctl hw.perflevel0.l2cachesize); written outside the timer.
+const X_BUF: usize = 512 << 20;
+
+fn mode_x(reps: u64, timed: bool) {
+    println!("# x reps={reps} timed={timed} (A19 (X)); arms AZ, OWN, CACHE-COLD, TLB-COLD, SQRT-PLANT, LIN-PLANT rotated per rep");
+    // Allocated and pre-faulted once, so the cold passes write resident memory and fault nothing.
+    let mut buf = vec![0u8; X_BUF];
+    for i in (0..X_BUF).step_by(4096) {
+        buf[i] = 1;
+    }
+    let arms = ["AZ", "OWN", "CACHE-COLD", "TLB-COLD", "SQRT-PLANT", "LIN-PLANT"];
+    for &n in &[10_000u64, 100_000, 1_000_000, 3_000_000, 10_000_000] {
+        for rep in 0..reps {
+            for k in 0..arms.len() {
+                let arm = arms[(k + rep as usize) % arms.len()];
+                // The plants are measured where the falsifier reads: 10^6 and 10^7.
+                if arm.ends_with("PLANT") && n != 1_000_000 && n != 10_000_000 {
+                    continue;
+                }
+                let (mut l, last) = az_build_owner(n, if arm == "AZ" { None } else { Some(1) });
+                match arm {
+                    // Every 128-B line: evicts the caches.
+                    "CACHE-COLD" => {
+                        for i in (0..X_BUF).step_by(128) {
+                            buf[i] = buf[i].wrapping_add(1);
+                        }
+                    }
+                    // One write per 16 KiB page: flushes the TLB, touches at most 1/128 of the sets.
+                    "TLB-COLD" => {
+                        for i in (0..X_BUF).step_by(16384) {
+                            buf[i] = buf[i].wrapping_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+                std::hint::black_box(&buf);
+                let walk: u64 = match arm {
+                    "SQRT-PLANT" => (n as f64).sqrt().ceil() as u64,
+                    "LIN-PLANT" => n,
+                    _ => 0,
+                };
+                if timed {
+                    let t0 = Instant::now();
+                    let mut hits = 0u64;
+                    for i in 1..=walk {
+                        if l.is_live(cid(1, i)) {
+                            hits += 1;
+                        }
+                    }
+                    l.apply(&Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) });
+                    let ns = t0.elapsed().as_nanos();
+                    std::hint::black_box(hits);
+                    println!("X arm={arm} N={n} rep={rep} ns={ns} walk={walk} live_after={}", l.live_ids_of(1).len());
+                } else {
+                    let e = Entry { term: 2, round: last + 1, command: abandon_c(sentinel(1)) };
+                    let f0 = minflt();
+                    let a0 = ALLOCS.load(Ordering::Relaxed);
+                    let mut hits = 0u64;
+                    for i in 1..=walk {
+                        if l.is_live(cid(1, i)) {
+                            hits += 1;
+                        }
+                    }
+                    l.apply(&e);
+                    let a1 = ALLOCS.load(Ordering::Relaxed);
+                    let f1 = minflt();
+                    std::hint::black_box(hits);
+                    println!("XC arm={arm} N={n} rep={rep} allocs={} minflt={} walk={walk} live_after={}", a1 - a0, f1 - f0, l.live_ids_of(1).len());
                 }
             }
         }
@@ -2332,6 +2418,7 @@ fn main() {
         Some("s6") => mode_s6(arg(2), arg(3), args.get(4).map(|x| x == "wm").unwrap_or(false)),
         Some("conformwide") => mode_conformwide(arg(2)),
         Some("fz") => mode_fz(arg(2), args.get(3).map(|x| x == "timed").unwrap_or(false)),
+        Some("x") => mode_x(arg(2), args.get(3).map(|x| x == "timed").unwrap_or(false)),
         Some("hb") => mode_hb(),
         _ => {
             eprintln!("usage: r11_dist_ledger counts <T> <N> | p6 | p8 <seed> | o2 <N> | timed");
