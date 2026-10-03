@@ -20,7 +20,7 @@ The untrimmed payload goes to .sessionstart_full.txt with five proof tokens spre
 The tokens exist ONLY in that file; the sentinel beside it holds their hashes. That is what
 makes pretooluse_handoff_read.sh an OUTCOME test rather than a wording test -- see its header.
 """
-import hashlib, io, os, re, secrets, subprocess, sys, datetime, glob
+import time, hashlib, io, os, re, secrets, subprocess, sys, datetime, glob
 
 R = "/Users/idide/projects/ferrodb"
 A = "/Users/idide/wt/artie-research"
@@ -251,15 +251,37 @@ def prose_parts():
     agents = "\n".join("  " + a[:150] for a in ag[-8:]) or "  (none recorded in this slice)"
     return ("\n".join(words) or "  (no verbatim messages extracted)", calls, agents)
 
+
+# ---------------------------------------------------------------------------------------
+# 0. NOW -- the lead-maintained current state (Ryan, 2026-10-03: "you should be removing and
+#    adding to the handoff as you go"). Every other section is derived from records that age
+#    (ledger rows, design notes, Ryan's words banked only at compaction). This file is edited by
+#    the lead as work starts and ends, so it carries today's objectives and live work. A missing
+#    or empty file is printed as a refusal, never as "nothing is going on".
+# ---------------------------------------------------------------------------------------
+def now():
+    p = os.path.join(A, "frontier", "HANDOFF-NOW.md")
+    txt = read(p)
+    if not txt or not txt.strip():
+        return ("  REFUSING: %s is missing or empty. Current objectives and live work are UNKNOWN;\n"
+                "  read frontier/RESUME.md's top banner and the live agent list before acting." % p)
+    try:
+        age = int(time.time() - os.path.getmtime(p))
+    except Exception:
+        age = -1
+    head = "  (file: %s, last edited %s ago)" % (p, ("%dh%02dm" % (age // 3600, age % 3600 // 60)) if age >= 0 else "?")
+    return head + "\n" + "\n".join("  " + l for l in txt.rstrip().splitlines())
+
 words, calls, agents = prose_parts()
 
 SECTIONS = [
     section("1. CONSTRAINTS THAT ARE NEVER RELAXED", CONSTRAINTS, 0),
+    section("0. NOW -- CURRENT OBJECTIVES AND LIVE WORK (lead-maintained, newest)", now(), 0),
     section("2. WHERE THE WORK IS RIGHT NOW (live git, not banked)", where(), 1),
-    section("3. OPEN LEDGER ROWS -- the single next action", ledger(), 2),
+    section("3. FERRODB ENGINEERING LEDGER -- PAUSED since 2026-09-24 (Ryan: inventions only); NOT the current work, see section 0", ledger(), 5),
     section("4. WHAT IS STILL LINEAR (the objective is 10^6 branches)", linear(), 3),
-    section("5. RYAN'S OWN WORDS -- NEWEST FIRST, verbatim", words, 4),
-    section("6. DESIGN DECISIONS + FALSIFIERS", design(), 5),
+    section("5. RYAN'S OWN WORDS AS BANKED AT THE LAST COMPACTION -- NEWEST FIRST (newer words are in section 0)", words, 2),
+    section("6. FERRODB DESIGN DECISIONS (SCALE-DESIGN) -- background for paused engineering", design(), 6),
     section("7. THE LAST TOOL CALLS BEFORE THE CUT", calls, 6),
     section("8. AGENTS DISPATCHED IN THAT SLICE -- any may still be LIVE", agents, 7),
 ]
