@@ -1,0 +1,51 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d176-merge-rowcount)
+    Finished `release` profile [optimized] target(s) in 8.83s
+     Running `target/release/examples/d176_merge_rowcount`
+D176 — merge cost as an INTEGER. rows = rows RETURNED by scans; tuples = tuples
+pulled off the heap by SeqScan. Both scoped to the statement window by read-twice-
+and-subtract. reps=5 per cell; min==max means the count is deterministic.
+
+== ARM A — plain MERGE;  delta FIXED at 4, table size varies 8x ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls   ok
+    500           4          4          2000         2000       4    5
+   1000           4          4          4000         4000       4    5
+   2000           4          4          8000         8000       4    5
+   4000           4          4         16000        16000       4    5
+
+== ARM B — SIMULATE … ASSERT ON t   (the surviving full scan; ALSO THE FIRE-CHECK) ==
+== B-CTL — SIMULATE … ASSERT ON small  (identical statement, 1-row assertion table) ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls   ok  arm
+    500        1012       1012          3000         3000      14    5  B
+    500          14         14          2002         2002      14    5  B-CTL
+   1000        2012       2012          6000         6000      14    5  B
+   1000          14         14          4002         4002      14    5  B-CTL
+   2000        4012       4012         12000        12000      14    5  B
+   2000          14         14          8002         8002      14    5  B-CTL
+   4000        8012       8012         24000        24000      14    5  B
+   4000          14         14         16002        16002      14    5  B-CTL
+
+== ARM C — delta axis, table size FIXED at 2000 ==
+  delta    rows_max   tuples_max    ok  path
+      1           1         2000     5  A (plain MERGE)
+      1        4003         6000     5  B (SIMULATE+ASSERT ON t)
+      2           2         4000     5  A (plain MERGE)
+      2        4006         8000     5  B (SIMULATE+ASSERT ON t)
+      4           4         8000     5  A (plain MERGE)
+      4        4012        12000     5  B (SIMULATE+ASSERT ON t)
+      8           8        16000     5  A (plain MERGE)
+      8        4024        20000     5  B (SIMULATE+ASSERT ON t)
+     16          16        32000     5  A (plain MERGE)
+     16        4048        36000     5  B (SIMULATE+ASSERT ON t)
+     32          32        64000     5  A (plain MERGE)
+     32        4096        68000     5  B (SIMULATE+ASSERT ON t)
+
+== VERDICT against bench/d176_prereg.txt ==
+F4 fire-check — ARM B grew with table size and reached >= n:  FIRED — instrument sees a full scan
+B-CTL control is flat in table size (14 -> 14):  YES — B's slope is the scan of t
+ARM A rows/merge: 4 at n=500 -> 4 at n=4000
+ARM B rows/merge: 1012 at n=500 -> 8012 at n=4000  (ratio to n: 2.00x at n=4000)
+⇒ F1 HOLDS: ARM A is FLAT in table size. The O(table) claim as banked is DEAD
+  for the plain-MERGE path at this commit.
+⇒ F2: ARM A rows move with DELTA at fixed size (1 -> 32): YES — 'independent of how much changed' is false
+
+[exited with code 0]

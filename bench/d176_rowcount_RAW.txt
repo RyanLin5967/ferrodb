@@ -1,0 +1,80 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d176-merge-rowcount)
+    Finished `release` profile [optimized] target(s) in 9.24s
+     Running `target/release/examples/d176_merge_rowcount`
+D176 — merge cost as an INTEGER. rows = rows RETURNED by scans; tuples = tuples
+pulled off the heap by SeqScan. Both scoped to the statement window by read-twice-
+and-subtract. reps=5 per cell; min==max means the count is deterministic.
+
+== ARM A — plain MERGE;  delta FIXED at 4, table size varies 8x ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls  scans idxscn   own_tup   ok
+    500           4          4          2000         2000       4      4     4         0    5
+   1000           4          4          4000         4000       4      4     4         0    5
+   2000           4          4          8000         8000       4      4     4         0    5
+   4000           4          4         16000        16000       4      4     4         0    5
+
+== ARM B — SIMULATE … ASSERT ON t   (the surviving full scan; ALSO THE FIRE-CHECK) ==
+== B-CTL — SIMULATE … ASSERT ON small  (identical statement, 1-row assertion table) ==
+  nrows    rows_min   rows_max    tuples_min   tuples_max   calls  scans idxscn   own_tup   ok  arm
+    500        1012       1012          3000         3000      14      6    12      1000    5  B
+    500          14         14          2002         2002      14      6    12         2    5  B-CTL
+   1000        2012       2012          6000         6000      14      6    12      2000    5  B
+   1000          14         14          4002         4002      14      6    12         2    5  B-CTL
+   2000        4012       4012         12000        12000      14      6    12      4000    5  B
+   2000          14         14          8002         8002      14      6    12         2    5  B-CTL
+   4000        8012       8012         24000        24000      14      6    12      8000    5  B
+   4000          14         14         16002        16002      14      6    12         2    5  B-CTL
+
+== ARM C — delta axis, table size FIXED at 2000 ==
+  delta    rows_max   tuples_max   calls  scans idxscn   own_tup   ok  path
+      1           1         2000       1      1     1         0    5  A (plain MERGE)
+      1        4003         6000       5      3     3      4000    5  B (SIMULATE+ASSERT ON t)
+      2           2         4000       2      2     2         0    5  A (plain MERGE)
+      2        4006         8000       8      4     6      4000    5  B (SIMULATE+ASSERT ON t)
+      4           4         8000       4      4     4         0    5  A (plain MERGE)
+      4        4012        12000      14      6    12      4000    5  B (SIMULATE+ASSERT ON t)
+      8           8        16000       8      8     8         0    5  A (plain MERGE)
+      8        4024        20000      26     10    24      4000    5  B (SIMULATE+ASSERT ON t)
+     16          16        32000      16     16    16         0    5  A (plain MERGE)
+     16        4048        36000      50     18    48      4000    5  B (SIMULATE+ASSERT ON t)
+     32          32        64000      32     32    32         0    5  A (plain MERGE)
+     32        4096        68000      98     34    96      4000    5  B (SIMULATE+ASSERT ON t)
+
+== ARM D — plain MERGE on an INDEXED t(id).  Same axis as ARM A. ==
+   AMENDMENT 1 to the pre-registration: added AFTER seeing ARM A, and recorded as
+   such. ARM A's tuples = delta*n could be a property of a table with no index on
+   the column the point lookups filter. This offers the planner one.
+  nrows    rows_max   tuples_min   tuples_max   calls  scans idxscn   own_tup   ok  arm
+    500           4         2000         2000       4      4     4         0    5  D (indexed)
+   1000           4         4000         4000       4      4     4         0    5  D (indexed)
+   2000           4         8000         8000       4      4     4         0    5  D (indexed)
+   4000           4        16000        16000       4      4     4         0    5  D (indexed)
+
+== VERDICT against bench/d176_prereg.txt ==
+F4 fire-check — ARM B grew with table size and reached >= n:  FIRED — instrument sees a full scan
+B-CTL control is flat in table size (14 -> 14):  YES — B's slope is the scan of t
+ARM A rows/merge:   4 at n=500 -> 4 at n=4000
+ARM B rows/merge:   1012 at n=500 -> 8012 at n=4000  (= 2.00x n)
+ARM A tuples/merge: 2000 at n=500 -> 16000 at n=4000  (= 4.00x n)
+ARM D tuples/merge: 2000 at n=500 -> 16000 at n=4000  (indexed t(id))
+⇒ ⛔ P5 FIRES — F1 DOES *NOT* HOLD. ARM A's rows are flat, but the TUPLES PULLED
+  OFF THE HEAP GROW LINEARLY IN TABLE SIZE. The merge returns `delta` rows and
+  reads the whole table to find them. The O(table) claim SURVIVES, through a
+  mechanism the ledger did not name.
+  ATTRIBUTION at n=4000, delta=4:
+    scan_table_where calls = 4   seq scans = 4   index scans = 4
+    tuples seq-scanned BY scan_table_where's own trees = 0
+    tuples seq-scanned by every OTHER scan in the window = 16000
+  ⇒ scan_table_where's own trees scanned ZERO tuples, so the 4 point lookups
+    at runtime.rs:4421 DO use the index — D69 did what its message says. Every one
+    of the 16000 sequentially-scanned tuples came from the OTHER per-delta loop:
+    publish turning each PendingWrite into an UPDATE (into_stmt/apply_dml_in).
+    ⇒ THE O(delta*table) COST IS IN THE PUBLISH PATH, NOT IN evaluate_merge.
+  ARM D: an index on t(id) DOES NOT FIX IT (2000 -> 16000). So this is a
+  property of the MERGE, not of the fixture's schema.
+⇒ F2 (rows):   ARM A rows move with DELTA at fixed n (1 -> 32): YES
+⇒ F2 (tuples): ARM A tuples move with DELTA at fixed n (2000 -> 64000): YES
+  ⇒ Cost moves with BOTH axes: it is O(delta * table), which is STRICTLY WORSE
+    than the O(table) that was banked. 'Independent of how much the branch
+    actually changed' is FALSE, and false in the expensive direction.
+RC=0
+=== D176 RUN COMPLETE ===
