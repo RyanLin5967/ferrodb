@@ -1,0 +1,1297 @@
+//! Throwaway adversarial probes against `Key::load` / `check_protection` / `unix_protection`.
+//!
+//! Two questions only: can `load` be made to SUCCEED on a key an attacker controls, and can it be
+//! made to REFUSE a key an operator set up correctly. Everything here is Unix-only on purpose --
+//! the Windows arm is a documented refusal and is not what these are aimed at.
+
+#![cfg(unix)]
+
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use super::*;
+
+fn chmod(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// 32 bytes that are recognisable in a string, so "did the key reach the message" is decidable.
+const RECOGNISABLE: &[u8; 32] = b"KEYBYTESKEYBYTESKEYBYTESKEYBYTES";
+
+fn write_key(dir: &Path, name: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, RECOGNISABLE).unwrap();
+    chmod(&p, 0o600);
+    p
+}
+
+// =============================================================================================
+// A. Make it SUCCEED where it should refuse
+// =============================================================================================
+
+/// The directory rule is applied to the SYMLINK's parent, never to the parent of the file that is
+/// actually opened. So a link in a locked-down directory launders a key that lives in a
+/// world-writable one.
+#[test]
+fn symlink_launders_a_key_out_of_a_world_writable_directory() {
+    let root = tempfile::tempdir().unwrap();
+
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let real = write_key(&open, "k");
+    chmod(&open, 0o777);
+
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&safe).unwrap();
+    chmod(&safe, 0o700);
+    let link = safe.join("k");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // Control: by its real name the rule fires, exactly as tests_signing asserts.
+    let direct = Key::load(&real);
+    assert!(direct.is_err(), "control: the real path must be refused");
+
+    // The probe.
+    let via_link = Key::load(&link);
+    println!(
+        "real={} (dir mode {:04o}) -> {:?}\nlink={} (dir mode {:04o}) -> {:?}",
+        real.display(),
+        mode_of(&open),
+        direct.as_ref().err().map(|e| e.to_string()),
+        link.display(),
+        mode_of(&safe),
+        via_link.as_ref().map(|k| k.len()).map_err(|e| e.to_string()),
+    );
+    assert!(
+        via_link.is_err(),
+        "PROBE HIT: the same 0600 key in a 0777 directory loads when reached through a symlink \
+         whose own parent is 0700 -- the directory an attacker can write is never inspected"
+    );
+}
+
+/// Same shape one level up: the key sits in a private directory, but that directory is reached
+/// through a symlink from a world-writable one.
+#[test]
+fn symlink_to_the_holding_directory_is_still_inspected() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let real_dir = root.path().join("realdir");
+    std::fs::create_dir(&real_dir).unwrap();
+    chmod(&real_dir, 0o777);
+    let real = write_key(&real_dir, "k");
+    let linkdir = open.join("d");
+    std::os::unix::fs::symlink(&real_dir, &linkdir).unwrap();
+    chmod(&open, 0o700);
+
+    let via = Key::load(linkdir.join("k"));
+    println!("through a symlinked directory -> {:?}", via.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    assert!(via.is_err(), "PROBE HIT: a symlinked holding directory escapes the mode check");
+    let _ = real;
+}
+
+/// A bare relative path has an EMPTY parent, and the empty parent is filtered away, so the
+/// directory check does not run at all. `"key"` and `"./key"` name the same file.
+#[test]
+fn a_bare_relative_path_has_an_empty_parent() {
+    assert_eq!(Path::new("key").parent(), Some(Path::new("")), "this is what the filter drops");
+    assert_eq!(Path::new("./key").parent(), Some(Path::new(".")), "and this is what it keeps");
+}
+
+/// The consequence, run for real in a child process whose CWD is a world-writable directory.
+#[test]
+fn a_bare_relative_path_skips_the_directory_check_entirely() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let _ = write_key(&open, "key");
+    chmod(&open, 0o777);
+
+    let me = std::env::current_exe().unwrap();
+    let name = format!(
+        "{}::bare_relative_child",
+        module_path!().split_once("::").expect("crate-qualified module path").1
+    );
+    let out = std::process::Command::new(&me)
+        .args(["--ignored", "--exact", "--nocapture", "--test-threads", "1", &name])
+        .current_dir(&open)
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    println!("child in CWD {} (mode {:04o}):\n{text}", open.display(), mode_of(&open));
+    assert!(out.status.success(), "child reported the divergence:\n{text}");
+}
+
+#[test]
+#[ignore = "driven by a_bare_relative_path_skips_the_directory_check_entirely with a chosen CWD"]
+fn bare_relative_child() {
+    let cwd = std::env::current_dir().unwrap();
+    let dmode = mode_of(&cwd);
+    let bare = Key::load("key");
+    let dotted = Key::load("./key");
+    println!("CWD {} mode {dmode:04o}", cwd.display());
+    println!("  Key::load(\"key\")   -> {:?}", bare.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    println!("  Key::load(\"./key\") -> {:?}", dotted.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    assert_eq!(
+        bare.is_ok(),
+        dotted.is_ok(),
+        "PROBE HIT: the same file in the same world-writable CWD loads under \"key\" and is \
+         refused under \"./key\" -- the empty-parent filter skips the directory rule"
+    );
+}
+
+/// A hard link puts a second name on the key's inode. If that name is in a directory an attacker
+/// can write, does loading through it (or merely its existence) get past the rule?
+#[test]
+fn a_hard_link_does_not_launder_the_key() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&safe).unwrap();
+    let real = write_key(&safe, "k");
+    let hard = open.join("k");
+    std::fs::hard_link(&real, &hard).unwrap();
+    chmod(&open, 0o777);
+    chmod(&safe, 0o700);
+
+    let via_hard = Key::load(&hard);
+    let via_safe = Key::load(&real);
+    println!(
+        "hard link in 0777 dir -> {:?}; original in 0700 dir -> {:?}",
+        via_hard.as_ref().map(|k| k.len()).map_err(|e| e.to_string()),
+        via_safe.as_ref().map(|k| k.len()).map_err(|e| e.to_string()),
+    );
+    assert!(via_hard.is_err(), "PROBE HIT: a hard link in a world-writable directory loads");
+    assert!(via_safe.is_ok(), "the original must still load; a second link is not the operator's problem");
+}
+
+/// The reverse direction of the symlink probe: a link sitting in a world-writable directory is the
+/// thing an attacker repoints, so it must be refused even though its target is fine.
+#[test]
+fn a_symlink_in_a_world_writable_directory_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&safe).unwrap();
+    let real = write_key(&safe, "k");
+    chmod(&safe, 0o700);
+    let link = open.join("k");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    chmod(&open, 0o777);
+    let r = Key::load(&link);
+    println!("link in 0777 dir -> {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    assert!(r.is_err(), "PROBE HIT: a repointable symlink in a world-writable directory loads");
+}
+
+/// A symlink to a group-readable file: the mode inspected must be the target's.
+#[test]
+fn a_symlink_to_a_group_readable_key_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let real = write_key(root.path(), "k");
+    chmod(&real, 0o644);
+    let link = root.path().join("l");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // A symlink's own mode is 0777 on every Unix; if the check read the link rather than the
+    // target it would report 0777 or pass on a permissive target.
+    let r = Key::load(&link);
+    println!("symlink -> 0644 target: {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    let err = r.err().expect("PROBE HIT: a 0644 target loads through a symlink");
+    assert!(err.to_string().contains("mode 0644"), "the target's mode must be the one named: {err}");
+}
+
+#[test]
+fn dev_null_is_refused() {
+    let r = Key::load("/dev/null");
+    println!("/dev/null -> {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    let err = r.err().expect("PROBE HIT: /dev/null loads as a key");
+    assert!(err.to_string().contains("not a regular file"), "{err}");
+}
+
+#[test]
+fn dev_zero_is_refused() {
+    // /dev/zero read_to_end would never terminate; the shape check must come first.
+    let r = Key::load("/dev/zero");
+    println!("/dev/zero -> {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    assert!(r.is_err(), "PROBE HIT: /dev/zero loads as a key");
+}
+
+/// A FIFO named where a key was expected. `is_file()` is false, so the shape check refuses it --
+/// but only once `File::open` has RETURNED, and opening a FIFO for reading blocks until a writer
+/// arrives. Measured with a bound, because "refuses" and "never returns" are different outcomes.
+#[test]
+fn a_fifo_named_as_the_key_does_not_hang_the_load() {
+    let root = tempfile::tempdir().unwrap();
+    let fifo = root.path().join("k");
+    let st = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(st.success(), "mkfifo failed");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = fifo.clone();
+    let h = std::thread::spawn(move || {
+        let r = Key::load(&probe).map(|k| k.len()).map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+
+    let verdict = rx.recv_timeout(std::time::Duration::from_millis(1500));
+    let hung = verdict.is_err();
+    println!("Key::load on a FIFO within 1500ms -> {verdict:?}");
+
+    // Unblock the thread whatever happened, so the test binary can exit.
+    if hung {
+        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let _ = w.write_all(RECOGNISABLE);
+        drop(w);
+        let late = rx.recv_timeout(std::time::Duration::from_secs(5));
+        println!("  after a writer arrived -> {late:?}");
+    }
+    h.join().unwrap();
+    assert!(!hung, "PROBE HIT: Key::load blocks indefinitely on a FIFO instead of refusing it");
+}
+
+/// The mode is taken from the open descriptor, the contents from the same descriptor. A file that
+/// gains bytes after the mode is approved yields the bytes present at read time, and nothing about
+/// the size is carried across from the metadata call.
+#[test]
+fn a_file_that_grows_between_open_and_read() {
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path().join("k");
+    std::fs::write(&p, b"").unwrap();
+    chmod(&p, 0o600);
+
+    // Empty at open time: refused for length, and the refusal names 0, not a stale size.
+    let empty = Key::load(&p);
+    println!("empty file -> {:?}", empty.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    assert!(empty.is_err());
+
+    std::fs::write(&p, RECOGNISABLE).unwrap();
+    let grown = Key::load(&p).expect("32 bytes is a key");
+    assert_eq!(grown.len(), 32, "the bytes read are the bytes present at read time");
+
+    // And the file's mode is judged through the descriptor, so relaxing the mode after the open
+    // cannot be what the check saw.
+    let mut big = Vec::from(*RECOGNISABLE);
+    big.extend_from_slice(&[7u8; 4096]);
+    std::fs::write(&p, &big).unwrap();
+    chmod(&p, 0o600);
+    assert_eq!(Key::load(&p).unwrap().len(), 32 + 4096, "no size is cached from the metadata call");
+}
+
+/// Every directory mode the brief names, and the setuid/setgid ones, with the verdict spelled out.
+#[test]
+fn directory_mode_table() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let p = write_key(&dir, "k");
+
+    // (mode, must_load) -- must_load is derived from the stated rule: refused iff group- or
+    // other-writable AND not sticky.
+    let table: &[(u32, bool)] = &[
+        (0o0700, true),
+        (0o0755, true),
+        (0o0777, false),
+        (0o0770, false),
+        (0o0707, false),
+        (0o0775, false),
+        (0o0757, false),
+        (0o1777, true),  // sticky: only the owner may replace the file
+        (0o1755, true),
+        (0o2777, false), // setgid, NOT sticky
+        (0o2755, true),
+        (0o4777, false), // setuid on a directory: no sticky semantics
+        (0o4755, true),
+        (0o6777, false),
+        (0o3777, true), // setgid + sticky
+        (0o0750, true),
+        (0o0705, true),
+    ];
+    let mut wrong = Vec::new();
+    for &(mode, must_load) in table {
+        chmod(&dir, mode);
+        let r = Key::load(&p);
+        let got = r.is_ok();
+        println!(
+            "  dir {mode:04o} (as set: {:04o}) -> {}",
+            mode_of(&dir),
+            if got { "LOADS".to_string() } else { format!("refused: {}", r.as_ref().err().unwrap()) }
+        );
+        if got != must_load {
+            wrong.push(format!("{mode:04o}: expected {}, got {}", if must_load { "load" } else { "refuse" }, if got { "load" } else { "refuse" }));
+        }
+    }
+    chmod(&dir, 0o700);
+    assert!(wrong.is_empty(), "PROBE HIT: {wrong:?}");
+}
+
+/// The directory check is `if let Ok(dmeta) = fs::metadata(dir)` -- an unreadable parent falls
+/// through to `Ok(())`. Race the parent's name away between the open and that stat.
+#[test]
+fn racing_the_parent_directory_away_between_the_open_and_the_stat() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("open");
+    let b = root.path().join("gone");
+    std::fs::create_dir(&a).unwrap();
+    let p = a.join("k");
+    std::fs::write(&p, RECOGNISABLE).unwrap();
+    chmod(&p, 0o600);
+    chmod(&a, 0o777);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flip = {
+        let (a, b, stop) = (a.clone(), b.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::rename(&a, &b);
+                let _ = std::fs::rename(&b, &a);
+            }
+        })
+    };
+
+    let mut loaded = 0usize;
+    let mut refused_dir = 0usize;
+    let mut refused_uninspectable = 0usize;
+    let mut refused_hop = 0usize;
+    let mut refused_open = 0usize;
+    // **Bounded by iterations first and the clock only as a backstop**, so a loaded machine makes
+    // this SLOWER rather than flaky: it keeps going until the window has been seen at least once
+    // AND enough iterations have run for the `loaded == 0` assertion to mean something.
+    const MIN_ITERS: usize = 50_000;
+    let cap = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut iters = 0usize;
+    while std::time::Instant::now() < cap
+        && loaded == 0
+        && (iters < MIN_ITERS || refused_uninspectable == 0)
+    {
+        iters += 1;
+        match Key::load(&p) {
+            // Stop at the FIRST one. A single load of a key in a 0777 directory is the whole
+            // finding, and stopping here is what keeps this test fast against a defect: the
+            // continuation condition below never comes true when the branch has been deleted, so
+            // without this the mutant run would burn the entire 60s cap instead of ~200 iterations.
+            Ok(_) => loaded += 1,
+            Err(e) if e.to_string().contains("writable by group or other") => refused_dir += 1,
+            // **The branch this test exists for**: the open SUCCEEDED and `check_directory`'s stat
+            // of the parent then failed. Matched on `check_directory`'s own wording, NOT on the
+            // shared phrase "could not be inspected" -- `directories_to_check` emits that too, for
+            // a failed `symlink_metadata` on a hop, and counting both together would make this
+            // report a number that is mostly the other branch.
+            Err(e)
+                if e.to_string().contains("the directory holding the consensus signing key")
+                    && e.to_string().contains("could not be inspected") =>
+            {
+                refused_uninspectable += 1
+            }
+            // The chain walk could not stat a hop. A different branch, counted separately.
+            Err(e) if e.to_string().contains("could not be inspected") => refused_hop += 1,
+            Err(_) => refused_open += 1,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flip.join().unwrap();
+    let _ = std::fs::rename(&b, &a);
+    chmod(&a, 0o700);
+    println!(
+        "iters={iters} loaded={loaded} refused_mode={refused_dir} \
+         refused_uninspectable={refused_uninspectable} refused_at_hop_walk={refused_hop} \
+         refused_at_open={refused_open}"
+    );
+    assert_eq!(
+        loaded, 0,
+        "a key in a 0777 directory loaded {loaded} time(s): fs::metadata on the parent failed and \
+         the check fell through to Ok(())"
+    );
+    assert!(
+        refused_uninspectable > 0,
+        "the open-succeeds-then-stat-fails window never opened, so this run proves nothing about \
+         that branch; loaded={loaded} refused_mode={refused_dir} \
+         refused_at_hop_walk={refused_hop} refused_at_open={refused_open}"
+    );
+}
+
+// =============================================================================================
+// B. Make it REFUSE where it should succeed
+// =============================================================================================
+
+#[test]
+fn an_ordinary_0600_key_in_an_ordinary_directory_loads() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("etc");
+    std::fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o755);
+    let p = write_key(&dir, "cluster.key");
+    assert_eq!(Key::load(&p).expect("the ordinary case must load").len(), 32);
+}
+
+#[test]
+fn a_key_directly_under_a_tempdir_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_key(dir.path(), "k");
+    println!("tempdir {} mode {:04o}", dir.path().display(), mode_of(dir.path()));
+    Key::load(&p).expect("PROBE HIT: a key under tempfile::tempdir() is refused");
+}
+
+#[test]
+fn paths_with_awkward_characters_load() {
+    let root = tempfile::tempdir().unwrap();
+    for (dirname, filename) in [
+        ("a dir with spaces", "the cluster.key"),
+        ("dir.with.dots", "k"),
+        ("dir-with-dash", "key with spaces and a 'quote'"),
+        ("ünïcode dir", "ключ.key"),
+        ("dir\twith\ttabs", "k"),
+        ("dir#with%weird&chars", "k=v"),
+    ] {
+        let d = root.path().join(dirname);
+        std::fs::create_dir(&d).unwrap();
+        let p = write_key(&d, filename);
+        Key::load(&p).unwrap_or_else(|e| panic!("PROBE HIT: {} is refused: {e}", p.display()));
+    }
+}
+
+#[test]
+fn redundant_path_syntax_loads() {
+    let root = tempfile::tempdir().unwrap();
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let _ = write_key(&sub, "k");
+    for variant in [
+        sub.join("./k"),
+        sub.join("../sub/k"),
+        PathBuf::from(format!("{}//k", sub.display())),
+        PathBuf::from(format!("{}/./././k", sub.display())),
+    ] {
+        Key::load(&variant).unwrap_or_else(|e| panic!("PROBE HIT: {} is refused: {e}", variant.display()));
+    }
+}
+
+#[test]
+fn a_bare_relative_path_in_an_ordinary_cwd_loads() {
+    // The crate root is the CWD under `cargo test`. Create, load, delete -- never left behind.
+    let cwd = std::env::current_dir().unwrap();
+    let name = format!(".f7-atk-probe-{}-{}", std::process::id(), line!());
+    let p = cwd.join(&name);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = Cleanup(p.clone());
+    std::fs::write(&p, RECOGNISABLE).unwrap();
+    chmod(&p, 0o600);
+    let r = Key::load(Path::new(&name));
+    println!("bare relative in CWD {} (mode {:04o}) -> {:?}", cwd.display(), mode_of(&cwd), r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    r.expect("PROBE HIT: a bare relative path is refused");
+}
+
+#[test]
+fn a_root_level_key_path_does_not_panic_on_a_missing_parent() {
+    // Path::new("/k").parent() is Some("/"); Path::new("/").parent() is None. Neither may panic.
+    assert_eq!(Path::new("/k").parent(), Some(Path::new("/")));
+    assert_eq!(Path::new("/").parent(), None);
+    let _ = Key::load("/");
+    let _ = Key::load("/f7-atk-nonexistent-key");
+}
+
+// =============================================================================================
+// C. Can the key's bytes reach an error message?
+// =============================================================================================
+
+#[test]
+fn no_error_or_rendering_carries_the_key_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut sightings = Vec::new();
+    let mut check = |what: &str, text: String| {
+        if text.contains("KEYBYTES") || text.contains("4b4559") || text.contains("75, 69, 89") {
+            sightings.push(format!("{what}: {text}"));
+        }
+        println!("  {what}: {text}");
+    };
+
+    // Short key: 31 recognisable bytes.
+    let short = root.path().join("short");
+    std::fs::write(&short, &RECOGNISABLE[..31]).unwrap();
+    chmod(&short, 0o600);
+    check("under-length", Key::load(&short).err().unwrap().to_string());
+
+    // Group-readable key with recognisable bytes.
+    let readable = write_key(root.path(), "readable");
+    chmod(&readable, 0o644);
+    check("group-readable", Key::load(&readable).err().unwrap().to_string());
+
+    // World-writable directory holding a recognisable key.
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let inopen = write_key(&open, "k");
+    chmod(&open, 0o777);
+    check("world-writable-dir", Key::load(&inopen).err().unwrap().to_string());
+    chmod(&open, 0o700);
+
+    // Not a regular file, and a missing file whose NAME is the key material.
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    check("not-a-regular-file", Key::load(&sub).err().unwrap().to_string());
+    check("missing", Key::load(root.path().join("nope")).err().unwrap().to_string());
+
+    // The Windows arm, reachable everywhere.
+    check("accept-unverifiable", accept_unverifiable(PermissionCheck::Enforce, &inopen).err().unwrap().to_string());
+
+    // A loaded key: Debug, source(), and the two frame-layer errors.
+    let good = write_key(root.path(), "good");
+    let key = Key::load(&good).unwrap();
+    check("debug", format!("{key:?}"));
+    check("debug-alternate", format!("{key:#?}"));
+    check("source", format!("{:?}", key.source()));
+    check("verify-too-short", verify_frame(&key, &[0u8; 4]).err().unwrap().to_string());
+    let signed = sign_frame(&key, b"body").unwrap();
+    let mut bad = signed.clone();
+    bad[0] ^= 0xff;
+    check("verify-bad-tag", verify_frame(&key, &bad).err().unwrap().to_string());
+    check("sign-too-large", sign_frame(&key, &vec![0u8; MAX_FRAME_BYTES]).err().unwrap().to_string());
+
+    // A panic message from an assertion that prints a Key, which is how a key most plausibly
+    // escapes: through a test failure rather than through a log line.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let k = Key::load(&good).unwrap();
+        assert!(false, "{k:?}");
+    }))
+    .err()
+    .unwrap();
+    let msg = panicked
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    check("panic-payload", msg);
+
+    assert!(sightings.is_empty(), "PROBE HIT: the key's bytes reached a message: {sightings:#?}");
+}
+
+/// The path is in every message, so a path that IS key material leaks it -- but that is the
+/// operator naming their file, not the module. Recorded so the boundary is explicit.
+#[test]
+fn the_path_is_echoed_and_the_bytes_are_not() {
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path().join("SECRETNAME");
+    std::fs::write(&p, &RECOGNISABLE[..8]).unwrap();
+    chmod(&p, 0o600);
+    let text = Key::load(&p).err().unwrap().to_string();
+    assert!(text.contains("SECRETNAME"), "the path is deliberately named: {text}");
+    assert!(!text.contains("KEYBYTES"), "the contents are not: {text}");
+}
+
+// =============================================================================================
+// D. The symlink hole, driven end to end: the attacker actually swaps the key
+// =============================================================================================
+
+/// Not just "the check is skipped" -- the substitution the check exists to stop, carried out.
+///
+/// `/safe/cluster.key` is a symlink into `/open`, which is 0777. The node loads it and signs a
+/// frame. The attacker then replaces the file in `/open` with a key they chose. The node reloads,
+/// still with `Key::load` and still without an error, and now the frames the ATTACKER signs verify.
+#[test]
+fn the_symlink_hole_lets_an_attacker_substitute_the_cluster_key() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&safe).unwrap();
+
+    let real = open.join("k");
+    std::fs::write(&real, b"THE-OPERATORS-REAL-CLUSTER-KEY!!").unwrap();
+    chmod(&real, 0o600);
+    chmod(&open, 0o777); // an attacker may create, rename and remove names here
+    chmod(&safe, 0o700);
+
+    let configured = safe.join("cluster.key");
+    std::os::unix::fs::symlink(&real, &configured).unwrap();
+
+    // The guard must refuse here: the INODE's directory is 0777 even though the NAME's is 0700.
+    let before = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the inode's directory: {e}");
+            assert!(
+                e.to_string().contains("open") && e.to_string().contains("0777"),
+                "refused for the wrong reason: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
+
+    // Only reached if the guard let it through. Carry the substitution out, so the report is the
+    // attack and not the absence of a check.
+    //
+    // **Threat-model note, because this writes the substitute as the SAME uid.** A different-uid
+    // attacker cannot get a file they authored past the mode rule: 0644 is refused, and 0600 owned
+    // by them is unreadable by the node. What this proves on its own is that the DIRECTORY GUARD
+    // DID NOT RUN. The cross-uid version needs no ownership of anything and is
+    // `the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between`.
+    let frame = sign_frame(&before, b"term=9 vote-for-me").unwrap();
+    let theirs = open.join(".theirs");
+    std::fs::write(&theirs, b"ATTACKER-CHOSEN-CLUSTER-KEY!!!!!").unwrap();
+    chmod(&theirs, 0o600);
+    std::fs::rename(&theirs, &real).unwrap();
+
+    let after = Key::load(&configured).expect("still loads, still without a complaint");
+    let forged = sign_frame(&after, b"term=9 vote-for-me").unwrap();
+    assert_ne!(forged, frame, "sanity: the two keys must differ");
+    panic!(
+        "PROBE HIT: a node reached its key through a symlink, the key was replaced by anyone with \
+         write access to the target's directory, and Key::load reported no problem either time"
+    );
+}
+
+/// The directory mode the rule ACCEPTS -- sticky and world-writable, i.e. `/tmp` -- still lets any
+/// user create a NEW name in it. A FIFO planted at the key's path before the operator writes the
+/// key turns "refuses to start" into "never returns".
+#[test]
+fn a_planted_fifo_in_an_accepted_sticky_directory_hangs_the_node_instead_of_refusing_it() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("tmpish");
+    std::fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o1777); // accepted by unix_protection: sticky
+
+    // Control: a real key here loads, which is the point of the sticky exception.
+    let real = write_key(&dir, "real.key");
+    Key::load(&real).expect("sticky world-writable is an accepted layout");
+
+    let planted = dir.join("cluster.key");
+    assert!(
+        std::process::Command::new("mkfifo").arg("-m").arg("600").arg(&planted).status().unwrap().success()
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = planted.clone();
+    let h = std::thread::spawn(move || {
+        let _ = tx.send(Key::load(&probe).map(|k| k.len()).map_err(|e| e.to_string()));
+    });
+    let within_3s = rx.recv_timeout(std::time::Duration::from_secs(3));
+    println!("Key::load on a planted FIFO, 3s bound -> {within_3s:?}");
+    let hung = within_3s.is_err();
+    if hung {
+        let mut w = std::fs::OpenOptions::new().write(true).open(&planted).unwrap();
+        let _ = w.write_all(b"x");
+        drop(w);
+        println!("  once a writer appeared -> {:?}", rx.recv_timeout(std::time::Duration::from_secs(5)));
+    }
+    h.join().unwrap();
+    assert!(!hung, "PROBE HIT: startup blocks forever on a FIFO an unprivileged user planted in a directory the rule accepts");
+}
+
+// =============================================================================================
+// E. Leftovers
+// =============================================================================================
+
+/// `unix_protection` takes no `PermissionCheck`, so the DIRECTORY rule must also be unbypassable
+/// by the operator's assertion. tests_signing pins that for the file's own mode; this is the dir.
+#[test]
+fn accept_unverifiable_does_not_bypass_the_directory_rule_either() {
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let p = write_key(&open, "k");
+    chmod(&open, 0o777);
+    let r = Key::load_with(&p, PermissionCheck::AcceptUnverifiable);
+    println!("AcceptUnverifiable + 0777 dir -> {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+    chmod(&open, 0o700);
+    assert!(r.is_err(), "PROBE HIT: the operator's assertion waives the directory rule on Unix");
+}
+
+#[test]
+fn degenerate_paths_do_not_panic_or_load() {
+    for p in ["", ".", "..", "/", "//", "/dev", "/dev/stdin", "/dev/fd/0"] {
+        let r = Key::load(p);
+        println!("{p:?} -> {:?}", r.as_ref().map(|k| k.len()).map_err(|e| e.to_string()));
+        assert!(r.is_err(), "PROBE HIT: {p:?} loaded as a signing key");
+    }
+}
+
+/// `Display` is what the tests above read. `Debug` on the error is what a `.unwrap()` prints, and
+/// is a separate rendering that could carry different content.
+#[test]
+fn the_debug_rendering_of_every_refusal_is_also_free_of_the_key() {
+    let root = tempfile::tempdir().unwrap();
+    let short = root.path().join("s");
+    std::fs::write(&short, &RECOGNISABLE[..31]).unwrap();
+    chmod(&short, 0o600);
+    let readable = write_key(root.path(), "r");
+    chmod(&readable, 0o644);
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let inopen = write_key(&open, "k");
+    chmod(&open, 0o777);
+
+    let mut sightings = Vec::new();
+    for (what, e) in [
+        ("short", Key::load(&short).err().unwrap()),
+        ("readable", Key::load(&readable).err().unwrap()),
+        ("open-dir", Key::load(&inopen).err().unwrap()),
+    ] {
+        for (kind, text) in [("Debug", format!("{e:?}")), ("Display", e.to_string())] {
+            println!("  {what}/{kind}: {text}");
+            if text.contains("KEYBYTES") || text.contains("4b4559") || text.contains("[75, 69") {
+                sightings.push(format!("{what}/{kind}"));
+            }
+        }
+    }
+    chmod(&open, 0o700);
+    assert!(sightings.is_empty(), "PROBE HIT: {sightings:?}");
+}
+
+// =============================================================================================
+// F. Against the PROPOSED canonicalize fix
+// =============================================================================================
+
+/// Which of two known keys a loaded `Key` is, decided without reading its bytes.
+fn identify(loaded: &Key, candidates: &[(&str, &[u8])]) -> String {
+    let probe = loaded.tag(b"which key is this");
+    for (name, bytes) in candidates {
+        let k = Key::from_bytes_for_test(bytes.to_vec()).unwrap();
+        if k.tag(b"which key is this") == probe {
+            return (*name).to_string();
+        }
+    }
+    "<neither>".to_string()
+}
+
+/// **The canonicalize fix checks the two ENDPOINTS of the resolution and no hop in between.**
+///
+/// `path.parent()` is the directory of the name as written. `canonicalize(path).parent()` is the
+/// directory of the inode finally reached. An attacker whose write access is at an INTERMEDIATE
+/// hop is in neither, so both checks pass and the resolution still ran through a directory they
+/// control.
+///
+/// No race, no ownership assumption, no same-uid assumption: the attacker's only move is to point
+/// a name they may write at a file the node can already read.
+#[test]
+fn the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+
+    const GOOD: &[u8; 32] = b"THE-OPERATORS-REAL-CLUSTER-KEY!!";
+    const OTHER: &[u8; 32] = b"SOME-OTHER-NODE-READABLE-FILE!!!";
+
+    // The operator's key, in a private directory.
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&safe).unwrap();
+    chmod(&safe, 0o700);
+    let good = safe.join("good");
+    std::fs::write(&good, GOOD).unwrap();
+    chmod(&good, 0o600);
+
+    // Any other file the node can already read: 0600, node-owned, in a private directory. A log, a
+    // rotated key, a fixture -- the attacker needs no write access to it, only its name.
+    let known = root.path().join("known");
+    std::fs::write(&known, OTHER).unwrap();
+    chmod(&known, 0o600);
+
+    // The middle hop: a directory the attacker may write.
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    chmod(&open, 0o777);
+
+    // The configured path, in a directory the operator locked down.
+    let configured = safe.join("cluster.key");
+    std::os::unix::fs::symlink(open.join("k"), &configured).unwrap();
+
+    // Honest state: the chain lands on the operator's key.
+    std::os::unix::fs::symlink(&good, open.join("k")).unwrap();
+    // The middle hop sits in a 0777 directory. A walk that checks every hop refuses here; one that
+    // checks only the two endpoints does not. A refusal naming `open` is the correct outcome.
+    let honest = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the middle hop: {e}");
+            assert!(
+                e.to_string().contains("open") && e.to_string().contains("0777"),
+                "refused for the wrong reason: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
+    assert_eq!(identify(&honest, &[("good", GOOD), ("other", OTHER)]), "good");
+
+    // The attacker's whole move: repoint the middle name. `rename` over it, which 0777-non-sticky
+    // permits and which needs no ownership of anything at either end.
+    let tmp = open.join(".t");
+    std::os::unix::fs::symlink(&known, &tmp).unwrap();
+    std::fs::rename(&tmp, open.join("k")).unwrap();
+
+    let after = Key::load(&configured);
+    println!("configured  = {}  (parent mode {:04o})", configured.display(), mode_of(&safe));
+    println!("middle hop  = {}  (parent mode {:04o})  <- the attacker writes here", open.join("k").display(), mode_of(&open));
+    println!("canonical   = {:?}", std::fs::canonicalize(&configured));
+    match &after {
+        Ok(k) => println!("Key::load -> Ok, and it is the {} key", identify(k, &[("good", GOOD), ("other", OTHER)])),
+        Err(e) => println!("Key::load -> {e}"),
+    }
+    let loaded = after.expect_err(
+        "PROBE HIT: both endpoint checks passed and the node loaded a file the attacker chose -- \
+         the world-writable directory was an intermediate hop and neither check looked at it",
+    );
+    let _ = loaded;
+}
+
+// =============================================================================================
+// G. Which path shapes BLOCK rather than refuse
+// =============================================================================================
+
+/// `Key::load(path)`, or `None` if it had not returned within `ms`.
+fn load_bounded(path: &Path, ms: u64) -> Option<Result<usize, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(Key::load(&p).map(|k| k.len()).map_err(|e| e.to_string()));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(ms)).ok()
+}
+
+/// The full inventory: which named shapes return, and which block `File::open` before `is_file()`
+/// is ever consulted. A shape that blocks turns "refuses to start" into "never returns".
+#[test]
+fn the_inventory_of_shapes_that_block_instead_of_refusing() {
+    let root = tempfile::tempdir().unwrap();
+    let mut blocked = Vec::new();
+
+    // A FIFO, which is the one an unprivileged user can plant.
+    let fifo = root.path().join("fifo");
+    assert!(std::process::Command::new("mkfifo").arg("-m").arg("600").arg(&fifo).status().unwrap().success());
+
+    // A unix-domain socket.
+    let sock = root.path().join("sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    // A regular file and a directory, as controls that must return.
+    let reg = write_key(root.path(), "reg");
+    let dir = root.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+
+    let mut cases: Vec<(String, PathBuf)> = vec![
+        ("fifo".into(), fifo.clone()),
+        ("unix socket".into(), sock.clone()),
+        ("regular file".into(), reg),
+        ("directory".into(), dir),
+    ];
+    // Device nodes present on this machine.
+    for d in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/console"] {
+        if Path::new(d).exists() {
+            cases.push((d.to_string(), PathBuf::from(d)));
+        }
+    }
+
+    for (name, path) in &cases {
+        match load_bounded(path, 1200) {
+            Some(r) => println!("  {name:<14} returned: {r:?}"),
+            None => {
+                println!("  {name:<14} BLOCKED (no answer in 1200ms)");
+                blocked.push(name.clone());
+            }
+        }
+    }
+
+    // Let the FIFO thread finish so the binary can exit.
+    if blocked.iter().any(|b| b == "fifo") {
+        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let _ = w.write_all(b"x");
+    }
+    assert!(blocked.is_empty(), "PROBE HIT: these shapes block instead of refusing: {blocked:?}");
+}
+
+// =============================================================================================
+// H. "The file exists but holds nothing anyone chose"
+// =============================================================================================
+
+/// An all-zero key is not merely weak — it is the CANONICAL one. RFC 2104 zero-pads a key shorter
+/// than the block, so a key of 1, 32 or 64 zero bytes, and a zero-length key, all pad to the same
+/// `k0` and therefore produce **byte-identical tags**. Every broken generator lands on the same
+/// key, so two unrelated clusters that both got a zero key can authenticate each other's frames.
+#[test]
+fn every_all_zero_key_is_the_same_key() {
+    let msg = b"a frame body";
+    let base = hmac_sha256(&[0u8; 32], msg);
+    for n in [0usize, 1, 16, 31, 32, 33, 63, 64] {
+        assert_eq!(
+            hmac_sha256(&vec![0u8; n], msg),
+            base,
+            "a {n}-byte zero key must be shown to collide with a 32-byte one"
+        );
+    }
+    // Above the block size RFC 2104 hashes the key first, so the collision stops there.
+    assert_ne!(hmac_sha256(&vec![0u8; 65], msg), base, "65 zero bytes is hashed first");
+
+    // And through the real type, not just the primitive.
+    let a = Key::from_bytes_for_test(vec![0u8; 32]).unwrap();
+    let b = Key::from_bytes_for_test(vec![0u8; 64]).unwrap();
+    assert_eq!(a.tag(msg), b.tag(msg), "two different zero key FILES sign identically");
+    assert!(b.verify(msg, &a.tag(msg)), "and each verifies the other's frames");
+}
+
+/// The shapes a file lands in when a generator wrote nothing, or wrote a placeholder. Recorded as
+/// a table of what `Key::load` does today; every one of them is >= 32 bytes and passes.
+#[test]
+fn the_table_of_keys_that_hold_nothing_anyone_chose() {
+    let root = tempfile::tempdir().unwrap();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // `truncate -s 32`, `dd if=/dev/zero`, a sparse file, a file extended past its end.
+        ("32 zero bytes", vec![0u8; 32]),
+        // A longer zero file: the same key as the line above, per the test.
+        ("64 zero bytes", vec![0u8; 64]),
+        // Erased flash, or a failed read that filled the buffer with ones.
+        ("32 0xFF bytes", vec![0xffu8; 32]),
+        // Any single repeated byte -- the general shape of "one value, repeated".
+        ("32 identical 0x41", vec![0x41u8; 32]),
+        // `echo >> key` in a loop, or a text editor that saved only newlines.
+        ("32 newlines", vec![b'\n'; 32]),
+        ("32 spaces", vec![b' '; 32]),
+        // A placeholder someone meant to replace.
+        ("placeholder text", b"changeme-changeme-changeme-change".to_vec()),
+        // `head -c 32 /dev/urandom > key` on a box where the tool printed an error into the file.
+        ("a shell error message", b"head: /dev/urandom: Permission denied\n".to_vec()),
+        // The operator's key committed as text and checked out with CRLF, or a here-doc.
+        ("32 bytes then a newline", {
+            let mut v = vec![0x41u8; 32];
+            v.push(b'\n');
+            v
+        }),
+    ];
+    let mut accepted = Vec::new();
+    for (name, bytes) in &cases {
+        let p = root.path().join(name.replace(' ', "_"));
+        std::fs::write(&p, bytes).unwrap();
+        chmod(&p, 0o600);
+        match Key::load(&p) {
+            Ok(k) => {
+                println!("  {name:<24} ({} bytes) -> ACCEPTED", k.len());
+                accepted.push(*name);
+            }
+            Err(e) => println!("  {name:<24} ({} bytes) -> refused: {e}", bytes.len()),
+        }
+    }
+    println!("still accepted, outside a zero-specific rule: {accepted:?}");
+    // The zero rule is what shipped, and it is deliberately "the generator produced nothing" and
+    // not an entropy rule. This asserts exactly that scope and inventories the rest.
+    for zero in ["32 zero bytes", "64 zero bytes"] {
+        assert!(!accepted.contains(&zero), "an all-zero key must be refused: {zero}");
+    }
+}
+
+/// A distinct axis from "holds nothing": a key with plenty of bytes and little entropy per byte.
+/// `openssl rand -hex 32 > key` is 64 bytes of hex TEXT -- it carries the full 256 bits, so this is
+/// not a defect, but it means a byte-count rule and an entropy rule are not the same rule.
+#[test]
+fn a_hex_encoded_key_is_bytes_not_entropy() {
+    let root = tempfile::tempdir().unwrap();
+    let hex = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let p = root.path().join("hex");
+    std::fs::write(&p, hex).unwrap();
+    chmod(&p, 0o600);
+    let k = Key::load(&p).expect("64 bytes of hex text is over the minimum");
+    let distinct: std::collections::BTreeSet<u8> = hex.iter().copied().collect();
+    println!("{} bytes, {} distinct byte values", k.len(), distinct.len());
+    assert_eq!(k.len(), 64);
+}
+
+// =============================================================================================
+// I. Against the hop-by-hop chain walk
+// =============================================================================================
+
+/// One chain shape: how to build it, and the path a node would be configured with.
+struct Shape {
+    name: &'static str,
+    /// Directories created under the root, in creation order. Every one of them takes part in
+    /// resolving the configured path.
+    dirs: Vec<&'static str>,
+    build: fn(&Path) -> PathBuf,
+}
+
+/// Flip exactly ONE directory of a chain to 0777 at a time and ask whether the walk notices.
+///
+/// The rule the fix states about itself is "the name's directory matters because whoever can write
+/// there can repoint the link". So for every directory that holds a name the resolution passes
+/// through, 0777 must be refused. Anything that loads is a directory an attacker can write while
+/// the guard says the key is protected.
+fn sweep(shape: &Shape) -> Vec<String> {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+    for d in &shape.dirs {
+        std::fs::create_dir_all(root.path().join(d)).unwrap();
+    }
+    for d in &shape.dirs {
+        chmod(&root.path().join(d), 0o700);
+    }
+    let configured = (shape.build)(root.path());
+
+    // Baseline: every directory closed, so the chain must load.
+    let base = Key::load(&configured);
+    assert!(base.is_ok(), "[{}] baseline must load, got {:?}", shape.name, base.err().map(|e| e.to_string()));
+
+    let mut missed = Vec::new();
+    for d in &shape.dirs {
+        let p = root.path().join(d);
+        chmod(&p, 0o777);
+        let verdict = Key::load(&configured);
+        chmod(&p, 0o700);
+        match verdict {
+            Err(_) => println!("  [{}] {d:<18} 0777 -> refused", shape.name),
+            Ok(_) => {
+                println!("  [{}] {d:<18} 0777 -> LOADED", shape.name);
+                missed.push(format!("{}: {d}", shape.name));
+            }
+        }
+    }
+    missed
+}
+
+#[test]
+fn every_directory_holding_a_name_in_the_chain_is_checked() {
+    let shapes = vec![
+        Shape {
+            name: "plain file",
+            dirs: vec!["a"],
+            build: |r| {
+                let p = r.join("a/k");
+                std::fs::write(&p, RECOGNISABLE).unwrap();
+                chmod(&p, 0o600);
+                p
+            },
+        },
+        Shape {
+            name: "link, absolute",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(&real, &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "link, relative ..",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink("../b/real", &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "three hops",
+            dirs: vec!["a", "mid", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(&real, r.join("mid/m")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("mid/m"), &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "leave and re-enter",
+            dirs: vec!["a", "mid"],
+            build: |r| {
+                let real = r.join("a/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(&real, r.join("mid/m")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("mid/m"), &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            // The lever the fix names -- "whoever can write there can repoint the link" -- applied
+            // to a name that is a DIRECTORY component rather than the final one.
+            name: "dir-component link",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                // `a/dl` is a symlink to the directory `b`. An attacker who can write in `a`
+                // repoints `dl` and redirects the key, exactly as they would a final-component link.
+                std::os::unix::fs::symlink(r.join("b"), r.join("a/dl")).unwrap();
+                r.join("a/dl/real")
+            },
+        },
+        Shape {
+            name: "dir-component mid-chain",
+            dirs: vec!["a", "b", "c"],
+            build: |r| {
+                let real = r.join("c/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(r.join("c"), r.join("b/dl")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("b/dl/real"), &k).unwrap();
+                k
+            },
+        },
+    ];
+
+    let mut missed = Vec::new();
+    for s in &shapes {
+        missed.extend(sweep(s));
+    }
+    println!("MISSED: {missed:#?}");
+    assert!(missed.is_empty(), "PROBE HIT: a 0777 directory holding a name in the chain was not caught: {missed:#?}");
+}
+
+/// **The walk follows the chain of the FINAL component and never the chain of a directory
+/// component.** `symlink_metadata(current)` asks whether `current` itself is a link; the kernel has
+/// already silently resolved every directory component to get there. So a name like `b/dl`, where
+/// `dl` is a symlink to a directory, is a name in the resolution that the walk never sees -- and
+/// the directory holding it, `b`, is checked by nobody.
+///
+/// `b` is an ancestor of NEITHER endpoint: not of the configured path `a/k`, and not of the file
+/// finally opened. It is the same class as the two-endpoint bypass, one level down.
+#[test]
+fn a_directory_component_symlink_redirects_the_key_with_every_checked_directory_closed() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+
+    const REAL: &[u8; 32] = b"THE-OPERATORS-REAL-CLUSTER-KEY!!";
+    const OLD: &[u8; 32] = b"A-ROTATED-KEY-THE-NODE-CAN-READ!";
+
+    for d in ["a", "b", "c", "backups"] {
+        std::fs::create_dir(root.path().join(d)).unwrap();
+    }
+    // The live key, and an old one the node can also read: both node-owned, 0600, both in 0700
+    // directories. The attacker owns neither and authors neither.
+    for (dir, bytes) in [("c", REAL), ("backups", OLD)] {
+        let p = root.path().join(dir).join("real");
+        std::fs::write(&p, bytes).unwrap();
+        chmod(&p, 0o600);
+    }
+    // `b/dl` is a directory symlink; `a/k` is the configured path and points through it.
+    std::os::unix::fs::symlink(root.path().join("c"), root.path().join("b/dl")).unwrap();
+    let configured = root.path().join("a/k");
+    std::os::unix::fs::symlink(root.path().join("b/dl/real"), &configured).unwrap();
+    for d in ["a", "c", "backups"] {
+        chmod(&root.path().join(d), 0o700);
+    }
+    // The one directory the attacker can write. Every OTHER directory stays 0700.
+    chmod(&root.path().join("b"), 0o777);
+
+    // `b` holds the name `dl`, which is part of the resolution. A walk over every COMPONENT
+    // refuses here; one over the final name of each hop does not.
+    let honest = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the directory holding the dir-component link: {e}");
+            assert!(
+                e.to_string().contains("/b,") && e.to_string().contains("0777"),
+                "refused, but not for `b`: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
+    assert_eq!(identify(&honest, &[("real", REAL), ("old", OLD)]), "real");
+
+    // The attacker's entire move: repoint the DIRECTORY symlink. No key is authored, nothing is
+    // chowned, and the file finally read is one the node already had at 0600 in a 0700 directory.
+    let tmp = root.path().join("b/.t");
+    std::os::unix::fs::symlink(root.path().join("backups"), &tmp).unwrap();
+    std::fs::rename(&tmp, root.path().join("b/dl")).unwrap();
+
+    let after = Key::load(&configured);
+    println!("configured   = a/k -> b/dl/real   (b is 0777; a, c, backups are 0700)");
+    println!("canonical    = {:?}", std::fs::canonicalize(&configured));
+    match &after {
+        Ok(k) => println!("Key::load -> Ok, and it is the {} key", identify(k, &[("real", REAL), ("old", OLD)])),
+        Err(e) => println!("Key::load -> {e}"),
+    }
+    let err = after.expect_err(
+        "PROBE HIT: repointing a DIRECTORY-component symlink swapped the key while every \
+         directory the walk checked was 0700 -- the directory holding that name is never checked",
+    );
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+}
+
+// =============================================================================================
+// J. The cost of dropping the ancestry limit, measured against real layouts
+// =============================================================================================
+
+/// **A second opinion, asked for: which ordinary layouts does "any ancestor" now refuse?**
+///
+/// Measured on this machine: `/opt/homebrew/etc` is `drwxrwxr-x idide:admin` -- group-writable and
+/// not sticky. That is the stock Homebrew config directory on Apple Silicon, and `/usr/local` is
+/// the same shape on Intel. A key at `<prefix>/etc/ferrodb/cluster.key` sits in a directory the
+/// operator made at 0755, so the immediate-parent rule accepted it; the ancestor rule does not.
+///
+/// The refusal is CORRECT -- anyone in `admin` can rename the whole `ferrodb` directory and swap
+/// the key. It is recorded here because it is common, not because it is wrong.
+#[test]
+fn the_ancestor_rule_refuses_a_stock_homebrew_layout() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o755);
+
+    // /opt/homebrew           drwxr-xr-x
+    // /opt/homebrew/etc       drwxrwxr-x   <- stock Homebrew, group-writable
+    // /opt/homebrew/etc/ferrodb  drwxr-xr-x  <- the operator's own directory
+    let prefix = root.path().join("homebrew");
+    let etc = prefix.join("etc");
+    let app = etc.join("ferrodb");
+    std::fs::create_dir_all(&app).unwrap();
+    let key = write_key(&app, "cluster.key");
+    chmod(&app, 0o755);
+    chmod(&etc, 0o775);
+    chmod(&prefix, 0o755);
+
+    let verdict = Key::load(&key);
+    match &verdict {
+        Ok(_) => println!("loads: only the immediate parent is inspected"),
+        Err(e) => println!("refused: {e}"),
+    }
+    let err = verdict.err().expect("the ancestor rule is what this test is about");
+    assert!(err.to_string().contains("0775"), "the offending mode must be named: {err}");
+    // The directory named is an ANCESTOR, not the key's own directory. An operator reading this
+    // is being told to chmod something their package manager owns and will reset.
+    assert!(
+        err.to_string().contains("etc") && !err.to_string().contains("ferrodb,"),
+        "the error names the ancestor rather than the key's own directory: {err}"
+    );
+}
+
+/// The layouts that must keep working, so the rule above is not mistaken for "refuses everything".
+#[test]
+fn the_ancestor_rule_still_accepts_the_ordinary_layouts() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o755);
+    for (name, modes) in [
+        ("etc-style 0755 all the way down", [0o755u32, 0o755, 0o700]),
+        ("a private tree", [0o700, 0o700, 0o700]),
+        ("group-readable but not writable", [0o755, 0o750, 0o750]),
+        ("sticky shared parent", [0o1777, 0o755, 0o755]),
+    ] {
+        let a = root.path().join(name.replace(' ', "_"));
+        let b = a.join("mid");
+        let c = b.join("app");
+        std::fs::create_dir_all(&c).unwrap();
+        let key = write_key(&c, "cluster.key");
+        chmod(&c, modes[2]);
+        chmod(&b, modes[1]);
+        chmod(&a, modes[0]);
+        let r = Key::load(&key);
+        println!("  {name:<34} {modes:?} -> {}", if r.is_ok() { "loads".into() } else { format!("REFUSED: {}", r.as_ref().err().unwrap()) });
+        r.unwrap_or_else(|e| panic!("PROBE HIT: {name} is an ordinary layout and must load: {e}"));
+    }
+}

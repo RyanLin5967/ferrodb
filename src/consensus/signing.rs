@@ -913,3 +913,7 @@ mod tests_signing;
 #[cfg(test)]
 #[path = "tests_f7_attack.rs"]
 mod tests_f7_attack;
+
+#[cfg(test)]
+#[path = "tests_f7_keyattack.rs"]
+mod tests_f7_keyattack;
