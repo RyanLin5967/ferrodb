@@ -1,0 +1,160 @@
+
+================ ATTACK L: hash-free confirmation of the sharing findings ================
+  n=1000 vlen=6  near-20swaps        order differs from ascending: true   rows identical: true   leaves 9/9   byte-identical leaves: 9
+  n=1000 vlen=6  full shuffle        order differs from ascending: true   rows identical: true   leaves 9/8   byte-identical leaves: 0
+  n=1000 vlen=6  evens-then-odds     order differs from ascending: true   rows identical: true   leaves 9/9   byte-identical leaves: 6
+  n=1000 vlen=6  descending          order differs from ascending: true   rows identical: true   leaves 9/9   byte-identical leaves: 0
+  n=1000 vlen=200 evens-then-odds    order differs from ascending: true   rows identical: true   leaves 100/100   byte-identical leaves: 100
+  n=2000 vlen=200 evens-then-odds    order differs from ascending: true   rows identical: true   leaves 200/200   byte-identical leaves: 200
+
+================ ATTACK K: 990-byte values (4 entries per leaf max) ================
+     n order                    lvsA   lvsB  shared   lcs  partEq
+     4 full shuffle                1      1       1     1    true
+     4 descending                  1      1       1     1    true
+     4 evens then odds             1      1       1     1    true
+     8 full shuffle                3      3       1     1   false
+     8 descending                  3      3       1     1   false
+     8 evens then odds             3      2       0     0   false
+    16 full shuffle                5      5       2     2   false
+    16 descending                  5      7       0     0   false
+    16 evens then odds             5      5       5     5    true
+    32 full shuffle               11     10       2     2   false
+    32 descending                 11     15       1     1   false
+    32 evens then odds            11     10       8     8   false
+    64 full shuffle               21     23       5     5   false
+    64 descending                 21     31       0     0   false
+    64 evens then odds            21     21      21    21    true
+   128 full shuffle               43     46      10    10   false
+   128 descending                 43     63       1     1   false
+   128 evens then odds            43     42      40    40   false
+   256 full shuffle               85     90      15    15   false
+   256 descending                 85    127       0     0   false
+   256 evens then odds            85     85      85    85    true
+   500 full shuffle              167    177      16    16   false
+   500 descending                167    249       1     1   false
+   500 evens then odds           167    166     164   164   false
+  1000 full shuffle              333    342      45    45   false
+  1000 descending                333    499       0     0   false
+  1000 evens then odds           333    333     333   333    true
+  2000 full shuffle              667    686     129   129   false
+  2000 descending                667    999       1     1   false
+  2000 evens then odds           667    666     664   664   false
+
+================ ATTACK J: same partition cid, two valid trees ================
+  both shapes probed on all 312 keys: get() disagreements = 0, wrong/absent values = 0
+  shape A height 2 (root -> 3 leaves), shape B height 3 (root -> inner -> leaves)
+    leaf_partition_cid  A=c43e68dee8bef6fb7eb6974ad94ec6d7  B=c43e68dee8bef6fb7eb6974ad94ec6d7  equal=true
+    leaf_content_cid    A=d7b1c105fbd6cf972b344a7079d0c08c  B=d7b1c105fbd6cf972b344a7079d0c08c  equal=true
+    subtree_cid         A=903bcc9ba5e969b501d3a073ca392352  B=ecc0737314252562d204f40cedd731b5  equal=false
+    walk_pages          A=4 pages  B=5 pages
+
+================ ATTACK I: force the detectors, drop the hash from the control ================
+  I1 collision counter: 0 over 1000 distinct inputs, 1 after planting one duplicate  -> detector FIRES
+  I2 same search machinery on a 24-bit prefix: collision at inputs 2313 / 6003  -> search FIRES
+  I3 hash-free control: ascending tree has 1000 rows, shuffled tree has 1000 rows, byte-identical sequences: true
+     (leaf_content_cid said equal: true)
+     same comparison against a 999-row tree: false  -> control FIRES
+  I4 hash-free partition: 9 leaves vs 8 leaves, leaves with byte-identical entry lists: 0
+     leaf sizes ascending: [108, 102, 102, 102, 102, 102, 102, 102, 178]
+     leaf sizes shuffled : [141, 137, 145, 140, 114, 112, 107, 104]
+     same comparison of the ascending tree against a second ascending build: 9 of 9  -> detector FIRES
+
+================ ATTACK E2: locate the threshold ================
+  ascending inserts: the first leaf split happens on insert #209 (20.9% of 1000)
+
+  head-shuffled p%% (shuffle the first p%% of the insert order, rest ascending):
+      p%  leaves  shared   partEq
+      15       9       9     true
+      18       9       9     true
+      20       9       9     true
+      21       9       0    false
+      22       9       0    false
+      23       9       0    false
+      25       9       0    false
+      30       9       0    false
+      35       8       0    false
+      40       9       0    false
+
+  bounded displacement: every key within d positions of sorted, n=1000:
+       d  leaves  shared    lcs   partEq
+       1       9       0      0    false
+       2       9       9      9     true
+       4       9       9      9     true
+       8       9       9      9     true
+      16       9       9      9     true
+      32       9       4      4    false
+      64       9       0      0    false
+      96       9       0      0    false
+     128       8       0      0    false
+     192       7       0      0    false
+     256       7       0      0    false
+     384       7       0      0    false
+     512       6       0      0    false
+    1000       8       0      0    false
+
+================ ATTACK H: is 0-of-9/8 the seed, or the family? ================
+  H1 ascending vs 300 full shuffles (n=1000):
+     shuffled leaf-count distribution: [(7, 3), (8, 297)]
+     max shared over 300 seeds = 0, max lcs = 0
+     seeds whose partition cid equals ascending's = 0 of 300
+     seeds whose CONTENT cid differs (control)    = 0 of 300 (must be 0)
+  H2 shuffle-vs-shuffle, 60 pairs (neither side sorted): max shared = 1, lcs = 1, of ~7 leaves
+  H3 ascending vs ascending-with-ONE-key-moved-to-the-end:
+     key 0    last: leaves 9/9  shared=0  lcs=0  partEq=false  contEq=true
+     key 1    last: leaves 9/9  shared=0  lcs=0  partEq=false  contEq=true
+     key 137  last: leaves 9/9  shared=1  lcs=1  partEq=false  contEq=true
+     key 500  last: leaves 9/9  shared=4  lcs=4  partEq=false  contEq=true
+     key 998  last: leaves 9/9  shared=9  lcs=9  partEq=true  contEq=true
+     key 999  last: leaves 9/9  shared=9  lcs=9  partEq=true  contEq=true
+
+================ ATTACK E: how much disorder does "0 shared" need? ================
+n=1000, values `v{n}` -- the test's OWN fixture. Only the insert order varies.
+
+  ascending: 9 leaves  part=c861c8777435729cecf24521cabccff5  sub=580b659cb8a1f5b8963aa148b1d6c7ab
+
+                       order  leaves   shared    lcs   partEq    subEq   contEq
+   adjacent-transpositions=0       9        9      9     true     true     true   <- order IS ascending (vacuous)
+   adjacent-transpositions=1       9        9      9     true     true     true
+   adjacent-transpositions=2       9        9      9     true     true     true
+   adjacent-transpositions=5       9        9      9     true     true     true
+  adjacent-transpositions=10       9        9      9     true     true     true
+  adjacent-transpositions=25       9        9      9     true     true     true
+  adjacent-transpositions=50       9        9      9     true     true     true
+ adjacent-transpositions=100       9        9      9     true     true     true
+ adjacent-transpositions=200       9        9      9     true     true     true
+ adjacent-transpositions=400       9        9      9     true     true     true
+ adjacent-transpositions=800       9        9      9     true     true     true
+adjacent-transpositions=1600       9        9      9     true     true     true
+adjacent-transpositions=3200       9        9      9     true     true     true
+adjacent-transpositions=6400       9        9      9     true     true     true
+adjacent-transpositions=12800       9        9      9     true     true     true
+adjacent-transpositions=25600       9        9      9     true     true     true
+            tail-shuffled=1%       9        9      9     true     true     true
+            tail-shuffled=2%       9        9      9     true     true     true
+            tail-shuffled=5%       9        9      9     true     true     true
+           tail-shuffled=10%       9        9      9     true     true     true
+           tail-shuffled=20%       9        9      9     true     true     true
+           tail-shuffled=40%       9        0      0    false    false     true
+           tail-shuffled=60%       8        0      0    false    false     true
+           tail-shuffled=80%       7        0      0    false    false     true
+          tail-shuffled=100%       8        0      0    false    false     true
+   full shuffle (the test's)       8        0      0    false    false     true
+
+================ ATTACK F: the #[ignore]d convergence test, re-run per order ================
+Those four assertions are the stated acceptance criterion for content-defined chunking.
+Which of them already hold TODAY, with the byte-balanced split still in place?
+
+  full shuffle (the test's own)    content=true  leafseq=false partition=false subtree=false  -> ignored test would fail
+  20 adjacent transpositions       content=true  leafseq=true  partition=true  subtree=true   -> ignored test would PASS
+  1 adjacent transposition         content=true  leafseq=true  partition=true  subtree=true   -> ignored test would PASS
+  400 adjacent transpositions      content=true  leafseq=true  partition=true  subtree=true   -> ignored test would PASS
+  evens ascending then odds        content=true  leafseq=false partition=false subtree=false  -> ignored test would fail
+  descending                       content=true  leafseq=false partition=false subtree=false  -> ignored test would fail
+
+================ ATTACK G: prove the physical fixtures are not vacuous ================
+  G1 one leaf, 20 entries, ascending vs descending insert:
+     raw page bytes differing: 167 of 4096   leaf_cid equal: true   (2be6a1f528c4d80b48e440abb47b1827)
+  G2 keys 0..20 by insert-only vs insert-0..60-then-delete-20..60:
+     raw page bytes differing: 328 of 4096   is a leaf: true   leaf_cid equal to G1's: true
+  G3 keys 0..20 clean vs after 20 insert+delete churn cycles:
+     raw page bytes differing: 390 of 4096   leaf_cid equal: true
