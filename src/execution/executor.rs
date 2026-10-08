@@ -201,6 +201,13 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
         // transaction's rollback had begun (`TxnManager::commit`), or a ROLLBACK whose undo had no
         // room, then left the transaction open in the ATT and forgotten by the only session that could
         // finish it: its rows held, every checkpoint refused, and no ROLLBACK able to reach it.
+        //
+        // `commit` answers `Ok` once its `Commit` is durable, whether or not its `TxnEnd` could be
+        // written (lane §21.18) and whatever the automatic checkpoint after it does (review 2's C4).
+        // `abort` answers `Ok` once its undo walk has finished, whether or not its `TxnEnd` could be
+        // written (review 8's F3). Both are fixed in `TxnManager`, not here. So an `Err` from either
+        // call means the transaction is still open: for a `Commit` whose flush failed, undecided on a
+        // poisoned log that refuses everything until a reopen (review 8's F4).
         Stmt::Commit => match session.current {
             Some(id) => {
                 txn.commit(id)?;
@@ -222,7 +229,9 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
             }
             catalog.create_index(&table, &column_name)?;
-            txn.checkpoint()?;
+            // Review 3's decision 1: while a release is owed, this flushes, keeps the log and answers
+            // Ok. `checkpoint` refused there, over an index that existed. See `TxnManager::ddl_checkpoint`.
+            txn.ddl_checkpoint()?;
             return Ok(Outcome::Ok)
         }
         // B8. Same three steps as CREATE INDEX above, for the same reasons: DDL inside a
@@ -234,7 +243,7 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
             }
             catalog.create_fulltext_index(&table, &column_name)?;
-            txn.checkpoint()?;
+            txn.ddl_checkpoint()?;
             return Ok(Outcome::Ok)
         }
         // B8 — ranked retrieval. A read, so it takes the same `ReadView` a SELECT does: inside a
@@ -330,7 +339,11 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             // consequence reversed: a refused DROP that had already dropped the table left it gone
             // from the catalog with no `DROP_TABLE` record logged, so a consumer would keep the
             // table in its own schema forever and simply never hear of it again.
-            txn.ddl_checkpointed(|| catalog.drop_table(&table))?;
+            //
+            // Lane §21: a DROP must TRUNCATE, not only flush, because it frees the pages the log's
+            // records name. So it names the heaps it frees, and is refused before the drop while
+            // another table owes a release. See `TxnManager::drop_checkpointed`.
+            txn.drop_checkpointed(&[dir_root, tt_root], || catalog.drop_table(&table))?;
             // B9: the agent layer keys row authorship and version stamps by a hash of the table
             // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
             // would attribute the new table's rows to an agent that never touched it. See
@@ -338,7 +351,7 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             //
             // AFTER the barrier's `?`, deliberately: a refused DROP must not forget a table that is
             // still there. B9's own `txn.checkpoint()?` is dropped rather than kept — the wrapper
-            // above already checkpoints (`ddl_checkpointed` -> `checkpoint_locked`), and a second
+            // above already checkpoints (`drop_checkpointed`), and a second
             // one would take a lock the first still holds.
             session.runtime.forget_table(&table);
             txn.log_ddl(DdlRecord {
@@ -504,11 +517,12 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
 ///   alone would let the user carry on inside a transaction they believe was rolled back.
 ///
 ///   ⛔ **Corrected (D211, re-adversary `fffdc62`).** This said `ROLLBACK` "can resume the undo from
-///   its CLRs", which was false until `TxnManager::undo_then_log`: the failed undo's CLR was already
+///   its CLRs", which was false until `TxnManager::apply_then_log`: the failed undo's CLR was already
 ///   logged, so a resumed abort skipped it. It also said nothing stopped the user carrying on;
 ///   nothing did, because `Aborting` was never read. Since D211, a retry reaches the failed record
 ///   itself, and the transaction is refused every statement but ROLLBACK
-///   (`tests/abort_that_cannot_finish.rs`). An undo that never finds room still never finishes;
+///   (`tests/undo_refused_is_held.rs`). Since D213 an undo never needs room it could lose, so what can
+///   still refuse one is an I/O error, a failed log append, or a page that disagrees with the log;
 ///   see `TxnManager::abort`.
 fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
     match txn.abort(txn_id) {

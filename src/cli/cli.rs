@@ -202,7 +202,16 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
+    // Review 2's C2 (the lead's decision) and D244's exit order, together: every exit step runs
+    // whatever the earlier ones returned (`exit_sequence` publishes the branch root, then the WAL
+    // checkpoint, which refuses while a release is owed (F2), then the arena checkpoint, and returns
+    // the first error after reporting the later ones). Its result is HELD so the failure counters
+    // below are printed on every exit, failed or not (review 3's caveat 4), and only then returned.
+    let exited = exit_sequence(&branches, &txn, &store, Path::new(&arena_path));
+    if let Some(line) = crate::wal::txn::failure_counters_line() {
+        eprintln!("{line}");
+    }
+    exited?;
     println!("bye bye");
     Ok(())
 }
