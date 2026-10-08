@@ -721,3 +721,25 @@ that `seal` never clears it, so a reaped quarantined branch leaves its reason fo
 occupant to read. That is a wrong sentence in a diagnostic, not a cross-agent answer about data — a
 correctness fix with no failing test behind it is how the item above got mis-filed in the first
 place, so it is recorded at the field instead of bundled here.
+
+## Addendum 7 — D232 review 4: two windows this lock closes today, for whoever removes it
+
+Recorded here because this is where a change to the statement lock starts (D232 review 4 B1). Branch
+`d232-arena-claim-order`. Nothing here was measured; every line is read from source.
+
+`RuntimeLock` serialises every reap with every statement and claim. Two D232 windows are closed by that and by
+nothing else, so a change that lets a reap run beside a statement or another reap must close them first:
+
+1. **The drain's owner check and its release** (`reaper.rs`, `drain_pending_seeded`). The check reads the extent
+   map, then `release_page` runs. The owner's own fast-path reap frees an extent whole, empty or not. Landing in
+   between, it sends the release into a gone extent, and once that range is reissued, into another extent's page.
+2. **A parked entry naming a gone extent** (`TwoTierReaper::foreign_arenas_skipped`). An extent free landing
+   between a read of the extent and the push of its pending entry leaves an entry the next drain must drop. The
+   three windows are the drain's `take_pending` → `put_pending`, `free_page`'s `arena_owner` → push, and
+   `retire_arenas_by_rule`'s `allocated_pages` → push.
+
+The sweeps are not on this list. They free only empty extents, and an extent that still holds the page in
+question is not empty. A snapshot install reaches both windows as well, and no lock holds it off
+(`PageStoreSnapshots::install` takes none). It is latent only because no production code constructs a
+`PageStoreSnapshots` (the one call is `tests/integration_cluster_snapshot.rs`). That half belongs to the
+consensus wiring (D232 review 2 F4), not to this record.

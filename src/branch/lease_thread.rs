@@ -306,6 +306,14 @@ pub struct LeaseStats {
     pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
+    /// Passes that reached the END of `scan_once`, the D88 orphan sweep included.
+    ///
+    /// `scans` cannot say that: it is counted before the orphan sweep runs, and a pass that
+    /// refused or failed early reaches neither. READ-VS-N's restart arm waits on this to know the
+    /// lease thread's first pass has finished, rather than guessing from elapsed time: until D209
+    /// that pass repeated the open's full sweep, see `TwoTierReaper::open_sweep_visits`. Observing
+    /// only.
+    pub finished: u64,
 }
 
 #[derive(Default)]
@@ -317,6 +325,12 @@ struct Counters {
     refused_scans: AtomicU64,
     refused_branches: AtomicU64,
     failed: AtomicU64,
+    finished: AtomicU64,
+    /// **D232.** The reaper's `unreadable_owners` as of the last report, so a later pass reports
+    /// only what is new, including increments a statement thread's reap made between passes.
+    reported_unreadable: AtomicU64,
+    /// **D232.** The reaper's `foreign_arenas_skipped` as of the last report.
+    reported_foreign: AtomicU64,
 }
 
 impl Counters {
@@ -329,6 +343,7 @@ impl Counters {
             refused_scans: self.refused_scans.load(Ordering::SeqCst),
             refused_branches: self.refused_branches.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
+            finished: self.finished.load(Ordering::SeqCst),
         }
     }
 }
@@ -396,6 +411,29 @@ impl LeaseThread {
         interval: Duration,
     ) -> Result<LeaseThread, FerroError> {
         let resumed = with_lock(&*lock, || reaper.resume_interrupted_reaps())?;
+        // **D209 — the open's orphan sweep is a collection, so the cadence counts from it.**
+        //
+        // `resume_interrupted_reaps` ends in the full O(live arenas) sweep and stamps nothing. The
+        // thread spawned below runs its first pass at once, and that pass ends in
+        // `collect_orphans_if_due`, which still read ORPHAN_SWEEP_NEVER, so every open swept every
+        // live arena twice, back to back.
+        //
+        // Read AFTER the sweep. `scan_once` reads its `now` before the sweep it stamps, so that two
+        // ticks racing cannot both pay; nothing can race here, because the thread that could does
+        // not exist yet. A reading from before the sweep is short by the sweep's whole length,
+        // which read-vs-n's PREREG R5 puts at 10-90 s for 10^6 arenas (inferred, unmeasured). Once
+        // that reaches ORPHAN_SWEEP_INTERVAL_MS the first pass sweeps again, and the fix is gone
+        // at exactly the scale it is for.
+        //
+        // The clock is `scan_once`'s, so the interval is measured in one unit. A node that cannot
+        // read it (a cluster member with no applied tick) stamps nothing and keeps the old
+        // behaviour: its first scan that knows the time runs a due pass straight away (since
+        // D221 the residue plus a slice, not a second full sweep). That is the safe direction.
+        // An interval has to start at a reading of the clock it is measured in, and the only cost
+        // is the repeat this row removes everywhere else.
+        if let Ok(now) = LeaseDeadline::try_now_millis() {
+            reaper.orphan_sweep_finished_at(now);
+        }
         if !resumed.is_empty() {
             // The reaper reclaimed pages without any client asking, so the runtime still holds
             // those branches' workspaces; nothing else will ever tell it.
@@ -765,10 +803,11 @@ fn scan_once(
     // **D88: the orphan sweep runs OUTSIDE the statement lock.**
     //
     // `with_lock` above is the table-catalog mutex in both production shapes, so anything inside
-    // it stalls every connection for its duration. `collect_orphans_if_due` is O(live arenas) and
-    // does not touch the table catalog at all — it reads `live_arenas`, asks the BRANCH catalog
-    // whether each owner is dead, and frees through the page store, each of which has its own
-    // lock. Running it here keeps the cadence and the work identical and removes the stall.
+    // it stalls every connection for its duration. `collect_orphans_if_due` does not touch the
+    // table catalog at all — it reads live arenas, asks the BRANCH catalog whether each owner is
+    // dead, and frees through the page store, each of which has its own lock. Running it here
+    // keeps the cadence and the work identical and removes the stall. (It was O(live arenas) per
+    // due pass until D221; it is now the recorded residue plus a fixed slice.)
     //
     // ⚠ Ordered AFTER the reap, not before: a reap is what produces collectable extents, so
     // sweeping first would always be one tick behind. And any error is reported rather than
@@ -778,12 +817,62 @@ fn scan_once(
     // D98 note: this no longer needs a `sweep_at` carried out of a closure, because the reading it
     // must use is now an ordinary local — but the rule that produced that variable is unchanged
     // and is why `now` is read once for the whole pass rather than re-read here.
+    let slice_freed_before = reaper.slice_freed();
     if let Err(e) = reaper.collect_orphans_if_due(now) {
         out(format!(
             "lease: orphan sweep failed: {e}. Nothing is lost — the complete answer is recomputed \
              at open by `resume_interrupted_reaps`, and the cadence retries."
         ));
     }
+    // **D221 — the slice's detector must reach a reader.** An extent the steady-state slice frees
+    // is one no in-process producer recorded, so the first one is the finding. A counter only a
+    // test reads is the D127 defect again: a real event that reaches nobody.
+    let slice_found = reaper.slice_freed() - slice_freed_before;
+    if slice_found > 0 {
+        out(format!(
+            "lease: the orphan sweep's slice freed {slice_found} extent(s) that no in-process \
+             producer recorded. They are collected, so nothing is lost now, but the producer \
+             list at `TwoTierReaper::collect_orphans_if_due` is missing a case, or one of its \
+             stated cases has occurred (a no-reaper seal, a snapshot install, a crash between a \
+             claim's map record and its catalog write). Expected: never on a healthy run."
+        ));
+    }
+    // **D232 — two more readings that are ZERO on a healthy database, and must reach a reader.**
+    // Both are counted where they happen, which includes a statement thread's reap between
+    // passes, so each is reported against what was last reported rather than against this pass.
+    let unreadable = reaper.unreadable_owners();
+    let seen = counters.reported_unreadable.swap(unreadable, Ordering::SeqCst);
+    if unreadable > seen {
+        out(format!(
+            "lease: {} orphan-sweep verdict(s) could not read the owning branch's record, so \
+             those extents were NOT freed. Nothing is lost; the space stays charged. A healthy \
+             catalog reads every record, so this is a storage fault or a corrupt catalog, the \
+             same class a refused reap reports (D127). An unreadable owner is never taken as a \
+             gone one (D232).",
+            unreadable - seen
+        ));
+    }
+    let foreign = reaper.foreign_arenas_skipped();
+    let seen = counters.reported_foreign.swap(foreign, Ordering::SeqCst);
+    if foreign > seen {
+        out(format!(
+            "lease: {} arena(s) listed under a reaped branch were NOT freed, because the store \
+             charges them to a different branch; each parked page a drain refused to release, \
+             for that reason or because its extent was already gone, counts as one too. That is \
+             an aliased catalog key: a claim whose catalog write outlived a crash that lost its \
+             map record, before D232 put the map record first, after which a restart issued the \
+             same arena id again. A parked page whose extent is gone has no serial cause: it \
+             takes an extent free or a snapshot install landing between the page being parked, \
+             or taken out for a drain, and its entry going back. The statement lock and the \
+             sweeps' emptiness check keep every such free out, and no shipped server installs \
+             snapshots into this store, so it is a concurrency defect, or an install on a build \
+             that wires consensus to it. Every other extent's data is intact because of this \
+             refusal.",
+            foreign - seen
+        ));
+    }
+    // Last statement of the pass, so a reader that sees it knows the sweep above is over.
+    counters.finished.fetch_add(1, Ordering::SeqCst);
 }
 
 fn join_ids(ids: &[BranchId]) -> String {

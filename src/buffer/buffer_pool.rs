@@ -281,6 +281,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
 use crate::buffer::page_table::PageTable;
+use crate::buffer::read_census::{self, Event};
 use crate::buffer::touch_queue::TouchQueue;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64};
@@ -700,8 +701,16 @@ impl BufferPoolManager {
     /// back to [`BufferPoolManager::fetch_page`], which is always correct. The returned stamp lets
     /// the caller ask later whether the page it read is still the page in that frame.
     pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
-        let frame_i = self.page_table.lookup(page_id)?;
-        self.read_frame_optimistic(frame_i, page_id)
+        // READ-VS-N: per-thread, never a shared word on this path. See `read_census`.
+        read_census::bump(Event::Optimistic);
+        let got = self
+            .page_table
+            .lookup(page_id)
+            .and_then(|frame_i| self.read_frame_optimistic(frame_i, page_id));
+        if got.is_none() {
+            read_census::bump(Event::OptimisticMiss);
+        }
+        got
     }
 
     /// The second half of [`Self::read_page_optimistic`]: read `frame_i`'s shadow as `page_id`,
@@ -749,6 +758,7 @@ impl BufferPoolManager {
         // here down. The thread-local depth counter is re-entrant, so the nested `enter_pool` in
         // `new_page -> fetch_page` is fine. See src/storage/page_latch.rs.
         let _pool = enter_pool();
+        read_census::bump(Event::Fetch);
         for _attempt in 0..FETCH_ATTEMPTS {
             // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
             if let Some(frame_i) = self.try_pin_resident(page_id) {
@@ -961,6 +971,7 @@ impl BufferPoolManager {
         // The read. **Nothing pool-wide is held here, and neither is the frame latch**: the frame
         // is already labelled `page_id` and pinned, so no scan will claim it and no evictor will
         // take it. This is the syscall that used to serialise the whole process.
+        read_census::bump(Event::Fault);
         let data = match self.disk_manager.read(page_id) {
             Ok(d) => d,
             Err(e) => {
