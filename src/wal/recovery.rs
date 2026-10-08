@@ -278,6 +278,11 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
         // returned the row. This is the same de-duplication rule E66 established for the write
         // paths, in the one path that never had it; it was found by B8's full-text search, which
         // resolves every posting through this index.
+        //
+        // ⚠ Since the reused-key fix (`execution::insert`, "The reused key must keep its old
+        // version reachable"), SQL no longer leaves two slots for one key: the new version is
+        // written into the dead version's slot. A heap written BEFORE that fix still holds them,
+        // and this rebuild is what reads such a heap after a crash, so the rule stays.
         let mut primary: BTreeMap<Value, (RecordId, bool)> = BTreeMap::new();
         for (rid, vals, deleted) in &rows {
             match primary.get_mut(&vals[0]) {
