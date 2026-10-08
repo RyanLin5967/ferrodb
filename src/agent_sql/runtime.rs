@@ -5792,41 +5792,7 @@ impl AgentRuntime {
         // Every table the branch touched is considered, not only the ones it altered: a branch
         // that forked before a sibling's `ADD COLUMN` has rows one value short of the target, and
         // that is a schema question about a branch with no schema edits of its own.
-        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
-        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
-        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
-        for (_, name) in &snapshot.tables {
-            altered_tables.insert(name.clone());
-        }
-        for (name, _) in snapshot.schema_edits.iter() {
-            altered_tables.insert(name.clone());
-        }
-        let mut merged_shapes: BTreeMap<String, Schema> = BTreeMap::new();
-        for name in &altered_tables {
-            let entry = ctx
-                .catalog
-                .get_table(name)
-                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
-            let target_now = entry.schema.clone();
-            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
-            let ours: Vec<SchemaEdit> = snapshot
-                .schema_edits
-                .iter()
-                .filter(|(t, _)| t == name)
-                .map(|(_, e)| e.clone())
-                .collect();
-            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
-            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
-            merged_shapes.insert(name.clone(), merged.shape.clone());
-            schema_reports.push(SchemaMergeReport {
-                table: name.clone(),
-                outcome: merged.outcome,
-                to_apply: merged.to_apply,
-                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
-            });
-        }
-
-        // Current shared state for every table this branch touched.
+        //
         // **B11's schema merge, evaluated here and applied in `publish_evaluation`.**
         //
         // B6 split `merge` into a half that decides and a half that applies, so B11's schema
@@ -5837,6 +5803,11 @@ impl AgentRuntime {
         // arrive after the gate had already passed the merge.
         //
         // `merged_shapes` from B11's version is dropped: it was written and never read.
+        //
+        // Computed ONCE. Main's resolution of this merge (1ecc5c9) left B11's original block in place
+        // above its own copy, so the schema merge ran twice per table with the second result
+        // shadowing the first; I15's resolution of the same merge (622a17b) kept one. Same inputs,
+        // pure function, so dropping the copy changes no result.
         let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
         let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
         let mut altered_tables: BTreeSet<String> = BTreeSet::new();
@@ -5869,6 +5840,7 @@ impl AgentRuntime {
             });
         }
 
+        // Current shared state for every table this branch touched.
         let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
         let mut table_names: BTreeMap<u32, String> =
