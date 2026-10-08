@@ -1,0 +1,13 @@
+# 2026-09-24T21:58:14Z HEAD=56ba536 dirty=0
+# cmd: timeout 1800 cargo test --no-fail-fast --test d270_catalog_persist_allocate_first
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d270.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.01s
+     Running tests/d270_catalog_persist_allocate_first.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d270_catalog_persist_allocate_first-6a040453678cad1b)
+
+running 2 tests
+test a_catalog_page_that_does_not_read_back_is_found_before_any_page_is_written ... ok
+test a_refused_allocation_for_the_catalog_leaves_its_pages_as_they_were ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+# rc=0 end=2026-09-24T21:58:17Z

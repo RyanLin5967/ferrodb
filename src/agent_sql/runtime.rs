@@ -2734,6 +2734,11 @@ impl AgentRuntime {
     /// [`Catalog::alter_table`] applies (`catalog::alter::resulting_schema`). An agent that types
     /// an `ADD COLUMN ... NOT NULL` is told so immediately rather than at merge, after everything
     /// that depended on it.
+    ///
+    /// **One exception** (D249): whether the catalog can ENCODE the resulting table entry — a
+    /// column name longer than its 255-byte length prefix, or an entry grown past one catalog page —
+    /// is asked by `Catalog::plan_alters`, which a branch reaches only at merge. Such an edit is
+    /// accepted here and refused at merge, before anything is written.
     pub fn stage_schema_edit(
         &self,
         catalog: &Catalog,

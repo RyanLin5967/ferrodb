@@ -1,0 +1,15 @@
+2026-09-24T21:48:43Z d207 acquiring (5s poll), pid 65562
+2026-09-24T21:57:56Z d207 ACQUIRED: 65562 d207 2026-09-24T21:57:56Z
+R_target.txt rc=101
+L_target.txt rc=0
+G_target.txt rc=0
+G_d254.txt rc=0
+C_lib_catalog.txt rc=0
+C_integration.txt rc=0
+Q1_first_page_written_before_allocating.txt rc=101
+Q2_first_page_written_before_the_walk.txt rc=101
+Q3_layout_size_refusal_removed.txt rc=101
+Z_target.txt rc=0
+done. Commit /Users/idide/wt/ferrodb-d270.noindex/bench/d270/raw (by explicit path) BEFORE reading it, then run the per-target suite.
+2026-09-24T22:00:47Z d207 rc=0
+2026-09-24T22:00:47Z d207 released (owner matched)

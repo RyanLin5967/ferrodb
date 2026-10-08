@@ -68,6 +68,7 @@ use std::sync::atomic::Ordering;
 
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::catalog::catalog_page::{TableEntry, refuse_unless_encodable};
 use crate::catalog::column::{DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::catalog::stats::{ColumnStats, TableStats};
@@ -370,6 +371,11 @@ pub struct AlterPlan {
     prov: Option<Arc<dyn ProvenanceStore>>,
     dir_root: u32,
     primary_root: u32,
+    /// The table's catalog entry exactly as the plan read it, before any change. Everything the plan
+    /// decided, the encoder's answer included, was decided against this entry, so
+    /// [`Catalog::apply_plan`] refuses the plan unless the live entry is still this one (D249 reviews,
+    /// F7 and G2-G3).
+    read: TableEntry,
 }
 
 impl AlterPlan {
@@ -582,16 +588,36 @@ impl Catalog {
         let primary_root = entry.primary_index_root;
         let row_count = self.stats.get(table).map(|s| s.row_count).unwrap_or(0);
 
-        // Every refusal lives in `resulting_schema`, shared with the branch path, so an agent is
-        // told at the moment it types the statement exactly what it would be told at merge — and
-        // it runs for EVERY action, against the shape the action before it produces, rather than
-        // for the first one only.
+        // Every refusal about the SHAPE lives in `resulting_schema`, shared with the branch path, so
+        // an agent is told at the moment it types the statement exactly what it would be told at
+        // merge — and it runs for EVERY action, against the shape the action before it produces,
+        // rather than for the first one only.
+        //
+        // **One refusal is not in it** (D249): whether the catalog can encode the resulting entry,
+        // asked below. That needs the whole `TableEntry` — the table's own name and its indexes — and
+        // not just a shape, so it is asked only here. A branch reaches here at MERGE, so a staged
+        // edit the catalog cannot hold is refused then, before anything is written, not when typed.
         let mut shapes = vec![old_schema.clone()];
         for action in actions {
             let next = resulting_schema(table, shapes.last().unwrap(), action, row_count)?;
             shapes.push(next);
         }
         let new_schema = shapes.last().unwrap().clone();
+
+        // **The entry `finish` will persist, asked of the encoder now, while nothing is written**
+        // (D249). `resulting_schema` checks a new column name for existence and duplicates only, and
+        // the catalog encoder refuses a name longer than its one-byte length prefix. Asked at
+        // `finish`, that refusal came after `rewrite_heap` had converted every row, and `finish`
+        // installs the new schema in memory before its `persist`: the refused name stayed in the
+        // catalog map and every later `persist` in the process refused on it. An undo there would
+        // have been worse, leaving rows in the new shape under the old schema (I19). This is the
+        // entry exactly as `apply_plan` and `finish` will install it: the new shape, and every
+        // index renamed through the same function they use. The primary root `finish` also writes
+        // is a fixed-width field, so it cannot change the answer.
+        let mut installed = entry.clone();
+        installed.schema = new_schema.clone();
+        rename_indexed_columns(&mut installed, actions);
+        refuse_unless_encodable(&installed)?;
 
         // The statistics are carried across the alteration by [`carried_stats`], and they are
         // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
@@ -633,6 +659,7 @@ impl Catalog {
             prov: prov.cloned(),
             dir_root,
             primary_root,
+            read: entry.clone(),
         })
     }
 
@@ -640,11 +667,34 @@ impl Catalog {
     /// a caller can log one DDL record per action carrying the shape that action produced.
     ///
     /// Everything the data could refuse was refused by [`Catalog::plan_alters`] while the heap was
-    /// still untouched. What is left here is the writing pass and the catalog install, and the
-    /// failures it can still meet are environmental — a buffer pool with no evictable frame, a
-    /// disk write that fails, a B+tree page that cannot be read. See [`prepare_rewrite`] for what
-    /// that boundary is and why the answer to crossing it is to log the rewrite rather than to
-    /// pretend it cannot happen.
+    /// still untouched. What is left here is the writing pass and the catalog install. Two refusals
+    /// remain, and both come before anything is written:
+    ///
+    /// - **the quiesce re-check**: a transaction in flight while tuples move;
+    /// - **the staleness check**: the table's catalog entry is no longer the one the plan read
+    ///   (D249). A plan can be held across a statement, and the plan's decisions, the encoder's
+    ///   answer included, hold only for the entry they were made against.
+    ///
+    /// Neither fires inside `AgentRuntime::merge`, and that is what keeps a merge atomic in its
+    /// refusals. The reasons (D249 review 3, H3):
+    ///
+    /// - **The quiesce re-check reads every session's transactions, not only the merge's.** What
+    ///   keeps another session from beginning one between the merge's plan loop and a later table's
+    ///   `apply_plan` is that every production `TxnManager::begin` runs with an exclusive borrow of
+    ///   the one `Catalog` (`executor::run_staged`, `apply_dml`'s `ExecCtx`), which the merge holds
+    ///   for its whole statement. The shared read path, `executor::try_run_read`, begins none. That
+    ///   borrow comes from the pgwire server's per-statement `Mutex<Catalog>`
+    ///   (`ServerContext::catalog`), from the CLI's per-statement catalog mutex, or, for an embedded
+    ///   caller, from its own `&mut Catalog`. The premise under all three is ONE `Catalog` per
+    ///   `TxnManager`. A second catalog over the same transactions could begin one mid-merge.
+    /// - **The staleness check:** a merge applies each table's plan with no statement in between
+    ///   that touches that table's entry, and `apply_plan` for one table changes only that table's
+    ///   entry.
+    ///
+    /// Past those two, the failures it can still meet are environmental — a buffer pool with no
+    /// evictable frame, a disk write that fails, a B+tree page that cannot be read. See
+    /// [`prepare_rewrite`] for what that boundary is and why the answer to crossing it is to log the
+    /// rewrite rather than to pretend it cannot happen.
     pub fn apply_plan(
         &mut self,
         plan: AlterPlan,
@@ -654,8 +704,45 @@ impl Catalog {
         // about what is in flight while tuples move, and a plan can be held across a statement.
         quiesce_guard(&plan.table, txn)?;
 
-        let AlterPlan { table, shapes, actions, prepared, carried, prov, dir_root, primary_root } =
-            plan;
+        let AlterPlan {
+            table,
+            shapes,
+            actions,
+            prepared,
+            carried,
+            prov,
+            dir_root,
+            primary_root,
+            read,
+        } = plan;
+
+        // **The table's catalog entry is still the one the plan read** (D249 reviews, F7 and
+        // G2-G3). Every decision `plan_alters` made was made against that entry: its shapes, its
+        // renames, and the catalog encoder's answer about the entry `finish` will install. A plan can
+        // be held across a statement, and if the entry changed in between (an index created, another
+        // ALTER, a root moved), installing now would persist an entry nobody asked about, over a
+        // shape the plan did not start from. So the live entry must equal it, compared as it is, with
+        // nothing overwritten first. A staleness check, not a second encoder guard: it compares, and
+        // asks the encoder nothing.
+        //
+        // **Its blind spot, stated by its condition: the heap changed while the entry compares
+        // equal.** Then the plan's `prepared` rows no longer describe the heap, and this cannot tell.
+        // Two known routes (D249 review 3, H2):
+        //
+        // - committed DML (an INSERT, UPDATE or DELETE) that moves no root;
+        // - `DROP TABLE` followed by a `CREATE TABLE` of the same declaration. `drop_table` frees every
+        //   page of the table, and the allocator walks its bitmap from bit 0, so the new table can
+        //   receive the same page ids and so an equal entry.
+        //
+        // Closing it would take a heap-side stamp taken at plan time. It stays with the caller's
+        // discipline, as `AgentRuntime::merge`'s ordering comment says: a plan's decision is only
+        // valid for the heap it read.
+        if self.require_table(&table)? != &read {
+            return Err(FerroError::Constraint(format!(
+                "the alteration of '{table}' was planned against its catalog entry as it was then, \
+                 and that entry has changed since; nothing was written. Plan it again."
+            )));
+        }
 
         // Reserve the space the relocations will need, before the first one happens.
         //
@@ -702,36 +789,9 @@ impl Catalog {
         //
         // Before `finish`, which is the `persist` both halves of the install ride on: two persists
         // would be two chances to store one half of an alteration.
-        let renames: Vec<(&String, &String)> = actions
-            .iter()
-            .filter_map(|a| match a {
-                AlterAction::RenameColumn { from, to } => Some((from, to)),
-                _ => None,
-            })
-            .collect();
-        if !renames.is_empty() {
+        if actions.iter().any(|a| matches!(a, AlterAction::RenameColumn { .. })) {
             let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
-            for (from, to) in renames {
-                // **Both lists, and the second one is not decoration.** A `TableEntry` keeps
-                // ordinary indexes and full-text indexes in separate vectors, and BOTH record
-                // their column by name. `planner::plan` resolves each of them with
-                // `position(|c| c.name == info.column_name).ok_or(KeyNotFound)` — the full-text one
-                // at `plan.rs:110` exactly as the ordinary one at `:102` — so missing either leaves
-                // an index that is not stale but unfindable, and every write against the table
-                // stops working. The pre-refactor rename arm walked only `indexes`; a full-text
-                // index over a renamed column has been broken since `CREATE FULLTEXT INDEX`
-                // existed, through the plain `ALTER TABLE` path as much as through a merge.
-                for ind in entry.indexes.iter_mut() {
-                    if &ind.column_name == from {
-                        ind.column_name = to.clone();
-                    }
-                }
-                for ind in entry.fulltext_indexes.iter_mut() {
-                    if &ind.column_name == from {
-                        ind.column_name = to.clone();
-                    }
-                }
-            }
+            rename_indexed_columns(entry, &actions);
         }
 
         let new_schema = shapes
@@ -775,6 +835,37 @@ impl Catalog {
         let shape = shape_of(&entry.schema);
         self.persist()?;
         Ok(shape)
+    }
+}
+
+/// Rename every index and full-text index column that `actions` renames, in the chain's own order.
+///
+/// One definition with two callers, and the second is why it is a function (D249):
+/// [`Catalog::apply_plan`] installs the renames, and [`Catalog::plan_alters`] builds the entry
+/// `finish` will persist so the encoder can be asked about it before the rewrite. Two copies of this
+/// loop could let the entry that was checked differ from the entry that is written.
+fn rename_indexed_columns(entry: &mut TableEntry, actions: &[AlterAction]) {
+    for action in actions {
+        let AlterAction::RenameColumn { from, to } = action else { continue };
+        // **Both lists, and the second one is not decoration.** A `TableEntry` keeps ordinary
+        // indexes and full-text indexes in separate vectors, and BOTH record their column by name.
+        // `planner::plan` resolves each of them with
+        // `position(|c| c.name == info.column_name).ok_or(KeyNotFound)` — the full-text one at
+        // `plan.rs:110` exactly as the ordinary one at `:102` — so missing either leaves an index
+        // that is not stale but unfindable, and every write against the table stops working. The
+        // pre-refactor rename arm walked only `indexes`; a full-text index over a renamed column had
+        // been broken since `CREATE FULLTEXT INDEX` existed, through the plain `ALTER TABLE` path as
+        // much as through a merge.
+        for ind in entry.indexes.iter_mut() {
+            if &ind.column_name == from {
+                ind.column_name = to.clone();
+            }
+        }
+        for ind in entry.fulltext_indexes.iter_mut() {
+            if &ind.column_name == from {
+                ind.column_name = to.clone();
+            }
+        }
     }
 }
 

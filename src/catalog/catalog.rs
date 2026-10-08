@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use crate::storage::disk_manager::PAGE_SIZE;
 use std::sync::Arc;
 use crate::buffer::buffer_pool::BufferPoolManager;
-use crate::catalog::catalog_page::{CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry};
+use crate::catalog::catalog_page::{
+    refuse_unless_encodable, CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry,
+};
 use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::HeapFileManager;
@@ -158,18 +161,26 @@ impl Catalog {
         // both halves are false, because `system_views::view_for` yields to the real table. The
         // honest answer there is the one above: the table already exists.
         crate::catalog::system_views::reject_view_name_collision(&name)?;
-        let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
-        let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
-        let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
-        let entry = TableEntry {
+        // **Asked of the encoder BEFORE the three allocations below** (D254). An entry the catalog
+        // cannot write is refused by `persist` too, but only after these pages exist, and nothing
+        // frees them: the undo below removes the entry, not its pages. The roots are placeholders
+        // here; they are fixed-width, so the real ones cannot change the answer.
+        let mut entry = TableEntry {
             name: name.clone(),
-            first_directory_page_id: hfm.first_directory_page_id,
+            first_directory_page_id: 0,
             schema,
-            primary_index_root: primary.root_page_id.load(Ordering::Relaxed),
-            time_travel_root: tt_heap.first_directory_page_id, 
+            primary_index_root: 0,
+            time_travel_root: 0,
             indexes: Vec::new(),
             fulltext_indexes: Vec::new()
         };
+        refuse_unless_encodable(&entry)?;
+        let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
+        let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
+        let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
+        entry.first_directory_page_id = hfm.first_directory_page_id;
+        entry.primary_index_root = primary.root_page_id.load(Ordering::Relaxed);
+        entry.time_travel_root = tt_heap.first_directory_page_id;
         self.tables.insert(name.clone(), entry);
         // Undo: the table never existed if it could not be written down.
         self.persist_or_undo(|c| {
@@ -279,6 +290,13 @@ impl Catalog {
                         .map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
                 )))?;
 
+            // Asked of the encoder BEFORE the tree is allocated (D254): the entry with this index,
+            // under a placeholder root. `persist` would refuse it too, but after the tree's pages
+            // exist, and the undo below pops the record, not the pages.
+            let mut with_index = entry.clone();
+            with_index.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: 0 });
+            refuse_unless_encodable(&with_index)?;
+
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
         let sec_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
@@ -369,6 +387,11 @@ impl Catalog {
                     entry.schema.columns[col_index].data_type
                 )));
             }
+
+            // Asked of the encoder BEFORE the tree is allocated (D254), as in `create_index`.
+            let mut with_index = entry.clone();
+            with_index.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: 0 });
+            refuse_unless_encodable(&with_index)?;
 
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
@@ -558,7 +581,6 @@ impl Catalog {
     }
 
     pub fn persist(&self) -> Result<(), FerroError> {
-        let mut curr_page_id = self.first_catalog_page_id;
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
         // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
         // same two tables produced a different on-disk layout on every run. Nothing can rely on the
@@ -567,77 +589,139 @@ impl Catalog {
         // reproducible at all.
         let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
         sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        let mut iter = sorted.into_iter().peekable();
 
-        loop {
-            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
+        // **Everything that can refuse happens before the first catalog write** (D270). This used to
+        // be one loop that read page k, allocated page k+1 when page k ended the old chain, and THEN
+        // wrote page k, so an error at turn k >= 2 left pages 1..k-1 rewritten over the old tail: a
+        // mixed image that could lose tables and record the one whose statement was refused. Now the
+        // phases run in order, and only the last two touch a catalog page.
 
-            let mut page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                CatalogPage::deserialize(frame.data)?
-            };
-
-            page.entries.clear();
-            page.num_entries = 0;
-
-            while let Some(entry) = iter.peek() {
-                if page.has_space(entry) {
-                    page.add_entry(iter.next().unwrap().clone())?;
-                } else {
-                    break;
+        // 1. Lay the pages out in memory. An entry larger than an EMPTY page fits nowhere; it is
+        //    refused here, by the encoder's own size question (D254).
+        let mut layout: Vec<CatalogPage> = vec![CatalogPage::new(0)];
+        for entry in sorted {
+            if !layout[layout.len() - 1].has_space(entry) {
+                let fresh = CatalogPage::new(0);
+                if !fresh.has_space(entry) {
+                    refuse_unless_encodable(entry)?;
+                    return Err(FerroError::Internal(format!(
+                        "the catalog entry of table '{}' fits no empty page, yet the encoder accepted it",
+                        entry.name
+                    )));
                 }
+                layout.push(fresh);
             }
-
-            let has_more = iter.peek().is_some();
-            let mut orphan_head = 0;
-            if has_more {
-                if page.next_catalog_page == 0 {
-                    let new_id = self.buffer_pool.new_page()?;
-                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
-                    // zero-filled page, and the next turn of this loop deserializes whatever is at
-                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
-                    // with format byte 0. That used to parse as an accidentally-empty page because
-                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
-                    // is between initialising the page here and teaching the format allowlist to
-                    // accept all-zeroes, which would let a genuinely corrupt page through.
-                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
-                    {
-                        let mut frame = self.buffer_pool.frame_write(frame_i);
-                        frame.data = CatalogPage::new(new_id).serialize()?;
-                    }
-                    self.buffer_pool.unpin_page(new_id, true);
-                    page.next_catalog_page = new_id;
-                }
-            } else {
-                orphan_head = page.next_catalog_page;
-                page.next_catalog_page = 0;
-            }
-
-            let next = page.next_catalog_page;
-
-            {
-                let mut frame = self.buffer_pool.frame_write(frame_i);
-                frame.data = page.serialize()?;
-            }
-            self.buffer_pool.unpin_page(curr_page_id, true);
-
-            if !has_more {
-                let mut free_id = orphan_head;
-                while free_id != 0 {
-                    let frame_i = self.buffer_pool.fetch_page(free_id)?;
-                    let next_orphan = {
-                        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                        CatalogPage::deserialize(frame.data)?.next_catalog_page
-                    };
-
-                    self.buffer_pool.unpin_page(free_id, false);
-                    self.buffer_pool.delete_page(free_id)?;
-                    free_id = next_orphan;
-                }
-                break;
-            }
-            curr_page_id = next;
+            let last = layout.len() - 1;
+            layout[last].add_entry(entry.clone())?;
         }
+
+        // 2. Serialize every page ONCE, with placeholder links. Every length-prefix refusal comes
+        //    from here, so these images are the encoder's whole answer: no entry is serialized twice.
+        let mut images: Vec<[u8; PAGE_SIZE]> = Vec::with_capacity(layout.len());
+        for page in &layout {
+            images.push(page.serialize()?);
+        }
+
+        // 3. Walk the chain the catalog already owns: reads only. A page that does not read back as a
+        //    catalog page is found here, not after its predecessors were rewritten. A chain that loops
+        //    back on itself is corruption; the old loop would have followed it for ever.
+        let mut chain: Vec<u32> = Vec::new();
+        let mut id = self.first_catalog_page_id;
+        while id != 0 {
+            if chain.contains(&id) {
+                return Err(FerroError::Corruption(format!(
+                    "the catalog's page chain returns to page {id}; refusing to rewrite a chain that \
+                     loops"
+                )));
+            }
+            chain.push(id);
+            let frame_i = self.buffer_pool.fetch_page(id)?;
+            let page = {
+                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                CatalogPage::deserialize(frame.data)
+            };
+            self.buffer_pool.unpin_page(id, false);
+            id = page?.next_catalog_page;
+        }
+
+        // 4. Allocate every page the layout needs beyond the chain, before any catalog write. Each
+        //    new page is stamped as an empty catalog page as soon as it exists, so nothing that later
+        //    links to it can read back a zero page. If an allocation refuses, the pages this call
+        //    allocated are freed and nothing of the catalog was touched.
+        let mut fresh: Vec<u32> = Vec::new();
+        while chain.len() + fresh.len() < layout.len() {
+            match self.stamped_catalog_page() {
+                Ok(new_id) => fresh.push(new_id),
+                Err(e) => {
+                    self.release_catalog_pages(&fresh);
+                    return Err(e);
+                }
+            }
+        }
+        let targets: Vec<u32> = chain.iter().chain(fresh.iter()).copied().take(layout.len()).collect();
+
+        // 5. Write. **The residual, stated:** each page is fetched as it is written, so a fetch that
+        //    fails here (a dirty frame that cannot be evicted, say) leaves the pages before it with the
+        //    new image and the rest with the old one. Every link still reaches a readable page, since
+        //    every new page was stamped in step 4. Pinning every target first would make these writes
+        //    infallible, but a catalog longer than the pool has frames could then never persist.
+        for (k, &page_id) in targets.iter().enumerate() {
+            let next = targets.get(k + 1).copied().unwrap_or(0);
+            CatalogPage::stamp_links(&mut images[k], page_id, next);
+            self.write_catalog_page(page_id, &images[k])?;
+        }
+
+        // 6. Free the old chain's pages past the new end, already unlinked by step 5's last write. A
+        //    failure here comes after the new image is complete: the error is returned, and the pages
+        //    hold the image while the caller's undo rolls memory back.
+        for &surplus in chain.iter().skip(layout.len()) {
+            self.buffer_pool.fetch_page(surplus)?;
+            self.buffer_pool.unpin_page(surplus, false);
+            self.buffer_pool.delete_page(surplus)?;
+        }
+        Ok(())
+    }
+
+    /// A new page, stamped as an empty catalog page before anything can link to it.
+    ///
+    /// `new_page` hands back a zero-filled page, and a later read of the chain deserializes whatever
+    /// sits at `next_catalog_page`, so an unstamped page arrives at `CatalogPage::deserialize` with
+    /// format byte 0. The choice is between initialising the page here and teaching the format
+    /// allowlist to accept all-zeroes, which would let a genuinely corrupt page through (B8).
+    fn stamped_catalog_page(&self) -> Result<u32, FerroError> {
+        let new_id = self.buffer_pool.new_page()?;
+        let stamped = self.buffer_pool.fetch_page(new_id).and_then(|frame_i| {
+            let image = CatalogPage::new(new_id).serialize();
+            if let Ok(bytes) = &image {
+                self.buffer_pool.frame_write(frame_i).data = *bytes;
+            }
+            self.buffer_pool.unpin_page(new_id, true);
+            image.map(|_| ())
+        });
+        match stamped {
+            Ok(()) => Ok(new_id),
+            Err(e) => {
+                self.release_catalog_pages(&[new_id]);
+                Err(e)
+            }
+        }
+    }
+
+    /// Free catalog pages this `persist` allocated and never linked, on its way out of a refusal.
+    ///
+    /// Best effort: the refusal being returned is the error the caller needs, and a page that cannot
+    /// be freed here is unlinked, so it is leaked and not corrupting.
+    fn release_catalog_pages(&self, ids: &[u32]) {
+        for &id in ids {
+            let _ = self.buffer_pool.delete_page(id);
+        }
+    }
+
+    /// Copy one serialized image into its page.
+    fn write_catalog_page(&self, page_id: u32, image: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
+        let frame_i = self.buffer_pool.fetch_page(page_id)?;
+        self.buffer_pool.frame_write(frame_i).data = *image;
+        self.buffer_pool.unpin_page(page_id, true);
         Ok(())
     }
 

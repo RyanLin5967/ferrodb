@@ -1,0 +1,13 @@
+--- a/src/catalog/alter.rs
++++ b/src/catalog/alter.rs
+@@ -691,7 +691,9 @@
+         // Closing it would take a heap-side stamp taken at plan time. It stays with the caller's
+         // discipline, as `AgentRuntime::merge`'s ordering comment says: a plan's decision is only
+         // valid for the heap it read.
+-        if self.require_table(&table)? != &read {
++        let mut live = self.require_table(&table)?.clone();
++        live.schema = read.schema.clone();
++        if live != read {
+             return Err(FerroError::Constraint(format!(
+                 "the alteration of '{table}' was planned against its catalog entry as it was then, \
+                  and that entry has changed since; nothing was written. Plan it again."

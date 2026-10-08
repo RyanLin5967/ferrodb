@@ -1,0 +1,10 @@
+--- a/src/catalog/alter.rs
++++ b/src/catalog/alter.rs
+@@ -586,7 +586,6 @@
+         // is a fixed-width field, so it cannot change the answer.
+         let mut installed = entry.clone();
+         installed.schema = new_schema.clone();
+-        rename_indexed_columns(&mut installed, actions);
+         refuse_unless_encodable(&installed)?;
+ 
+         // The statistics are carried across the alteration by [`carried_stats`], and they are

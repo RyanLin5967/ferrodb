@@ -1,0 +1,93 @@
+# 2026-09-24T21:59:56Z HEAD=56ba536 dirty=0
+# cmd: timeout 1800 cargo test --no-fail-fast --test d141_long_identifier --test d249_alter_encodable --test integration_alter_column --test integration_merge_ddl_atomicity --test integration_alter_refusal_paths
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d270.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.00s
+     Running tests/d141_long_identifier.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d141_long_identifier-aa2222abb63538df)
+
+running 4 tests
+test a_three_hundred_byte_table_name_does_not_corrupt_the_catalog ... ok
+test the_longest_expressible_table_name_still_works_from_sql ... ok
+test a_refused_create_table_does_not_wedge_the_next_one ... ok
+test many_refused_statements_leave_the_database_working ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/d249_alter_encodable.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d249_alter_encodable-78f073dd67732cc9)
+
+running 7 tests
+test a_plan_held_across_a_change_to_its_own_table_is_refused ... ok
+test a_plan_held_across_another_alter_of_its_own_table_is_refused ... ok
+test an_added_ninth_column_the_catalog_cannot_hold_is_refused_and_wedges_nothing ... ok
+test a_rename_to_a_column_name_the_catalog_cannot_hold_is_refused_and_wedges_nothing ... ok
+test an_added_column_whose_name_the_catalog_cannot_hold_is_refused_and_wedges_nothing ... ok
+test a_rename_that_grows_an_indexed_column_past_a_page_is_refused_by_size ... ok
+test a_thirty_third_column_the_catalog_cannot_hold_is_refused_before_any_row_is_rewritten ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/integration_alter_column.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_alter_column-19d5bafdeeed6834)
+
+running 29 tests
+test a_branch_whose_only_statement_is_an_alter_still_merges_against_its_fork_point ... ok
+test a_merge_report_names_the_shape_it_produced ... ok
+test a_branchs_schema_change_is_invisible_until_it_merges ... ok
+test a_column_an_agent_added_reaches_the_feed ... ok
+test an_alter_is_refused_while_any_transaction_is_open ... ok
+test a_column_added_mid_stream_survives_a_pump_boundary ... ok
+test a_row_written_before_a_sibling_widened_the_table_still_publishes ... ok
+test decoding_a_range_twice_gives_the_same_answer_across_an_alter ... ok
+test a_pump_after_an_alter_does_not_silently_truncate_the_row ... ok
+test deleted_rows_stay_deleted_across_a_rewrite ... ok
+test crossing_the_null_bitmap_boundary_keeps_every_value ... ok
+test renaming_an_indexed_column_leaves_the_table_queryable ... ok
+test retyping_a_middle_column_does_not_disturb_its_neighbours ... ok
+test rows_written_before_the_column_are_still_readable_after_it ... ok
+test the_altered_shape_survives_a_truncation_and_a_reopen ... ok
+test the_feed_carries_the_column_change_in_log_order ... ok
+test two_branches_adding_different_columns_compose ... ok
+test the_refusals_refuse_and_the_permitted_cases_are_permitted ... ok
+test two_branches_retyping_one_column_conflict_with_the_predicate ... ok
+test three_branches_forked_at_three_different_shapes_all_compose ... ok
+test two_branches_making_the_same_change_do_not_conflict ... ok
+test history_learned_from_one_log_is_not_applied_to_another ... ok
+test a_lookup_by_key_still_finds_a_row_the_rewrite_moved ... ok
+test a_secondary_index_over_a_retyped_column_still_answers ... ok
+test statistics_survive_an_alteration_exactly ... ok
+test the_decoders_history_does_not_grow_with_every_checkpoint ... ok
+test a_column_name_needing_escaping_survives_the_whole_pipeline ... ok
+test a_rename_and_a_retype_reach_the_destination_without_losing_data ... ok
+test a_column_added_mid_stream_reaches_the_destination ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.97s
+
+     Running tests/integration_alter_refusal_paths.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_alter_refusal_paths-58a897f4b4bc3fb2)
+
+running 9 tests
+test a_refused_merge_leaves_a_branch_that_does_not_double_apply_on_retry ... ok
+test the_retry_after_a_refused_merge_does_not_report_success_while_dropping_the_edit ... ok
+test a_retry_that_reports_ok_must_have_applied_the_staged_retype ... ok
+test a_merge_refused_on_the_second_edit_does_not_leave_the_first_applied ... ok
+test the_half_applied_rename_is_on_disk_not_just_in_memory ... ok
+test a_merge_refused_for_size_still_publishes_the_branch_rows ... ok
+test control_the_same_merge_lands_when_the_rows_leave_room ... ok
+test a_second_branch_refused_leaves_the_first_branchs_merge_intact ... ok
+test a_merge_refused_on_the_second_edit_does_not_leave_the_heap_rewritten ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.41s
+
+     Running tests/integration_merge_ddl_atomicity.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_merge_ddl_atomicity-81b4e1b7467e1784)
+
+running 9 tests
+test a_row_the_merge_would_publish_with_a_null_in_a_not_null_column_refuses_the_whole_merge ... ok
+test a_merge_publishes_its_rows_into_the_shape_its_own_edits_produced ... ok
+test an_index_follows_its_column_across_the_renames_a_merge_applies ... ok
+test a_rename_follows_its_column_into_the_fulltext_index_too ... ok
+test a_chain_refused_at_its_first_edit_names_that_edit_and_not_the_last ... ok
+test a_row_the_merge_would_publish_too_wide_for_the_shape_it_lands_in_refuses_the_whole_merge ... ok
+test narrowing_a_row_and_retyping_behind_it_takes_two_merges_and_the_refusal_says_so ... ok
+test planning_a_refused_merge_does_not_even_append_an_empty_page ... ok
+test a_merge_refused_at_its_third_edit_leaves_neither_of_the_first_two_applied ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.00s
+
+# rc=0 end=2026-09-24T22:00:27Z

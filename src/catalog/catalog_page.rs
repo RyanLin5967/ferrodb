@@ -126,8 +126,7 @@ impl CatalogPage {
         // field, and writing 4 back out alongside a v2 body is exactly the misparse the stamp
         // exists to prevent.
         bytes[0] = CATALOG_PAGE_TYPE;
-        bytes[1..5].copy_from_slice(&self.page_id.to_be_bytes());
-        bytes[5..9].copy_from_slice(&self.next_catalog_page.to_be_bytes());
+        Self::stamp_links(&mut bytes, self.page_id, self.next_catalog_page);
         // Guard 1/8 — the page's table count. Checked here, before the body loop writes anything,
         // so an over-count refuses rather than reaching a slice index.
         let num_entries = fits_u16(|| "the catalog page's table count".to_string(), self.entries.len())?;
@@ -257,6 +256,15 @@ impl CatalogPage {
     }
 
     // header -> entries (table name -> page id -> schema (column name -> datatype tag & null tag) -> index)
+    /// Write a page's own id and its successor's into a serialized image, where `serialize` puts them.
+    ///
+    /// One definition of where the two links live, used by `serialize` and by `Catalog::persist`, which
+    /// serializes every page once before it knows the page ids it will write them to (D270).
+    pub(crate) fn stamp_links(image: &mut [u8; PAGE_SIZE], page_id: u32, next: u32) {
+        image[1..5].copy_from_slice(&page_id.to_be_bytes());
+        image[5..9].copy_from_slice(&next.to_be_bytes());
+    }
+
     pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
         // An allowlist, and it has to be: byte 0 was previously written and never read, so a page
         // that is neither format is a page this build cannot parse. Falling through to "assume the
@@ -383,6 +391,48 @@ impl CatalogPage {
         HEADER_SIZE + entry.length() + entries_len <= PAGE_SIZE
     }
     
+}
+
+/// Refuse an entry the catalog page format cannot hold, **by asking the encoder itself** (D249,
+/// D254).
+///
+/// For a caller that has to know BEFORE it changes anything whether an entry will persist:
+///
+/// - `ALTER` decides everything in `Catalog::plan_alters` and only then rewrites the heap. A refusal
+///   that first arrives at `persist`, after the rewrite, can neither be undone (the rows are already
+///   in the new shape) nor left in memory (every later `persist` would re-serialize it and refuse
+///   too) (D249).
+/// - `create_table`, `create_index` and `create_fulltext_index` ask it before they allocate their
+///   pages, which nothing would free after a refusal (D254).
+/// - `Catalog::persist` lays every page out in memory before it writes any (D270), and asks it of an
+///   entry that fits no empty page: such an entry used to send its placement loop round for ever,
+///   truncating the catalog's image (D254). Every other refusal comes from `persist` serializing its
+///   page images, once, before the first write.
+///
+/// **It is not a second length check.** It runs `serialize`, the single authority the header above
+/// describes, so a change to any guard in there changes this answer with it, and nothing here can
+/// mask a mutant of one. It asks the two questions `Catalog::persist` itself asks:
+///
+/// - **Does the entry fit an empty page?** `persist` places entries with `has_space`, and an entry
+///   no page can hold is never placed: `persist` links a fresh page per turn until allocation
+///   refuses. Asked first, and asked only here, because `serialize` has no bounds check and would
+///   panic on such an entry.
+/// - **Does it serialize?** Every length prefix is checked there.
+pub(crate) fn refuse_unless_encodable(entry: &TableEntry) -> Result<(), FerroError> {
+    let mut page = CatalogPage::new(0);
+    if !page.has_space(entry) {
+        return Err(FerroError::Constraint(format!(
+            "the catalog entry of table {} would be {} bytes, more than one {}-byte catalog page \
+             holds; refused before any catalog page was written",
+            elide(&entry.name),
+            HEADER_SIZE + entry.length(),
+            PAGE_SIZE
+        )));
+    }
+    // Pushed rather than `add_entry`ed: `add_entry` asks `has_space` again, and a second copy of the
+    // question above would let a mutant of it survive.
+    page.entries.push(entry.clone());
+    page.serialize().map(|_| ())
 }
 
 impl TableEntry {
@@ -912,5 +962,59 @@ use super::*;
 
         let result = page.add_entry(mock_entry("overflow pls"));
         assert!(matches!(result, Err(FerroError::NotEnoughSpace)));
+    }
+
+    // ---- D249: the pre-check `Catalog::plan_alters` asks before an ALTER rewrites anything ----
+
+    /// An entry no catalog page can hold is refused as a value, not as a panic.
+    ///
+    /// Sixteen columns with 255-byte names is 16 × 258 bytes of columns, more than a 4096-byte page
+    /// less its header. `persist` would never place it and would link a fresh page per turn instead;
+    /// `serialize` has no bounds check and would panic on it. The pre-check must say no first.
+    #[test]
+    fn an_entry_larger_than_an_empty_page_is_refused_rather_than_serialized() {
+        let mut entry = bare_entry("wide");
+        entry.schema = Schema::new(
+            (0..16)
+                .map(|i| Column::new(format!("{i:02}{}", "c".repeat(253)), DataType::Integer, true))
+                .collect(),
+        );
+        assert!(
+            HEADER_SIZE + entry.length() > PAGE_SIZE,
+            "the fixture ({} bytes) fits a page, so this tests nothing",
+            HEADER_SIZE + entry.length()
+        );
+        assert!(
+            entry.schema.columns.iter().all(|c| c.name.len() == MAX_U8_LEN),
+            "the fixture's names must each fit their length prefix, so only the page size refuses"
+        );
+        match refuse_unless_encodable(&entry) {
+            Err(FerroError::Constraint(msg)) => assert!(
+                msg.contains("\"wide\"") && msg.contains("catalog page"),
+                "the refusal does not name the table and the page: {msg}"
+            ),
+            other => panic!("an entry larger than a page was not refused by size: {other:?}"),
+        }
+    }
+
+    /// The boundary control: the longest column name the format can express is encodable, so the
+    /// pre-check is not "refuse every long name".
+    #[test]
+    fn the_longest_expressible_column_name_is_encodable() {
+        let mut entry = bare_entry("t");
+        entry.schema = Schema::new(vec![
+            Column::new("id".to_string(), DataType::Integer, false),
+            Column::new("c".repeat(MAX_U8_LEN), DataType::Integer, true),
+        ]);
+        refuse_unless_encodable(&entry).expect("a 255-byte column name is exactly what the prefix holds");
+
+        entry.schema.columns[1].name.push('c');
+        assert!(
+            matches!(
+                refuse_unless_encodable(&entry),
+                Err(FerroError::Unrepresentable { len: 256, limit: 255, .. })
+            ),
+            "one byte past the prefix must be refused by the encoder's own guard"
+        );
     }
 }

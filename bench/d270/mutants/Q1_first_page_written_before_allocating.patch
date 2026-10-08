@@ -1,0 +1,14 @@
+--- a/src/catalog/catalog.rs
++++ b/src/catalog/catalog.rs
+@@ -562,6 +562,11 @@
+         //    new page is stamped as an empty catalog page as soon as it exists, so nothing that later
+         //    links to it can read back a zero page. If an allocation refuses, the pages this call
+         //    allocated are freed and nothing of the catalog was touched.
++        {
++            let mut early = images[0];
++            CatalogPage::stamp_links(&mut early, chain[0], chain.get(1).copied().unwrap_or(0));
++            self.write_catalog_page(chain[0], &early)?;
++        }
+         let mut fresh: Vec<u32> = Vec::new();
+         while chain.len() + fresh.len() < layout.len() {
+             match self.stamped_catalog_page() {
