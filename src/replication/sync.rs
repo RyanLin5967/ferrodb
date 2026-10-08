@@ -379,8 +379,17 @@ mod tests {
     /// **window-width dependent** — which is precisely why CI saw it intermittently and only
     /// under load, and why no local run reproduced it.
     ///
-    /// This cannot flake on the fixed code: `retained` is monotonic and `forget` does not touch
-    /// it, so the waiter's observation does not depend on which thread wins.
+    /// A generous deadline is deliberate: on fixed code the waiter returns on the first check
+    /// after the notify, so it costs nothing here and only prevents a starved thread from failing
+    /// this test for a reason unrelated to acknowledgements.
+    ///
+    /// ⚠ This replaces an earlier sentence of mine reading *"This cannot flake on the fixed code:
+    /// `retained` is monotonic and `forget` does not touch it."* That justification is TRUE and
+    /// does not support the claim it was offered for. Monotonic `retained` removes the ORDERING
+    /// failure; it says nothing about a wall-clock deadline expiring while the waiter is
+    /// descheduled. The deadline was 60ms, and on 2026-09-23 three suites ran concurrently on this
+    /// box — the exact condition that would have fired it. It passed even then, so raising it is
+    /// insurance, not a repair.
     #[test]
     fn a_concurrent_forget_does_not_take_the_ack_with_it() {
         let (mut lost, trials) = (0, 200);
@@ -388,7 +397,7 @@ mod tests {
             let t = Arc::new(AckTracker::new());
             let waiter = {
                 let t = Arc::clone(&t);
-                std::thread::spawn(move || t.wait_for(1000, Duration::from_millis(60)).is_ok())
+                std::thread::spawn(move || t.wait_for(1000, Duration::from_secs(5)).is_ok())
             };
             // Let the waiter park inside `wait_timeout` and release the mutex, so this models the
             // primary's main thread already waiting when the replica's last ack arrives.
@@ -406,9 +415,10 @@ mod tests {
         );
     }
 
-    /// ⛔ **D184 FOLLOW-UP — `AckTracker` LOST ITS `Default` IMPL IN `2ba9949`. BODY COMMENTED OUT
-    /// DELIBERATELY: IT DOES NOT COMPILE, AND A COMPILE ERROR WOULD RED-BUILD THE WHOLE CRATE
-    /// RATHER THAN FAIL ONE TEST. UNCOMMENT IT WHEN THE DERIVE IS RESTORED.**
+    /// **RESOLVED in `3e125e8`: the derive is restored, and the assertion below is live and
+    /// passing.** It is kept as a regression guard, because the way this broke leaves no other
+    /// trace — nothing in-tree calls `AckTracker::default()`, so the impl could vanish again and
+    /// every other test in the crate would still pass.
     ///
     /// `2ba9949` inserted `struct Acks` between `#[derive(Default)]` and `pub struct AckTracker`.
     /// An attribute binds to the *next* item, so the derive silently re-targeted onto the new
@@ -424,8 +434,8 @@ mod tests {
     /// acknowledged…"*) above `Acks`, where it merges into one docstring whose first sentence
     /// describes a different type — which is the tell that the move was accidental, not intended.
     ///
-    /// Fix: put `#[derive(Default)]` back on `AckTracker` (correct now, since `Acks: Default` and
-    /// `Condvar: Default`), move that doc line back with it, and uncomment the body here.
+    /// That was fixed by putting `#[derive(Default)]` back on `AckTracker` and moving the
+    /// stranded doc line back with it.
     #[test]
     fn acktracker_still_implements_default() {
         let _t: AckTracker = Default::default();
