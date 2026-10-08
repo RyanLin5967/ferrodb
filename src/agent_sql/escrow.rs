@@ -229,6 +229,47 @@ impl EscrowLedger {
         Ok(())
     }
 
+    /// [`Self::check_all`], then charge every spend: one batch, all of it or none of it.
+    ///
+    /// **One call, so no caller can put a window between the check and the charge.** D258:
+    /// `AgentRuntime::stage_all` used to run `check_all` under one lock acquisition and `spend` per
+    /// cell under others, so a spend landing in between was charged against a balance the check had
+    /// already approved for someone else. Here both halves run on `&mut self`, which the caller can
+    /// only hold under one lock.
+    ///
+    /// Once the check passes nothing below can refuse — the same arithmetic `spend` would redo per
+    /// cell, already done for the sum — so the charge is written directly rather than through
+    /// `spend`'s `Result`, which would reintroduce a half-charged batch as a representable outcome.
+    pub fn spend_all(&mut self, branch: BranchId, spends: &[(Cell, i64)]) -> Result<(), FerroError> {
+        self.check_all(branch, spends)?;
+        for (cell, amount) in spends {
+            if *amount <= 0 {
+                continue; // giving headroom back is always safe, exactly as in `spend`
+            }
+            if let Some(pool) = self.pools.get_mut(cell) {
+                *pool.spent.entry(branch).or_insert(0) += *amount;
+            }
+        }
+        Ok(())
+    }
+
+    /// Give back what [`Self::spend_all`] charged for a batch whose write then failed.
+    ///
+    /// **Saturating.** A branch released or settled in between has nothing left to give back, and a
+    /// refund must never take `spent` below zero: a negative spend is headroom nobody claimed,
+    /// minted by a failure.
+    pub fn refund_all(&mut self, branch: BranchId, spends: &[(Cell, i64)]) {
+        for (cell, amount) in spends {
+            if *amount <= 0 {
+                continue;
+            }
+            let Some(pool) = self.pools.get_mut(cell) else { continue };
+            if let Some(spent) = pool.spent.get_mut(&branch) {
+                *spent -= (*amount).min(*spent);
+            }
+        }
+    }
+
     /// Return everything `branch` holds. Called when a branch merges or is abandoned — an agent
     /// that dies holding a claim must not strand the resource, which is the failure mode that
     /// makes reservation schemes unusable in practice.
@@ -462,5 +503,64 @@ mod tests {
             "agents spent {total_spent} out of 20; the counter would be at {}",
             20 - total_spent
         );
+    }
+
+    /// **D258. `spend_all` charges a whole batch, or none of it.**
+    ///
+    /// The refused batch overdraws on its SECOND cell, so a charge-as-you-go implementation would
+    /// have spent the first cell's units before refusing — the exact shape that drained a claim on a
+    /// statement that never landed. The accepted batch carries a credit, which must not be counted.
+    #[test]
+    fn spend_all_charges_the_whole_batch_or_none_of_it() {
+        const CELL2: Cell = (TableId(1), RowId(2), ColId(1));
+        let mut e = EscrowLedger::new();
+        e.open(CELL, 20).unwrap();
+        e.open(CELL2, 20).unwrap();
+        e.claim(b(1), CELL, 10).unwrap();
+        e.claim(b(1), CELL2, 3).unwrap();
+
+        e.spend_all(b(1), &[(CELL, 5), (CELL2, 5)]).expect_err("the second cell overdraws");
+        assert_eq!(e.remaining(b(1), &CELL), Some(10), "a refused batch charged its first cell");
+        assert_eq!(e.remaining(b(1), &CELL2), Some(3));
+
+        e.spend_all(b(1), &[(CELL, 5), (CELL2, 3), (CELL, -50)]).expect("the batch fits");
+        assert_eq!(e.remaining(b(1), &CELL), Some(5), "an accepted batch was not charged");
+        assert_eq!(e.remaining(b(1), &CELL2), Some(0));
+
+        // Per cell, summed: two spends of 3 against 5 left.
+        e.spend_all(b(1), &[(CELL, 3), (CELL, 3)]).expect_err("overdraws only in aggregate");
+        assert_eq!(e.remaining(b(1), &CELL), Some(5));
+    }
+
+    /// **D258. A refund returns what `spend_all` charged, and never more.**
+    ///
+    /// The second refund of the same batch is the case that tells saturating from subtracting: a
+    /// plain subtraction takes `spent` to -6 and `remaining` to 16 against a claim of 10, headroom
+    /// minted by a failure. A branch released or settled in between has nothing to give back.
+    #[test]
+    fn a_refund_returns_what_was_spent_and_never_more() {
+        let mut e = EscrowLedger::new();
+        e.open(CELL, 20).unwrap();
+        e.claim(b(1), CELL, 10).unwrap();
+        e.spend_all(b(1), &[(CELL, 6)]).unwrap();
+        assert_eq!(e.remaining(b(1), &CELL), Some(4));
+
+        e.refund_all(b(1), &[(CELL, 6), (CELL, -3)]);
+        assert_eq!(e.remaining(b(1), &CELL), Some(10), "the refund did not return the spend");
+        e.refund_all(b(1), &[(CELL, 6)]);
+        assert_eq!(e.remaining(b(1), &CELL), Some(10), "a second refund minted headroom");
+
+        e.claim(b(2), CELL, 5).unwrap();
+        e.spend_all(b(2), &[(CELL, 5)]).unwrap();
+        e.release(b(2));
+        e.refund_all(b(2), &[(CELL, 5)]);
+        assert_eq!(e.remaining(b(2), &CELL), Some(0), "a refund after release resurrected a claim");
+
+        e.claim(b(3), CELL, 5).unwrap();
+        e.spend_all(b(3), &[(CELL, 5)]).unwrap();
+        e.settle_all(b(3));
+        e.refund_all(b(3), &[(CELL, 5)]);
+        // Slack 20 - 5 settled = 15, of which b(1) still claims 10.
+        assert_eq!(e.unclaimed(&CELL), Some(5), "a refund after settling changed the pool");
     }
 }

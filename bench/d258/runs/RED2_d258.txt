@@ -1,0 +1,41 @@
+# 2026-09-24T22:06:48Z tree=/Users/idide/wt/ferrodb-d258-red2.noindex HEAD=e21505ab57c2a98185ba389fc19bd0e0c9bfe41a
+# cmd: lockrun d258 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d258_stage_atomic
+2026-09-24T22:06:49Z d258 acquiring (5s poll), pid 29223
+2026-09-24T22:06:49Z d258 ACQUIRED: 29223 d258 2026-09-24T22:06:49Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d258-red2.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.19s
+     Running tests/d258_stage_atomic.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d258_stage_atomic-288d6c220e7fde21)
+
+running 9 tests
+test an_oversized_row_is_refused_and_merge_publishes_nothing ... ok
+test a_refused_statement_leaves_no_trace_and_its_retry_applies_once ... ok
+test a_row_at_the_entry_cap_still_stages_mirrors_and_merges ... ok
+test a_refused_statement_spends_neither_escrow_nor_row_write_budget ... ok
+test a_row_write_that_lands_and_then_fails_is_put_back_too ... FAILED
+test a_log_limit_refusal_does_not_wedge_the_branch ... ok
+test a_failed_log_write_leaves_no_trace_and_restores_the_page_tree ... ok
+test a_sibling_merge_that_refuses_on_its_second_table_stages_nothing ... ok
+test a_page_tree_failure_mid_statement_leaves_no_trace ... ok
+
+failures:
+
+---- a_row_write_that_lands_and_then_fails_is_put_back_too stdout ----
+
+thread 'a_row_write_that_lands_and_then_fails_is_put_back_too' (357631796) panicked at tests/d258_stage_atomic.rs:925:9:
+assertion `left == right` failed: row 1 is in the branch's page tree after a statement that failed: its write landed before the error, and nothing put it back
+  left: Some([Integer(1), Integer(15), Varchar("a")])
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_row_write_that_lands_and_then_fails_is_put_back_too
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+error: test failed, to rerun pass `--test d258_stage_atomic`
+error: 1 target failed:
+    `--test d258_stage_atomic`
+2026-09-24T22:07:03Z d258 rc=101
+2026-09-24T22:07:03Z d258 released (owner matched)
+# rc=101 end=2026-09-24T22:07:03Z HEAD_after=e21505ab57c2a98185ba389fc19bd0e0c9bfe41a

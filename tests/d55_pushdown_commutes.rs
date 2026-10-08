@@ -25,7 +25,7 @@
 //!   workspace `BTreeMap`.
 //! * `AgentRuntime::with_storage(.., ArenaPageStore, ..)` — `storage: Some(PagedRows)`. Every
 //!   staged row is ALSO mirrored onto the branch's own copy-on-write page tree by
-//!   `stage_all` (`src/agent_sql/runtime.rs`, the `if self.storage.is_some()` block), which
+//!   `stage_all` (`src/agent_sql/runtime.rs`; since D258 the write is `mirror_rows`, step 4), which
 //!   allocates arena pages, publishes a new branch root through the catalog, and takes the
 //!   catalog lock while doing it. None of that code runs on the map-backed path, and a layer
 //!   exercised on one backend only is untested on the other.
@@ -39,12 +39,14 @@
 //! **`visible_rows_where` never reads the page store.** It filters the base scan and then folds in
 //! `state.workspaces[branch].rows`, which is the same in-memory map on both backends; `self.storage`
 //! appears nowhere on that path (`src/agent_sql/runtime.rs` — the only uses are `storage()`,
-//! `rows()`, `live_page_count` and `stage_all`'s mirror block). So the six case assertions
+//! `rows()`, `live_page_count`, and `stage_all`'s size precheck and mirror, which D258 moved into
+//! `mirror_rows`). So the six case assertions
 //! **cannot** diverge between the two backends, and a green arena run is not independent
 //! confirmation that pushdown commutes "on disk" — the overlay it reads is not on disk.
 //!
 //! That was fire-checked rather than reasoned at: with `stage_all`'s mirror block disabled
-//! (`if false && self.storage.is_some()`), so that nothing whatsoever reached the arena, all six
+//! (`if false && self.storage.is_some()`, before D258 moved that block into `mirror_rows`), so
+//! that nothing whatsoever reached the arena, all six
 //! arena case assertions still PASSED. The one assertion that fired was the page-growth guard.
 //!
 //! What the arena test therefore does buy, which the map-backed test cannot:
