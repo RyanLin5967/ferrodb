@@ -91,7 +91,7 @@
 //! sweep still continues past one — that is what the absorption is FOR — it just no longer
 //! continues *quietly*.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -306,7 +306,9 @@ pub struct LeaseStats {
     pub refused_branches: u64,
     /// Scans whose reap returned an error.
     pub failed: u64,
-    /// Passes that reached the END of `scan_once`, the D88 orphan sweep included.
+    /// Passes that REACHED the end of `scan_once`, after the D88 orphan sweep was ATTEMPTED. A sweep
+    /// that failed is reported and the pass still counts: this says the sweep is over, not that it
+    /// succeeded.
     ///
     /// `scans` cannot say that: it is counted before the orphan sweep runs, and a pass that
     /// refused or failed early reaches neither. READ-VS-N's restart arm waits on this to know the
@@ -314,6 +316,27 @@ pub struct LeaseStats {
     /// that pass repeated the open's full sweep, see `TwoTierReaper::open_sweep_visits`. Observing
     /// only.
     pub finished: u64,
+    /// **D265: the scan thread died by panicking.** Set by a guard in its body as it unwinds
+    /// (`DeathFlag`). Nothing is reaped in this process after it, and `OpenDatabase::close` fails
+    /// on it. Before this field a dead thread's counters read exactly like a healthy thread's, and
+    /// the only sign was one stderr line at shutdown.
+    pub panicked: bool,
+}
+
+impl LeaseStats {
+    /// **D265: the one check every entry point makes at shutdown** (PREREG A22.1). `Err` when the
+    /// scan thread died by panicking, so the process exits non-zero: `run_cli` reaches it through
+    /// `OpenDatabase::close`, and `examples/pgserver.rs` calls it after its final checkpoint.
+    /// `tests/d265_entry_points_check_the_lease.rs` holds both entry points to it.
+    pub fn ended_alive(&self) -> Result<(), FerroError> {
+        if self.panicked {
+            Err(FerroError::Branch(
+                "the lease scan thread panicked during this session: no lease was reaped after it died".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -331,6 +354,7 @@ struct Counters {
     reported_unreadable: AtomicU64,
     /// **D232.** The reaper's `foreign_arenas_skipped` as of the last report.
     reported_foreign: AtomicU64,
+    panicked: AtomicBool,
 }
 
 impl Counters {
@@ -344,6 +368,19 @@ impl Counters {
             refused_branches: self.refused_branches.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
             finished: self.finished.load(Ordering::SeqCst),
+            panicked: self.panicked.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// **D265.** Marks the scan thread dead if it unwinds. A `Drop` guard rather than `catch_unwind`,
+/// so the panic still ends the thread, and `shutdown` still reports it on stderr.
+struct DeathFlag(Arc<Counters>);
+
+impl Drop for DeathFlag {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.panicked.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -453,13 +490,17 @@ impl LeaseThread {
             let halt = Arc::clone(&halt);
             std::thread::Builder::new()
                 .name("ferrodb-lease".into())
-                .spawn(move || loop {
-                    if halt.is_stopping() {
-                        return;
-                    }
-                    scan_once(&reaper, &runtime, &*lock, &counters, &report);
-                    if halt.wait(interval) {
-                        return;
+                .spawn(move || {
+                    // D265: set on unwind, so `stats()` and `stop()` say the thread died.
+                    let _death = DeathFlag(Arc::clone(&counters));
+                    loop {
+                        if halt.is_stopping() {
+                            return;
+                        }
+                        scan_once(&reaper, &runtime, &*lock, &counters, &report);
+                        if halt.wait(interval) {
+                            return;
+                        }
                     }
                 })
                 .map_err(|e| {
@@ -498,7 +539,8 @@ impl LeaseThread {
         self.halt.signal();
         if let Some(h) = self.handle.take() {
             // A panicked scan thread is reported, not propagated: this runs from `Drop` as well,
-            // and panicking there during an unwind aborts the process.
+            // and panicking there during an unwind aborts the process. `stop()`'s caller learns
+            // of it through `LeaseStats::panicked` (D265).
             if h.join().is_err() {
                 report("lease: the scan thread panicked; no further leases will be reaped in this process".to_string());
             }
@@ -616,6 +658,11 @@ fn scan_once(
     counters: &Counters,
     out: &dyn Fn(String),
 ) {
+    // D265's unit-test seam: an empty inline fn outside `cargo test` (both definitions are at the
+    // file's end). No attribute here: `tests/d53_private_root_allowlist.rs` stops reading at the
+    // first `#[cfg(test)]` it finds anywhere in a line, and this is the middle of production code.
+    scan_seam::fire(reaper);
+
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
     counters.attempts.fetch_add(1, Ordering::SeqCst);
@@ -938,6 +985,68 @@ fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
 fn report(msg: String) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
+/// **D265's test seam, outside `cargo test`: nothing.** `scan_once` calls `fire` unconditionally so
+/// no attribute line sits in the production region (PREREG A22.2); here it compiles to nothing.
+/// Placed before the `#[cfg(test)]` definition below, which is where both tripwires stop reading.
+#[cfg(not(test))]
+mod scan_seam {
+    use crate::branch::TwoTierReaper;
+
+    #[inline(always)]
+    pub(super) fn fire(_reaper: &TwoTierReaper) {}
+}
+
+/// **D265's test seam, compiled into unit tests only.** A scan whose reaper sits at an armed
+/// address panics once, first thing, so a test can kill ONE lease thread and no other in the same
+/// test binary. Placed last so both tripwires (`open_path_allowlist`, which stops at the first
+/// bare `#[cfg(test)]` line, and `d53_private_root_allowlist`, which stops at the first
+/// `#[cfg(test)]` substring) still read every line of production code above it.
+#[cfg(test)]
+pub(crate) mod scan_seam {
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::branch::TwoTierReaper;
+
+    /// `(reaper address, fired)`.
+    static ARMED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+
+    fn addr(reaper: &TwoTierReaper) -> usize {
+        reaper as *const TwoTierReaper as usize
+    }
+
+    /// Arm `reaper`'s next scan to panic, once.
+    pub(crate) fn arm(reaper: &TwoTierReaper) {
+        let a = addr(reaper);
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        armed.retain(|&(x, _)| x != a);
+        armed.push((a, false));
+    }
+
+    /// Whether `reaper`'s armed scan has panicked.
+    pub(crate) fn fired(reaper: &TwoTierReaper) -> bool {
+        let a = addr(reaper);
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|&(x, f)| x == a && f)
+    }
+
+    /// Called first thing in `scan_once`.
+    pub(super) fn fire(reaper: &TwoTierReaper) {
+        let a = addr(reaper);
+        let fire = {
+            let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+            match armed.iter_mut().find(|e| e.0 == a && !e.1) {
+                Some(e) => {
+                    e.1 = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if fire {
+            panic!("D265 test seam: this reaper's lease scan panics");
+        }
+    }
 }
 
 #[cfg(test)]

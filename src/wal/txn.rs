@@ -17,7 +17,10 @@ use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::
 ///
 /// Read once, because a value that changes underneath a running database would make checkpoint
 /// timing depend on when the environment was last read rather than on how much work has happened.
-fn checkpoint_interval() -> u64 {
+///
+/// Public so a harness can print the value in force (READ-VS-N, PREREG A14.3) rather than the raw
+/// variable, which a `0` or an unparseable value would misreport.
+pub fn checkpoint_interval() -> u64 {
     use std::sync::OnceLock;
     static INTERVAL: OnceLock<u64> = OnceLock::new();
     *INTERVAL.get_or_init(|| {

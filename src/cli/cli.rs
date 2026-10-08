@@ -96,8 +96,17 @@ pub struct OpenDatabase {
     pub lease: LeaseThread,
     pub arena_path: String,
     pub timings: OpenTimings,
+    /// Whether `open_recovered` found log records to replay. NOT whether it rebuilt the indexes: it
+    /// also rebuilds when the stale-index marker is present, with this false. **Observing only —
+    /// READ-VS-N arm 3** judges D216 on this rather than on a timer: a clean shutdown should leave
+    /// nothing to replay, and before D216 it does. This flag is also the rebuild's GATE (with the
+    /// marker), so the rebuild's time is a consequence of it, not a check on it.
+    pub recovered: bool,
     /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
-    /// the lock file goes and another process may open the database.
+    /// the lock file goes and another process may open the database. That covers THIS struct's
+    /// handles only: an `Arc` cloned out of it and held elsewhere outlives the lock, so its holder
+    /// must drop it before letting another process open the files (the READ-VS-N harness does, before
+    /// it spawns its restart child).
     _lock: DbLock,
 }
 
@@ -116,6 +125,10 @@ impl OpenDatabase {
         // The exit steps the tests run (`tests/d244_clean_exit_publishes_the_root.rs`), so the
         // binary and READ-VS-N's restart arm close through the same code as those tests.
         let closed = exit_sequence(&self.branches, &self.txn, &self.store, Path::new(&self.arena_path));
+        // D265: a lease thread that died leaves a database that stopped reaping for the rest of the
+        // session. The exit steps above still ran; the close then fails, so `run_cli` exits
+        // non-zero instead of printing "bye bye".
+        let closed = closed.and_then(|()| stats.ended_alive());
         (stats, closed)
     }
 }
@@ -136,7 +149,7 @@ pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, 
     // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
     // function every binary opens through. It times its own steps and hands them back
     // (`BootTimings`), so they are measured where they run and not re-spelled here.
-    let OpenedDatabase { bp, txn, catalog, timings: boot, .. } =
+    let OpenedDatabase { bp, txn, catalog, recovered, timings: boot, .. } =
         open_recovered(Path::new(db_path), &lock)?;
     timings.boot = boot;
 
@@ -265,6 +278,7 @@ pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, 
         lease,
         arena_path,
         timings,
+        recovered,
         _lock: lock,
     })
 }
@@ -315,6 +329,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         || stats.refused_scans > 0
         || stats.refused_branches > 0
         || stats.failed > 0
+        || stats.panicked
     {
         println!("ferrodb: lease scan {stats:?}");
     }

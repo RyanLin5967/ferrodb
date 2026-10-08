@@ -1478,3 +1478,60 @@ fn d232_unreadable_owners_and_foreign_arenas_are_printed_not_only_counted() {
     let quiet = quiet.text();
     assert!(!quiet.contains("NOT freed"), "a pass with nothing new reported: {quiet:?}");
 }
+
+// -------------------------------------------------------------------------------------------
+// D265: a scan thread that panicked must say so, and the shipped close must fail on it.
+// -------------------------------------------------------------------------------------------
+
+/// **D265 (a).** A lease scan thread that panicked says so in what `stop()` returns. Before the
+/// fix its final counters read exactly like a healthy thread's, and the panic surfaced only as one
+/// stderr line at shutdown. Read through `Debug`, so this compiles against the API before the
+/// `panicked` field exists (red first).
+#[test]
+fn a_scan_thread_that_panicked_says_so_in_its_stats() {
+    let f = fixture();
+    scan_seam::arm(&f.reaper);
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("the armed scan to panic", || scan_seam::fired(&f.reaper));
+    let done = lease.stop();
+    assert!(
+        format!("{done:?}").contains("panicked: true"),
+        "a dead scan thread's final stats read as a healthy thread's: {done:?}"
+    );
+}
+
+/// **D265 (b).** The shipped close errs when its lease thread died, so `run_cli` exits non-zero
+/// instead of printing "bye bye" over a database that stopped reaping for the rest of the process.
+#[test]
+fn the_shipped_close_errs_when_its_lease_thread_died() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d265.db");
+    let db = crate::cli::cli::open_database(path.to_str().unwrap(), BRISK).unwrap();
+    scan_seam::arm(&db.reaper);
+    wait_for("the armed scan to panic", || scan_seam::fired(&db.reaper));
+    let (stats, closed) = db.close();
+    assert!(closed.is_err(), "a close whose lease thread died returned Ok: {stats:?}");
+}
+
+/// **D265 (c), the negative control.** A healthy scan thread's `stop()` reads `panicked = false`,
+/// so (a) cannot pass on a field that reads true whatever happened.
+#[test]
+fn a_healthy_scan_thread_does_not_read_as_dead() {
+    let f = fixture();
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("a scan to finish", || lease.stats().finished > 0);
+    let done = lease.stop();
+    assert!(!done.panicked, "a healthy scan thread read as dead: {done:?}");
+}
