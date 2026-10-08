@@ -1,0 +1,27 @@
+2026-09-24T21:53:35Z d216-a_red216-site acquiring (5s poll), pid 38948
+2026-09-24T21:53:35Z d216-a_red216-site ACQUIRED: 38948 d216-a_red216-site 2026-09-24T21:53:35Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.86s
+     Running tests/integration_cluster_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_snapshot-350a4148b9c71550)
+
+running 1 test
+test an_install_under_a_wal_pin_is_refused_and_names_the_pin ... FAILED
+
+failures:
+
+---- an_install_under_a_wal_pin_is_refused_and_names_the_pin stdout ----
+
+thread 'an_install_under_a_wal_pin_is_refused_and_names_the_pin' (356183713) panicked at tests/integration_cluster_snapshot.rs:832:5:
+the refusal does not name the OLDEST pin, the one below the records it would have to discard: wal error: this node's WAL could not be discarded before installing a snapshot (base is still 1); something holds a pin below it. Those records describe the database this install replaced and recovery would replay them over the installed pages.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    an_install_under_a_wal_pin_is_refused_and_names_the_pin
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `--test integration_cluster_snapshot`
+2026-09-24T21:53:37Z d216-a_red216-site rc=101
+2026-09-24T21:53:37Z d216-a_red216-site released (owner matched)
+rc=101

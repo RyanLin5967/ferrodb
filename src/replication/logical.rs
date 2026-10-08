@@ -125,10 +125,12 @@ pub enum ChangeOp {
     /// DDL actually occupied means the events before it describe the old shape and the ones after
     /// describe the new one, with no ambiguity to resolve.
     ///
-    /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint,
-    /// because a checkpoint truncates the log and must re-establish the schema at the new base for
-    /// the log to stay self-describing. So a consumer will see the same `CREATE_TABLE` many times
-    /// for one table and must read it as "this table has this shape" rather than "a table was just
+    /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint that
+    /// truncates the log, because the truncation discarded it and the schema has to be re-established
+    /// at the new base for the log to stay self-describing. A checkpoint that a pin kept from
+    /// truncating re-emits it only once a pin has passed its last declaration, so that a consumer
+    /// following the log still learns the shape (D234). So a consumer will see the same
+    /// `CREATE_TABLE` many times for one table and must read it as "this table has this shape" rather than "a table was just
     /// created" — anything counting them is counting checkpoints. Measured at
     /// `FERRODB_CHECKPOINT_INTERVAL=1`, where 30 commits produced 61 events: 30 rows and 31
     /// re-declarations.
@@ -203,7 +205,7 @@ impl SchemaChange {
     ///
     /// The distinction a consumer needs is not "is this about shape" — all five are — but
     /// **"is this a declaration or is it news"**. `CREATE_TABLE` is re-emitted at every checkpoint
-    /// and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
+    /// that truncates the log and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
     /// set. The column-level three are delivered exactly once, in log order, at the position the
     /// DDL occupied, and a consumer that re-applies one has renamed a column twice.
     pub fn is_declaration(&self) -> bool {
@@ -363,6 +365,18 @@ pub struct Decoded {
     /// with nothing staged and emit nothing at all. `open` alone cannot express that, because it
     /// names the transactions without saying where they began.
     pub open_from: Option<u64>,
+    /// Where the walk stopped: every record in `[from_lsn, walked_to)` was read, and each became an
+    /// event, was withheld as part of an open transaction (`open_from`), or was counted
+    /// (`internal`, `aborted`, `unresolved`, `undecodable`) or yields nothing (a `TxnEnd`, a
+    /// transaction-0 run declaration). Always a record boundary, and it can lie past `to_lsn`: the
+    /// last record read may straddle it.
+    ///
+    /// **D252: what lets a caught-up cursor pass a log's no-event tail.** An event's
+    /// `commit_end_lsn` ends at its `Commit`, and a cursor computed only from events stopped there,
+    /// below the `TxnEnd` every commit appends, so a live subscription pinned the log below its end
+    /// and no checkpoint truncated while it lived. With nothing open and nothing refused, a caller
+    /// may advance to here.
+    pub walked_to: u64,
 }
 
 impl Decoded {
@@ -415,10 +429,11 @@ struct Learned {
     /// with the warm one; a sequential pump loop has no gap to fill and scans nothing extra, so the
     /// performance reason the history exists is preserved.
     ///
-    /// Two invariants this must keep, both of which reopen a fixed defect if dropped: it is reset
-    /// to 0 whenever the log changes (an LSN means nothing across files — the A9 defect), and it is
-    /// clamped UP to `base_lsn` on truncation, because records below the floor are gone and can
-    /// never be scanned again.
+    /// Three invariants this must keep, each of which reopens a defect if dropped: it is reset to 0
+    /// whenever the log changes (an LSN means nothing across files — the A9 defect); it is clamped UP
+    /// to `base_lsn` on truncation, because records below the floor are gone and can never be
+    /// scanned again; and it is always a record boundary, because the gap fill starts reading there
+    /// (the D252 review's B1: a range's bound can fall inside a record).
     covered_through: u64,
 }
 
@@ -640,12 +655,16 @@ impl LogicalDecoder {
     /// This is the gap fill behind `Learned::covered_through`. It reads records rather than rows:
     /// no tuple is deserialized, nothing is staged, and no event is produced, so the cost is one
     /// pass over the record headers of a range the caller was going to skip anyway.
+    ///
+    /// Returns where it stopped: a record boundary at or past `to`, because a record that starts
+    /// below `to` is read whole. `to` itself is a caller's cursor and may lie inside a record; the
+    /// position returned never does (the second D252 review's finding 1).
     fn scan_ddl(
         wal: &WalManager,
         from: u64,
         to: u64,
         shapes: &mut Vec<ShapeAt>,
-    ) -> Result<(), FerroError> {
+    ) -> Result<u64, FerroError> {
         let mut lsn = from;
         while lsn < to {
             let (rec, next) = wal.read_record(lsn)?;
@@ -668,7 +687,7 @@ impl LogicalDecoder {
             }
             lsn = next;
         }
-        Ok(())
+        Ok(lsn)
     }
 
     /// Fold newly-seen DDL into the remembered history.
@@ -698,8 +717,12 @@ impl LogicalDecoder {
     /// against the log's base, and a live subscription pins the base, so under a held pin nothing
     /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
     /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
-    /// for every table after every truncation, so a long-running database mints one entry per table
-    /// per checkpoint, all carrying the identical shape.
+    /// for every table after every truncation, and until D234 also at every checkpoint a pin kept
+    /// from truncating, so a long-running database minted one entry per table per checkpoint, all
+    /// carrying the identical shape. Since D234 a checkpoint under a pin re-declares only when a pin
+    /// has passed the last declaration, so a pin held at the base stops that at the source. Identical
+    /// runs still arrive at real truncations, as a following pin advances, and in archived logs
+    /// (`tests/d234_decoder_history_still_collapses.rs`).
     ///
     /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
     /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
@@ -829,13 +852,16 @@ impl LogicalDecoder {
             if history.covered_through < from_lsn {
                 let gap_from = history.covered_through;
                 let mut found = Vec::new();
-                Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
+                let scanned_to = Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
                 // Through the shared merge: a decoder that walked an UPPER range first already holds
                 // shapes inside the gap, and appending blindly would duplicate them.
                 let mut shapes = std::mem::take(&mut history.shapes);
                 Self::merge_shapes(&mut shapes, found);
                 history.shapes = shapes;
-                history.covered_through = from_lsn;
+                // Where the scan stopped, not `from_lsn`: a cursor handed in from outside (a client's
+                // resume position) can lie inside a record, and the watermark must stay on a
+                // boundary. The walk below then fails on that cursor, as it should.
+                history.covered_through = scanned_to;
             }
 
             for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
@@ -1180,6 +1206,7 @@ impl LogicalDecoder {
             }
             lsn = next;
         }
+        out.walked_to = lsn;
 
         // I20: publish what this walk learned, so the next range starts from it. Merged rather than
         // assigned — two threads may pump concurrently through one `Arc<FeedStreamer>`, and a range
@@ -1189,10 +1216,16 @@ impl LogicalDecoder {
             let mut shapes = std::mem::take(&mut history.shapes);
             Self::merge_shapes(&mut shapes, learned);
             history.shapes = shapes;
-            // The walk reached `to_lsn`, so the history is now complete up to there — and this must
+            // The walk reached `walked_to`, so the history is now complete up to there — and this must
             // happen even when the range held NO DDL, or a pump over a quiet stretch would leave a
             // gap behind it and re-scan the same records on every later call.
-            history.covered_through = history.covered_through.max(to_lsn);
+            //
+            // `walked_to`, not `to_lsn` (the D252 review's B1). The last record read may start below
+            // `to_lsn` and end above it, so `to_lsn` can be a position INSIDE a record. A pump that
+            // then resumed past it (after a `Commit` straddling the bound at `00f4c39`, after any
+            // straddling record once the cursor passes a no-event tail) gap-filled from the middle of
+            // a record, failed, and failed again on every later pump of that decoder.
+            history.covered_through = history.covered_through.max(out.walked_to);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,

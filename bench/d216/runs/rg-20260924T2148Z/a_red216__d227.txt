@@ -1,0 +1,27 @@
+2026-09-24T21:53:22Z d216-a_red216-d227 acquiring (5s poll), pid 32656
+2026-09-24T21:53:22Z d216-a_red216-d227 ACQUIRED: 32656 d216-a_red216-d227 2026-09-24T21:53:22Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.29s
+     Running tests/d227_restart_keeps_declarations.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d227_restart_keeps_declarations-ea80bb72efbe4570)
+
+running 1 test
+test a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind ... FAILED
+
+failures:
+
+---- a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind stdout ----
+
+thread 'a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind' (356178356) panicked at tests/d227_restart_keeps_declarations.rs:99:5:
+after a restart, the exit checkpoint declared no table: []
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+error: test failed, to rerun pass `--test d227_restart_keeps_declarations`
+2026-09-24T21:53:33Z d216-a_red216-d227 rc=101
+2026-09-24T21:53:33Z d216-a_red216-d227 released (owner matched)
+rc=101

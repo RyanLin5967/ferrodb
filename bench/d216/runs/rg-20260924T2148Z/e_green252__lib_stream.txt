@@ -1,0 +1,92 @@
+2026-09-24T23:04:23Z d216-e_green252-lib_stream acquiring (5s poll), pid 72027
+2026-09-24T23:04:23Z d216-e_green252-lib_stream ACQUIRED: 72027 d216-e_green252-lib_stream 2026-09-24T23:04:23Z
+2026-09-24T23:04:23Z d216-e_green252-lib_stream pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 776 files, 488.8MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.78s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 28 tests
+test replication::stream::tests::a_transaction_that_was_in_flight_at_snapshot_time_is_still_delivered ... ok
+test replication::stream::tests::a_batch_that_is_entirely_suppressed_still_advances_the_cursor ... ok
+test replication::stream::tests::a_resume_cursor_inside_a_record_does_not_break_later_pumps ... ok
+test replication::stream::tests::a_batch_that_is_entirely_refused_does_not_advance_the_cursor ... ok
+test replication::stream::tests::a_refusal_leaves_a_subscriptions_claim_below_the_refused_commit ... ok
+test replication::stream::tests::an_already_delivered_event_does_not_wedge_the_cursor_when_it_later_becomes_unpublishable ... ok
+test replication::stream::tests::a_schema_event_survives_the_snapshot_filter ... ok
+test replication::stream::tests::a_large_backlog_is_delivered_in_bounded_batches ... ok
+test replication::stream::tests::an_excluded_tables_events_are_dropped_and_the_cursor_keeps_moving ... ok
+test replication::stream::tests::a_long_open_transaction_does_not_cause_endless_redelivery ... ok
+test replication::stream::tests::a_pump_emits_committed_changes_and_advances_past_them ... ok
+test replication::stream::tests::an_in_flight_transaction_does_not_move_the_cursor_and_is_emitted_after_it_commits ... ok
+test replication::stream::tests::a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it ... ok
+test replication::stream::tests::a_cursor_below_the_logs_base_is_refused_by_name ... ok
+test replication::stream::tests::a_refused_event_is_replayed_after_the_publication_is_widened ... ok
+test replication::stream::tests::a_bound_inside_a_commit_does_not_break_the_next_pump ... ok
+test replication::stream::tests::a_streamer_without_a_snapshot_boundary_suppresses_nothing ... ok
+test replication::stream::tests::a_subscription_holds_the_log_across_a_checkpoint ... ok
+test replication::stream::tests::lag_shrinks_as_a_consumer_catches_up ... ok
+test replication::stream::tests::changes_that_are_not_durable_yet_are_not_emitted ... ok
+test replication::stream::tests::events_the_snapshot_already_contained_are_not_re_delivered ... ok
+test replication::stream::tests::following_takes_its_cursor_from_the_boundary_and_refuses_without_one ... ok
+test replication::stream::tests::resuming_from_the_returned_cursor_does_not_repeat_events ... ok
+test replication::stream::tests::an_open_transaction_is_not_stepped_over_when_a_later_one_commits ... ok
+test replication::stream::tests::withholding_a_column_still_ships_the_row_and_advances_the_cursor ... ok
+test replication::stream::tests::every_commit_a_refusal_holds_back_keeps_its_rows ... ok
+test replication::stream::tests::resuming_from_a_commit_position_alone_loses_an_in_flight_transaction ... ok
+test replication::stream::tests::subscribing_below_the_base_is_refused_immediately ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 1672 filtered out; finished in 0.18s
+
+2026-09-24T23:04:40Z d216-e_green252-lib_stream rc=0
+2026-09-24T23:04:40Z d216-e_green252-lib_stream released (owner matched)
+rc=0

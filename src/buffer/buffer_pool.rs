@@ -290,6 +290,14 @@ pub struct Frame {
     pub page_id: Option<u32>,
     pub pin_counter: AtomicU16,
     pub dirty_flag: AtomicBool,
+    /// **D216: where the log's end was the last time these bytes changed.** `wal_gate` makes the
+    /// log durable up to here before it writes back a page with no LSN of its own (an index,
+    /// catalog or directory page), because every record such a change depends on was appended
+    /// before it. Set by [`FrameWriteGuard`]'s drop while the write lock is still held, so a
+    /// reader of the frame always sees the mark that goes with the bytes. Never lowered and never
+    /// reset: a mark left by a page this frame used to hold is below the log's end when the next
+    /// change raises it, so at worst it asks for a flush that is already done.
+    pub wal_mark: AtomicU64,
 }
 
 /// What happened when the pool tried to take a replacement victim's frame.
@@ -567,6 +575,8 @@ pub struct FrameWriteGuard<'a> {
     guard: Option<RwLockWriteGuard<'a, Frame>>,
     shadow: &'a FrameShadow,
     touched: bool,
+    /// The pool's log, if one is attached, so `drop` can set [`Frame::wal_mark`]. D216.
+    wal: Option<&'a WalManager>,
     /// The frame's label when this guard was taken.
     ///
     /// **A relabel and a fill are two different writes, and only the fill's bytes belong to the
@@ -601,6 +611,12 @@ impl DerefMut for FrameWriteGuard<'_> {
 impl Drop for FrameWriteGuard<'_> {
     fn drop(&mut self) {
         if self.touched {
+            if let (Some(frame), Some(wal)) = (self.guard.as_ref(), self.wal) {
+                // D216: under the write lock, so the mark and the bytes are published together.
+                // Read after the change, so it is at or past the end of every record appended
+                // before the change began. See `Frame::wal_mark`.
+                frame.wal_mark.fetch_max(wal.next_lsn.load(Ordering::SeqCst), Ordering::Relaxed);
+            }
             if let Some(frame) = self.guard.as_ref() {
                 // See `label_at_acquire`: bytes and label must be published together or not at all.
                 let label = if frame.page_id == self.label_at_acquire {
@@ -689,6 +705,7 @@ impl BufferPoolManager {
             guard: Some(guard),
             shadow: &self.shadows[frame_i],
             touched: false,
+            wal: self.wal.get().map(|w| &**w),
             label_at_acquire,
             _pool,
         }
@@ -1075,7 +1092,7 @@ impl BufferPoolManager {
                 return Ok(Evicted::Declined);
             }
             if frame.dirty_flag.load(Ordering::Relaxed) {
-                self.wal_gate(&frame.data)?;
+                self.wal_gate(&frame)?;
                 self.disk_manager.write(victim, &frame.data)?;
                 frame.dirty_flag.store(false, Ordering::Relaxed);
             }
@@ -1220,7 +1237,7 @@ impl BufferPoolManager {
 
         let frame = self.frames[frame_i].read().unwrap();
         if frame.dirty_flag.load(Ordering::Relaxed) {
-            self.wal_gate(&frame.data)?;
+            self.wal_gate(&frame)?;
             self.disk_manager.write(page_id, &frame.data)?;
             frame.dirty_flag.store(false, Ordering::Relaxed);
         }
@@ -1259,7 +1276,7 @@ impl BufferPoolManager {
         for (page_id, frame_i) in pages {
             let frame = self.frames[frame_i].read().unwrap();
             if frame.dirty_flag.load(Ordering::Relaxed) {
-                self.wal_gate(&frame.data)?;
+                self.wal_gate(&frame)?;
                 self.disk_manager.write(page_id, &frame.data)?;
                 frame.dirty_flag.store(false,Ordering::Relaxed);
             }
@@ -1422,12 +1439,50 @@ impl BufferPoolManager {
         let _ = self.wal.set(wal);
     }
 
-    fn wal_gate(&self, data: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
-        if let Some(wal) = self.wal.get() {
-            let plsn = page_lsn_of(data);
-            if plsn > 0 {
-                wal.flush_up_to(plsn)?;
-            }
+    /// Write-ahead logging for one page about to be written back: the log records its contents
+    /// depend on must be durable first. What a page depends on is decided by [`log_dependency`],
+    /// from the page itself.
+    ///
+    /// **D216: a table page with no LSN of its own waits for the log up to [`Frame::wal_mark`].**
+    /// Index pages are not logged, and their LSN field is always 0 (nothing in `storage::index`
+    /// sets it); a catalog or directory page has none. This gate used to skip all of them. But an
+    /// index leaf's contents still depend on logged changes: it holds the key of every row inserted
+    /// under it, and each such row's `HeapInsert` is appended BEFORE the leaf changes (heap first, in
+    /// `execution::insert` and `execution::update`). So an eviction could write a leaf holding an
+    /// uncommitted key while that transaction's `Begin` and `HeapInsert` were still only in the log
+    /// buffer. After a crash nothing in the log accounts for the key, recovery sees no work, and
+    /// the key names a slot the heap never got
+    /// (`an_index_page_reaches_disk_only_after_the_log_records_it_depends_on`). The mark is where
+    /// the log's end was when the page last changed, so every record the change depends on is
+    /// below it, without the page having to say which.
+    ///
+    /// This is what lets `wal::recovery::recover` decide from the log alone whether the trees can be
+    /// stale: an index page on disk that reflects a change made since the last checkpoint implies
+    /// that the change's data record is in the log.
+    ///
+    /// The mark and not the whole log, which was this fix's first version (the D216 adversary's F4).
+    /// At `00f4c39` a commit left its `TxnEnd` in the buffer (D252 writes it with the `Commit`),
+    /// and under load the buffer holds the open transactions' records, so "flush the whole log" cost
+    /// a log write and an fsync on nearly every eviction of a dirty index, catalog or directory page
+    /// in a 1024-frame pool. Against the mark, a page whose changes were committed finds its records already durable
+    /// (`an_index_page_whose_records_are_durable_does_not_flush_the_log`). What is left costs what
+    /// the heap page already costs: a flush when the page holds a change whose records are not yet
+    /// durable. Unmeasured.
+    ///
+    /// **D247: an arena page waits for nothing.** The CLI and pgserver build `ArenaPageStore` over
+    /// this same pool. The classifier this replaced read any page whose first byte is 0 as a heap
+    /// page, and an arena page begins with its birth epoch as a big-endian u64, so its bytes 11..19
+    /// (arena id, checksum, type, flags) became an "LSN" of about 2^24 to 2^56, and the first dirty
+    /// arena write-back after any commit paid a log write and an fsync
+    /// (`tests/d247_arena_page_write_back_flushes_no_log.rs`). A branch page is not logged.
+    fn wal_gate(&self, frame: &Frame) -> Result<(), FerroError> {
+        let Some(wal) = self.wal.get() else {
+            return Ok(());
+        };
+        match log_dependency(&frame.data, frame.page_id) {
+            LogDependency::UpTo(lsn) => wal.flush_up_to(lsn)?,
+            LogDependency::Through => wal.flush_through(frame.wal_mark.load(Ordering::Relaxed))?,
+            LogDependency::Nothing => {}
         }
         Ok(())
     }
@@ -1437,9 +1492,14 @@ impl BufferPoolManager {
 ///
 /// Classifies by `data[0]` alone, and that byte is not a type on every page: on the bitmap page it
 /// is the low byte of the next-bitmap pointer, and on a COW arena page it is the top byte of
-/// `birth_epoch`. Both read as a heap page here. The WAL gate can live with that, since it only
-/// flushes the log further than it needed to. `WalManager::open_for_database` cannot, so it also
-/// requires the page to name itself in bytes 1..5, as redo does.
+/// `birth_epoch`. Both read as a heap page here. `WalManager::open_for_database` (D280), its one
+/// caller, therefore also requires the page to name itself in bytes 1..5, as redo does. The WAL
+/// gate no longer reads it: it classifies with [`log_dependency`] (D216, D247), which makes the
+/// same self-naming check and recognises an arena page by its checksum.
+///
+/// ⚠ It and [`log_dependency`] differ on one point: for a B+tree page (type 2 or 3) this reads an
+/// LSN at bytes 5..13, while `log_dependency` treats every self-naming type 1 to 5 as a page with
+/// no LSN of its own (nothing in `storage::index` sets one, so the field is 0 in practice).
 pub(crate) fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
     match data[0] {
         0 => u64::from_be_bytes(data[11..19].try_into().unwrap()),
@@ -1448,9 +1508,44 @@ pub(crate) fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
     }
 }
 
+/// What a page about to be written back depends on in the log. D216, D247.
+#[derive(Debug, PartialEq, Eq)]
+enum LogDependency {
+    /// A heap page carrying the LSN of the last record applied to it.
+    UpTo(u64),
+    /// A page with no LSN of its own that may still reflect logged changes (an index, directory or
+    /// catalog page, or a heap page no logged change has touched), or a page this cannot classify.
+    /// It waits for the log up to its [`Frame::wal_mark`].
+    Through,
+    /// A copy-on-write arena page, recognised by its own checksum. Branch pages are not logged.
+    Nothing,
+}
+
+/// Classify `data`, the bytes of page `page_id`, POSITIVELY. A page that fits no class waits for
+/// the log (`Through`), because waiting when it was not needed costs a flush, and not waiting when
+/// it was needed breaks write-ahead logging.
+///
+/// - A table page names itself: heap, directory, B+tree and catalog headers all carry the page id
+///   in bytes 1..5 after a type byte of 0 to 5. `recovery::redo_one` makes the same check before it
+///   trusts a heap page. Without it the classifier took an arena page for a heap page (D247).
+/// - An arena page carries a crc32 of itself (`cow::page_header`), which a table page does not.
+///   It is checked only for a page that is not a table page naming itself.
+fn log_dependency(data: &[u8; PAGE_SIZE], page_id: Option<u32>) -> LogDependency {
+    let names_itself = page_id.is_some_and(|id| data[1..5] == id.to_be_bytes());
+    match data[0] {
+        0 if names_itself => match u64::from_be_bytes(data[11..19].try_into().unwrap()) {
+            0 => LogDependency::Through,
+            lsn => LogDependency::UpTo(lsn),
+        },
+        1..=5 if names_itself => LogDependency::Through,
+        _ if crate::cow::page_header::verify_checksum(data) => LogDependency::Nothing,
+        _ => LogDependency::Through,
+    }
+}
+
 impl Frame {
     pub fn new() -> Self {
-        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false)}
+        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false), wal_mark: AtomicU64::new(0)}
     }
 }
 #[cfg(test)]

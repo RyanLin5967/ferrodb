@@ -49,8 +49,11 @@ fn main() {
     // CLI rebuilt.
     //
     // AFTER: `open_recovered`, the function the CLI and pgserver also call. A phase that opens a
-    // database whose log is not empty (`merge` and `read`, never a first `seed`) now rebuilds every
-    // index from the recovered heap and checkpoints, before it runs anything.
+    // database whose log holds a data record (`merge` and `read`, never a first `seed`) now rebuilds
+    // every index from the recovered heap and checkpoints, before it runs anything. D216 narrowed
+    // "not empty" to "holds a data record". `seed` ends in `flush_all`, not a checkpoint, so its
+    // rows are still in the log that `merge` opens. `read` rebuilds when the merge before it left a
+    // data record, which a merge that crashed before its first write does not.
     //
     // WHAT THAT CAN MOVE, by reading the source (not by a run): nothing the test reads.
     // - `read` reports `SELECT id, qty FROM inventory;`, a sequential scan, so its STATE does not

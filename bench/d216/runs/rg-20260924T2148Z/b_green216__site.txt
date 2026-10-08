@@ -1,0 +1,14 @@
+2026-09-24T22:04:06Z d216-b_green216-site acquiring (5s poll), pid 50694
+2026-09-24T22:04:06Z d216-b_green216-site ACQUIRED: 50694 d216-b_green216-site 2026-09-24T22:04:06Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.41s
+     Running tests/integration_cluster_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_snapshot-350a4148b9c71550)
+
+running 1 test
+test an_install_under_a_wal_pin_is_refused_and_names_the_pin ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.32s
+
+2026-09-24T22:04:09Z d216-b_green216-site rc=0
+2026-09-24T22:04:09Z d216-b_green216-site released (owner matched)
+rc=0

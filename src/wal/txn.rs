@@ -1,10 +1,10 @@
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU32, AtomicU64, Ordering}}};
 
 use crate::catalog::column::{DataType, Value};
 use crate::storage::{heap_file_manager::RecordId, index::BPlusTreeManager};
 use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, Truncation, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
 ///
@@ -95,12 +95,27 @@ pub struct TxnManager {
     /// name the database's writers.
     ///
     /// **Stated cost:** this grows with the number of distinct runs and is never pruned, and every
-    /// checkpoint rewrites all of it — the same unbounded shape `schema_log` has for tables, where
-    /// the bound is the schema and here it is the agent history. A database with a very large
+    /// checkpoint that truncates the log rewrites all of it (since D234, never one a pin kept) — the
+    /// same unbounded shape `schema_log` has for tables, where the bound is the schema and here it
+    /// is the runs this process has bound. A database with a very large
     /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a
     /// caller sees the size; nothing here caps it, because dropping declarations would silently
     /// make some writers unnameable and that is the failure this record exists to prevent.
-    run_log: Mutex<Vec<RunEntity>>,
+    ///
+    /// It holds only the runs bound in THIS process, and is never refilled at open: the lead's
+    /// 09:44Z decision on D227's run half (SCALE-DESIGN "D227 run half"). Refilling it from the
+    /// provenance store made every open and every checkpoint re-declare every run ever interned, one
+    /// per branch ever created, while an event's writer already travels in its own transaction's
+    /// binding.
+    ///
+    /// **Keyed by slot (`prov_id.0`)**, so a declaration costs O(log R), not the linear scan a `Vec`
+    /// needed on every `bind_run` (the D216 re-adversary's F3). Replayed in slot order.
+    run_log: Mutex<BTreeMap<u32, RunEntity>>,
+    /// **D234: where the log's last FULL schema declaration begins** (the LSN at which
+    /// [`TxnManager::replay_schema`] last started appending). A reader whose pin sits above it cannot
+    /// see any table declared before it, which is what a checkpoint that a pin keeps from truncating
+    /// asks before it re-declares the schema. Zero until the first declaration.
+    schema_declared_at: AtomicU64,
     /// Open transaction -> the run that will be named immediately before its `Commit`.
     ///
     /// Held here rather than written when it is bound, and that is the whole correctness property.
@@ -279,8 +294,12 @@ pub struct ReadView {
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
-        let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
+        // **Id 0 is never issued (the D216 adversary's F3).** DDL and run declarations are logged
+        // under it, every log reader takes a record under 0 for a declaration, and recovery never
+        // undoes it. A fresh log's header starts at 1, but `WalManager::truncate` writes whatever
+        // it is given, and a snapshot install gives it 0.
+        let start = wal.header_txn_id.max(1);
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(BTreeMap::new()), schema_declared_at: AtomicU64::new(0), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -611,9 +630,15 @@ impl TxnManager {
     ///
     /// Refuses to hold two different actors under one `prov_id`: the slot is the reference every
     /// stamped version carries, so two meanings for it would make every attribution ambiguous.
+    ///
+    /// ⚠ This writes nothing (the D234 adversary's F6). Since D234 a checkpoint re-appends the
+    /// retained runs only after a real truncation, so a run that is only retained stays out of the
+    /// log for as long as a pin keeps every checkpoint from truncating. `bind_run`, the one
+    /// production caller, is covered by the binding its commit writes (a rolled-back binding
+    /// described no committed row). A new caller that needs the run in the log must write it.
     pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
         let mut log = self.run_log.lock().unwrap();
-        if let Some(existing) = log.iter().find(|r| r.prov_id == run.prov_id) {
+        if let Some(existing) = log.get(&run.prov_id.0) {
             // `same_actor`, not `==`. Full equality compares `started_at`, which is when a session
             // began rather than part of who the actor is — so a second session of the same run
             // carries a different one and was being refused for having a later clock reading. The
@@ -629,7 +654,7 @@ impl TxnManager {
             }
             return Ok(());
         }
-        log.push(run);
+        log.insert(run.prov_id.0, run);
         Ok(())
     }
 
@@ -644,7 +669,7 @@ impl TxnManager {
     /// and transaction 0 never commits, so it binds nothing. `LogicalDecoder` relies on exactly
     /// that to tell a declaration from a binding.
     fn replay_runs(&self) -> Result<(), FerroError> {
-        let runs = self.run_log.lock().unwrap().clone();
+        let runs: Vec<RunEntity> = self.run_log.lock().unwrap().values().cloned().collect();
         if runs.is_empty() {
             return Ok(());
         }
@@ -667,8 +692,18 @@ impl TxnManager {
             self.append_chained(txn_id, &RecKind::RunIdentity { run })?;
         }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
+        // **D252: the `TxnEnd` goes in before the flush that makes the `Commit` durable, so it is
+        // written with it.** A change-feed reader reads only what is durable, and this record used
+        // to wait in the buffer for the next flush: usually the checkpoint's own, which then found
+        // every subscription pinned below it and kept the whole log. The flush still asks for the
+        // `Commit`, which is what the caller is owed; it writes the whole buffer, so the `TxnEnd`
+        // rides along at no extra fsync. Only a concurrent flush landing between the two appends
+        // leaves it buffered until some later flush, and a checkpoint before then keeps the log
+        // once more; nothing is lost. A failed append here still returns only after the `Commit`
+        // is durable, as before.
+        let end = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.wal.flush_up_to(commit_lsn)?;
-        let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        let _ = end?;
         self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
         // D202: committed, so nothing may ever undo these writes. Dropped here and not left for
@@ -864,14 +899,23 @@ impl TxnManager {
     /// corrections).
     ///
     /// Durable: a marker beside the log, which the next `wal::recovery::open_recovered` honours by
-    /// rebuilding every tree, even when the log it opens is empty. `recover` returns `false` for an
-    /// empty log, and a clean restart can leave one, so without this "the next open rebuilds" was
-    /// false. Visible: one line on stderr, written with `writeln!` and not `eprintln!` (which panics
-    /// on a closed stderr; `branch::lease_thread` records why), plus [`INDEX_UNDO_FAILURES`].
+    /// rebuilding every tree, even when the log it opens holds no data record. `recover` returns
+    /// `false` for such a log, and a clean restart can leave one (an empty log, or since D216 one of
+    /// re-declarations), so without this "the next open rebuilds" was false. Visible: one line on
+    /// stderr, written with `writeln!` and not `eprintln!` (which panics on a closed stderr;
+    /// `branch::lease_thread` records why), plus [`INDEX_UNDO_FAILURES`].
     fn mark_indexes_stale(&self, txn_id: u64, e: &FerroError) {
         use std::io::Write;
         let marker = stale_indexes_marker(&self.wal.path);
-        let written = std::fs::write(&marker, format!("txn {txn_id}: {e}\n"));
+        // **Through `replace_atomically`, not `std::fs::write`** (the D216 re-adversary's M3). The
+        // marker has to survive a power cut, not only a process exit: the entries it describes can
+        // reach the disk before the next checkpoint. D216 also made it the ONLY trigger for a log of
+        // re-declarations, which before then asked for the rebuild by itself.
+        let written = crate::storage::atomic_file::replace_atomically(
+            &crate::storage::atomic_file::OsFileOps,
+            &marker,
+            format!("txn {txn_id}: {e}\n").as_bytes(),
+        );
         let _ = writeln!(
             std::io::stderr(),
             "ferrodb: the rollback of transaction {txn_id} could not undo its primary-index writes ({e}); \
@@ -967,28 +1011,38 @@ impl TxnManager {
     /// for every op: `CreateTable` and `AlterColumn` both carry it, and `DropTable` carries none
     /// because there is no shape left to declare.
     pub fn log_ddl(&self, rec: DdlRecord) -> Result<(), FerroError> {
-        {
-            let mut log = self.schema_log.lock().unwrap();
-            match &rec.op {
-                DdlOp::CreateTable => {
-                    log.retain(|r| r.dir_root != rec.dir_root);
-                    log.push(rec.clone());
-                }
-                DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
-                DdlOp::AlterColumn(_) => {
-                    log.retain(|r| r.dir_root != rec.dir_root);
-                    log.push(DdlRecord {
-                        op: DdlOp::CreateTable,
-                        table: rec.table.clone(),
-                        dir_root: rec.dir_root,
-                        time_travel_root: rec.time_travel_root,
-                        columns: rec.columns.clone(),
-                    });
-                }
-            }
-        }
+        self.retain_ddl(&rec);
         self.append_ddl(&rec)?;
         self.wal.flush()
+    }
+
+    /// The retention half of [`Self::log_ddl`]: remember `rec` so every later checkpoint re-declares
+    /// it, and write nothing to the log.
+    ///
+    /// **D227: what an open calls to refill `schema_log`.** The list lives in memory, so a restarted
+    /// process began with it empty, and its first checkpoint left a log that declared no table.
+    /// `wal::recovery::open_recovered` hands every table in the catalog to this as a `CreateTable`
+    /// carrying its current shape, which is exactly what the retained list would hold for it
+    /// (an `AlterColumn` is retained as that same re-declaration, below).
+    pub(crate) fn retain_ddl(&self, rec: &DdlRecord) {
+        let mut log = self.schema_log.lock().unwrap();
+        match &rec.op {
+            DdlOp::CreateTable => {
+                log.retain(|r| r.dir_root != rec.dir_root);
+                log.push(rec.clone());
+            }
+            DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
+            DdlOp::AlterColumn(_) => {
+                log.retain(|r| r.dir_root != rec.dir_root);
+                log.push(DdlRecord {
+                    op: DdlOp::CreateTable,
+                    table: rec.table.clone(),
+                    dir_root: rec.dir_root,
+                    time_travel_root: rec.time_travel_root,
+                    columns: rec.columns.clone(),
+                });
+            }
+        }
     }
 
     /// The shape the log would re-declare for `dir_root` after a truncation, if any.
@@ -1023,6 +1077,12 @@ impl TxnManager {
     /// Called immediately after a truncation. Without it the log is self-describing only until the
     /// first checkpoint, which is to say almost never.
     fn replay_schema(&self) -> Result<(), FerroError> {
+        // Where this declaration begins, recorded even when there is nothing to declare: a reader at
+        // or below it has seen the whole schema, which is then empty (D234). Recorded BEFORE the
+        // copy: `log_ddl` retains before it appends, so a statement racing this either made the
+        // copy or appended its own record at or above this position, and no reader starting here
+        // can miss it.
+        self.schema_declared_at.store(self.wal.next_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
         let records = self.schema_log.lock().unwrap().clone();
         if records.is_empty() {
             return Ok(());
@@ -1088,14 +1148,43 @@ impl TxnManager {
         self.bp.disk_manager.sync()?;
         // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
         // with no spare room — keeps its meaning and its format.
-        self.wal.truncate(self.txn_ids.issued_through())?;
+        let truncation = self.wal.truncate(self.txn_ids.issued_through())?;
+        // Reset either way: every page was flushed, and a counter left over the threshold would
+        // make every commit under a pin take another flush of the whole pool.
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
-        // The truncation just discarded every DDL record. Put them back, or a log reader starting
-        // at the new base has no way to know what any table is.
-        self.replay_schema()?;
-        // And every run declaration, for the same reason: a reader starting at the new base would
-        // otherwise have no way to name the database's writers.
-        self.replay_runs()?;
+        // **D234: re-declare after a real truncation; under a pin, only what a reader cannot see.**
+        // A pin below the log's end (a base backup, a snapshot handoff, a change stream's cursor) makes
+        // `truncate` keep the whole log. The kept log still holds, for a reader starting at its base:
+        // - the declarations the last real truncation re-appended;
+        // - every DDL since, which `log_ddl` appended as it ran;
+        // - every run since, as the binding its commit appended.
+        // Re-appending all of them anyway grew the log by every declaration at every checkpoint: O(M)
+        // per checkpoint, O(M²) over a pinned period, and recovery read all of it. The lead's
+        // decisions for a kept checkpoint:
+        // - runs are never re-declared (D227 run half, 09:44Z); an event's writer travels in its own
+        //   binding;
+        // - the schema is re-declared only when a reader starts ABOVE its last full declaration
+        //   (09:47Z, lane §10.2). A change-feed consumer follows the log, and its own pin keeps every
+        //   checkpoint from truncating, so without this it would never learn a table declared before
+        //   its cursor. This costs O(tables) each time a pin advances past a declaration.
+        // "A reader starts above it" is the NEWEST pin, not the oldest. A lagging reader below the
+        // declaration must not keep a newer one from being told (the lane's reading of the decision
+        // for several readers).
+        match truncation {
+            Truncation::Truncated => {
+                // The truncation just discarded every DDL record. Put them back, or a log reader
+                // starting at the new base has no way to know what any table is.
+                self.replay_schema()?;
+                // And every run declaration, for the same reason: a reader starting at the new base
+                // would otherwise have no way to name the database's writers.
+                self.replay_runs()?;
+            }
+            Truncation::Kept { newest_pin, .. } => {
+                if newest_pin > self.schema_declared_at.load(Ordering::SeqCst) {
+                    self.replay_schema()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1965,7 +2054,7 @@ use super::*;
 
         // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
         // resume point must fail.
-        wal.truncate(txn.txn_ids.issued_through()).unwrap();
+        let _ = wal.truncate(txn.txn_ids.issued_through()).unwrap();
         assert!(
             wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
             "the log was not truncated past the open transaction, so this test proves nothing"
@@ -2177,6 +2266,120 @@ use super::*;
         assert!(
             index_undo_failures() >= before + 1,
             "an index undo failed and nothing counted it: the failure is silent"
+        );
+    }
+    /// **D234 — a checkpoint that a pin kept from truncating re-appends no run, and the schema only
+    /// once a pin has passed the last declaration of it.**
+    ///
+    /// `WalManager::truncate` keeps the whole log while any pin sits below its end (a base backup, a
+    /// snapshot handoff, a change stream's cursor), and `checkpoint_locked` re-appended every DDL and
+    /// run declaration regardless: O(M) per checkpoint, O(M²) over a pinned period, all of it replayed
+    /// by recovery. The lead's decisions: re-declare after a real truncation as before; at a kept
+    /// checkpoint never the runs (D227 run half, 09:44Z), and the schema only when a pin sits ABOVE
+    /// the last full schema declaration, because a reader starting there cannot see it (09:47Z, on
+    /// lane §10.2: a change-feed consumer following the log would otherwise never learn a table
+    /// declared before its cursor). So it costs O(T) per pin advance past a declaration.
+    ///
+    /// One committed transaction per round stands in for real work. Phases:
+    /// 1. Under one pin, which sits just above the last declaration: the first kept checkpoint
+    ///    re-declares the schema once, and later ones nothing, because the pin is now below that
+    ///    re-declaration. No run, ever.
+    /// 2. A second pin past it, while the first still lags below: exactly one more schema
+    ///    re-declaration. That is the NEWEST pin deciding. The oldest pin alone would leave the newer
+    ///    reader without the schema (the lane's reading of "above the last declaration" for several
+    ///    readers, stated in the report).
+    /// 3. With the pins released, the checkpoint truncates and re-declares every run and the table,
+    ///    or "re-declares nothing" would pass against a checkpoint that lost them.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the phase-1 assertion: each of the
+    /// 5 rounds re-appends all 40 runs and the table, (200, 5) against (0, 1).
+    #[test]
+    fn a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it() {
+        const RUNS: u32 = 40;
+        const ROUNDS: usize = 5;
+        let (_bp, wal, txn, _dir) = setup();
+        let runs = |recs: &[LogRecord]| {
+            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::RunIdentity { .. })).count()
+        };
+        let tables = |recs: &[LogRecord]| {
+            recs.iter().filter(|r| r.txn_id == 0 && matches!(r.kind, RecKind::Ddl { .. })).count()
+        };
+        let since = |lsn: u64| -> Vec<LogRecord> { walk_log(&wal).into_iter().filter(|r| r.lsn >= lsn).collect() };
+        let a_round = || {
+            let t = txn.begin().unwrap();
+            txn.commit(t).unwrap();
+        };
+        for prov in 1..=RUNS {
+            txn.declare_run(a_run(prov, &format!("agent-{prov}"))).unwrap();
+        }
+        txn.log_ddl(DdlRecord {
+            op: DdlOp::CreateTable,
+            table: "t".into(),
+            dir_root: 7,
+            time_travel_root: 8,
+            columns: vec![("id".into(), DataType::Integer, false)],
+        })
+        .unwrap();
+        txn.checkpoint().unwrap();
+        assert_eq!(
+            (runs(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize, 1),
+            "premise failed: the unpinned checkpoint did not declare every run and the table"
+        );
+
+        // Phase 1: one pin, just above the declaration the checkpoint wrote.
+        let lagging = wal.pin_durable();
+        let base = wal.base_lsn.load(Ordering::SeqCst);
+        let before = wal.next_lsn.load(Ordering::SeqCst);
+        for _ in 0..ROUNDS {
+            a_round();
+            txn.checkpoint().unwrap();
+        }
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise failed: a checkpoint truncated past a held pin");
+        let written = since(before);
+        assert!(!written.is_empty(), "premise failed: the rounds wrote nothing, so there is no range to inspect");
+        assert_eq!(
+            (runs(written.as_slice()), tables(written.as_slice())),
+            (0, 1),
+            "{ROUNDS} checkpoints under one held pin wrote (runs, tables) = ({}, {}) declarations in {} bytes: \
+             runs must never be re-declared under a pin, and the schema once, when the pin had passed its \
+             last declaration",
+            runs(written.as_slice()),
+            tables(written.as_slice()),
+            wal.next_lsn.load(Ordering::SeqCst) - before
+        );
+
+        // Phase 2: a newer reader past that re-declaration, while the first still lags below it.
+        a_round();
+        let newer = wal.pin_durable();
+        let before = wal.next_lsn.load(Ordering::SeqCst);
+        a_round();
+        txn.checkpoint().unwrap();
+        a_round();
+        txn.checkpoint().unwrap();
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), base, "premise failed: a checkpoint truncated past a held pin");
+        let written = since(before);
+        assert_eq!(
+            (runs(written.as_slice()), tables(written.as_slice())),
+            (0, 1),
+            "with a reader past the last schema declaration and another lagging below it, two kept checkpoints \
+             wrote (runs, tables) = ({}, {}): the schema must be re-declared once, for the newer reader",
+            runs(written.as_slice()),
+            tables(written.as_slice())
+        );
+
+        // Phase 3: released, so the checkpoint truncates and re-declares everything retained.
+        drop(lagging);
+        drop(newer);
+        txn.checkpoint().unwrap();
+        assert!(
+            wal.base_lsn.load(Ordering::SeqCst) > base,
+            "premise failed: with the pins released the checkpoint still did not truncate"
+        );
+        assert_eq!(
+            (runs(walk_log(&wal).as_slice()), tables(walk_log(&wal).as_slice())),
+            (RUNS as usize, 1),
+            "the first checkpoint after the pins were released did not re-declare every run and the table"
         );
     }
 }

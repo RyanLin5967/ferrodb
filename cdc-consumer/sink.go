@@ -164,8 +164,8 @@ func quoteIdent(s string) string {
 // ensureTable creates the destination table from a schema event.
 //
 // IF NOT EXISTS is load-bearing, not defensive habit: a CREATE_TABLE is re-emitted at every
-// checkpoint of the source, because a checkpoint truncates the log and has to re-establish the
-// schema at the new base. A sink that treated each one as "a new table appeared" would fail on the
+// checkpoint of the source that truncates its log, because the truncation discarded it and the
+// schema has to be re-established at the new base. A sink that treated each one as "a new table appeared" would fail on the
 // second checkpoint of every table's life.
 //
 // `declared` says where `cols` came from, and it decides whether the type-agreement check below
@@ -276,7 +276,7 @@ func (s *Sink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTyp
 // bypassed it.
 //
 // Re-emission is the COMMON case, not the exception — a CREATE_TABLE is re-sent at every checkpoint
-// of the source — so agreement stays a silent no-op. Only a genuine difference is an error, and the
+// of the source that truncates its log — so agreement stays a silent no-op. Only a genuine difference is an error, and the
 // message names the column and both types, because "schema mismatch" alone sends the reader to diff
 // two schemas by hand.
 func (s *Sink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []string) error {

@@ -110,14 +110,17 @@ impl TableBranchCatalog {
     /// writes". THAT IS FALSE, and the replacement is stricter than the claim it removes — the
     /// gate is a provable no-op here, so anything built on it was resting on nothing.**
     ///
-    /// `BufferPoolManager::wal_gate` flushes only `if plsn > 0`, and `plsn` comes from
-    /// `page_lsn_of`, which is `match data[0] { 0 => .., 2 | 3 => .., _ => 0 }` — an LSN exists
-    /// only for a heap page (0) and a B+tree internal/leaf page (2, 3). This page's first four
-    /// bytes are [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`, which takes the
-    /// `_ => 0` arm: **the gate does nothing on it.** Nor does it help the tree this page names —
-    /// B+tree pages never set an LSN either, and index structure is not logged at all, because
-    /// `wal::recovery::rebuild_indexes` frees every index tree and builds a fresh one from the
-    /// heap. There is no ordering here for a gate to provide.
+    /// `BufferPoolManager::wal_gate` classifies a page with `log_dependency`. A table page names
+    /// itself in bytes 1..5 after a type byte of 0 to 5; an arena page passes its own crc32. This
+    /// page's first four bytes are [`HEADER_PAGE_MAGIC`] (`0xFE44_0B01`), so `data[0]` is `0xFE`
+    /// and it is neither. It takes the conservative arm: flush the log up to where the log's end
+    /// was when the page last changed (`Frame::wal_mark`, D216). Until D216 the gate did nothing
+    /// for it. Either way it orders nothing that matters here: `open_sidecar`'s pool has no WAL
+    /// attached, so the gate returns at once, and on a pool with one, neither this page nor the
+    /// tree it names is logged, so there is no record for either to wait on. B+tree pages never set
+    /// an LSN, and index structure is not logged at all, because `wal::recovery::rebuild_indexes`
+    /// frees every index tree and builds a fresh one from the heap. There is no ordering here for a
+    /// gate to provide.
     ///
     /// ⇒ What the fixed page buys is the single-write sentence above, and nothing more.
     /// **Do not build a durability argument on the WAL gate.**

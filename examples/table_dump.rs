@@ -81,7 +81,7 @@ fn main() {
     // Recovery before reading: an unclean shutdown leaves committed work in the log and not yet in the
     // pages, and dumping without replaying it would report rows the source considers written as
     // missing. Through the one open path (D204), so the trees are also rebuilt from the recovered
-    // heap. This dump reads by `SELECT *` and would not notice a stale tree, but the next binary to
+    // heap whenever recovery replayed a data record. This dump reads by `SELECT *` and would not notice a stale tree, but the next binary to
     // open the file might, and there is one way to open a database, not one per caller.
     let OpenedDatabase { bp, txn, mut catalog, .. } = open_recovered(Path::new(&db), &_lock).unwrap_or_else(|e| {
         eprintln!("table_dump: open {db}: {e}");

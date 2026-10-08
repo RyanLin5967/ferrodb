@@ -779,7 +779,7 @@ mod tests {
         // WAL is told directly. Fault injection, deliberately: the path is rare and used to be
         // unrecoverable.
         let open = txn.begin().unwrap();
-        txn.wal.truncate(txn.next_txn_id()).unwrap();
+        let _ = txn.wal.truncate(txn.next_txn_id()).unwrap();
 
         let mut buf = Vec::new();
         let err = snapshot_table_exact("t", &txn, &Publication::unrestricted(), &mut buf, |_reader| Ok(rows()))

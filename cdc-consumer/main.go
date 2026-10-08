@@ -167,8 +167,9 @@ func isSchema(op string) bool {
 //
 // This is the distinction that matters to a consumer, and it is NOT the same as isSchema. A
 // CREATE_TABLE is a declaration — "this table has this shape" — re-sent at every checkpoint of the
-// source, because a checkpoint truncates the log and has to re-establish the schema at the new
-// base. A DROP_TABLE likewise leaves the source's retained set. The column-level three are
+// source that truncates its log, because the truncation discarded it and the schema has to be
+// re-established at the new base (since D234, a checkpoint a pin kept from truncating re-sends it
+// only once a pin has passed its last declaration). A DROP_TABLE likewise leaves the source's retained set. The column-level three are
 // **news**: each is delivered exactly once, at the position the DDL occupied, and a consumer that
 // applies one twice has renamed a column that no longer has the old name.
 //
@@ -179,7 +180,7 @@ func isDeclaration(op string) bool { return op == "CREATE_TABLE" || op == "DROP_
 
 // bypassesCursor reports ops whose idempotence CANNOT come from the resume cursor.
 //
-// Schema events are re-emitted at every checkpoint by design, so they were always exempt. READ joins
+// Schema events are re-emitted at every truncating checkpoint by design, so they were always exempt. READ joins
 // them for a sharper reason: a snapshot is ONE logical batch taken at a single LSN, and
 // `replication::snapshot` gives every row of it the same lsn, commit_lsn AND commit_end_lsn. No
 // positional key can order rows that share every position — so the composite (commit_lsn, lsn) key
