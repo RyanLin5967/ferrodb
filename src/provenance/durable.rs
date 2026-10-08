@@ -79,7 +79,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::branch::types::BranchId;
 use crate::error::FerroError;
@@ -134,6 +134,9 @@ pub struct RecoveryReport {
     pub discarded_tail_bytes: u64,
 }
 
+/// Every live store in this process, by file (D250 review 4's N4). See [`DurableProvenanceStore::shared`].
+static SHARED: Mutex<Vec<(PathBuf, Weak<DurableProvenanceStore>)>> = Mutex::new(Vec::new());
+
 /// A provenance store backed by a file, so attribution outlives the process that recorded it.
 #[derive(Debug)]
 pub struct DurableProvenanceStore {
@@ -170,6 +173,36 @@ pub struct DurableProvenanceStore {
 }
 
 impl DurableProvenanceStore {
+    /// **The store for `path` in this process: the live one if there is one, or opened here** (D250
+    /// review 4's N4). Two stores on one file are two appenders whose in-memory indexes disagree: a
+    /// stamp made through one is invisible to the other until a restart replays the file. Production
+    /// code opens the file only through here (`tests/open_path_allowlist.rs`, test 12);
+    /// [`DurableProvenanceStore::open`] stays public for this module's tests, which open files directly.
+    ///
+    /// Keyed by the file's canonical directory plus its name, and held WEAKLY: a store that no runtime
+    /// and no open holds any more is closed, and the next call replays the file afresh. Dead entries
+    /// are pruned at every call, so the registry holds one entry per live store. The open runs under the
+    /// registry's lock, so opens of different files wait for each other; opens are rare. **Blind spots,
+    /// stated:** a hard link, or two spellings the canonical directory does not unify, gets two stores.
+    pub fn shared(path: impl AsRef<Path>) -> Result<Arc<Self>, FerroError> {
+        let path = path.as_ref();
+        let key = match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => {
+                let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+                std::fs::canonicalize(dir).map(|d| d.join(name)).unwrap_or_else(|_| path.to_path_buf())
+            }
+            _ => path.to_path_buf(),
+        };
+        let mut live = SHARED.lock().unwrap();
+        live.retain(|(_, store)| store.strong_count() > 0);
+        if let Some(store) = live.iter().filter(|(k, _)| *k == key).find_map(|(_, store)| store.upgrade()) {
+            return Ok(store);
+        }
+        let store = Arc::new(Self::open(path)?);
+        live.push((key, Arc::downgrade(&store)));
+        Ok(store)
+    }
+
     /// Open a store at `path`, creating it if absent and replaying whatever is there.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, FerroError> {
         let path = path.as_ref().to_path_buf();

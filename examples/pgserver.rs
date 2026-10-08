@@ -18,7 +18,7 @@ use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase, ProvenanceBacking};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -56,8 +56,10 @@ fn main() {
     // refuses a data file whose pages carry LSNs its log never issued, as the CLI does. The refusal
     // is reported and exits 1 with the lock released by hand, because `process::exit` runs no
     // destructors and a lock left behind refuses the next open as stale
-    // (`tests/d280_orphaned_wal_binaries.rs` checks both).
-    let OpenedDatabase { bp, txn, catalog, .. } = match open_recovered(Path::new(&db), &_lock) {
+    // (`tests/d280_orphaned_wal_binaries.rs` checks both). Every later post-lock failure in this
+    // file panics instead, which unwinds and drops the lock (see the lease scan below).
+    // Kept whole until the runtime exists: the runtime joins it through `attach_runtime` below (D250).
+    let opened = match open_recovered(Path::new(&db), &_lock) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("pgserver: {e}");
@@ -88,11 +90,11 @@ fn main() {
     );
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
+        ArenaPageStore::reopen_from_checkpoint(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
             .expect("reattach to the arena")
     } else {
-        let base = bp.disk_manager.high_water().expect("high water") + 32_736;
-        ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
+        let base = opened.bp.disk_manager.high_water().expect("high water") + 32_736;
+        ArenaPageStore::new(opened.bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
     });
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
@@ -103,7 +105,10 @@ fn main() {
         store.clone(),
     ));
 
-    let runtime = Arc::new(
+    // Through the opened database's one door (D250 review 1's F7, review 3's A), with an in-memory
+    // provenance store. `tests/open_path_allowlist.rs` holds both entry points to the door and to
+    // their backing.
+    let runtime = opened.attach_runtime(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
@@ -123,7 +128,13 @@ fn main() {
         // merged or abandoned branch is marked `Reaped` and its extents are never freed, so every
         // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
         .with_reaper(reaper.clone() as Arc<dyn Reaper>),
-    );
+        // In memory, as before: its forget is a stated no-op. A provenance file the CLI left for this
+        // database is still forgotten in, by `open_recovered` itself (D250 review 3's A).
+        ProvenanceBacking::InMemory,
+    )
+    .unwrap_or_else(|e| panic!("pgserver: {e}"));
+
+    let OpenedDatabase { bp, txn, catalog, .. } = opened;
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
     let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));

@@ -549,6 +549,110 @@ fn both_production_entry_points_open_through_the_shared_function() {
     }
 }
 
+/// D250 review 1's F7, the lead's ruling (lane `lane_d250_drop_logged.md` §3.7 test 12): a DROP the
+/// open completed must also be forgotten by the agent runtime (B9), and that forget is unskippable
+/// only if each production entry point builds its runtime through `OpenedDatabase::attach_runtime`,
+/// the one door that runs it. The list is private to `wal::recovery`, so an entry point cannot run
+/// the loop itself; what this catches is one that wraps its runtime in an `Arc` on its own and never
+/// reaches the door, or that names the list at all.
+#[test]
+fn both_production_entry_points_build_their_runtime_through_the_opened_database() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for entry in ENTRY_POINTS {
+        let code = production_text(&std::fs::read_to_string(root.join(entry)).unwrap_or_else(|e| {
+            panic!("{entry} is not where this test expects an entry point: {e}")
+        }));
+        let t = tokens(&code);
+        let doors = (1..t.len())
+            .filter(|&k| punct(&t, k - 1, '.') && ident(&t, k) == Some("attach_runtime") && punct(&t, k + 1, '('))
+            .count();
+        assert_eq!(
+            doors, 1,
+            "{entry} calls `.attach_runtime(` {doors} times, not once: a runtime built without it keeps the \
+             provenance of every table whose DROP the open completed"
+        );
+        assert!(
+            !(0..t.len()).any(|k| ident(&t, k) == Some("completed_drops")),
+            "{entry} names `completed_drops`: the list belongs to `OpenedDatabase::attach_runtime`, and an \
+             entry point that reads it has a way round the door"
+        );
+        // Lane §3.15 (D250 review 3's R): the list the door reads is `dropped_tables`.
+        assert!(
+            !(0..t.len()).any(|k| ident(&t, k) == Some("dropped_tables")),
+            "{entry} names `dropped_tables`, the list the door forgets from"
+        );
+        // Lane §3.15: each entry point names the provenance it attaches: the CLI's is durable, and
+        // pgserver's stays in memory (a stated no-op for the forget).
+        let backing = if *entry == "src/cli/cli.rs" { "Durable" } else { "InMemory" };
+        assert!(
+            (0..t.len()).any(|k| {
+                ident(&t, k) == Some("ProvenanceBacking")
+                    && punct(&t, k + 1, ':')
+                    && punct(&t, k + 2, ':')
+                    && ident(&t, k + 3) == Some(backing)
+            }),
+            "{entry} does not attach its runtime with `ProvenanceBacking::{backing}`"
+        );
+    }
+    // Lane §3.15 (D250 review 3's Q1c, aimed at the hazard): a DURABLE provenance store reaches a
+    // runtime only through `OpenedDatabase::attach_runtime`, which the open has already made forget
+    // every dropped table in it. So no production file under `src/` or `examples/` names
+    // `with_durable_provenance` except its definition in `src/agent_sql/runtime.rs`.
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("examples"), &mut files);
+    assert!(files.len() > 20, "walked src/ and examples/ and found {} .rs files: the walk is broken", files.len());
+    let mut named = Vec::new();
+    for f in &files {
+        let name = rel(root, f);
+        let t = tokens(&production_text(&std::fs::read_to_string(f).unwrap()));
+        if (0..t.len()).any(|k| ident(&t, k) == Some("with_durable_provenance")) {
+            named.push(name);
+        }
+    }
+    assert_eq!(
+        named,
+        vec!["src/agent_sql/runtime.rs".to_string()],
+        "these name `with_durable_provenance`, so a durable store can reach a runtime without the door"
+    );
+    // Lane §3.17 (D250 review 4's N4): one store per provenance file per process. Production code opens
+    // the file only through `DurableProvenanceStore::shared`, so `DurableProvenanceStore::open` is named
+    // only in its own file; and a store is installed into a runtime (`with_provenance_store`) only by the
+    // runtime itself and by the door. Allowlists: the one-name scan above was a denylist.
+    let mut opens = Vec::new();
+    let mut installs = Vec::new();
+    for f in &files {
+        let name = rel(root, f);
+        let t = tokens(&production_text(&std::fs::read_to_string(f).unwrap()));
+        if (0..t.len()).any(|k| {
+            ident(&t, k) == Some("DurableProvenanceStore")
+                && punct(&t, k + 1, ':')
+                && punct(&t, k + 2, ':')
+                && ident(&t, k + 3) == Some("open")
+        }) {
+            opens.push(name.clone());
+        }
+        if (0..t.len()).any(|k| ident(&t, k) == Some("with_provenance_store")) {
+            installs.push(name);
+        }
+    }
+    opens.sort();
+    installs.sort();
+    assert!(
+        opens.iter().all(|f| f == "src/provenance/durable.rs"),
+        "these name `DurableProvenanceStore::open`, so a second store can be opened on a file the process already \
+         holds one for: {opens:?}"
+    );
+    assert!(
+        installs.iter().all(|f| f == "src/agent_sql/runtime.rs" || f == "src/wal/recovery.rs"),
+        "these install a provenance store into a runtime without the door: {installs:?}"
+    );
+    assert!(
+        installs.contains(&"src/wal/recovery.rs".to_string()),
+        "premise failed: the scan does not see the door's own `with_provenance_store`, so it can see nothing"
+    );
+}
+
 #[test]
 fn the_shared_function_recovers_and_then_rebuilds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
