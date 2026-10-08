@@ -54,6 +54,14 @@
 //! one. Recorded here because this header is where the next reader checks what the file's numbers
 //! rest on, and it is the THIRD time this paragraph described a mechanism it did not have.
 //!
+//! ⚠ **And on branch `d183-drain-elide`, the "at each one" above is false for one event.** A
+//! pending-free drain that released nothing and owes no recycled list writes NO record, because
+//! the record would change nothing in the file except its `live` snapshot. The property still
+//! holds: the map is durable as of the last extent event, because such a drain is not one. Within
+//! a reap, the `TAIL_PAGES_PARKED` or `TAIL_EXTENT_FREED` record just before the drain already
+//! carries `live`, and nothing moves `live` between that record and the drain. So "exact after a
+//! reap" below is unaffected.
+//!
 //! * `reserved_page_count` is exact whenever the map is read, because it only ever changes at an
 //!   extent event, which is the moment the map is made durable.
 //! * `live_page_count` counts individual pages, and those are handed out **between** extent events.
