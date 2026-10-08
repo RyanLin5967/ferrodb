@@ -18,8 +18,10 @@
 //! `agent_sql::runtime` kept a second, narrower path of its own that retained exact versions only.
 //! Two implementations, and the one the runtime used was the one that could not answer
 //! `REVERT ... CASCADE` for a scan. The runtime now feeds a [`TxnCapture`] per agent task, so there
-//! is one retention type, one place edges are derived ([`ProvenanceLog::dependency_graph`]), and two
-//! *sources* that fill a capture:
+//! is one retention type and two *sources* that fill a capture. Edges are derived in two places, on
+//! purpose since wall #18: [`ProvenanceLog::dependency_graph`] joins everything, and
+//! [`crate::provenance::capture_set::CaptureSet::plan_revert`] walks out from one target through an
+//! index of reads. The second is checked against the first; see that module for how. The sources:
 //!
 //! - [`CapturingScan`], which wraps a Volcano operator and reads `begin_ts` out of the real 24-byte
 //!   version header (`tests/provenance_e2e.rs`);
@@ -155,8 +157,9 @@ impl TxnCapture {
     ///
     /// **Causality and inspection are different questions, and this is the one place they part.**
     /// `UPDATE ... WHERE id = 7` decided which row to write by naming it, so the write causally
-    /// depends on that row: a revert of whatever published it has a dependent here, and
-    /// [`ProvenanceLog::dependency_graph`] has to see the region. It inspected no *value*, so it must
+    /// depends on that row: a revert of whatever published it has a dependent here, and both edge
+    /// derivations — [`ProvenanceLog::dependency_graph`] and `CaptureSet`'s walk, which indexes it
+    /// as a point — have to see the region. It inspected no *value*, so it must
     /// not enter the read-set builder — `blind_writes` would stop reporting every
     /// `UPDATE ... WHERE <pk> = <lit>` as a blind write, which is the entire shape DESIGN.md
     /// section 4's metric exists to catch, and `ReadPremiseCheck` would downgrade itself to
@@ -191,6 +194,24 @@ impl TxnCapture {
 
     pub fn writes(&self) -> &[WriteRecord] {
         &self.writes
+    }
+
+    /// The versions this transaction has retained EXACTLY, sorted and de-duplicated. What the
+    /// `ExactVersions` read-set in [`TxnCapture::read_sets`] would hold, without building it.
+    pub fn exact_reads(&self) -> &[VersionRef] {
+        self.reads.exact_versions()
+    }
+
+    /// Whether `v` is among [`TxnCapture::exact_reads`]. Asked of the RESULT of a read, so that a
+    /// caller indexing reads never has to restate the shape rule `on_read` applies.
+    pub fn has_exact_read(&self, v: &VersionRef) -> bool {
+        self.reads.contains_version(v)
+    }
+
+    /// Every predicate-form read this transaction retained, with the snapshot it read at, in the
+    /// order retained. Append-only for the life of the capture, so a position is a stable name.
+    pub fn predicate_reads(&self) -> &[TimedPredicate] {
+        &self.predicates
     }
 
     /// What this transaction has read so far, in the form each access shape demanded, **without
@@ -267,6 +288,18 @@ impl ProvenanceLog {
 
     /// Read-after-write edges across everything retained, both exact and predicate-derived.
     pub fn dependency_graph(&self) -> DependencyGraph {
+        self.builder().build()
+    }
+
+    /// [`ProvenanceLog::dependency_graph`], without adding to
+    /// [`crate::provenance::revert::GRAPH_BUILD_PAIRS`]. For the debug-build oracle in
+    /// [`crate::provenance::capture_set::CaptureSet`] only: that oracle runs beside the production
+    /// planner, and counting it would make the instrument report work production no longer does.
+    pub(crate) fn dependency_graph_unobserved(&self) -> DependencyGraph {
+        self.builder().build_unobserved()
+    }
+
+    fn builder(&self) -> DependencyGraphBuilder {
         let mut b = DependencyGraphBuilder::new();
         for t in &self.txns {
             for w in &t.writes {
@@ -277,7 +310,7 @@ impl ProvenanceLog {
                 b.record_predicate_read(t.txn, p.summary.clone(), p.observed_at);
             }
         }
-        b.build()
+        b
     }
 
     /// Exit criterion 10. Halt is the default: the plan names the downstream work and reverts
