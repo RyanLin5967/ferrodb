@@ -291,7 +291,8 @@ fn every_leaf_but_the_last_ends_on_a_content_boundary() {
 /// drift: leaves average about `NODE_CAPACITY / CHUNK_SHIFT` bytes, not a number nobody chose.
 ///
 /// Measured against the byte-balanced split this replaces, on the same 1500 rows: 68 rows per
-/// leaf before, about 15 after.
+/// leaf before, 16.0 after. `chunker::CHUNK_SHIFT` carries what that bought and why a setting
+/// with twice the fanout passes this test and is still wrong.
 #[test]
 fn leaves_average_the_target_chunk_size_and_never_exceed_a_page() {
     let set = pairs(1500);
@@ -451,4 +452,154 @@ fn the_key_limit_holds_on_both_sides_and_refuses_before_spending_a_page() {
     assert_eq!(f.leaf_partition(root), partition_before, "the refused insert moved a boundary");
     assert!(pages_before <= pages, "fixture: the limit-sized inserts should have grown the tree");
     assert!(before.len() <= partition_before.len());
+}
+
+/// The partition numbers this change is reported with, measured from the code rather than from a
+/// model of it.
+///
+/// Carried `#[ignore]`d, the way `branch::table_catalog`'s measurement is: it is an instrument,
+/// not an assertion, and the properties it would otherwise assert are already pinned by the tests
+/// above. Run it with:
+///
+/// ```text
+/// cargo test --lib cow::tests_chunking::measure_the_partition -- --ignored --nocapture
+/// ```
+///
+/// It exists because the distribution table on `chunker::key_hash` was first taken from a Python
+/// reimplementation of the chunker. A reimplementation is a second thing that can be wrong, and a
+/// number carrying its name is not a number about this code.
+#[test]
+#[ignore]
+fn measure_the_partition() {
+    let set = pairs(1500);
+    let sizes: Vec<usize> = set.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
+    let hashes: Vec<u32> = set.iter().map(|(k, _)| chunker::key_hash(k)).collect();
+    let cuts = chunker::leaf_cuts(&sizes, &hashes, node::NODE_CAPACITY);
+    let nominal: Vec<usize> = (0..set.len() - 1)
+        .filter(|&i| chunker::is_boundary(&set[i].0, &set[i].1))
+        .map(|i| i + 1)
+        .collect();
+
+    let fa = Fixture::new();
+    let a = fa.leaf_partition(fa.build(&set));
+    let fb = Fixture::new();
+    let b = fb.leaf_partition(fb.build(&permute(&set, SEEDS[0])));
+
+    println!("-- 1500-row fixture, CHUNK_SHIFT={} target={}B --", chunker::CHUNK_SHIFT, chunker::TARGET_CHUNK_BYTES);
+    println!("chunker cuts          : {}  (leaves {})", cuts.len(), cuts.len() + 1);
+    println!("of which byte-capacity: {}", cuts.len() - nominal.len());
+    println!("ascending build leaves: {}", a.len());
+    println!("shuffled  build leaves: {}", b.len());
+    println!("mean rows per leaf    : {:.1}", 1500.0 / a.len() as f64);
+    let bytes: Vec<usize> = a
+        .iter()
+        .map(|l| l.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).sum())
+        .collect();
+    println!(
+        "leaf bytes mean/max   : {:.0} / {}   (page {})",
+        bytes.iter().sum::<usize>() as f64 / bytes.len() as f64,
+        bytes.iter().max().unwrap(),
+        node::NODE_CAPACITY
+    );
+
+    // The degenerate-key distribution, same arms as the guard test, so the table on
+    // `chunker::key_hash` can be quoted from this output rather than from a model.
+    println!("\n-- 200k-row boundary distribution, no refinement --");
+    let fixed = vec![b'x'; 20];
+    let shapes: Vec<(&str, Vec<(Vec<u8>, Vec<u8>)>)> = vec![
+        ("ascending key{:06}", (0..200_000u32).map(|i| (format!("key{:06}", i).into_bytes(), fixed.clone())).collect()),
+        ("big-endian u64 counter", (0..200_000u32).map(|i| ((i as u64).to_be_bytes().to_vec(), fixed.clone())).collect()),
+        ("big-endian u32 counter", (0..200_000u32).map(|i| (i.to_be_bytes().to_vec(), fixed.clone())).collect()),
+        ("monotonic timestamps", (0..200_000u32).map(|i| ((1_700_000_000_000u64 + i as u64 * 1000).to_be_bytes().to_vec(), fixed.clone())).collect()),
+        ("32-byte common prefix", (0..200_000u32).map(|i| { let mut k = b"tenant-00000000000000000001-row-".to_vec(); k.extend_from_slice(&(i as u64).to_be_bytes()); (k, fixed.clone()) }).collect()),
+        ("random-ish 16-byte (control)", (0..200_000u32).map(|i| {
+            let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let x = z ^ (z >> 31);
+            let y = x.wrapping_mul(0x94D0_49BB_1331_11EB) ^ 0x5DEE_CE66_D1F3_A7B9;
+            let mut k = x.to_be_bytes().to_vec();
+            k.extend_from_slice(&y.to_be_bytes());
+            (k, fixed.clone())
+        }).collect()),
+    ];
+    for (name, rows) in &shapes {
+        let mut cs: Vec<usize> = Vec::new();
+        let mut acc = 0usize;
+        for (k, v) in rows {
+            acc += node::leaf_entry_bytes(k, v);
+            if chunker::is_boundary(k, v) {
+                cs.push(acc);
+                acc = 0;
+            }
+        }
+        if acc > 0 {
+            cs.push(acc);
+        }
+        let over = cs.iter().filter(|&&c| c > node::NODE_CAPACITY).count();
+        println!(
+            "{:30} chunks {:6}  mean {:4.0}B  max {:6}B  over-page {:3} ({:.2}%)",
+            name,
+            cs.len(),
+            cs.iter().sum::<usize>() as f64 / cs.len() as f64,
+            cs.iter().max().unwrap(),
+            over,
+            100.0 * over as f64 / cs.len() as f64
+        );
+    }
+}
+
+/// **Written as a known-open defect, carried `#[ignore]`d the way this repo marks one — and
+/// repaired on main before it landed. Status: expected green, NOT RUN since the merge.**
+///
+/// At D89's base, `CowTree::delete` removed the entry and relinked the path; nothing unlinked a
+/// leaf that the delete emptied. So deleting every row of one leaf left an empty leaf in the
+/// partition, and the tree stopped agreeing with the chunker about its own content — the property
+/// the rest of this file asserts.
+///
+/// Main repaired that independently: D104 (`d15db6a`) has `delete` hand an emptied leaf to
+/// `CowTree::unlink_up`, and D108 (`4240842`) joins a leaf that lost its terminator with its
+/// right-hand neighbour via `CowTree::merge_right` — the sibling access this doc once called the
+/// architectural limit, reached without a sibling pointer. `btree::delete_unlink_tests` and
+/// `cid.rs`'s delete-partition tests cover the same ground from the btree side. The assertions
+/// below state the repaired behaviour, so this test should now pass; it stays `#[ignore]`d only
+/// because the merge that met the two was made without a build. Run it with `--ignored`; if it is
+/// green, un-ignore it and delete this paragraph, and if it is red, the repair has a gap on this
+/// fixture.
+///
+/// Overwrite is deliberately **not** in this test: since the chunking hash reads the key alone, a
+/// same-length rewrite moves nothing, which `rewriting_values_in_place_leaves_the_partition_alone`
+/// holds green.
+#[test]
+#[ignore]
+fn deleting_every_row_of_a_leaf_leaves_it_linked_and_empty() {
+    let set = pairs(1500);
+    let f = Fixture::new();
+    let mut root = f.build(&set);
+    let before = f.leaf_partition(root);
+    assert!(before.len() > 4, "fixture: need several leaves");
+
+    // Empty leaf 2 exactly, by deleting the rows it holds and nothing else.
+    let victim: Vec<(Vec<u8>, Vec<u8>)> = before[2].clone();
+    for (k, _) in &victim {
+        let e = f.tick();
+        root = f.tree.delete(root, BranchId::TRUNK, e, k).unwrap();
+    }
+
+    let after = f.leaf_partition(root);
+    let empties = after.iter().filter(|l| l.is_empty()).count();
+    let remaining: Vec<(Vec<u8>, Vec<u8>)> =
+        set.iter().filter(|(k, _)| !victim.iter().any(|(vk, _)| vk == k)).cloned().collect();
+
+    assert_eq!(
+        empties, 0,
+        "delete left {} empty leaf/leaves linked in the partition: {}",
+        empties,
+        describe(&after)
+    );
+    assert_eq!(
+        after,
+        canonical(&remaining),
+        "after deleting a whole leaf the tree no longer matches the chunker's partition"
+    );
 }
