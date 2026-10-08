@@ -268,6 +268,7 @@
 //! trace over 4096 pages, 7899 evictions, byte-identical output and equal sha256 before and after.
 //! The gate is forced to fire in the same file (deleting `touch` changes the sequence), so
 //! "identical" is a result rather than an instrument that cannot see anything.
+use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
@@ -290,6 +291,21 @@ pub struct Frame {
     pub page_id: Option<u32>,
     pub pin_counter: AtomicU16,
     pub dirty_flag: AtomicBool,
+    /// **Being freed** by `BufferPoolManager::free_pages` (D237 review 2, N1): set in its pass 1,
+    /// with the label left as it is, and cleared either in the same frame-lock hold that resets the
+    /// frame to free (pass 3) or by a refusal. A freeing frame is not free (`claim_free_frame` takes
+    /// only an unlabelled frame) and not pinnable (`pin_if_labelled` refuses it), and an eviction
+    /// leaves its verdict to phase 2, which waits for the call. Unlabelling it instead, as pass 1
+    /// first did, made it look free, and a concurrent fault of another page claimed it.
+    ///
+    /// **Invariant: true only while a `free_pages` call holds `in_transit`, the ARC cache and
+    /// `page_table` write.** So a frame is never unlabelled and still being freed. That state is
+    /// representable (this is a separate field, not one label enum), because `page_id` is written
+    /// outside this file (`branch::arena`'s `evict`) and read directly by integration tests; one
+    /// enum would rewrite both, and the tests' part is a test edit (D237 review 3, R2). So the
+    /// invariant is checked instead, by a `debug_assert!` at every other writer that unlabels a
+    /// frame: `release_frame`, `delete_page`, `free_page`, `invalidate_all` and `arena::evict`.
+    pub freeing: bool,
 }
 
 /// What happened when the pool tried to take a replacement victim's frame.
@@ -616,7 +632,119 @@ impl Drop for FrameWriteGuard<'_> {
     }
 }
 
+/// A pin on one page, **released when this drops** (D237). Take one with
+/// [`BufferPoolManager::pin`].
+///
+/// `fetch_page` returns a bare frame index and leaves the matching `unpin_page` to the caller, so
+/// every `?` between the two returned with the page still pinned. `HeapFileManager::read` was one:
+/// a slot that reads `SlotDeleted`, which D202 makes reachable from SQL, left its page pinned for
+/// the life of the process, and the next `DROP TABLE` stopped part way at `free_page`'s refusal.
+/// The shape is `wal::log::WalPin`'s, applied to a page.
+///
+/// # A frame guard borrows its pin (D237 review F3)
+///
+/// [`PagePin::read`] and [`PagePin::write`] return guards that borrow the pin, and there is no bare
+/// frame index to take out of one. The unpin takes the frame's lock itself
+/// (`release_pin_if_labelled`), so releasing a pin while one of its guards is alive would block on
+/// a lock this thread holds; that, and reading a frame through a pin already dropped, no longer
+/// compile:
+///
+/// ```compile_fail
+/// # fn f(pool: &ferrodb::buffer::buffer_pool::BufferPoolManager) -> Result<(), ferrodb::error::FerroError> {
+/// let pin = pool.pin(1)?;
+/// let frame = pin.write();
+/// pin.unpin(true); // E0505: `pin` is borrowed by `frame`
+/// drop(frame);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The same holds for the read guard (review 2, N4):
+///
+/// ```compile_fail
+/// # fn f(pool: &ferrodb::buffer::buffer_pool::BufferPoolManager) -> Result<(), ferrodb::error::FerroError> {
+/// let pin = pool.pin(1)?;
+/// let frame = pin.read();
+/// pin.unpin(false); // E0505: `pin` is borrowed by `frame`
+/// drop(frame);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// (A `compile_fail` doctest passes on ANY compile error, so each snippet holds nothing but that one
+/// borrow. With guards tied to the POOL's lifetime instead, as `write` first was, both compile; that
+/// is the fire-check's mutant M8, their red arm.)
+///
+/// # Dirtiness
+///
+/// - [`PagePin::unpin`] states the flag, exactly as the hand-written `unpin_page(id, dirty)` it
+///   replaces did, so every path that already chose one keeps it.
+/// - A pin dropped without it (an early return) unpins dirty if [`PagePin::write`] was taken, and
+///   clean otherwise. Whatever sits in a frame that was written is what readers have already seen,
+///   so it is kept rather than thrown away on eviction. For every caller converted in D237 the
+///   frame is unchanged on those paths anyway (`frame.data = x?` assigns only when `x` is `Ok`),
+///   so the cost is at most one write-back of identical bytes.
+///
+/// # Borrowed, where `cow::PageHandle` owns an `Arc`
+///
+/// `PageHandle` is the same guard for the copy-on-write store, which keeps handles in a write
+/// journal and so needs them to own the pool. It pays one `Arc` clone per fetch and one drop per
+/// release: two atomic read-modify-writes on a counter every thread shares. D35 took two
+/// acquisitions of exactly that kind of line off this hit path, so the heap does not put them
+/// back. Its callers hold the pool across the access anyway.
+///
+/// # Blind spot: a panic keeps the pin
+///
+/// The drop does nothing while the thread is panicking. A panic under a frame's write lock
+/// poisons it, the unpin would then panic on that lock, and a panic inside a drop during
+/// unwinding aborts the process. So a panic leaks the pin, which is what it did before this guard
+/// existed.
+#[must_use = "a pin that is not kept is released at once"]
+pub struct PagePin<'a> {
+    pool: &'a BufferPoolManager,
+    page_id: u32,
+    frame_i: usize,
+    wrote: Cell<bool>,
+    stated: Option<bool>,
+}
+
+impl PagePin<'_> {
+    /// Read-lock the frame, through the tracked accessor. The guard borrows the pin.
+    pub fn read(&self) -> FrameGuard<RwLockReadGuard<'_, Frame>> {
+        self.pool.frame_read(self.frame_i)
+    }
+
+    /// Write-lock the frame. The only way to write through a pin, because it is how the pin knows
+    /// the page may be dirty. The guard borrows the pin.
+    pub fn write(&self) -> FrameWriteGuard<'_> {
+        self.wrote.set(true);
+        self.pool.frame_write(self.frame_i)
+    }
+
+    /// Release the pin now, marking the page dirty or not exactly as asked.
+    pub fn unpin(mut self, dirty: bool) {
+        self.stated = Some(dirty);
+        // `self` drops here, and the drop unpins with the stated flag.
+    }
+}
+
+impl Drop for PagePin<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let dirty = self.stated.unwrap_or(self.wrote.get());
+        self.pool.unpin_page(self.page_id, dirty);
+    }
+}
+
 impl BufferPoolManager {
+    /// Pin `page_id` and return the pin as a guard that releases it on drop. See [`PagePin`].
+    pub fn pin(&self, page_id: u32) -> Result<PagePin<'_>, FerroError> {
+        let frame_i = self.fetch_page(page_id)?;
+        Ok(PagePin { pool: self, page_id, frame_i, wrote: Cell::new(false), stated: None })
+    }
+
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
         let shadows: Vec<FrameShadow> = (0..MAX_BUFFER_POOL_PAGES).map(|_| FrameShadow::new()).collect();
@@ -863,7 +991,9 @@ impl BufferPoolManager {
         // src/storage/page_latch.rs.
         let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
-        if frame.page_id != Some(page_id) {
+        // A frame `free_pages` is part way through freeing keeps its label, so the label alone
+        // would let this pin it after the call's pin check (D237 review 2, N1).
+        if frame.page_id != Some(page_id) || frame.freeing {
             return None;
         }
         frame.pin_counter.fetch_add(1, Ordering::Relaxed);
@@ -906,6 +1036,9 @@ impl BufferPoolManager {
             let mut cache = self.arc_locked();
             cache.request(page_id, &|id| self.is_pinned(id))
         };
+        // Test seam (D237 review 2, N1): a unit test can park this fault here, verdict in hand and no
+        // frame claimed yet. An empty stub outside tests; see `buffer::fault_hooks`.
+        let parked = crate::buffer::fault_hooks::park_before_claim(self, page_id);
 
         let frame_i = match verdict {
             ArcResult::Hit => {
@@ -978,6 +1111,7 @@ impl BufferPoolManager {
         // never find the label already updated and the bytes not yet — that is serving another
         // page's contents, which is the one failure a storage engine cannot apologise for.
         self.frame_write(frame_i).data = data;
+        crate::buffer::fault_hooks::signal_filled(parked);
         self.page_table.write().unwrap().insert(page_id, frame_i);
         Ok(Some(frame_i))
     }
@@ -988,6 +1122,10 @@ impl BufferPoolManager {
     /// happen under one acquisition of that frame's lock, so two threads scanning at once cannot
     /// both take it — the original bug here probed under a read lock and re-acquired a write lock,
     /// and both threads wrote a different page into the same frame.
+    ///
+    /// **Only an unlabelled frame is free.** A frame `free_pages` is freeing keeps its label while
+    /// it is marked (`Frame::freeing`) and loses it only in the same lock hold that resets it, so a
+    /// claim can never take a frame part way through being freed (D237 review 2, N1).
     fn claim_free_frame(&self, incoming: u32) -> Option<usize> {
         // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
         // only from `fetch_page`, which already opens a section -- the marker is here anyway
@@ -1023,6 +1161,9 @@ impl BufferPoolManager {
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
         let mut frame = self.frame_write(frame_i);
+        // This fault claimed the frame, and its page is in `in_transit`, so no `free_pages` call can
+        // hold it: the call refuses a set with a page in transit (`Frame::freeing`'s invariant).
+        debug_assert!(!frame.freeing, "release_frame: frame {frame_i} is being freed");
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -1061,6 +1202,9 @@ impl BufferPoolManager {
             // `delete_page` or `free_page` removed the victim between the verdict and here.
             return Ok(Evicted::Gone);
         };
+        // Test seam (D237 review 3, R1): a unit test can park here, between the lookup and the
+        // latch. An empty stub outside tests; see `buffer::fault_hooks`.
+        crate::buffer::fault_hooks::between_evict_lookup_and_latch(self, victim);
 
         // Write-back under the victim's OWN latch. A read lock is what keeps `data` stable -- a
         // writer needs the write lock -- and it is the same lock discipline `flush_page` uses. IO
@@ -1074,7 +1218,14 @@ impl BufferPoolManager {
             if frame.pin_counter.load(Ordering::Relaxed) > 0 {
                 return Ok(Evicted::Declined);
             }
-            if frame.dirty_flag.load(Ordering::Relaxed) {
+            // A victim `free_pages` is freeing is NOT gone yet: the call may still refuse and leave
+            // it resident, and a `Gone` would not be handed back to the policy, which dropped it
+            // from its resident lists when it named it (D237 review 3, R1). Its bytes must not be
+            // written back over a slot pass 2 may give away, so the write-back is skipped and the
+            // verdict is left to phase 2. Phase 2's `page_table` write waits for the call, which
+            // holds it throughout, and then sees the outcome: freed (label `None`: `Gone`) or
+            // refused (label kept: `Took`, or `Declined` while the skipped write-back left it dirty).
+            if frame.dirty_flag.load(Ordering::Relaxed) && !frame.freeing {
                 self.wal_gate(&frame.data)?;
                 self.disk_manager.write(victim, &frame.data)?;
                 frame.dirty_flag.store(false, Ordering::Relaxed);
@@ -1084,8 +1235,12 @@ impl BufferPoolManager {
         // Re-verify and take it. The latch was released across the write-back, so the victim may
         // have been fetched, dirtied and unpinned again in between; `dirty` is checked as well as
         // the pin because that whole cycle can complete and leave the count back at zero.
+        crate::buffer::fault_hooks::before_evict_phase_2(self, victim);
         let mut pt = self.page_table.write().unwrap();
         let mut frame = self.frame_write(frame_i);
+        // No mark can be seen here: a mark exists only while a `free_pages` call holds
+        // `page_table` write, and this thread holds it now (D237 review 3, R1).
+        debug_assert!(!frame.freeing, "frame {frame_i} is being freed under a held page_table write lock");
         if frame.page_id != Some(victim) {
             return Ok(Evicted::Gone);
         }
@@ -1117,6 +1272,7 @@ impl BufferPoolManager {
     /// The structural argument is that it cannot get a stale candidate at all: **a pinned page
     /// cannot be evicted.** Every path that would unmap it refuses while `pin_counter > 0` —
     /// `evict_into` returns `Declined`, `delete_page` and `free_page` return `PagePinned`,
+    /// `free_pages` refuses the whole set (and refuses a pin on a frame it is freeing),
     /// `invalidate_all` refuses the whole sweep, and `branch::arena::evict` leaves it. So between
     /// the pin this call is undoing and this call, the mapping cannot have changed.
     ///
@@ -1296,6 +1452,9 @@ impl BufferPoolManager {
         drop(pt);
 
         let mut frame = self.frame_write(frame_i);
+        // `page_table` write was held until the entry was removed, so no `free_pages` call held it,
+        // and none can mark this frame now: its pass 1 finds frames through the table.
+        debug_assert!(!frame.freeing, "delete_page: frame {frame_i} is being freed");
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -1329,12 +1488,133 @@ impl BufferPoolManager {
             pt.remove(&page_id);
             drop(pt);
             let mut frame = self.frame_write(frame_i);
+            // As in `delete_page`: the entry left the table under its write lock, so no call marks it.
+            debug_assert!(!frame.freeing, "free_page: frame {frame_i} is being freed");
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
             self.arc_locked().remove(page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Free every page in `page_ids`, **or none of them** (D237).
+    ///
+    /// [`BufferPoolManager::free_page`] refuses one page at a time, so a caller freeing a structure
+    /// in a loop stopped part way. `Catalog::drop_table` did: it freed the heap, met a leaked pin
+    /// further on, and returned with the heap's pages free while the catalog still named them. The
+    /// next allocation handed them to another table, and a retried DROP freed them from under it.
+    ///
+    /// # All or none by construction, not by the caller's exclusion (D237 review F2)
+    ///
+    /// The first version checked every pin, let go of its locks, then called `free_page` per page,
+    /// and said the caller keeps other pinners out. A hot base backup does not:
+    /// `replication::backup::take` pins every page through `fetch_page` outside the statement lock.
+    /// A pin landing between the check and page k's free made `free_page` refuse part way. So:
+    ///
+    /// - `in_transit`, the ARC cache and `page_table` (write) are taken in the module's order and
+    ///   HELD from the first check to the last frame reset. Every miss, fault-in, eviction, flush and
+    ///   table lookup waits.
+    /// - Pass 1 write-locks each resident page's frame in turn. A pin refuses the whole call: the
+    ///   frames already marked are unmarked, and nothing has been freed. An unpinned frame is
+    ///   **marked as being freed** (`Frame::freeing`), with its label left as it is. That closes
+    ///   the one pin path that takes none of the three locks: a hit pins under the frame's READ
+    ///   lock after checking the label (`pin_if_labelled`), and it refuses a freeing frame.
+    /// - **Marked, not unlabelled (review 2, N1).** A fault that got its replacement verdict before
+    ///   this call took the ARC lock claims a frame without any of the three locks
+    ///   (`claim_free_frame`, one frame lock at a time), and it takes any UNLABELLED frame. The
+    ///   first version unlabelled here, so such a fault claimed a frame of the set; pass 3 then
+    ///   zeroed its bytes and reset its pin, or a refusal wrote the old label over the new one. A
+    ///   freeing frame keeps its label, so no claim takes it, and an eviction treats it as gone.
+    /// - Pass 2 is the disk: [`DiskManager::deallocate_many`] validates every page before it clears
+    ///   any bit (review F4). A refusal there unmarks too. Unmarking clears the mark and nothing
+    ///   else, so it cannot write over anything.
+    /// - Pass 3 forgets the frames, each in one frame-lock hold: label to `None`, bytes, pin count,
+    ///   dirty flag and mark, then the table entry and the ARC entry.
+    ///
+    /// A pinner therefore either pinned before the check, and the call refuses whole, or waits
+    /// until the frees are done; a fault of another page finds its frame elsewhere. Costs (review 2
+    /// N6), all with the three locks held, so every miss, fault-in, eviction, flush and table
+    /// lookup in the process waits for them, once per call: one bitmap read and one bitmap write
+    /// per touched bitmap page; one frame write lock per resident page in each of pass 1 and pass 3
+    /// (and in the unmark, on a refusal); and one 4 KB shadow refresh per resident page for each of
+    /// those writes, since a frame write guard republishes the frame to optimistic readers on drop.
+    /// A mark or an unmark leaves the label alone, so a refused call leaves no shadow at `NO_PAGE`.
+    /// A page listed twice is freed once.
+    ///
+    /// **Not covered:** an I/O failure on the second of two touched bitmap pages (see
+    /// `deallocate_many`); and anything after the frees in the caller, which is D229's durable
+    /// pending-free list.
+    pub fn free_pages(&self, page_ids: &[u32]) -> Result<(), FerroError> {
+        // Lock-order: `in_transit -> arc_cache -> page_table -> frame`, the module's order, as in
+        // `invalidate_all`, and all three pool locks are held to the end. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
+        let transit = self.in_transit.lock().unwrap();
+        if page_ids.iter().any(|p| transit.contains(p)) {
+            return Err(FerroError::PagePinned);
+        }
+        let mut cache = self.arc_locked();
+        let mut pt = self.page_table.write().unwrap();
+
+        // Takes pass 1's marks off again, when the call refuses after marking some. It clears the
+        // mark and touches nothing else: a label is never written back, so it cannot land on a
+        // frame anything else has claimed since (D237 review 2, N1).
+        let unmark = |taken: &[(u32, usize)]| {
+            for &(page_id, frame_i) in taken {
+                let mut frame = self.frame_write(frame_i);
+                if frame.freeing && frame.page_id == Some(page_id) {
+                    frame.freeing = false;
+                }
+            }
+        };
+
+        // Pass 1: refuse on any pin; mark every other resident frame as being freed.
+        let mut taken: Vec<(u32, usize)> = Vec::new();
+        for &page_id in page_ids {
+            let Some(&frame_i) = pt.get(&page_id) else { continue };
+            let mut frame = self.frame_write(frame_i);
+            if frame.page_id != Some(page_id) || frame.freeing {
+                continue; // listed twice, and an earlier turn already marked its frame
+            }
+            if frame.pin_counter.load(Ordering::Relaxed) > 0 {
+                drop(frame);
+                unmark(&taken[..]);
+                return Err(FerroError::PagePinned);
+            }
+            frame.freeing = true;
+            drop(frame);
+            taken.push((page_id, frame_i));
+        }
+
+        // Test seam (D237 review 2, N1): a unit test can park the call here, between pass 1 and
+        // pass 2. An empty stub outside tests; see `buffer::fault_hooks`.
+        crate::buffer::fault_hooks::between_pass_1_and_2(self);
+
+        // Pass 2: the disk, validated whole before any bit is cleared.
+        if let Err(e) = self.disk_manager.deallocate_many(page_ids) {
+            unmark(&taken[..]);
+            return Err(e);
+        }
+
+        // Pass 3: forget the frames. The label goes to `None` and the mark comes off in the SAME
+        // frame-lock hold as the reset, as `free_page` does, so no one ever sees a free-looking frame
+        // that still holds a freed page's state.
+        for &(page_id, frame_i) in &taken {
+            pt.remove(&page_id);
+            let mut frame = self.frame_write(frame_i);
+            frame.page_id = None;
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+            frame.freeing = false;
+        }
+        // Past the commit point: pass 2 has freed the pages on disk, so nothing here may fail the
+        // call. `ArcCache::remove` of an absent page is a no-op, as in `invalidate_all`.
+        for &(page_id, _) in &taken {
+            let _ = cache.remove(page_id);
         }
         Ok(())
     }
@@ -1404,6 +1684,8 @@ impl BufferPoolManager {
         pt.clear();
         for (page_id, frame_i) in resident {
             let mut frame = self.frame_write(frame_i);
+            // `in_transit` is held, which a `free_pages` call holds for its whole run.
+            debug_assert!(!frame.freeing, "invalidate_all: frame {frame_i} is being freed");
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
@@ -1450,7 +1732,7 @@ pub(crate) fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
 
 impl Frame {
     pub fn new() -> Self {
-        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false)}
+        Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false), freeing: false}
     }
 }
 #[cfg(test)]
@@ -1606,5 +1888,332 @@ mod tests {
             "an accepted delete must actually evict"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- D237 review 2, N1: a fault that lands while `free_pages` holds a set ------------------
+    //
+    // The race, driven by `buffer::fault_hooks` rather than by timing: a fault of an unrelated page
+    // parks with its verdict in hand, `free_pages` parks between pass 1 and pass 2, and the test
+    // thread lets each go in turn. At 639ab19 pass 1 unlabelled the set's frames to `None`, the
+    // exact state `claim_free_frame` takes as free, so the fault claimed one; pass 3 then zeroed it
+    // and reset its pin, or a refusal wrote the set page's label back over the fault's.
+
+    /// The N1 tests share `fault_hooks`' two global slots, so they run one at a time.
+    static N1_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// How long a seam may take to be reached. A seam that is never reached (a mutant that
+    /// removes it) fails the test here instead of hanging the run.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn n1_pool(tag: &str) -> (Arc<BufferPoolManager>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("ferro-bp-n1-{}-{}.db", std::process::id(), tag));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        (Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap()))), path)
+    }
+
+    fn stamp(bp: &BufferPoolManager, page: u32, byte: u8) {
+        let i = bp.fetch_page(page).unwrap();
+        bp.frame_write(i).data[0] = byte;
+        bp.unpin_page(page, true);
+    }
+
+    fn first_byte(bp: &BufferPoolManager, page: u32) -> u8 {
+        let i = bp.fetch_page(page).unwrap_or_else(|e| panic!("page {page} cannot be pinned: {e}"));
+        let byte = bp.frames[i].read().unwrap().data[0];
+        bp.unpin_page(page, false);
+        byte
+    }
+
+    /// Every table entry's frame carries that entry's label, and no two entries share a frame.
+    fn assert_table_consistent(bp: &BufferPoolManager, when: &str) {
+        let pt = bp.page_table.read().unwrap();
+        let mut owner: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for (&page, &frame) in pt.iter() {
+            let label = bp.frames[frame].read().unwrap().page_id;
+            assert_eq!(label, Some(page), "{when}: page {page}'s table entry names frame {frame}, labelled {label:?}");
+            if let Some(other) = owner.insert(frame, page) {
+                panic!("{when}: pages {other} and {page} both map to frame {frame}");
+            }
+        }
+    }
+
+    struct N1Run {
+        free_result: Result<(), FerroError>,
+        set_frames: Vec<usize>,
+        probe_pinned: bool,
+        fault_frame: usize,
+        fault_pins: u16,
+        fault_byte: u8,
+    }
+
+    /// Fault `faulted` (not resident) while `free_pages(set)` runs, with the fault's frame claim
+    /// placed inside the window between pass 1 and pass 2. `set[0]` must be resident.
+    fn run_n1(bp: &Arc<BufferPoolManager>, set: &[u32], faulted: u32) -> N1Run {
+        use crate::buffer::fault_hooks::{address, FaultPark, FreePark, FAULT, FREE};
+        use std::sync::mpsc::channel;
+
+        let _serial = N1_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let set_frames: Vec<usize> =
+            set.iter().filter_map(|p| bp.page_table.read().unwrap().get(p).copied()).collect();
+        let (arrived_tx, arrived_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (filled_tx, filled_rx) = channel();
+        let (open_tx, open_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        *FAULT.lock().unwrap() = Some(FaultPark {
+            pool: address(bp),
+            page: faulted,
+            arrived: arrived_tx,
+            release: release_rx,
+            filled: filled_tx,
+        });
+        *FREE.lock().unwrap() = Some(FreePark { pool: address(bp), window_open: open_tx, resume: resume_rx });
+
+        // Each thread sends its result instead of being joined, so a thread that never returns fails
+        // the test within `PATIENCE` instead of holding the run (D237 review 3, R5).
+        let (faulted_tx, faulted_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            std::thread::spawn(move || {
+                let i = bp.fetch_page(faulted).unwrap();
+                let (pins, byte) = {
+                    let f = bp.frames[i].read().unwrap();
+                    (f.pin_counter.load(Ordering::Relaxed), f.data[0])
+                };
+                bp.unpin_page(faulted, false);
+                let _ = faulted_tx.send((i, pins, byte));
+            });
+        }
+        arrived_rx.recv_timeout(PATIENCE).expect("the fault never reached its seam");
+        // The claim scans from here, so the set's frames come first.
+        bp.free_hint.store(0, Ordering::Relaxed);
+        let (freed_tx, freed_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            let set = set.to_vec();
+            std::thread::spawn(move || {
+                let _ = freed_tx.send(bp.free_pages(&set));
+            });
+        }
+        open_rx.recv_timeout(PATIENCE).expect("free_pages never reached its seam");
+        // The window: pass 1 is done and pass 2 has not begun.
+        let probe_pinned = bp.pin_if_labelled(set_frames[0], set[0]).is_some();
+        release_tx.send(()).unwrap();
+        filled_rx.recv_timeout(PATIENCE).expect("the fault never filled its frame");
+        resume_tx.send(()).unwrap();
+        let free_result = freed_rx.recv_timeout(PATIENCE).expect("free_pages did not return within 10 s");
+        let (fault_frame, fault_pins, fault_byte) =
+            faulted_rx.recv_timeout(PATIENCE).expect("the fault did not return within 10 s");
+        N1Run { free_result, set_frames, probe_pinned, fault_frame, fault_pins, fault_byte }
+    }
+
+    /// ⛔ **D237 review 2 N1, red first:** a fault of an unrelated page that claims its frame while
+    /// `free_pages` holds a set must keep that frame, its pin and its bytes, and a frame being
+    /// freed must refuse a pin.
+    #[test]
+    fn a_fault_that_claims_a_frame_while_a_set_is_freed_keeps_it() {
+        let (bp, path) = n1_pool("keeps");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x10 + n as u8);
+        }
+        let faulted = bp.disk_manager.allocate().unwrap();
+        bp.disk_manager.write(faulted, &[0xAB; PAGE_SIZE]).unwrap();
+        assert!(bp.page_table.read().unwrap().get(&faulted).is_none(), "premise: the faulted page is not resident");
+
+        let run = run_n1(&bp, &set, faulted);
+
+        assert!(run.free_result.is_ok(), "premise: the set was not freed: {:?}", run.free_result);
+        assert!(!run.probe_pinned, "pin_if_labelled pinned a frame free_pages was part way through freeing");
+        assert!(
+            !run.set_frames.contains(&run.fault_frame),
+            "the fault claimed frame {} of the set being freed ({:?})",
+            run.fault_frame,
+            run.set_frames
+        );
+        assert_eq!(run.fault_pins, 1, "the fault's own pin on frame {} was reset under it", run.fault_frame);
+        assert_eq!(run.fault_byte, 0xAB, "the faulted page's bytes were zeroed under it");
+        assert_table_consistent(&bp, "after the free");
+        assert_eq!(first_byte(&bp, faulted), 0xAB, "the faulted page does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ⛔ **D237 review 2 N1, red first, the refusal half:** when `free_pages` refuses after the
+    /// fault claimed its frame, the refusal must not write a set page's label over the fault's.
+    /// The set carries a page no bitmap page maps, so pass 2 refuses.
+    #[test]
+    fn a_refused_free_does_not_relabel_a_frame_a_fault_claimed() {
+        let (bp, path) = n1_pool("refused");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x10 + n as u8);
+        }
+        let faulted = bp.disk_manager.allocate().unwrap();
+        bp.disk_manager.write(faulted, &[0xAB; PAGE_SIZE]).unwrap();
+        let mut batch = set.clone();
+        batch.push((PAGE_SIZE as u32 - 4) * 8 * 4);
+
+        let run = run_n1(&bp, &batch, faulted);
+
+        assert!(run.free_result.is_err(), "premise: the batch with an unmapped page was freed");
+        assert_table_consistent(&bp, "after the refusal");
+        for (n, &p) in set.iter().enumerate() {
+            assert_eq!(first_byte(&bp, p), 0x10 + n as u8, "set page {p} does not read back its bytes after the refusal");
+        }
+        assert_eq!(first_byte(&bp, faulted), 0xAB, "the faulted page does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- D237 review 3, R1: an eviction whose victim a `free_pages` call is freeing ---------------
+
+    fn verdict_name(v: &Result<Evicted, FerroError>) -> String {
+        match v {
+            Ok(Evicted::Took(i)) => format!("Took({i})"),
+            Ok(Evicted::Declined) => "Declined".to_string(),
+            Ok(Evicted::Gone) => "Gone".to_string(),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    /// Run `evict_into(victim, incoming)` while `free_pages(set)` holds the set: the evictor parks
+    /// between its table lookup and its frame latch until pass 1 has marked the set, then reads the
+    /// frame while the mark is set. The free resumes only once the evictor has either answered or
+    /// reached phase 2 (where it waits for `page_table`), whichever this build does. Every wait is
+    /// bounded by `PATIENCE`. Returns the free's result and the eviction's verdict.
+    fn evict_during_free(
+        bp: &Arc<BufferPoolManager>,
+        set: &[u32],
+        victim: u32,
+        incoming: u32,
+    ) -> (Result<(), FerroError>, Result<Evicted, FerroError>) {
+        use crate::buffer::fault_hooks::{address, EvictPark, EvictPast, FreePark, EVICT, EVICT_PAST, FREE};
+        use std::sync::mpsc::{channel, TryRecvError};
+
+        let _serial = N1_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (arrived_tx, arrived_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (past_tx, past_rx) = channel();
+        let (open_tx, open_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        *EVICT.lock().unwrap() = Some(EvictPark { pool: address(bp), victim, arrived: arrived_tx, release: release_rx });
+        *EVICT_PAST.lock().unwrap() = Some(EvictPast { pool: address(bp), victim, past: past_tx });
+        *FREE.lock().unwrap() = Some(FreePark { pool: address(bp), window_open: open_tx, resume: resume_rx });
+
+        let (verdict_tx, verdict_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            std::thread::spawn(move || {
+                let _ = verdict_tx.send(bp.evict_into(victim, incoming));
+            });
+        }
+        arrived_rx.recv_timeout(PATIENCE).expect("evict_into never reached its seam");
+        let (free_tx, free_rx) = channel();
+        {
+            let bp = Arc::clone(bp);
+            let set = set.to_vec();
+            std::thread::spawn(move || {
+                let _ = free_tx.send(bp.free_pages(&set));
+            });
+        }
+        open_rx.recv_timeout(PATIENCE).expect("free_pages never reached its seam");
+        // Pass 1 has marked the victim; the evictor now latches its frame and sees the mark.
+        release_tx.send(()).unwrap();
+        let started = std::time::Instant::now();
+        let mut early = None;
+        loop {
+            match verdict_rx.try_recv() {
+                Ok(v) => {
+                    early = Some(v);
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => panic!("the evicting thread panicked"),
+                Err(TryRecvError::Empty) => {}
+            }
+            if past_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(started.elapsed() < PATIENCE, "evict_into neither answered nor reached phase 2 within 10 s");
+            std::thread::yield_now();
+        }
+        resume_tx.send(()).unwrap();
+        let free_result = free_rx.recv_timeout(PATIENCE).expect("free_pages did not return within 10 s");
+        let verdict = match early {
+            Some(v) => v,
+            None => verdict_rx.recv_timeout(PATIENCE).expect("evict_into did not return within 10 s"),
+        };
+        // A build that answered in phase 1 never reached the phase-2 hook: disarm it, so no later
+        // pool at this address inherits it.
+        *EVICT_PAST.lock().unwrap() = None;
+        (free_result, verdict)
+    }
+
+    /// ⛔ **D237 review 3 R1, red first:** a victim that `free_pages` was freeing when the eviction
+    /// latched it, and that the call then REFUSED to free, is still resident. `evict_into` must not
+    /// call it `Gone`: the replacement policy removed it from its resident lists when it named it,
+    /// and a `Gone` verdict is not handed back, so the policy would stop counting a page that is
+    /// still in the pool, and its frame would never be a victim again. The set carries a page no
+    /// bitmap page maps, so pass 2 refuses. The victim was stamped, so it is dirty.
+    ///
+    /// Hand-worked: at the base the phase-1 check answers `Gone` while the mark is set. At the fix
+    /// phase 1 skips the write-back and phase 2 waits for the call, then sees the victim resident,
+    /// unpinned and dirty: `Declined`, which the caller hands back.
+    #[test]
+    fn a_victim_a_refused_free_was_freeing_is_not_reported_gone() {
+        let (bp, path) = n1_pool("evict-refused");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x20 + n as u8);
+        }
+        let victim = set[0];
+        let incoming = bp.disk_manager.allocate().unwrap();
+        let mut batch = set.clone();
+        batch.push((PAGE_SIZE as u32 - 4) * 8 * 4);
+
+        let (free_result, verdict) = evict_during_free(&bp, &batch, victim, incoming);
+
+        assert!(free_result.is_err(), "premise: the batch with an unmapped page was freed");
+        let resident = bp.page_table.read().unwrap().get(&victim).copied();
+        let frame = resident.expect("premise: the refused free left the victim resident");
+        assert_eq!(bp.frames[frame].read().unwrap().page_id, Some(victim), "premise: the victim's frame keeps its label");
+        assert!(
+            !matches!(verdict, Ok(Evicted::Gone)),
+            "evict_into reported Gone for page {victim}, which the refused free left resident in frame {frame}: \
+             the policy would stop counting a page that is still in the pool (verdict {})",
+            verdict_name(&verdict)
+        );
+        assert!(
+            matches!(verdict, Ok(Evicted::Declined)),
+            "the dirty victim {victim} was not declined: {}",
+            verdict_name(&verdict)
+        );
+        assert_table_consistent(&bp, "after the refused free and the eviction");
+        assert_eq!(first_byte(&bp, victim), 0x20, "the victim does not read back its bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The other outcome, and the fix's guard in the other direction: when the call completes, the
+    /// victim it freed IS gone, and `evict_into` must say so rather than take a freed frame.
+    #[test]
+    fn a_victim_a_completed_free_took_is_reported_gone() {
+        let (bp, path) = n1_pool("evict-freed");
+        let set: Vec<u32> = (0..4).map(|_| bp.new_page().unwrap()).collect();
+        for (n, &p) in set.iter().enumerate() {
+            stamp(&bp, p, 0x30 + n as u8);
+        }
+        let victim = set[0];
+        let incoming = bp.disk_manager.allocate().unwrap();
+
+        let (free_result, verdict) = evict_during_free(&bp, &set, victim, incoming);
+
+        assert!(free_result.is_ok(), "premise: the set was not freed: {free_result:?}");
+        assert!(bp.page_table.read().unwrap().get(&victim).is_none(), "premise: the freed victim is still in the table");
+        assert!(
+            matches!(verdict, Ok(Evicted::Gone)),
+            "evict_into did not report Gone for page {victim}, which the free took: {}",
+            verdict_name(&verdict)
+        );
+        assert_table_consistent(&bp, "after the free and the eviction");
+        let _ = std::fs::remove_file(path);
     }
 }
