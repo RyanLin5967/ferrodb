@@ -703,6 +703,24 @@ fn claim_eq(a: &EscrowClaim, b: &EscrowClaim) -> bool {
 /// in place of `==` on the two vectors that can hold a bare `f64`. Guards need no special case:
 /// every float inside one is a `Value`, whose comparison is already total.
 fn frame_eq(a: &TxnFrame, b: &TxnFrame) -> bool {
+    // **D115 instrument.** Two clauses here are O(size of the OPEN frame) and they fire under
+    // different conditions, so they are counted apart.
+    //
+    // `a.guards == b.guards` runs BEFORE the op-count check, and `Vec::eq` only short-circuits
+    // when the LENGTHS differ. A statement that pushes a guard therefore costs nothing here, and
+    // a statement that pushes NONE — an INSERT, or an UPDATE whose predicate captured no guard —
+    // compares every guard the session has accumulated, each one a recursive `GuardExpr` walk.
+    // That is a per-statement O(n) term on the same axis as the frame clone and it is not the
+    // clone, which is exactly the confusion this row exists to avoid.
+    if a.guards.len() == b.guards.len() {
+        crate::tel::stage_probe::bump(
+            &crate::tel::stage_probe::EQ_GUARD_CMP,
+            a.guards.len() as u64,
+        );
+    }
+    if a.ops.len() == b.ops.len() {
+        crate::tel::stage_probe::bump(&crate::tel::stage_probe::EQ_OP_CMP, a.ops.len() as u64);
+    }
     a.txn_id == b.txn_id
         && a.branch == b.branch
         && a.base == b.base
@@ -725,6 +743,19 @@ fn extends(old: &TxnFrame, new: &TxnFrame) -> bool {
     fn prefix<T, F: Fn(&T, &T) -> bool>(old: &[T], new: &[T], eq: F) -> bool {
         old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| eq(a, b))
     }
+    // **D115 instrument.** The ops prefix is re-compared in full on every re-append, so a session
+    // that runs W statements compares O(W^2) ops here — the same axis as `stage_all`'s frame
+    // clone, and one term is indistinguishable from the other without counting both. Bumped ONCE
+    // per call with the length, not once per comparison: a `fetch_add` inside the loop would cost
+    // more than the comparison it counts.
+    // ⚠ It is an UPPER bound, not an exact count: `all()` short-circuits, so a prefix that
+    // mismatches early compares fewer than this says. On the path being measured the prefix always
+    // matches in full, so the two coincide there — and the error is in the safe direction for a
+    // counter whose job is to show a term is LARGE.
+    crate::tel::stage_probe::bump(
+        &crate::tel::stage_probe::EXTENDS_OP_CMP,
+        old.ops.len().min(new.ops.len()) as u64,
+    );
     old.base == new.base
         && old.seq == new.seq
         && old.schema_ver == new.schema_ver
@@ -780,6 +811,13 @@ impl EffectLog for MemEffectLog {
                 f.branch == frame.branch && f.txn_id == frame.txn_id
             });
             scan_count::record(scan_count::SITE_APPEND_SHADOW, by_scan.is_some(), scanned);
+            // **D115 instrument**, re-anchored onto D138. D115 counted the frames walked by this
+            // function's `position()` scan, once per statement, on the SESSIONS axis. Since D138
+            // the lookup that decides `i` is the index above and walks no frame; the only
+            // `position()` walk left in this function is the shadow scan just run, so that is
+            // what `POSITION_SCAN` reports — the walk this call actually made, read from the
+            // iterator that walked (`scanned`), never recomputed and never run a second time.
+            crate::tel::stage_probe::bump(&crate::tel::stage_probe::POSITION_SCAN, scanned);
             if by_scan != at {
                 scan_count::note_mismatch();
             }
@@ -798,6 +836,13 @@ impl EffectLog for MemEffectLog {
                 // accepted. Extending here makes the two stores hold the identical frame for
                 // every input rather than for the inputs a producer happens to send.
                 Reappend::Grew { ops, guards, claims } => {
+                    // **D115 instrument.** The TAIL, which is what this branch copies. If this
+                    // tracks the statement's own op count while `EXTENDS_OP_CMP` tracks the
+                    // session's, then the growth is in the comparison and not in the copy.
+                    crate::tel::stage_probe::bump(
+                        &crate::tel::stage_probe::EXTEND_TAIL_OPS,
+                        (frame.ops.len() - ops) as u64,
+                    );
                     // Grown **at the position it already occupies**, which is the half of the
                     // append-only contract that lets [`Frames`] store positions at all.
                     let stored = &mut frames.frames[i];

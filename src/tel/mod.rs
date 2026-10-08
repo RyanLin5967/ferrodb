@@ -21,6 +21,7 @@ pub mod log;
 pub mod merge;
 pub mod op;
 pub mod schema_merge;
+pub mod stage_probe;
 
 pub use capture::{capture_assignment, capture_guard, to_guard_expr, ColMap, RowSnapshot};
 pub use engine::{dedup_by_txn, ComposedState, Deduped, Side, ThreeWayMerger};

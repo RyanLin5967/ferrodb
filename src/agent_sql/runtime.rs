@@ -85,6 +85,8 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::storage::index_page::entries_an_update_writes;
 use crate::tel::frame::TxnFrame;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use crate::tel::stage_probe;
+use std::time::Instant;
 use crate::tel::guard::{ArithOp, CmpOp, Guard, GuardExpr};
 use crate::tel::ids::{ColId, RowId, TableId, TxnId};
 use crate::tel::merge::{ConflictKind, ConflictReport, MergeOutcome, MergePolicy};
@@ -3199,6 +3201,10 @@ impl AgentRuntime {
     /// then is anything charged or recorded. Summing per cell matters: one statement can lower the same
     /// cell twice, and checking each half against the full remaining balance would admit a batch that
     /// overdraws in aggregate.
+    /// **D115 instrument.** The body is [`Self::stage_all_measured`]; this wrapper exists only so
+    /// that `STAGE_NS` covers every early return, including the refusals, without a timer having
+    /// to be closed on each `?`. A missed refusal would understate the phase that refused, which
+    /// is the one direction of error that reads as a clean result.
     fn stage_all(
         &self,
         branch: BranchId,
@@ -3207,6 +3213,22 @@ impl AgentRuntime {
         pk_type: &DataType,
         items: Vec<Staged>,
     ) -> Result<(), FerroError> {
+        let t = Instant::now();
+        let out = self.stage_all_measured(branch, tbl, table, pk_type, items);
+        stage_probe::bump(&stage_probe::STAGE_NS, t.elapsed().as_nanos() as u64);
+        stage_probe::bump(&stage_probe::STAGE_CALLS, 1);
+        out
+    }
+
+    fn stage_all_measured(
+        &self,
+        branch: BranchId,
+        tbl: TableId,
+        table: &str,
+        pk_type: &DataType,
+        items: Vec<Staged>,
+    ) -> Result<(), FerroError> {
+        let t_decide = Instant::now();
         // ---- decide -------------------------------------------------------------------------
         //
         // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying off
@@ -3298,16 +3320,20 @@ impl AgentRuntime {
         if charge > 0 {
             self.branches.charge_row_writes(branch, charge)?;
         }
+        stage_probe::bump(&stage_probe::DECIDE_NS, t_decide.elapsed().as_nanos() as u64);
 
         // ---- apply --------------------------------------------------------------------------
         //
         // Past this point nothing may fail on a per-row basis: `check_all` has already established that
         // every spend fits, so `spend` cannot refuse.
+        let t_apply = Instant::now();
         for (cell, amount) in spends {
             self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
         }
 
         let mut mirrored: Vec<(RowId, RowState)> = Vec::with_capacity(items.len());
+        #[allow(unused_assignments)]
+        let mut clone_ns = 0u64;
         let frame = {
             let mut state = self.state.lock().unwrap();
             let ws = state.workspaces.get_mut(&branch).ok_or_else(|| {
@@ -3336,35 +3362,56 @@ impl AgentRuntime {
             // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Times THIS clone alone and pairs it
             // with the integer `ops.len()` at the same moment, so the timer never travels without
             // its counter.
+            //
+            // D115 reads the SAME span: one clone, one timer, reported to both instruments, so
+            // neither the clone nor its timing is paid twice.
             {
                 let n = ws.frame.ops.len() as u64;
-                let t0 = std::time::Instant::now();
+                let t0 = Instant::now();
                 let f = ws.frame.clone();
-                D172_CLONE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                clone_ns = t0.elapsed().as_nanos() as u64;
+                D172_CLONE_NS.fetch_add(clone_ns, std::sync::atomic::Ordering::Relaxed);
                 D172_CLONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 D172_OPS_LEN_SUM.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 D172_OPS_LEN_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                stage_probe::bump(&stage_probe::CLONE_OPS, f.ops.len() as u64);
+                stage_probe::bump(&stage_probe::CLONE_GUARDS, f.guards.len() as u64);
                 f
             }
         };
+        // The clone is charged to its own counter and SUBTRACTED from the apply phase, so the two
+        // do not both contain it. `saturating_sub` because the two clocks are read at different
+        // depths and a coarse tick can order them the wrong way at the smallest point.
+        stage_probe::bump(&stage_probe::CLONE_NS, clone_ns);
+        stage_probe::bump(
+            &stage_probe::APPLY_NS,
+            (t_apply.elapsed().as_nanos() as u64).saturating_sub(clone_ns),
+        );
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
         // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
         // statement, which is also why the frame is cloned after every row is folded in.
         // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The second Theta(S) site: classify's
         // frame_eq + extends compare op-by-op over the stored frame.
-        {
-            let t0 = std::time::Instant::now();
-            let r = self.log.append(&frame);
-            D172_APPEND_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            r?
-        };
+        // D115 reads the same span into `APPEND_NS`: one timer, two instruments.
+        let t_append = Instant::now();
+        let appended = self.log.append(&frame);
+        let append_ns = t_append.elapsed().as_nanos() as u64;
+        D172_APPEND_NS.fetch_add(append_ns, std::sync::atomic::Ordering::Relaxed);
+        stage_probe::bump(&stage_probe::APPEND_NS, append_ns);
         // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The third Theta(S) site: dropping the
         // clone deallocates S `Op`s and their witnesses, outside both timers above.
-        {
-            let t0 = std::time::Instant::now();
-            drop(frame);
-            D172_DROP_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        //
+        // **The clone's other half** (D115). `drop` runs `Op`'s destructor once per element, so
+        // freeing the copy is the same O(ops) walk that making it was. Dropped HERE, explicitly,
+        // rather than at the end of the scope — left implicit it lands outside every span and
+        // shows up only as an unattributed remainder. Dropped BEFORE the append's error is
+        // propagated (D115's order), so a failed append's drop is timed too.
+        let t_drop = Instant::now();
+        drop(frame);
+        let drop_ns = t_drop.elapsed().as_nanos() as u64;
+        D172_DROP_NS.fetch_add(drop_ns, std::sync::atomic::Ordering::Relaxed);
+        stage_probe::bump(&stage_probe::DROP_NS, drop_ns);
+        appended?;
 
         // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
         // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
@@ -3383,12 +3430,16 @@ impl AgentRuntime {
                 "the caller's TableId disagrees with the table name it passed, so the tree and the \
                  workspace map would key the same row differently"
             );
+            let t_mirror = Instant::now();
+            let n = mirrored.len() as u64;
             for (row, state) in mirrored {
                 match state {
                     RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
                     RowState::Deleted => self.delete_row(branch, table, row.0)?,
                 }
             }
+            stage_probe::bump(&stage_probe::MIRROR_NS, t_mirror.elapsed().as_nanos() as u64);
+            stage_probe::bump(&stage_probe::MIRROR_ROWS, n);
         }
         Ok(())
     }
