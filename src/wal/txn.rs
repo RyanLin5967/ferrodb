@@ -1735,6 +1735,15 @@ impl TxnManager {
     /// never succeeds blocked all DDL for ever (review 2's Q3). A DROP frees pages, and goes through
     /// [`TxnManager::drop_checkpointed`].
     ///
+    /// **D271: CREATE [FULLTEXT] INDEX runs only its ATTACH here.** Its O(rows) backfill runs first,
+    /// outside, into a tree no record names (`Catalog::build_index`), so the hold covers the O(1)
+    /// attach and the checkpoint and never the backfill. The checkpoint still flushes and syncs the
+    /// pages the backfill dirtied, so a `begin` can wait on that write: at most the pool's frames,
+    /// however many rows the table has. A refusal here frees that tree
+    /// (`execution::executor::attach_built_index`). Until D271 those statements attached first and
+    /// then called a checkpoint that refused while another session's transaction was open: A8's
+    /// shape, for indexes.
+    ///
     /// Nothing reachable from `f` or from the checkpoint takes `att` or `release_retry`, so this
     /// cannot deadlock on itself. The lock order is `att`, then `release_retry`, then the buffer pool,
     /// and no path takes `att` while it holds `release_retry`. The retry's releases are appended
@@ -1898,11 +1907,15 @@ impl TxnManager {
     /// the index was built and flushed. The client was told the DDL failed over an index that existed
     /// and was used, which is A8's shape.
     ///
-    /// Refuses while a transaction is open, as `checkpoint` does. They are not moved under
-    /// [`TxnManager::ddl_checkpointed`]: that would hold `att` shut across the index's backfill, so
-    /// every `begin`, and every reader whose cached snapshot missed, would wait O(rows). An open
-    /// transaction elsewhere therefore still refuses them after the index is built. That is A8's
-    /// shape for indexes, it predates this lane, and it is unchanged here.
+    /// Refuses while a transaction is open, as `checkpoint` does (the check is in
+    /// `checkpoint_or_keep_locked`, under D253's fence).
+    ///
+    /// **Since D271 no production path calls this.** CREATE [FULLTEXT] INDEX now builds its tree
+    /// unattached, outside `att`, and runs only the O(1) attach and the checkpoint under
+    /// [`TxnManager::ddl_checkpointed`] (see there), which removes A8's shape for indexes. D271 deleted
+    /// this function on a branch where nothing else called it; D253, merged alongside it, fences it and
+    /// drives it from its own tests (`wal::recovery`'s `via_ddl_checkpoint`), so it is kept, as one of
+    /// the fenced checkpoint entries. Removing it means retiring those tests first.
     pub fn ddl_checkpoint(&self) -> Result<(), FerroError> {
         self.checkpoint_or_keep_locked(true).map(|_| ())
     }

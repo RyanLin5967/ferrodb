@@ -69,6 +69,31 @@ pub struct Catalog {
     epoch: u64,
 }
 
+/// Which list of its table a [`BuiltIndex`] joins when it is attached (D271).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltIndexKind {
+    /// `TableEntry::indexes`.
+    Secondary,
+    /// `TableEntry::fulltext_indexes`.
+    FullText,
+}
+
+/// **D271: an index tree built from its table's heap and not yet attached to the catalog.** Made
+/// by [`Catalog::build_index`] or [`Catalog::build_fulltext_index`], and consumed by
+/// [`Catalog::attach_index`], which hands it back only when it refused before persisting anything;
+/// [`Catalog::discard_index`] then frees its pages. Until it is attached no record names the tree,
+/// so a dropped `BuiltIndex` whose tree was not discarded leaks its pages: the holder must attach
+/// or discard it.
+#[must_use = "an unattached index tree's pages stay allocated until it is attached or discarded"]
+#[derive(Debug)]
+pub struct BuiltIndex {
+    table: String,
+    column: String,
+    kind: BuiltIndexKind,
+    /// The root read after the backfill (D222).
+    root: u32,
+}
+
 impl Catalog {
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let page_id = buffer_pool.new_page()?; // = 1 on a fresh DB
@@ -257,21 +282,28 @@ impl Catalog {
         ))
     }
 
-    /// Free an index tree whose backfill failed, and return the failure. D225.
-    ///
-    /// The tree is not in the catalog yet, so nothing else can hold a handle on it. If freeing it
-    /// fails too, both are reported, with the backfill's failure first because it is the cause.
-    fn abandon_backfill(tree: &BPlusTreeManager<(Value, Value), ()>, failure: FerroError) -> FerroError {
-        match tree.free_all() {
-            Ok(()) => failure,
-            Err(e) => FerroError::Internal(format!(
-                "{failure}; and freeing the half-built index tree failed too, leaking its pages: {e}"
-            )),
-        }
+    // create a secondary B+ tree, push an IndexInfo onto the table, persist
+    //
+    // D271: build the tree unattached, then attach it; an attach refused before it persisted frees
+    // what was built (`attach_or_discard`). `execution::executor` does the two steps itself, so that
+    // only the attach runs under
+    // `TxnManager::ddl_checkpointed` (see `build_index`).
+    pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
+        let built = self.build_index(table, column)?;
+        self.attach_or_discard(built)
     }
 
-    // create a secondary B+ tree, push an IndexInfo onto the table, persist
-    pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
+    /// **D271: build `table.column`'s secondary index from the heap, WITHOUT attaching it.** No
+    /// record is pushed, nothing is persisted, no cell is seeded and the epoch does not move, so a
+    /// catalog that never attaches the result has not changed at all. [`Catalog::attach_index`] is
+    /// the O(1) second step; [`Catalog::discard_index`] frees a tree that will not be attached.
+    ///
+    /// Split so that CREATE INDEX can run this O(rows) backfill OUTSIDE the transaction table's
+    /// hold and only the attach and the checkpoint inside it (`TxnManager::ddl_checkpointed`). When
+    /// the two ran as one step before the checkpoint, another session's open transaction made the
+    /// checkpoint refuse AFTER the index was attached: the statement answered `Err` over an index
+    /// the next checkpoint made durable.
+    pub fn build_index(&self, table: &str, column: &str) -> Result<BuiltIndex, FerroError> {
         let (schema, first_dir_page_id, col_index) = {
             // E67: both of these were bare `KeyNotFound`, so `CREATE INDEX ix ON nosuch (v)` and
             // `CREATE INDEX ix ON t (nosuchcol)` - two different mistakes - produced the identical
@@ -291,8 +323,8 @@ impl Catalog {
                 )))?;
 
             // Asked of the encoder BEFORE the tree is allocated (D254): the entry with this index,
-            // under a placeholder root. `persist` would refuse it too, but after the tree's pages
-            // exist, and the undo below pops the record, not the pages.
+                    // under a placeholder root. `persist` would refuse it too, but after the tree's pages
+            // exist, and the undo in `attach_index` pops the record, not the pages.
             let mut with_index = entry.clone();
             with_index.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: 0 });
             refuse_unless_encodable(&with_index)?;
@@ -302,7 +334,7 @@ impl Catalog {
         let sec_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        let backfill = (|| -> Result<(), FerroError> {
+        let filled = (|| -> Result<(), FerroError> {
             for item in hfm.scan() {
                 let (_, tuple) = item?;
                 let deleted = tuple.version_header()?.end_ts != 0;
@@ -320,34 +352,120 @@ impl Catalog {
             }
             Ok(())
         })();
-        // D225: a backfill that fails leaves a half-built tree nothing will ever name, and a row
-        // too wide for an index entry (legal in an unindexed VARCHAR column) now fails it by name,
-        // every time it is retried. Free the tree rather than leak one per attempt.
-        if let Err(e) = backfill {
-            return Err(Self::abandon_backfill(&sec_tree, e));
-        }
         // D222 — the root is read AFTER the backfill. A backfill that splits the root moves it to a
         // new page, and the page `create` returned is left as the leftmost leaf: recording that
         // seeded the shared cell with one leaf, so a lookup past the leaf walk's 64 hops missed and
         // an INSERT landed in that leaf whatever its key (`tests/d222_index_root_after_backfill.rs`).
-        let new_root_id = sec_tree.root_page_id.load(Ordering::Relaxed);
+        let built = BuiltIndex {
+            table: table.to_string(),
+            column: column.to_string(),
+            kind: BuiltIndexKind::Secondary,
+            root: sec_tree.root_page_id.load(Ordering::Relaxed),
+        };
+        // D271: a backfill that fails part-way frees what it built, as a refused attach does. D225's
+        // refusal of a row too wide for an index entry is such a failure, and it repeats on every
+        // retry, so without the free each attempt would leak a tree (`tests/d225_byte_split.rs`).
+        match filled {
+            Ok(()) => Ok(built),
+            Err(e) => Err(self.discard_after(e, built)),
+        }
+    }
 
-        let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
-        entry.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
+    /// **D271: attach a [`BuiltIndex`] to its table.** Push the record (refusing a second index
+    /// of the same kind on the column), persist, seed the shared root cells and bump the epoch: the
+    /// O(1) second half of CREATE [FULLTEXT] INDEX, which the executor runs inside
+    /// `TxnManager::ddl_checkpointed`. On `Err` nothing is attached in memory: a failed persist
+    /// undoes the push.
+    ///
+    /// **The tree comes back only when no persist ran** (`Err((e, Some(built)))`): the table is
+    /// gone, or the column already has an index of this kind. The caller may then free it with
+    /// [`Catalog::discard_index`]. **After a failed persist the tree is KEPT** (`Err((e, None))`),
+    /// allocated, and the error says so. `persist` writes the catalog into the buffer pool page by
+    /// page and can fail after writing one that names this root: fetching the next page of the
+    /// chain, allocating one, or freeing an orphan tail after the last page is written. The undo
+    /// runs only in memory, so that pool page stays, and the next checkpoint (anyone's) makes it
+    /// durable. A freed tree would leave the durable catalog naming pages that `allocate` hands out
+    /// next. A kept one is a bounded leak on a path that is already an error, and a crash-restart
+    /// rebuild frees it if the durable catalog names it
+    /// (`tests/d271_create_index_refused_leaves_nothing.rs`, T3 and T4).
+    pub fn attach_index(&mut self, built: BuiltIndex) -> Result<(), (FerroError, Option<BuiltIndex>)> {
+        let Some(entry) = self.tables.get_mut(&built.table) else {
+            return Err((FerroError::KeyNotFound, Some(built)));
+        };
+        match built.kind {
+            BuiltIndexKind::Secondary => {
+                if entry.indexes.iter().any(|ind| ind.column_name == built.column) {
+                    return Err((FerroError::IndexAlreadyExists, Some(built)));
+                }
+                entry.indexes.push(IndexInfo { column_name: built.column.clone(), root_page_id: built.root });
+            }
+            BuiltIndexKind::FullText => {
+                if entry.fulltext_indexes.iter().any(|ind| ind.column_name == built.column) {
+                    return Err((FerroError::IndexAlreadyExists, Some(built)));
+                }
+                entry.fulltext_indexes.push(FullTextIndexInfo { column_name: built.column.clone(), root_page_id: built.root });
+            }
+        }
 
         // Undo: pop the index this call pushed. A column name too long for its length prefix is
         // refused by the encoder exactly as a table name is.
-        let table = table.to_string();
-        self.persist_or_undo(|c| {
+        let table = built.table.clone();
+        let kind = built.kind;
+        if let Err(e) = self.persist_or_undo(|c| {
             if let Some(e) = c.tables.get_mut(&table) {
-                e.indexes.pop();
+                match kind {
+                    BuiltIndexKind::Secondary => {
+                        e.indexes.pop();
+                    }
+                    BuiltIndexKind::FullText => {
+                        e.fulltext_indexes.pop();
+                    }
+                }
             }
-        })?;
+        }) {
+            return Err((
+                FerroError::Io(format!(
+                    "{e}; the index tree it had built (root page {}) stays allocated, because a catalog \
+                     page in the buffer pool may already name it",
+                    built.root
+                )),
+                None,
+            ));
+        }
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
         self.epoch += 1;
         Ok(())
+    }
+
+    /// **D271: free every page of a [`BuiltIndex`] that was never attached.** Only for a tree no
+    /// record names, which is what [`Catalog::attach_index`] hands back: an attached one is freed
+    /// by `drop_table`.
+    pub fn discard_index(&self, built: BuiltIndex) -> Result<(), FerroError> {
+        BPlusTreeManager::<(Value, Value), ()>::open(built.root, self.buffer_pool.clone()).free_all()
+    }
+
+    /// Attach `built`. If the attach refused before persisting, free it, so a refused create leaves
+    /// no pages; after a failed persist it stays allocated (D271, [`Catalog::attach_index`]).
+    fn attach_or_discard(&mut self, built: BuiltIndex) -> Result<(), FerroError> {
+        match self.attach_index(built) {
+            Ok(()) => Ok(()),
+            Err((e, Some(built))) => Err(self.discard_after(e, built)),
+            Err((e, None)) => Err(e),
+        }
+    }
+
+    /// `e`, after freeing `built`. If the free fails too, both errors are returned, because the
+    /// tree's pages then stay allocated with nothing naming them.
+    pub fn discard_after(&self, e: FerroError, built: BuiltIndex) -> FerroError {
+        match self.discard_index(built) {
+            Ok(()) => e,
+            Err(f) => FerroError::Io(format!(
+                "{e}; and the index tree it had built could not be freed ({f}), so its pages stay allocated \
+                 with nothing naming them"
+            )),
+        }
     }
 
     /// B8 — create a full-text index on one `VARCHAR` column and backfill it from the heap.
@@ -369,7 +487,15 @@ impl Catalog {
     ///    dead one's slot, so a heap written after it holds one slot per key. A heap written
     ///    before it still holds two, and the probe is what keeps this correct over one.
     /// 3. **It lands in `fulltext_indexes`**, not `indexes` — see `FullTextIndexInfo`.
+    ///
+    /// D271: built unattached, then attached, as `create_index` is.
     pub fn create_fulltext_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
+        let built = self.build_fulltext_index(table, column)?;
+        self.attach_or_discard(built)
+    }
+
+    /// D271: [`Catalog::build_index`] for a full-text index. Nothing is attached.
+    pub fn build_fulltext_index(&self, table: &str, column: &str) -> Result<BuiltIndex, FerroError> {
         let (schema, first_dir_page_id, col_index) = {
             let entry = self.tables.get(table).ok_or_else(|| self.unknown_table(table))?;
 
@@ -401,7 +527,7 @@ impl Catalog {
         let ft_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        let backfill = (|| -> Result<(), FerroError> {
+        let filled = (|| -> Result<(), FerroError> {
             for item in hfm.scan() {
                 let (_, tuple) = item?;
                 let deleted = tuple.version_header()?.end_ts != 0;
@@ -418,28 +544,18 @@ impl Catalog {
             }
             Ok(())
         })();
-        // D225: as in `create_index`, a failed backfill frees its half-built tree.
-        if let Err(e) = backfill {
-            return Err(Self::abandon_backfill(&ft_tree, e));
+        // D222 — after the backfill, for the reason `create_index` gives. A failed backfill (D225's
+        // refusal included) frees its half-built tree, as in `build_index`.
+        let built = BuiltIndex {
+            table: table.to_string(),
+            column: column.to_string(),
+            kind: BuiltIndexKind::FullText,
+            root: ft_tree.root_page_id.load(Ordering::Relaxed),
+        };
+        match filled {
+            Ok(()) => Ok(built),
+            Err(e) => Err(self.discard_after(e, built)),
         }
-        // D222 — after the backfill, for the reason `create_index` gives.
-        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
-
-        let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
-        entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
-
-        // Undo: pop the full-text index this call pushed. Same reason as `create_index`.
-        let table = table.to_string();
-        self.persist_or_undo(|c| {
-            if let Some(e) = c.tables.get_mut(&table) {
-                e.fulltext_indexes.pop();
-            }
-        })?;
-        // The set of trees changed, so seed (or retire) their shared root cells, and tell
-        // every cached reader snapshot that the schema moved.
-        self.sync_root_cells();
-        self.epoch += 1;
-        Ok(())
     }
 
     /// Remove a table and give back every page it allocated.
