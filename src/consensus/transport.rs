@@ -57,8 +57,12 @@
 //! lost with no number attached, and only the frame whose own write failed reaches `lost_in_flight`.
 //! That includes the first frame written after the peer closed its end, which is exactly what the
 //! peer's `idle_deadline` does. The write succeeds locally, the peer answers with a reset, and it is
-//! the next write that fails. So a live connection closed for silence costs its sender two frames,
-//! not nothing. The same is true of the receiving side. A connection closed on a frame with an
+//! the next write that fails. Since D224 a sender probes a link it has left idle before writing to
+//! it, and redials if the peer closed it ([`Transport::idle_probes`], [`Transport::idle_redials`]).
+//! So an idle close costs frames (at least two: every write before the peer's reset arrives is lost
+//! uncounted, and the first after it is counted) only in the cases `idle_probe_gap` lists: the narrow race at the peer's close, the band of gaps a violated deadline premise leaves
+//! unprobed, and a redial that lands on a peer shutting down mid-handshake. The same is
+//! true of the receiving side. A connection closed on a frame with an
 //! unknown tag, one `decode` refuses, a truncated or over-long frame, or the idle deadline discards
 //! whatever the peer sends after it; of those closes, only the idle one is counted
 //! ([`Transport::idle_closed`]). Consensus re-sends, so none of these is a correctness loss; they
@@ -89,7 +93,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -1121,7 +1125,9 @@ pub struct TransportOptions {
     /// the queue is empty and then it goes in — so no message is ever unsendable because of this
     /// knob, however small it is set.
     pub queue_bytes: usize,
-    /// Socket read timeout, and the listener's accept poll. Bounds shutdown latency.
+    /// Socket read timeout, and the pause after a failed `accept` or a refusal at a full cap. Bounds
+    /// shutdown latency. The listener itself is NOT polled (F1): `accept` blocks, and
+    /// [`Transport::shutdown`] wakes it.
     pub poll_interval: Duration,
     /// How long a sender thread waits after a failed dial before trying that peer again.
     pub reconnect_delay: Duration,
@@ -1143,15 +1149,18 @@ pub struct TransportOptions {
     /// A peer whose host vanishes without sending a FIN leaves a connection that is never readable
     /// and never errors, so its thread and descriptors are pinned for the life of the process.
     ///
-    /// **What closing a live peer costs**, stated because it used to say "only a reconnect". The
-    /// leader heartbeats its followers, and they answer it, so those connections are never silent
-    /// for long. **Followers send each other nothing** while a leader holds, so each follower's
-    /// connection *to* another is closed by the receiver after this long. The sender does not read
-    /// its socket and does not see the close. When the leader then dies, a surviving follower's
-    /// first campaign frame to the other survivor is written into the closed connection and lost
-    /// uncounted. Its second fails the write and is counted in `lost_in_flight`. Only then does it
-    /// redial. So a failover after a long stable term can take an election round or two longer than
-    /// one after a short term. See the module header for why neither loss is a correctness failure.
+    /// **What closing a live peer costs.** The leader heartbeats its followers, and they answer it,
+    /// so those connections are never silent for long. **Followers send each other nothing** while
+    /// a leader holds, so each follower's connection *to* another is closed by the receiver after
+    /// this long. The sender does not read its socket, so it does not see the close.
+    ///
+    /// Until D224, a surviving follower's first campaign frame after the leader died went into that
+    /// closed connection and was lost uncounted. Its second failed and was counted. Failover after a
+    /// long stable term took an election round or two longer.
+    ///
+    /// Now the sender probes a link idle for half of this before its next write, and redials first
+    /// if the link is closed (`idle_probe_gap`). For that to hold, no node's value may be below half
+    /// of another's. Nothing enforces it; every node in this repo runs this default.
     pub idle_deadline: Duration,
     /// Most bytes of undelivered inbound messages held before further ones are refused.
     ///
@@ -1212,6 +1221,18 @@ struct Counters {
     /// Outbound messages refused because they were addressed to this node itself, or to a node this
     /// transport holds no address for: configuration mistakes that are otherwise a silent partition.
     unaddressable: AtomicU64,
+    /// Times a sender probed its link before the first write after an idle gap (D224). A link that
+    /// consensus keeps busy never reaches the gate, so this should move only on links it leaves
+    /// silent: follower to follower during a stable term.
+    idle_probes: AtomicU64,
+    /// Probes that found the peer had closed the link, so the sender redialled before writing
+    /// instead of losing the frame to the closed connection (D224).
+    idle_redials: AtomicU64,
+    /// Connections this listener took on its first `accept` after the accept thread SLEPT (F1). Each
+    /// one became pending while the thread slept and waited for the sleep to end before its handshake
+    /// was answered, and `dial` blocks on that answer. With no accept failing and the cap not full,
+    /// nothing should ever wait there: a redial after an idle close carries a campaign frame.
+    accepts_after_sleep: AtomicU64,
     /// Inbound frames that did not authenticate against this node's signing key, and were refused
     /// **before** [`decode`] saw them.
     ///
@@ -1317,6 +1338,14 @@ pub struct Transport {
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The accept thread, kept apart from `threads` because it alone blocks in a call the stop flag
+    /// cannot interrupt, so `shutdown` must wake it before it can join it (F1, `wake_accept`).
+    accept: Mutex<Option<JoinHandle<()>>>,
+    /// Where `shutdown` connects to wake the accept thread. See `wake_addr`.
+    wake: SocketAddr,
+    /// `TransportOptions::handshake_deadline` and `poll_interval`, which bound and pace that wake.
+    wake_deadline: Duration,
+    wake_retry: Duration,
     /// Held for the whole of [`Transport::shutdown`], so a concurrent second call waits for the
     /// first to finish joining rather than taking an empty thread list and returning early. Without
     /// it "a second call is a barrier" was true only for a sequential caller — and a `Drop` racing
@@ -1487,8 +1516,18 @@ impl Transport {
         }
 
         let local_addr = listener.local_addr().map_err(|e| FerroError::Io(e.to_string()))?;
+        // **Blocking, so a connection is answered the moment it is pending (F1).** The listener used
+        // to be nonblocking and polled: the accept thread slept `poll_interval` whenever nothing was
+        // pending, so a connection that arrived during the sleep waited it out before its handshake
+        // was answered, and `dial` blocks on that answer. For a link dialled once at startup that is
+        // noise. For D224's redial after an idle close it is not: that connection carries a
+        // survivor's campaign frame, and with election timeouts drawn in whole ticks, a wait of up to
+        // one tick (50 ms by default) splits the vote between two survivors whose timers expire within
+        // a tick of each other (r11-dist DC2: 14.96 splits per 100 first failovers, 0.21 without the
+        // wait). Set explicitly, because a caller's listener may arrive nonblocking. A blocking
+        // `accept` does not see the stop flag, so `shutdown` wakes it: see `wake_accept`.
         listener
-            .set_nonblocking(true)
+            .set_nonblocking(false)
             .map_err(|e| FerroError::Io(e.to_string()))?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1554,12 +1593,12 @@ impl Transport {
         let ids_c = next_conn_id;
         let opts_c = opts.clone();
         let key_c = key.clone();
-        match std::thread::Builder::new()
+        let accept = match std::thread::Builder::new()
             .name(format!("consensus-accept-{self_id}"))
             .spawn(move || {
                 accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c, key_c)
             }) {
-            Ok(h) => threads.push(h),
+            Ok(h) => h,
             Err(e) => {
                 stop_started(&stop, &outbox_list, threads);
                 return Err(FerroError::Io(format!(
@@ -1567,7 +1606,7 @@ impl Transport {
                      already started was stopped and joined rather than detached"
                 )));
             }
-        }
+        };
 
         Ok(Transport {
             self_id,
@@ -1577,6 +1616,10 @@ impl Transport {
             counters,
             stop,
             threads: Mutex::new(threads),
+            accept: Mutex::new(Some(accept)),
+            wake: wake_addr(local_addr),
+            wake_deadline: opts.handshake_deadline,
+            wake_retry: opts.poll_interval,
             shutdown_lock: Mutex::new(()),
             inbound_conns,
             key,
@@ -1774,6 +1817,18 @@ impl Transport {
     pub fn unaddressable(&self) -> u64 {
         self.counters.unaddressable.load(Ordering::SeqCst)
     }
+    /// Links probed before the first write after an idle gap. See `Counters::idle_probes`.
+    pub fn idle_probes(&self) -> u64 {
+        self.counters.idle_probes.load(Ordering::SeqCst)
+    }
+    /// Probes that found the link closed by the peer and redialled first.
+    pub fn idle_redials(&self) -> u64 {
+        self.counters.idle_redials.load(Ordering::SeqCst)
+    }
+    /// Connections accepted only after the accept thread had slept. See `Counters::accepts_after_sleep`.
+    pub fn accepts_after_sleep(&self) -> u64 {
+        self.counters.accepts_after_sleep.load(Ordering::SeqCst)
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -1794,6 +1849,11 @@ impl Transport {
     /// `handshake_deadline` is a knob rather than a constant. It is not shortened here, because the
     /// alternative is failing a legitimately slow connect, and a slow shutdown is the cheaper
     /// failure.
+    ///
+    /// **A second, of the same size (F1):** the accept thread blocks in `accept`, and is woken by a
+    /// connection to this listener. If this node cannot connect to its own listening address for a
+    /// whole `handshake_deadline`, the accept thread is left detached, holding the listener, rather
+    /// than joined for ever. See `wake_accept`.
     pub fn shutdown(&self) {
         // Taken first and held throughout: a second caller blocks here until the first has finished
         // joining, which is what makes the barrier claim true for a concurrent caller and not just
@@ -1816,6 +1876,13 @@ impl Transport {
         let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.threads.lock().unwrap());
         for h in handles {
             let _ = h.join();
+        }
+        // Last, as before F1, and woken first: it is parked in a blocking `accept`.
+        let accept = self.accept.lock().unwrap().take();
+        if let Some(h) = accept {
+            if wake_accept(&h, self.wake, self.wake_deadline, self.wake_retry) {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -1870,6 +1937,9 @@ pub struct TransportCounters {
     pub unauthenticated: u64,
     pub unencodable: u64,
     pub unaddressable: u64,
+    pub idle_probes: u64,
+    pub idle_redials: u64,
+    pub accepts_after_sleep: u64,
     pub live_inbound_conns: usize,
     pub inbox_bytes: usize,
 }
@@ -1892,6 +1962,9 @@ impl Transport {
             unauthenticated: self.unauthenticated(),
             unencodable: self.unencodable(),
             unaddressable: self.unaddressable(),
+            idle_probes: self.idle_probes(),
+            idle_redials: self.idle_redials(),
+            accepts_after_sleep: self.accepts_after_sleep(),
             live_inbound_conns: self.live_inbound_conns(),
             inbox_bytes: self.inbox_bytes(),
         }
@@ -1919,6 +1992,9 @@ impl std::fmt::Debug for Transport {
             .field("refused_after_stop", &self.refused_after_stop())
             .field("unencodable", &self.unencodable())
             .field("unaddressable", &self.unaddressable())
+            .field("idle_probes", &self.idle_probes())
+            .field("idle_redials", &self.idle_redials())
+            .field("accepts_after_sleep", &self.accepts_after_sleep())
             // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
             // reports only whether there is one.
             .field("signed", &self.signs_its_traffic())
@@ -1936,6 +2012,19 @@ fn sender_loop(
     opts: TransportOptions,
 ) {
     let mut conn: Option<TcpStream> = None;
+    // When the current connection last carried a frame, or was dialled. The gap since then decides
+    // whether the link is probed before the next write (D224; the gate is just before the write).
+    let mut last_used = Instant::now();
+    // A frame already taken from the queue whose link the probe found closed. It is written first on
+    // the next connection, so finding the close does not itself lose the frame. The dial resets
+    // `last_used`, though, so the carried frame goes out unprobed, and a redial that lands on a peer
+    // shutting down mid-handshake still loses it (`idle_probe_gap`, "a redial onto a refusal").
+    // It sits outside the queue's drop-oldest bound while the peer is down, so on return the
+    // stalest frame goes first, against `push`'s policy. Consensus refuses a stale term, so one such
+    // frame is harmless.
+    let mut carried: Option<Vec<u8>> = None;
+    // Half the idle deadline; the reasons for both bounds are at `idle_probe_gap`.
+    let probe_gap = idle_probe_gap(&opts);
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -1962,6 +2051,7 @@ fn sender_loop(
                         }
                     }
                     conn = Some(s);
+                    last_used = Instant::now();
                 }
                 Err(_) => {
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
@@ -1973,8 +2063,11 @@ fn sender_loop(
             }
         }
 
-        // Take one frame, waiting a bounded time so the stop flag is checked regularly.
-        let frame = {
+        // Take one frame — the one a probe carried over, if there is one — waiting a bounded time so
+        // the stop flag is checked regularly.
+        let frame = if let Some(f) = carried.take() {
+            Some(f)
+        } else {
             let mut st = ob.state.lock().unwrap();
             while st.queue.is_empty() && !st.stopped && !stop.load(Ordering::SeqCst) {
                 let (g, timed_out) = ob.woken.wait_timeout(st, opts.poll_interval).unwrap();
@@ -1995,6 +2088,34 @@ fn sender_loop(
         let Some(frame) = frame else { continue };
 
         let s = conn.as_mut().expect("connected above");
+        // **Probe a link that has been idle before writing to it** (D224). The receiver closes a
+        // connection silent past its `idle_deadline`, and this thread never reads its socket, so it
+        // would not know: the frame would go into the closed connection and be lost with no number
+        // attached, and only the next write would fail. Consensus leaves follower-to-follower links
+        // silent for a whole term, so that lost frame was a survivor's first campaign frame after the
+        // leader died. A link consensus keeps busy never reaches this gate, so all it pays is two clock
+        // reads per frame: this one and the refresh after the write.
+        if last_used.elapsed() >= probe_gap {
+            counters.idle_probes.fetch_add(1, Ordering::SeqCst);
+            if peer_has_closed(s) {
+                // A shutdown closes `st.live`, which shares this socket, so the probe sees its close
+                // too. Both shutdown paths set `stop` before they close it, so that close is always
+                // seen here with `stop` set: it is not a redial, and it is not counted as one. The
+                // frame is dropped uncounted, as the queue is at shutdown.
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                counters.idle_redials.fetch_add(1, Ordering::SeqCst);
+                let mut st = ob.state.lock().unwrap();
+                if let Some(old) = st.live.take() {
+                    let _ = old.shutdown(Shutdown::Both);
+                }
+                drop(st);
+                conn = None;
+                carried = Some(frame);
+                continue;
+            }
+        }
         // A write that fails part way through has left a partial frame on the wire, and there is no
         // way to resume it — the peer's reader is now inside a frame that will never finish. So the
         // connection is dropped, which is what makes the peer's reader see EOF and reset. The frame
@@ -2012,6 +2133,8 @@ fn sender_loop(
             }
             drop(st);
             conn = None;
+        } else {
+            last_used = Instant::now();
         }
     }
 
@@ -2021,6 +2144,93 @@ fn sender_loop(
     }
     drop(st);
     drop(conn);
+}
+
+/// The idle gap after which a sender probes its link before writing (D224): half `idle_deadline`.
+///
+/// **Above the longest gap on any link consensus keeps busy.** A leader heartbeats every
+/// `heartbeat` ticks (3, at a 50 ms `NodeOptions::tick`: 150 ms), and every heartbeat is an `Append`
+/// each follower answers at once. So leader↔follower links see gaps of about one heartbeat, and at
+/// the default deadline this gate is 200 heartbeats away. A link that missed that many has lost its
+/// leader several election timeouts ago.
+///
+/// **At most the peer's `idle_deadline`, so every link the peer may have closed is probed.** The peer
+/// closes a link only after hearing nothing for longer than its `idle_deadline`, counted from the
+/// last complete frame it read, which began no earlier than this sender's last write. So a gap under
+/// this cannot have been closed, as long as the peer's deadline is at least this gate. The refresh
+/// after a write comes a scheduling delay after the write itself; that slack sits inside the residual
+/// race below.
+///
+/// **Premise, stated and not enforced: no node's `idle_deadline` is below half of another's.** That
+/// is the receiver's `D_r ≥ D_s / 2`, where `D_s` is this sender's; equal deadlines are not needed.
+/// The handshake carries no options, so nothing checks it, and in this repo every node runs the
+/// default. If it is violated, gaps between `D_r` and this gate are closed but never probed, and the
+/// pre-D224 loss returns for that band only. There is no new failure mode.
+///
+/// **Why half: tolerance, not a narrower race.** Half is what lets a peer's deadline be as low as half
+/// this one's. It does not narrow the race below, which sits at the peer's close wherever the gate
+/// is.
+///
+/// **The residual race.** A gap that lands within about one `poll_interval` and a round trip of the
+/// peer's close can be probed just before the close. The write then succeeds locally and is lost
+/// uncounted. It also refreshes the gap, so the next frame is not probed: it fails against the reset
+/// and is counted. That is at least two frames, the whole pre-D224 cost, at a small probability:
+/// every write made before the peer's reset reaches this socket is lost uncounted, and only the
+/// first one after it is counted. A follower-to-follower link idle for a whole term is far outside
+/// that window.
+///
+/// **A redial onto a refusal** (D224 review 2, G2). A dial resets the gap, so the frame the probe
+/// carried, and any queued behind it, goes out unprobed. If the redial lands on a peer that is
+/// shutting down mid-handshake, `dial` succeeds with that peer's `Error` frame and FIN waiting. The
+/// carried frame, and any written behind it before the reset arrives, is lost uncounted, and the
+/// next one fails and is counted: the same cost, at least two frames.
+/// A peek at the end of `dial` would catch only an `Error` that arrived with the handshake; closing
+/// this fully needs the acceptor to send a verdict, which is a protocol change.
+///
+/// **What bounds every one of these losses is consensus retransmission, not this transport.** A
+/// pre-candidate re-campaigns each time its countdown reaches `election_timeout`, **but only while
+/// `may_campaign()` holds** (not behind, not unjoined, a voter in its own configuration), and a
+/// campaign restarts the countdown (`election.rs`, `voter_tick` and `start_precampaign`). When
+/// `may_campaign()` is false the countdown restarts and nothing is sent: no campaign was due, so no
+/// lost campaign frame goes unresent. A leader re-sends from each peer's `next` on every heartbeat
+/// (`leader_tick`, then `bcast_append` in `replicate.rs`). So a lost frame costs one retransmission
+/// interval, never a round.
+///
+/// **A restarted peer is caught only across a gap of at least this**, which in practice means an idle
+/// follower-to-follower link. It is not caught on a busy link, where it costs two heartbeats, nor
+/// when the peer restarts mid-election, when campaign frames go out under a second apart. A rebooted
+/// host sends nothing to find until this side writes.
+fn idle_probe_gap(opts: &TransportOptions) -> Duration {
+    opts.idle_deadline / 2
+}
+
+/// Whether the peer has closed this connection: asked without blocking and without consuming
+/// anything (D224).
+///
+/// This side only ever writes to the link. The accepting side writes after the handshake on one
+/// path only: a refused handshake sends its own handshake, then an `Error` frame, then closes
+/// (`conn_loop`). `dial` reads just the six handshake bytes, so that frame stays unread for good, in
+/// front of the FIN. So every readable state means the link is closed or closing: a FIN (`peek`
+/// returns 0), a reset (an error), or unread bytes. Reading unread bytes as "alive" left the probe
+/// blind on such a link for good (the D224 review's F4). Nothing to read means the link is up. A
+/// socket that cannot be put back into blocking mode is treated as closed too: the sender redials
+/// rather than write through a socket in the wrong mode.
+fn peer_has_closed(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let closed = match s.peek(&mut probe) {
+        Ok(0) => true,
+        // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
+        // link. Either way the frame is carried to a redial rather than written into a closed link.
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    s.set_nonblocking(false).is_err() || closed
 }
 
 /// Dial a peer and complete the handshake as the **connecting** side: write ours, then read theirs.
@@ -2068,6 +2278,50 @@ fn dial(
     Ok(s)
 }
 
+/// Where [`Transport::shutdown`] connects to wake its own accept thread (F1): the listener's address,
+/// with an unspecified IP (a listener bound to every interface) replaced by loopback of the same
+/// family, because `0.0.0.0` and `::` are not addresses every platform will connect to.
+fn wake_addr(listening: SocketAddr) -> SocketAddr {
+    let mut a = listening;
+    if a.ip().is_unspecified() {
+        a.set_ip(match a {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    a
+}
+
+/// Wake an accept thread parked in a blocking `accept` (F1). True once it will leave by itself; false
+/// if it could not be reached within `deadline`, and then the caller must not join it.
+///
+/// The stop flag is set before this runs, so the thread leaves at its loop head or on the first
+/// connection `accept` returns, this one or any peer's: one connect that SUCCEEDS is enough, whether
+/// or not it is the connection the thread takes. A failed connect is retried every `retry`, because
+/// `shutdown` has just closed every socket this transport held, and a process that was out of
+/// descriptors may have room again.
+///
+/// **Its blind spot, stated:** a node that cannot connect to its own listening address for a whole
+/// `deadline` (an interface address removed while it listened on it) leaves the thread in `accept`,
+/// holding the listener. It is detached, not joined, because that join would never return. That is
+/// the one way a shut-down transport still holds its port.
+fn wake_accept(h: &JoinHandle<()>, wake: SocketAddr, deadline: Duration, retry: Duration) -> bool {
+    let until = Instant::now() + deadline;
+    loop {
+        if h.is_finished() {
+            return true;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if TcpStream::connect_timeout(&wake, left).is_ok() {
+            return true;
+        }
+        std::thread::sleep(retry.min(until.saturating_duration_since(Instant::now())));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn accept_loop(
@@ -2082,9 +2336,21 @@ fn accept_loop(
     key: Option<Arc<Key>>,
 ) {
     let mut conn_threads: Vec<JoinHandle<()>> = Vec::new();
+    // Set by every sleep below and taken by the next accepted connection, which is the one that may
+    // have waited out that sleep (F1, `Counters::accepts_after_sleep`).
+    let mut slept = false;
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // A connection taken after a stop is closed unserved, and the loop leaves: the
+                // transport is stopping, and this may be `shutdown`'s own wake (F1).
+                if stop.load(Ordering::SeqCst) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
+                if std::mem::take(&mut slept) {
+                    counters.accepts_after_sleep.fetch_add(1, Ordering::SeqCst);
+                }
                 // **Refused before a thread is spawned for it.** This transport does not
                 // authenticate, so an unbounded accept loop is an unauthenticated peer choosing how
                 // many threads this process runs.
@@ -2119,6 +2385,7 @@ fn accept_loop(
                         // for free. One poll per refusal bounds that, and delays a stop by at most
                         // the poll the stop flag is already allowed (D207, from `207d362`).
                         std::thread::sleep(opts.poll_interval);
+                        slept = true;
                         continue;
                     }
                     map.insert(id, mine);
@@ -2173,10 +2440,15 @@ fn accept_loop(
                 // handles for every connection it has ever accepted.
                 conn_threads.retain(|h| !h.is_finished());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // A failed accept is retried after one poll, so a failure that persists (descriptors
+            // exhausted) cannot spin this thread. On the blocking listener `start` sets up, this and
+            // the refusal pacing above are the only sleeps on a pending connection's path, and the
+            // next accept counts both. A nonblocking listener, which only a test hands this loop
+            // directly, reaches here on every empty poll.
+            Err(_) => {
                 std::thread::sleep(opts.poll_interval);
+                slept = true;
             }
-            Err(_) => std::thread::sleep(opts.poll_interval),
         }
     }
     // Joined, not detached: `Transport::shutdown` joins this thread, and it must not return while
@@ -2235,8 +2507,14 @@ fn conn_loop(
         }
         // A peer whose host vanished without a FIN leaves a socket that never becomes readable and
         // never errors. Without this, its thread and both its descriptors are held for the life of
-        // the process. Consensus heartbeats every few ticks, so silence past this deadline is not a
-        // slow peer — it is a gone one.
+        // the process.
+        //
+        // **Silence is not proof the peer is gone.** This used to say it was, because consensus
+        // heartbeats every few ticks. That is true of a leader's links and false of
+        // follower-to-follower links, which carry nothing for a whole stable term. Those are closed
+        // here too. The cost is paid by the sender, which probes a link it has left idle before
+        // writing to it, and redials if the link is closed (`idle_probe_gap`, `peer_has_closed`;
+        // D224).
         if last_heard.elapsed() > opts.idle_deadline {
             counters.idle_closed.fetch_add(1, Ordering::SeqCst);
             break;

@@ -1,0 +1,13 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2344,10 +2344,6 @@
+             Ok((stream, _)) => {
+                 // A connection taken after a stop is closed unserved, and the loop leaves: the
+                 // transport is stopping, and this may be `shutdown`'s own wake (F1).
+-                if stop.load(Ordering::SeqCst) {
+-                    let _ = stream.shutdown(Shutdown::Both);
+-                    break;
+-                }
+                 if std::mem::take(&mut slept) {
+                     counters.accepts_after_sleep.fetch_add(1, Ordering::SeqCst);
+                 }

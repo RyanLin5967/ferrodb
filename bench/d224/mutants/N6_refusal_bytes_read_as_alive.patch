@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2176,7 +2176,7 @@
+         Ok(0) => true,
+         // A refusal left in front of the peer's FIN, or bytes the protocol never sends on an open
+         // link. Either way the frame is carried to a redial rather than written into a closed link.
+-        Ok(_) => true,
++        Ok(_) => false,
+         Err(e) => !matches!(
+             e.kind(),
+             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
