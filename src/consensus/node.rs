@@ -305,6 +305,8 @@ pub struct Node<A: Applier> {
     refusals: Vec<FerroError>,
     /// Role transitions since the last drain, for a caller that wants them without polling.
     transitions: Vec<(Role, Term, Option<NodeId>)>,
+    /// r11-dist MEASUREMENT ONLY: every role change with its instant.
+    r11_role_log: Vec<(Instant, Role, Term)>,
     /// F6. See the module header.
     snapshots: Option<Box<dyn super::snapshot::SnapshotStore>>,
     retain_rounds: Option<u64>,
@@ -332,6 +334,15 @@ pub struct Node<A: Applier> {
     /// `snapshots_installed` on that node is where it is counted.
     snapshots_armed: u64,
     snapshots_installed: u64,
+    /// r11-dist GC arm (group commit; NOT landed). Off by default, and off means every path below
+    /// is HEAD's: one `sync` per `Action::Persist`, fed back at once.
+    group_commit: bool,
+    /// With `group_commit`: appended-but-unsynced rounds, as (this node's term at the FIRST deferred
+    /// append, last round appended). Synced and fed back as one `Persisted` when the drain's queue
+    /// empties, and before any action whose order against the log's durability HEAD fixes.
+    deferred: Option<(Term, Round)>,
+    /// Instrument: `RoundLog::sync` calls made for `Action::Persist`, in either mode.
+    persist_syncs: u64,
 }
 
 /// The hard-state record: `term`, then a tagged `voted_for`, then a checksum over both.
@@ -477,6 +488,7 @@ impl<A: Applier> Node<A> {
             pending: VecDeque::new(),
             refusals: Vec::new(),
             transitions: Vec::new(),
+            r11_role_log: Vec::new(),
             snapshots: opts.snapshots,
             retain_rounds: opts.retain_rounds,
             spooled: 0,
@@ -484,6 +496,9 @@ impl<A: Applier> Node<A> {
             installed_round: None,
             snapshots_armed: 0,
             snapshots_installed: 0,
+            group_commit: false,
+            deferred: None,
+            persist_syncs: 0,
         };
         if let Some(why) = digest_note {
             // Degraded, not wrong: a zero base digest is the one value `AppendResp` reads as "not
@@ -517,8 +532,53 @@ impl<A: Applier> Node<A> {
     /// Transfers this node has installed, as a follower. **The anti-vacuity counter**: a
     /// convergence test that never sees this move proved only that ordinary replication works.
     pub fn snapshots_installed(&self) -> u64 { self.snapshots_installed }
+    /// r11-dist GC arm: batch the fsyncs of every `Persist` performed in one drain.
+    pub fn set_group_commit(&mut self, on: bool) {
+        self.group_commit = on;
+    }
+    /// `RoundLog::sync` calls made for `Action::Persist` so far.
+    pub fn persist_syncs(&self) -> u64 {
+        self.persist_syncs
+    }
+    /// Instrument (r11-dist A10): this node's current election timeout and ticks since it last
+    /// heard a leader, both in ticks. Read-only.
+    pub fn election_timer(&self) -> (u32, u32) {
+        (self.sm.election_timeout, self.sm.since_heard)
+    }
+    /// Instrument (r11-dist A11): the leader's view of each peer, as (peer, next, matched, silent
+    /// ticks, needs_snapshot, diverged). Empty on a node that has never led. Read-only.
+    pub fn peer_progress(&self) -> Vec<(NodeId, Round, Round, u32, bool, Option<String>)> {
+        let me = self.sm.id();
+        self.sm
+            .progress
+            .iter()
+            .filter(|(n, _)| **n != me)
+            .map(|(n, p)| (*n, p.next, p.matched, p.silent, p.needs_snapshot, p.diverged.clone()))
+            .collect()
+    }
+    /// r11-dist GC arm: queue every command, then drain once. Returns the log's last round.
+    pub fn propose_many(&mut self, cs: Vec<Command>) -> Result<Round, FerroError> {
+        let before = self.log.last_round();
+        for c in cs {
+            self.pending.push_back(Event::Propose(c));
+        }
+        self.drain()?;
+        Ok(self.log.last_round().max(before))
+    }
     pub fn take_transitions(&mut self) -> Vec<(Role, Term, Option<NodeId>)> {
         std::mem::take(&mut self.transitions)
+    }
+    /// r11-dist MEASUREMENT ONLY: role changes with their instants since the last take.
+    pub fn take_r11_role_log(&mut self) -> Vec<(Instant, Role, Term)> {
+        std::mem::take(&mut self.r11_role_log)
+    }
+    /// r11-dist MEASUREMENT ONLY: the next tick's due instant; the tick grid never moves (see `poll`).
+    pub fn r11_next_tick(&self) -> Instant {
+        self.next_tick
+    }
+    /// r11-dist MEASUREMENT ONLY: the transport's event trace.
+    pub fn r11_transport_trace(&self) -> Vec<(Instant, u8, u64)> {
+        self.net.r11_trace()
     }
 
     /// Ask for a command to be committed. Only meaningful on a leader; anywhere else the state
@@ -647,6 +707,7 @@ impl<A: Applier> Node<A> {
 
     fn drain(&mut self) -> Result<(), FerroError> {
         let mut steps = 0usize;
+        loop {
         while let Some(ev) = self.pending.pop_front() {
             steps += 1;
             if steps > MAX_DRAIN_STEPS {
@@ -676,6 +737,11 @@ impl<A: Applier> Node<A> {
             // leak the spool file.
             self.release_installed_spool();
             self.install_pending_snapshot()?;
+        }
+        // r11-dist GC arm: the queue is empty; make the batch durable, then let its `Persisted` run.
+        if !self.flush_deferred()? {
+            break;
+        }
         }
         // **Outside the loop**, because neither is about any one event and both are expensive.
         // A checkpoint rewrites the log and fsyncs three times; a capture copies the page file.
@@ -915,9 +981,28 @@ impl<A: Applier> Node<A> {
         Ok(())
     }
 
+    /// r11-dist GC arm: sync the deferred batch and queue its `Persisted`. `false` if none.
+    fn flush_deferred(&mut self) -> Result<bool, FerroError> {
+        match self.deferred.take() {
+            None => Ok(false),
+            Some((term, round)) => {
+                self.log.sync().map_err(LogError::into_ferro)?;
+                self.persist_syncs += 1;
+                self.pending.push_back(Event::Persisted { term, round });
+                Ok(true)
+            }
+        }
+    }
+
     /// Perform one action, completely, before returning. See the module header for why the order
     /// matters and why none of this may be deferred.
     fn perform(&mut self, a: Action) -> Result<(), FerroError> {
+        // r11-dist GC arm: only Send, Persist and Apply may run ahead of a deferred sync. A Send
+        // never carries this node's ack (acks are produced by `Persisted`), and Apply hands on
+        // committed rounds, which a quorum made durable; reading them back needs no sync here.
+        if self.deferred.is_some() && !matches!(a, Action::Send(_) | Action::Persist { .. } | Action::Apply { .. }) {
+            self.flush_deferred()?;
+        }
         match a {
             Action::Send(m) => {
                 // A send that cannot be delivered is dropped and counted by the transport, not an
@@ -954,7 +1039,15 @@ impl<A: Applier> Node<A> {
                 let term = self.sm.term();
                 let round = entries.last().expect("non-empty above").round;
                 self.log.append(&entries).map_err(LogError::into_ferro)?;
+                if self.group_commit {
+                    self.deferred = Some(match self.deferred {
+                        Some((first_term, _)) => (first_term, round),
+                        None => (term, round),
+                    });
+                    return Ok(());
+                }
                 self.log.sync().map_err(LogError::into_ferro)?;
+                self.persist_syncs += 1;
                 self.pending.push_back(Event::Persisted { term, round });
             }
 
@@ -987,6 +1080,7 @@ impl<A: Applier> Node<A> {
 
             Action::RoleChanged { role, term, leader } => {
                 self.transitions.push((role, term, leader));
+                self.r11_role_log.push((Instant::now(), role, term));
             }
 
             Action::Refuse { why } => self.refusals.push(why),
