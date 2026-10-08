@@ -1,0 +1,20 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=pgwire. THE SAME L0→L3 LADDER, AT THE LAYER PRODUCTION RUNS.
+
+⚠ LAYER: the shipped pgwire server over a real TCP socket, one client connection per
+  thread, forks issued as `BEGIN AGENT SESSION`. Locks held, outermost first:
+  `ServerContext::catalog()` -> `AgentRuntime` state -> `TableBranchCatalog::logical`.
+  E.6 measured that this is NOT the same experiment as MODE=direct.
+
+  outer = ServerContext::catalog(), the per-statement mutex every connection waits on.
+  inner = TableBranchCatalog::logical, the mutex the 21x/1.9x pair is about.
+  Counted with process-wide atomics (the library owns these threads) — the `direct`
+  mode's cross-check is what licenses that.
+# pgwire_start: 2026-09-22T07:28:11Z  load_at_acquire=s: 26.24 28.71 25.87
+
+  threads  stub   forks   outer/op outerCont/op   inner/op innerCont/op stmts/sec
+        4     0      20     4.2000      2.00000     3.0000      0.00000      35.3
+ceiling: REFUSING. ABANDON returned an error: branch error: branch b1@g0 not found

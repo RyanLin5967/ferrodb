@@ -1,0 +1,23 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+
+CEILING — MODE=model. THE FIRE-CHECK, and the shape a PURE mutex produces.
+LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock. This cell exists
+to make the counter fire on purpose and to show what it reads when it should read 0.
+# model_start: 2026-09-22T07:05:44Z  load_at_acquire=s: 7.98 8.07 11.73
+
+              cell    T      hold   outside      ops   contended/op     acq/op
+  NEG single-thread    1      2000         0    20000        0.00000     1.0000
+  POS 64t all-lock   64     20000         0    25600        0.04688     1.0000
+ceiling: REFUSING. POSITIVE CONTROL FAILED: 64 threads doing nothing but hold one mutex reported only 0.0469 contended acquisitions per op. The counter does not fire when contention is certain, so a low reading anywhere else in this run means nothing.
+
+================================================================================================
+WHAT THIS FILE IS. Raw output of the FIRST run of MODE=model on branch CEILING-resume (off
+CEILING-park-or-structure c00b26e), banked BEFORE any interpretation and BEFORE the scaffold was
+touched. The harness refused and exited 1. THE REFUSAL IS THE MEASUREMENT.
+
+  NEG single-thread  T=1   contended/op 0.00000   acq/op 1.0000   ops 20000   -> PASSED
+  POS 64t all-lock   T=64  contended/op 0.04688   acq/op 1.0000   ops 25600   -> REFUSED (<0.5)
+
+The gate it tripped was written by THIS SAME SCAFFOLD in its previous run and encodes the claim
+"64 threads doing nothing but hold one mutex must show contended/op near 1.0". That claim is
+FALSE and this file is what falsified it.  See bench/ceiling_park_or_structure.txt.

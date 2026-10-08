@@ -1,0 +1,66 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=model. THE FIRE-CHECK, and the shape a PURE mutex produces.
+LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock. This cell exists
+to make the counter fire on purpose and to show what it reads when it should read 0.
+# model_start: 2026-09-22T07:12:07Z  load_at_acquire=s: 22.93 15.25 13.74
+
+  queue_mean / queue_max = threads inside the acquire region when one got in, self
+  included (the SECOND witness; see IN_ACQ). 1 means nobody else was there at all.
+
+                cell    T      hold    outside      ops     secs   contended/op   acq/op queue_mean queue_max
+   NEG single-thread    1      2000          0    20000    0.043        0.00000   1.0000       1.00         1
+      POS 64t queued   64     20000      20000    51200    1.354        0.67178   1.0000      61.07        64
+    BARGE 64t no-out   64     20000          0    51200    1.072        0.01031   1.0000      46.80        64
+
+  ⇒ BLIND SPOT, MEASURED: the BARGE row has queue_mean/queue_max showing threads ARE
+    parked, while contended/op reads far below the POS row. `try_lock` failure counts
+    COLLISIONS, not PARKED THREADS, and the two come apart when the releaser re-takes
+    the lock. Direction of the error: contended/op UNDER-reports blocking, i.e. it errs
+    toward killing pre-registered outcome 1. Every low reading below inherits that.
+
+  REFERENCE SHAPE — 64 threads, total work per iteration held CONSTANT at 20,000
+  spins, moved out of the section a step at a time. This is the stub ladder's own
+  transition (hold shrinks, outside grows) in a system with NO other term.
+
+                cell    T      hold    outside      ops     secs   contended/op   acq/op queue_mean queue_max
+        work-in 100%   64     20000          0    25600    0.536        0.01711   1.0000      45.72        64
+         work-in 50%   64     10000      10000    25600    0.409        0.42973   1.0000      59.26        64
+         work-in 10%   64      2000      18000    25600    0.109        0.41578   1.0000      54.26        64
+          work-in 2%   64       500      19500    25600    0.047        0.27406   1.0000      44.89        62
+          work-in 0%   64       100      19900    25600    0.042        0.10344   1.0000      37.44        58
+
+  OPERATING-POINT REFERENCE (a) — SPIN OUTSIDE. A pure mutex driven at the SAME
+  hold/cycle fraction as each recorded rung (L0 0.015023, L3 0.001326; d123 §3b,
+  T=64). ⚠ The outside work is a SPIN, so all 64 threads are runnable at once on a
+  ~12-core box. Achieved utilisation therefore falls well short of the offered load;
+  the U_ach column says by how much, and (b) below is the faithful version.
+
+  spin calibration: 1.111e9 spins/sec single-threaded (hold=2000 spins = 0.0018 ms)
+
+                cell    T      hold    outside      ops     secs   contended/op   acq/op queue_mean queue_max   U_ach
+    L0-like rho=.961   64      2000     131129    25600    0.293        0.13145   1.0000      30.73        61   15.7%
+    L3-like rho=.085   64      2000    1506296    25600    2.437        0.04863   1.0000       4.70        51    1.9%
+
+  OPERATING-POINT REFERENCE (b) — SLEEP OUTSIDE. ⭐ THIS IS THE ONE TO COMPARE THE
+  REAL LADDER AGAINST. Both the hold and the outside interval are set to the recorded
+  rung's own WALL-CLOCK values, and the outside interval is a sleep, so a thread
+  between forks leaves the runnable set exactly as it does inside `durable()`'s fsync.
+  From d123 §3b at T=64:  L0 hold 0.20079 ms / cycle 13.365 ms
+                          L3 hold 0.00941 ms / cycle  7.096 ms
+  It is a MODEL, not an fsync: no I/O, no group commit, and the wake-up carries timer
+  granularity. What it reproduces is the ARRIVAL PROCESS at each rung.
+
+                cell    T      hold    outside      ops     secs   contended/op   acq/op queue_mean queue_max   U_ach
+     L0-like 0.201ms   64    223033 sleep 13.164ms    12800    3.756        0.85633   1.0000       5.81        61   68.4%
+    L3-like 0.0094ms   64     10452 sleep 7.087ms    12800    1.967        0.54711   1.0000       3.36        29    6.1%
+
+⭐ READ IT THIS WAY. `contended/op` near 0.67 is what a mutex reads when threads are
+   genuinely queued on it. Reference (b) gives the value a pure mutex reads at each
+   recorded rung's own arrival process: L0-like 0.85633 (queue_mean 5.81), L3-like 0.54711
+   (queue_mean 3.36). If the real ladder's L3 lands near the L3-like reference, the
+   lock is simply not busy and nothing is queued on it — pre-registered outcome 1 dies.
+   If it lands near 0.67 instead, threads are still piling up and outcome 1 lives.
+# end: 2026-09-22T07:12:19Z  load_at_acquire=s: 28.42 16.83 14.32

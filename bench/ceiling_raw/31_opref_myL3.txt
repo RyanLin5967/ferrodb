@@ -1,0 +1,19 @@
+⛔ CEILING MEASUREMENT SCAFFOLD — branch CEILING-park-or-structure, MUST NEVER MERGE.
+   PROVENANCE at process start, read back from the probe: stub_level=0 extra_upserts=0 extra_new_keys=false probe_clock=false
+   Every rung re-asserts this. A non-zero stub or extra count REFUSES, it does not warn.
+
+CEILING — MODE=opref. A PURE MUTEX AT AN OPERATING POINT YOU SUPPLY.
+LAYER: none. A bare `Mutex<()>`: no fsync, no tree, no second lock.
+⚠ Feed it THIS session's measured hold and cycle, not a recorded one.
+# opref_start: 2026-09-22T07:39:24Z  load_at_acquire=s: 24.41 23.78 24.60
+  spin calibration: 1.487e9 spins/sec single-threaded
+  asked for: T=64  hold=0.01063 ms  cycle=17.981 ms  (offered rho = 0.03784)
+
+                cell    T      hold        outside      ops   contended/op     acq/op queue_max   U_ach
+           0.01063ms   64     15804 sleep 17.970ms    12800        0.55070     1.0000        39    3.1%
+  queue_mean 2.46
+
+⚠ U_ach is the utilisation this model ACHIEVED, not the one asked for. If it is far
+  below the real rung's U(hold), the arrival processes are not comparable and the
+  contended/op below is not the right reference. Say so rather than using it.
+# end: 2026-09-22T07:39:29Z  load_at_acquire=s: 24.41 23.78 24.60
