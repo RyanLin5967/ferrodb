@@ -80,7 +80,7 @@ use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRe
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceFlush, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::storage::index_page::entries_an_update_writes;
 use crate::tel::frame::TxnFrame;
@@ -6479,7 +6479,30 @@ impl AgentRuntime {
         // repair at all. Closing them needs the heap rewrite logged, which is a larger change than
         // this row. What IS closed, below, is the change feed — it never carries half of a
         // multi-table merge.
-        let prov = Arc::clone(self.provenance());
+        //
+        // **D219 — this merge's provenance is made durable by one sync per durability point.** The
+        // rewrite below re-stamps the rows it moves and the publish loop stamps every version it
+        // writes, both through `prov`, which is the guard's stamper: applied to the index at once
+        // with every guard, and written later. Each table's rewrite flushes its own stamps right
+        // after `finish` installs it (`Catalog::apply_plan`), because the rewrite can reach the
+        // disk before the publish begins; the publish loop's ride `record_applied`'s row authorship,
+        // the merge's final durable write. `provenance.flush()` after it covers anything left, and
+        // the guard's `Drop` covers every early return. So a merge syncs the provenance file once,
+        // plus once per altered table whose rewrite moved an attributed row.
+        let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
+        let prov = Arc::clone(provenance.stamper());
+        // **A merge that will stamp asks the store FIRST (PREREG A3, review 7 F5).** Every write
+        // this merge publishes is stamped or recorded by `record_applied` (whose `ProvId::NONE`
+        // clears an author, which is a write too), so a store already refusing writes would refuse
+        // this merge at its first publish stamp, after the schema below had been installed and
+        // logged. `plan_alters` asks only for a rewrite that will re-stamp an attributed row, so a
+        // merge whose altered tables carry none was not asked at all. Asked here, before any table
+        // is planned, the refusal leaves nothing behind (E82). A merge that publishes nothing is
+        // not asked: it writes no provenance (D219 F1's rule for ALTER). Advisory, as the trait
+        // says: a store that starts refusing after this line is refused at the write.
+        if !pending.is_empty() {
+            prov.check_writable()?;
+        }
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
         for (i, report) in schema_reports.iter().enumerate() {
             if report.to_apply.is_empty() {
@@ -6708,7 +6731,7 @@ impl AgentRuntime {
         for w in ready {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
-            let author = Some((Arc::clone(self.provenance()), snapshot.prov));
+            let author = Some((Arc::clone(&prov), snapshot.prov));
             if let Err(e) = w.apply_in(ctx, publish_txn, author) {
                 ctx.txn.abort(publish_txn)?;
                 return Err(e);
@@ -6732,6 +6755,13 @@ impl AgentRuntime {
             &images,
             reserved,
         );
+        // **D219 — durable before the merge is acknowledged.** A no-op, with no sync, whenever
+        // `record_applied` had a row to attribute: its write already carried every pending stamp.
+        // Folded into `authorship` rather than `?`-ed, for the reason just given (Amendment 12,
+        // F1): returning here would skip the attestation and the seal of a merge whose publish has
+        // committed. `and` runs the flush whatever `record_applied` returned, and reports the
+        // authorship error first when both fail.
+        let authorship = authorship.and(provenance.flush());
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -6908,6 +6938,9 @@ impl AgentRuntime {
         // record is in memory. When a stamp sat inside this loop and failed, the publish had
         // already committed, so the rows were visible and the later versions unnamed: an exact read
         // of such a row named the version before it, and nothing refused that read.
+        //
+        // The rows this merge published, one entry per applied op, attributed in ONE batch at the
+        // end of this pass (D219).
         let mut stamps: Vec<(u32, u64)> = Vec::new();
         let mut next_seq = reserved.start;
         for r in rows {
@@ -6972,6 +7005,8 @@ impl AgentRuntime {
                 if seen.is_empty() {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
+                // Authorship of the published row, kept past `seal` AND past the process
+                // (exit criterion 9). Recorded at the end of this pass, all at once.
                 stamps.push((op.tbl.0, op.row.0));
             }
         }
@@ -7022,31 +7057,44 @@ impl AgentRuntime {
         // 9). This is the write that makes `who_wrote_row` durable. Last, so that a failure here
         // leaves authorship incomplete and nothing else.
         //
+        // **D219 — one append and one fsync for the whole merge's authorship.** This was one
+        // `stamp_row` per op inside the loop above, and a durable store syncs once per call, so a
+        // merge of δ ops held `state` — which every agent statement takes — across δ fsyncs. The
+        // records, their order and their bytes are unchanged; only the number of syncs they share
+        // went from δ to 1. This is still the write that makes `who_wrote_row` durable, and it
+        // still completes before this function returns, so before `merge` acknowledges anything.
+        // It is also the publish's ONE sync: every physical stamp the publish loop left pending
+        // (`ProvenanceFlush` in `publish_evaluation_as`) is written ahead of these records in the
+        // same append. An ALTER's rewrite flushed its own stamps before the publish began.
+        //
+        // It stays under `state` deliberately. The sync could be awaited after releasing `state`
+        // (stage under the lock, wait outside it, as `begin_session_as_staged` does for a fork),
+        // but every shape that runs SQL holds the catalog lock for the whole MERGE statement —
+        // `cli.rs` per statement, and pgwire's `writer_active` stands every shared reader down —
+        // so no STATEMENT could observe the shorter hold. The one caller that takes `state`
+        // outside the catalog lock is the lease thread's `forget_reaped_branches` reconciliation
+        // (D98 moved it out), which is background housekeeping no client waits on.
+        //
         // **Best-effort, and never stale (Amendment 13, D).** Stopping at the first failure left
-        // every later row naming its PREVIOUS author: a version this merge replaced. So a row whose
-        // stamp fails is cleared to "nobody on record", and the loop goes on. A row that can be
-        // neither stamped nor cleared is named in the error. A durable store that refuses both is
+        // every later row naming its PREVIOUS author: a version this merge replaced. A batch is
+        // refused WHOLE (`ProvenanceStore::stamp_rows`: no row is attributed when any is refused),
+        // so on a failure every row of it is cleared to "nobody on record" — as one batch too —
+        // rather than the failed rows alone, as the per-op loop this replaces did. Rows that can be
+        // neither stamped nor cleared are named in the error. A durable store that refuses both is
         // poisoned, and a poisoned store refuses to say who wrote any row (`durable.rs`).
-        let mut first_failure: Option<FerroError> = None;
-        let mut unstamped: Vec<(u32, u64)> = Vec::new();
-        let mut uncleared: Vec<(u32, u64)> = Vec::new();
-        for (tbl, row) in stamps {
-            if let Err(e) = self.prov_store.stamp_row(tbl, row, snapshot.prov) {
-                unstamped.push((tbl, row));
-                if self.prov_store.stamp_row(tbl, row, ProvId::NONE).is_err() {
-                    uncleared.push((tbl, row));
-                }
-                if first_failure.is_none() {
-                    first_failure = Some(e);
-                }
+        match self.prov_store.stamp_rows(&stamps, snapshot.prov) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let uncleared: &[(u32, u64)] =
+                    match self.prov_store.stamp_rows(&stamps, ProvId::NONE) {
+                        Ok(()) => &[],
+                        Err(_) => &stamps,
+                    };
+                Err(FerroError::Provenance(format!(
+                    "{e}; rows left unattributed (table, row): {stamps:?}; of those, rows whose \
+                     previous author could not be cleared: {uncleared:?}"
+                )))
             }
-        }
-        match first_failure {
-            None => Ok(()),
-            Some(e) => Err(FerroError::Provenance(format!(
-                "{e}; rows left unattributed (table, row): {unstamped:?}; of those, rows whose \
-                 previous author could not be cleared: {uncleared:?}"
-            ))),
         }
     }
 
@@ -10152,6 +10200,36 @@ mod tests {
             }
             self.inner.stamp_row(table, row, id)
         }
+        // Merge fixup (D219 batched `record_applied`'s stamps into one `stamp_rows`, and added the
+        // trait methods below). Each row of a batch counts as one call, so `fail_at` still names
+        // the same row it did when every row was its own `stamp_row`; and a batch holding the
+        // failing call is refused WHOLE, which is the trait's contract for `stamp_rows`.
+        fn stamp_rows(&self, rows: &[(u32, u64)], id: ProvId) -> Result<(), FerroError> {
+            let first = self
+                .calls
+                .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if (first..first + rows.len()).contains(&self.fail_at) {
+                return Err(FerroError::Internal("injected stamp failure".into()));
+            }
+            self.inner.stamp_rows(rows, id)
+        }
+        fn stamp_pending(
+            &self,
+            rid: crate::storage::heap_file_manager::RecordId,
+            id: ProvId,
+        ) -> Result<(), FerroError> {
+            self.inner.stamp_pending(rid, id)
+        }
+        fn flush(&self) -> Result<(), FerroError> {
+            self.inner.flush()
+        }
+        fn check_writable(&self) -> Result<(), FerroError> {
+            self.inner.check_writable()
+        }
+        fn sync_counts(&self) -> crate::provenance::SyncCounts {
+            self.inner.sync_counts()
+        }
         fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
             self.inner.row_author(table, row)
         }
@@ -10896,5 +10974,154 @@ mod tests {
         assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
         assert!(!st.retention.readers.contains_key(&h), "no pin reads h, yet it is still held");
         assert!(st.retention.by_reader.is_empty() && st.retention.pending.is_empty());
+    }
+
+    // ---- D219 PREREG A3 (review 7 F5): a MERGE that will stamp asks the store before its schema --
+    //
+    // Unit tests because `DurableProvenanceStore::fail_next_append`, the only way to poison a store
+    // without killing the process, exists only under `cfg(test)`. The agent statements go through
+    // the runtime's API rather than dispatch: `designated::tests` designates a runtime process-wide
+    // in this same binary, and dispatch refuses agent statements on any other while it does.
+
+    struct PoisonedMerge {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<crate::wal::txn::TxnManager>,
+        wal: Arc<crate::wal::log::WalManager>,
+        rt: Arc<AgentRuntime>,
+        branch: BranchId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn f5_parse(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// `t (id, v)` with nothing on the target (so no row of it is attributed, and `plan_alters`
+    /// never probes), a completed session of run `r1` that staged `ADD COLUMN w` and, if `publish`,
+    /// an INSERT, and then the provenance store poisoned.
+    fn a_merge_on_a_poisoned_store(publish: bool) -> PoisonedMerge {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("f5.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let wal = Arc::new(crate::wal::log::WalManager::new(dir.path().join("f5.wal")).unwrap());
+        let txn = Arc::new(crate::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let durable = Arc::new(
+            crate::provenance::DurableProvenanceStore::open(dir.path().join("f5.provenance")).unwrap(),
+        );
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = durable.clone() as Arc<dyn ProvenanceStore>;
+        let rt = Arc::new(rt);
+        let mut plain = crate::execution::session::Session::with_runtime(Arc::clone(&rt));
+        crate::execution::executor::run(
+            f5_parse("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut plain,
+        )
+        .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}"));
+        let session = rt
+            .begin_session_as(
+                RunIdentity {
+                    agent_id: "a",
+                    run_id: Some("r1"),
+                    model: Some(("claude-opus-5", "2026-05")),
+                    prompt: None,
+                },
+                BranchId::TRUNK,
+            )
+            .unwrap_or_else(|e| panic!("BEGIN failed: {e}"));
+        if publish {
+            rt.write(
+                &mut ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() },
+                session.branch,
+                f5_parse("INSERT INTO t VALUES (1, 10);"),
+            )
+            .unwrap_or_else(|e| panic!("INSERT in the session failed: {e}"));
+        }
+        let Stmt::AlterTable { table, action } = f5_parse("ALTER TABLE t ADD COLUMN w INTEGER;")
+        else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        rt.stage_schema_edit(&catalog, session.branch, &table, &action)
+            .unwrap_or_else(|e| panic!("staging the ALTER failed: {e}"));
+        durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            durable.stamp_row(1, 1, session.prov).is_err(),
+            "premise: the injected failure did not poison the store"
+        );
+        PoisonedMerge { catalog, bp, txn, wal, rt, branch: session.branch, _dir: dir }
+    }
+
+    impl PoisonedMerge {
+        fn merge(&mut self) -> Result<MergeReport, FerroError> {
+            let rt = Arc::clone(&self.rt);
+            rt.merge(
+                &mut ExecCtx { catalog: &mut self.catalog, bp: self.bp.clone(), txn: self.txn.clone() },
+                self.branch,
+            )
+        }
+
+        fn columns_of_t(&self) -> usize {
+            self.catalog.require_table("t").unwrap().schema.columns.len()
+        }
+    }
+
+    /// **P1 (PREREG A3): a MERGE that will stamp, on a store refusing writes, is refused before its
+    /// schema installs.** The altered table has no attributed row, so `plan_alters` does not probe;
+    /// without a probe of its own the merge installed and logged the ADD COLUMN and was refused only
+    /// at the first publish stamp: `Err` from a statement that changed the target's schema and told
+    /// the change feed so (E82).
+    #[test]
+    fn a_merge_that_will_stamp_on_a_poisoned_store_is_refused_before_its_schema_installs() {
+        let mut f = a_merge_on_a_poisoned_store(true);
+        let logged_before = f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        match f.merge() {
+            Ok(_) => panic!("a MERGE that publishes attributed rows succeeded on a store refusing writes"),
+            Err(e) => assert!(
+                format!("{e}").contains("refusing further writes"),
+                "refused, but not by the poisoned store: {e}"
+            ),
+        }
+        assert_eq!(
+            f.columns_of_t(),
+            2,
+            "the refused MERGE installed its ADD COLUMN before refusing: a schema change from a \
+             statement that returned Err"
+        );
+        assert_eq!(
+            f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            logged_before,
+            "the refused MERGE wrote to the log: its DDL record reached the change feed"
+        );
+    }
+
+    /// **P2 (PREREG A3): a MERGE that publishes nothing is not refused by a store refusing
+    /// writes.** It writes no provenance, so there is nothing to refuse: the probe asks only when
+    /// the merge will stamp, as `plan_alters`' asks only when a rewrite will re-stamp (D219 F1).
+    #[test]
+    fn a_merge_that_publishes_nothing_on_a_poisoned_store_is_not_refused() {
+        let mut f = a_merge_on_a_poisoned_store(false);
+        if let Err(e) = f.merge() {
+            panic!("a schema-only MERGE was refused by a store it writes nothing to: {e}");
+        }
+        assert_eq!(f.columns_of_t(), 3, "the schema-only MERGE did not install its ADD COLUMN");
     }
 }
