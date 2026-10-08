@@ -1,16 +1,17 @@
 use std::{io, path::Path, sync::Arc};
 use std::io::Write;
+use std::time::{Duration, Instant};
 use crate::execution::executor::run;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
-use crate::wal::recovery::{open_recovered, OpenedDatabase};
+use crate::wal::recovery::{open_recovered, BootTimings, OpenedDatabase};
 use crate::wal::txn::TxnManager;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::TableBranchCatalog;
-use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseThread, RuntimeLock};
+use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
 use crate::branch::reaper::TwoTierReaper;
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
@@ -40,23 +41,104 @@ fn arena_headroom() -> u32 {
         .unwrap_or(DEFAULT_ARENA_HEADROOM)
 }
 
-// super basic cli, make better later
-pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
-    // Read before anything else: it touches no file, and a database that cannot be reaped is a
-    // database that should not be opened. `examples/pgserver.rs` has a harder reason to put it
-    // first — its refusal path is `process::exit`, which does not drop the lock — and the two are
-    // ordered the same way so neither has to be read against the other.
-    let interval = scan_interval_from_env()?;
+/// Wall time of each step of [`open_database`], in the order the steps run.
+///
+/// **READ-VS-N, arm 3 — observing only.** D65 timed two calls of this sequence (the branch
+/// catalog's `open_sidecar` and the arena's `reopen_from_checkpoint`), and its adversary listed what
+/// that leaves out: WAL recovery, the `.tel` and `.provenance` replays, and `LeaseThread::start`'s
+/// synchronous orphan sweep. Timing the whole sequence from outside cannot say which step a slope
+/// belongs to, and re-spelling the sequence in a harness to time it step by step is how a harness
+/// ends up measuring something the binary does not run. So the steps are timed where they run,
+/// and the harness reads this.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenTimings {
+    /// `DbLock::acquire`.
+    pub lock: Duration,
+    /// `wal::recovery::open_recovered`'s own steps — the file and pool, `recover`, the catalog, and
+    /// the index rebuild — timed inside it (D204: it is the one open path, so its steps are timed
+    /// there rather than here).
+    pub boot: BootTimings,
+    /// `TableBranchCatalog::default_for_database`: the `{db}.branchcat` sidecar.
+    pub branch_catalog: Duration,
+    /// `ArenaPageStore::reopen_from_checkpoint` (or `new`), plus arming `checkpoint_to`.
+    pub arena: Duration,
+    /// `DurableEffectLog::default_for_database`: the `.tel` replay.
+    pub effect_log: Duration,
+    /// `AgentRuntime::reopen_with_storage` (or `with_storage`).
+    pub runtime: Duration,
+    /// `with_durable_provenance`: the `.provenance` replay.
+    pub provenance: Duration,
+    /// `LeaseThread::start`: `resume_interrupted_reaps`, which ends in the full orphan sweep, on
+    /// this thread and under the runtime lock. The pass its thread starts afterwards is NOT in
+    /// here — see `TwoTierReaper::open_sweep_visits`.
+    pub lease_start: Duration,
+    /// All of the above, lock to lease thread, under one timer.
+    pub total: Duration,
+}
+
+/// A database opened the way the shipped binary opens one, holding everything a session needs.
+///
+/// Built only by [`open_database`], which is `run_cli`'s open sequence moved into a function so
+/// that the binary and READ-VS-N's restart arm run the SAME code. Its first half is
+/// `wal::recovery::open_recovered` — D204's one bootstrap, which every binary calls and
+/// `tests/open_path_allowlist.rs` enforces — and this adds only what the CLI builds on top of it. Closing it cleanly is
+/// [`OpenDatabase::close`]; dropping it without closing is an unclean shutdown as far as the files
+/// are concerned — the case `checkpoint_to` and `resume_interrupted_reaps` exist for.
+pub struct OpenDatabase {
+    pub bp: Arc<BufferPoolManager>,
+    pub txn: Arc<TxnManager>,
+    /// The per-statement lock, shared with the lease thread. See `run_cli`'s REPL loop.
+    pub catalog: Arc<CatalogLock>,
+    pub branches: Arc<TableBranchCatalog>,
+    pub store: Arc<ArenaPageStore>,
+    pub reaper: Arc<TwoTierReaper>,
+    pub runtime: Arc<AgentRuntime>,
+    pub lease: LeaseThread,
+    pub arena_path: String,
+    pub timings: OpenTimings,
+    /// LAST on purpose: fields drop in declaration order, so every handle above is closed before
+    /// the lock file goes and another process may open the database.
+    _lock: DbLock,
+}
+
+impl OpenDatabase {
+    /// Shut down the way `run_cli` does: stop the lease scan, then run [`exit_sequence`] (D244: the
+    /// branch catalog's root publish, the WAL checkpoint, which flushes the pool, then the arena
+    /// checkpoint, each run whatever the one before it returned).
+    ///
+    /// The lease stats come back whether or not the checkpoints succeed, so a caller can still
+    /// report what the scan did before it reports the failure.
+    pub fn close(self) -> (LeaseStats, Result<(), FerroError>) {
+        // Stop the scan before the checkpoints below. A scan that freed an extent after the
+        // free-space map was written would leave a durable map that still charges pages nothing
+        // owns.
+        let stats = self.lease.stop();
+        // The exit steps the tests run (`tests/d244_clean_exit_publishes_the_root.rs`), so the
+        // binary and READ-VS-N's restart arm close through the same code as those tests.
+        let closed = exit_sequence(&self.branches, &self.txn, &self.store, Path::new(&self.arena_path));
+        (stats, closed)
+    }
+}
+
+/// Open (or create) the database at `db_path` exactly as the shipped binary does, and start its
+/// lease scan at `interval`.
+pub fn open_database(db_path: &str, interval: Duration) -> Result<OpenDatabase, FerroError> {
+    let mut timings = OpenTimings::default();
+    let t_total = Instant::now();
 
     // FIRST, before anything opens a file. Two processes on one database hand out the same arena
     // pages to different branches, and every such page still passes its checksum — so this refusal
-    // is the only point at which the problem is detectable. Held for the whole session: `_lock`
-    // lives to the end of this function and releases on the way out, including on `?`.
-    let _lock = DbLock::acquire(Path::new(db_path))?;
+    // is the only point at which the problem is detectable. Held for the whole session: the lock
+    // lives in the returned `OpenDatabase` and releases when it drops, including on `?` here.
+    let t = Instant::now();
+    let lock = DbLock::acquire(Path::new(db_path))?;
+    timings.lock = t.elapsed();
     // D204: recover, then rebuild every index from the recovered heap, then checkpoint, in the one
-    // function every binary opens through. This sequence used to be written out here, and
-    // `examples/pgserver.rs` had its own copy that omitted the rebuild.
-    let OpenedDatabase { bp, txn, catalog, .. } = open_recovered(Path::new(db_path), &_lock)?;
+    // function every binary opens through. It times its own steps and hands them back
+    // (`BootTimings`), so they are measured where they run and not re-spelled here.
+    let OpenedDatabase { bp, txn, catalog, timings: boot, .. } =
+        open_recovered(Path::new(db_path), &lock)?;
+    timings.boot = boot;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`
@@ -73,14 +155,17 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // of implementation belong beside the format, and an entry point wiring a runtime should make
     // no decision. It also owns the one-time conversion of a legacy `{db}.branches` log, which an
     // entry point has no business knowing about.
+    let t = Instant::now();
     let branches = Arc::new(TableBranchCatalog::default_for_database(
         db_path,
         TRUNK_ROOT_PLACEHOLDER,
     )?);
+    timings.branch_catalog = t.elapsed();
 
     // A checkpoint on disk is the only thing that says where the arena starts. Its absence means
     // "no arena has ever been created here", which is a different situation from "reattach", and
     // `reopen_from_checkpoint` refuses rather than guessing a base.
+    let t = Instant::now();
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
         ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone(), Path::new(&arena_path))?
@@ -99,10 +184,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         ArenaPageStore::new(bp.clone(), branches.clone(), base)?
     });
     // Persist the free-space map whenever the arena claims a new extent, not only at exit. The
-    // exit checkpoint below is still worth taking - it captures the final partial extent - but it
-    // is the one a `kill -9` or a power cut never reaches, and a map older than the durable branch
-    // catalog is a map that re-issues pages the catalog still points at.
+    // exit checkpoint in `OpenDatabase::close` is still worth taking - it captures the final
+    // partial extent - but it is the one a `kill -9` or a power cut never reaches, and a map older
+    // than the durable branch catalog is a map that re-issues pages the catalog still points at.
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
+    timings.arena = t.elapsed();
 
     // F11 - the reaper, built over the SAME branch catalog and page store as the runtime. That is
     // the contract `with_reaper` states and cannot check, so it is satisfied here by construction.
@@ -123,29 +209,32 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // `default_for_database` rather than a path spelled out here: the naming convention and the
     // choice of implementation belong beside the format, and an entry point wiring a runtime
     // should make no decision. Built once and shared by both arms, which open the same file.
+    let t = Instant::now();
     let effects = DurableEffectLog::default_for_database(db_path)?;
+    timings.effect_log = t.elapsed();
 
-    let runtime = Arc::new(
-        if arena_exists {
-            AgentRuntime::reopen_with_storage(
-                branches.clone() as Arc<dyn BranchCatalog>,
-                effects.clone(),
-                store.clone() as Arc<dyn PageStore>,
-            )?
-        } else {
-            AgentRuntime::with_storage(
-                branches.clone() as Arc<dyn BranchCatalog>,
-                effects.clone(),
-                store.clone() as Arc<dyn PageStore>,
-            )?
-        }
-        .with_durable_provenance(format!("{db_path}.provenance"))?
-        // Retiring a branch now reclaims it. Without this, `seal` took its no-reaper path: a
-        // merged or abandoned branch was marked `Reaped` and its extents were never freed, so
-        // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
-        .with_reaper(reaper.clone() as Arc<dyn Reaper>),
-    );
-    let mut session = Session::with_runtime(runtime.clone());
+    let t = Instant::now();
+    let runtime = if arena_exists {
+        AgentRuntime::reopen_with_storage(
+            branches.clone() as Arc<dyn BranchCatalog>,
+            effects.clone(),
+            store.clone() as Arc<dyn PageStore>,
+        )?
+    } else {
+        AgentRuntime::with_storage(
+            branches.clone() as Arc<dyn BranchCatalog>,
+            effects.clone(),
+            store.clone() as Arc<dyn PageStore>,
+        )?
+    };
+    timings.runtime = t.elapsed();
+    let t = Instant::now();
+    let runtime = runtime.with_durable_provenance(format!("{db_path}.provenance"))?;
+    timings.provenance = t.elapsed();
+    // Retiring a branch now reclaims it. Without this, `seal` took its no-reaper path: a merged or
+    // abandoned branch was marked `Reaped` and its extents were never freed, so every `MERGE` and
+    // every `ABANDON` in this CLI leaked the branch's pages.
+    let runtime = Arc::new(runtime.with_reaper(reaper.clone() as Arc<dyn Reaper>));
 
     // The catalog moves behind a mutex, and is locked for exactly one statement.
     //
@@ -155,17 +244,46 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // server. One rule, in both places that run SQL, rather than a second lock ordering here.
     let catalog = Arc::new(CatalogLock::new(catalog));
 
+    let t = Instant::now();
     let lease = LeaseThread::start(
-        reaper,
-        runtime,
+        reaper.clone(),
+        runtime.clone(),
         catalog.clone() as Arc<dyn RuntimeLock>,
         interval,
     )?;
+    timings.lease_start = t.elapsed();
+    timings.total = t_total.elapsed();
+
+    Ok(OpenDatabase {
+        bp,
+        txn,
+        catalog,
+        branches,
+        store,
+        reaper,
+        runtime,
+        lease,
+        arena_path,
+        timings,
+        _lock: lock,
+    })
+}
+
+// super basic cli, make better later
+pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
+    // Read before anything else: it touches no file, and a database that cannot be reaped is a
+    // database that should not be opened. `examples/pgserver.rs` has a harder reason to put it
+    // first — its refusal path is `process::exit`, which does not drop the lock — and the two are
+    // ordered the same way so neither has to be read against the other.
+    let interval = scan_interval_from_env()?;
+
+    let db = open_database(db_path, interval)?;
+    let mut session = Session::with_runtime(db.runtime.clone());
     println!("ferrodb: type .exit to quit");
     println!(
         "ferrodb: lease scan every {}ms; {} interrupted reap(s) finished on startup",
         interval.as_millis(),
-        lease.resumed().len()
+        db.lease.resumed().len()
     );
     let stdin = io::stdin();
     let mut buffer = String::new();
@@ -186,12 +304,10 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         if let Some(pos) = buffer.rfind(';') {
             let complete = buffer[..=pos].to_string();
             buffer = buffer[pos + 1..].to_string();
-            execute_sql(&complete, &catalog, bp.clone(), txn.clone(), &mut session);
+            execute_sql(&complete, &db.catalog, db.bp.clone(), db.txn.clone(), &mut session);
         }
     }
-    // Stop the scan before the checkpoints below. A scan that freed an extent after the free-space
-    // map was written would leave a durable map that still charges pages nothing owns.
-    let stats = lease.stop();
+    let (stats, closed) = db.close();
     // **D127** put `refused_branches` in this condition. A session that reaped nothing, refused no
     // whole scan and failed nothing, but declined to decide about a branch, used to print no line
     // at all — the exact shape of "a real event reaches no reader" this row closes.
@@ -202,13 +318,14 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
+    closed?;
     println!("bye bye");
     Ok(())
 }
 
 /// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
-/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs.
+/// stopped. `run_cli` calls this (through [`OpenDatabase::close`]), and so do the tests, so a test
+/// runs the code the binary runs.
 ///
 /// 1. **D244 review F7.** The branch catalog publishes its root and syncs. A publish that failed on
 ///    a mutation's exit is otherwise retried only by the next mutation or the next sync

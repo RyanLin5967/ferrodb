@@ -1178,3 +1178,303 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
          Live-only and resume_interrupted_reaps runs at open, not per tick."
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D209 — an open sweeps the live arenas ONCE.
+// -------------------------------------------------------------------------------------------
+
+/// **D209.** `start` runs `resume_interrupted_reaps`, which ends in the full O(live arenas)
+/// orphan sweep, and then spawns the thread, whose first pass runs at once and ends in
+/// `collect_orphans_if_due`. The open's sweep stamped nothing, so that gate still read
+/// `ORPHAN_SWEEP_NEVER` and the same sweep ran again straight after it: every open paid for its
+/// orphan sweep twice. read-vs-n's PREREG R5 puts one sweep at 10-90 s for 10^6 branches
+/// (inferred, unmeasured).
+///
+/// Observed only through counters that exist without the fix — `sweep_visits`,
+/// `open_sweep_visits` and `LeaseStats::finished` — so this compiles against the unfixed tree and
+/// fails there, with the first pass's visits equal to the open's.
+///
+/// It refuses to pass vacuously in both directions. The open must have visited arenas, because a
+/// sweep over nothing repeats nothing. And the first pass must have FINISHED: `finished` is raised
+/// after `collect_orphans_if_due` returns, so a thread that has not reached its sweep yet cannot
+/// read as one that skipped it. Nothing may expire, because a reap's narrowed sweep adds visits of
+/// its own. A second pass, which `NEVER` leaves only a spurious condvar wakeup to cause, cannot
+/// move the count: it lands inside the interval whichever pass or open stamped it, so it skips.
+#[test]
+fn d209_an_open_sweeps_the_live_arenas_once_not_twice() {
+    let f = fixture();
+    // Three live branches that own extents, so the open sweep has at least three arenas to visit.
+    for _ in 0..3 {
+        branch_with_pages(&f, FAR_FUTURE, 2);
+    }
+    let before = f.reaper.sweep_visits();
+
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the lease thread's first pass to finish", || lease.stats().finished >= 1);
+    let stats = lease.stop();
+
+    let at_open = f.reaper.open_sweep_visits();
+    let first_pass = f.reaper.sweep_visits() - before - at_open;
+    assert!(
+        at_open >= 3,
+        "the open swept {at_open} arenas over three live branches with pages, so there was no \
+         sweep for the first pass to repeat and this test proves nothing"
+    );
+    assert_eq!(stats.reaped, 0, "fixture: nothing had expired, so no reap may add visits");
+    assert_eq!(
+        first_pass, 0,
+        "the lease thread's first pass visited {first_pass} arenas right after the open had \
+         visited {at_open}: the open's full orphan sweep did not stamp the cadence, so \
+         `collect_orphans_if_due` read ORPHAN_SWEEP_NEVER and repeated the whole O(live arenas) \
+         sweep (D209)"
+    );
+}
+
+/// A lock that stands off before it runs the body, then records the lease clock just before the
+/// body starts. For `start`, the body is `resume_interrupted_reaps`, whose last step is the open's
+/// orphan sweep.
+struct StandOffGate {
+    statement: Mutex<()>,
+    stand_off: Duration,
+    /// The lease clock at the FIRST entry. Later entries would be the scan's reaps; the tests that
+    /// use this gate expire nothing, so there are none, and only the first is kept regardless.
+    entered: Mutex<Option<u64>>,
+}
+
+impl RuntimeLock for StandOffGate {
+    fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+        std::thread::sleep(self.stand_off);
+        let mut entered = self.entered.lock().unwrap();
+        if entered.is_none() {
+            *entered = Some(LeaseDeadline::now_millis());
+        }
+        drop(entered);
+        body();
+    }
+}
+
+/// **D209, the other half: where the stamp may land.** The red test above cannot tell the right
+/// stamp from two wrong ones that also silence the first pass, and each wrong one costs something
+/// the counters there never see:
+///
+/// * **A stamp read before the resume.** That is the order `scan_once` uses for its own `now`, so
+///   it is the likely wrong one. It is short of the open's sweep by the sweep's whole length, and
+///   once that length reaches `ORPHAN_SWEEP_INTERVAL_MS` the first pass sweeps again: D209 back,
+///   but only at a scale no unit test runs. This gate stands off for `STAND_OFF` before it runs
+///   the resume, so such a stamp lands at least that far before `entered`.
+/// * **A stamp in the future, or from another clock.** It shuts the cadence for longer than one
+///   interval, and the residue of an in-process error path waits on it for that long.
+///
+/// So the stamp is bracketed. It must be at or after `entered`, the lease clock read inside the
+/// lock just before the resume ran. It must be at or before `after`, read once the first pass has
+/// finished. A due-check one millisecond short of an interval from `entered` must NOT sweep; one a
+/// full interval after `after` MUST, and must visit every live arena again (since D221 a due pass
+/// visits one slice of the live arenas, and this fixture's few fit in one).
+///
+/// Blind spots, stated. A MISSING stamp passes here: the first pass then sweeps and stamps its own
+/// `now`, which lands inside the bracket. The red test above is what catches that. And a stamp
+/// read inside the resume but before its sweep also lands after `entered`; on a sweep this small
+/// no test can separate it from one read after the sweep. `start` reads the clock after
+/// `with_lock` returns, and this pins everything short of that.
+#[test]
+fn d209_the_open_stamp_holds_the_cadence_one_interval_from_the_sweep_and_no_longer() {
+    use crate::branch::reaper::ORPHAN_SWEEP_INTERVAL_MS;
+    const STAND_OFF: Duration = Duration::from_millis(50);
+
+    let f = fixture();
+    for _ in 0..3 {
+        branch_with_pages(&f, FAR_FUTURE, 2);
+    }
+    let gate = Arc::new(StandOffGate {
+        statement: Mutex::new(()),
+        stand_off: STAND_OFF,
+        entered: Mutex::new(None),
+    });
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&gate) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the lease thread's first pass to finish", || lease.stats().finished >= 1);
+    let stats = lease.stop();
+    let after = LeaseDeadline::now_millis();
+    let entered =
+        (*gate.entered.lock().unwrap()).expect("start never took the lock for the resume");
+    assert_eq!(stats.reaped, 0, "fixture: nothing had expired, so no reap may add visits");
+
+    let at_open = f.reaper.open_sweep_visits();
+    assert!(
+        at_open >= 3,
+        "the open swept {at_open} arenas over three live branches with pages, so the sweep below \
+         has nothing to be counted against"
+    );
+
+    let held = f.reaper.sweep_visits();
+    f.reaper.collect_orphans_if_due(entered + ORPHAN_SWEEP_INTERVAL_MS - 1).unwrap();
+    assert_eq!(
+        f.reaper.sweep_visits(),
+        held,
+        "a due-check one millisecond short of an interval after the open took its lock swept \
+         anyway: the stamp predates the open's sweep (read before the resume, at least \
+         {STAND_OFF:?} early here). At 10^6 arenas that is the second sweep again."
+    );
+
+    f.reaper.collect_orphans_if_due(after + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+    assert_eq!(
+        f.reaper.sweep_visits() - held,
+        at_open,
+        "a full interval after the open, the cadence did not sweep every live arena: the stamp is \
+         later than the open or on another clock, so the gate stays shut past its interval and \
+         the residue of an in-process error path waits on it"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// D221 — a steady-state pass costs the residue, not the live arena count.
+// -------------------------------------------------------------------------------------------
+
+/// Claim one EMPTY extent for each of `n` new live branches. An empty extent of a LIVE owner is
+/// never collectable, so a sweep over these visits and descends and frees nothing: the fixture
+/// moves only the count a scan of every live arena would pay for.
+fn claim_live_extents(f: &Fixture, n: usize) {
+    for _ in 0..n {
+        let b = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+        f.h.store.arena_for(b).unwrap();
+    }
+}
+
+/// **D221.** A due pass of the cadence ran the full O(live arenas) scan. With the lease loop's
+/// 30 s wait and the 60 s interval, every pass is due once reaping plus sweeping takes 30 s, so at
+/// 10^6 arenas the lease thread would spend at least half its time sweeping (read-vs-n PREREG R5
+/// puts one sweep at 10-90 s; inferred, unmeasured).
+///
+/// Stated as a slope rather than a ratio: a due pass at N live arenas, then one at 2N, with no
+/// residue either time. Before the fix the second visits twice as many. After it, both visit the
+/// fix's fixed slice (1,024, below N here), so they are equal. Each is the FIRST due pass of a
+/// fresh reaper, so the second does not inherit the first's progress through the arenas: a pass
+/// finishing a slice rotation the first began would visit fewer, which is cheaper, not "flat". It
+/// observes only `sweep_visits`, `deferred_len` and `collect_orphans_if_due`, which all exist
+/// without the fix, so it compiles against the unfixed tree and fails there.
+#[test]
+fn d221_a_due_pass_does_not_grow_with_the_live_arena_count() {
+    const N: usize = 1_500;
+    // Below every lease `FAR_FUTURE` hands out, so the due-check decides the sweep and nothing
+    // else.
+    let t0 = 1_000_000u64;
+    let f = fixture();
+    let first_due_pass = || {
+        let reaper = TwoTierReaper::new(Arc::clone(&f.h.catalog), Arc::clone(&f.h.store));
+        assert_eq!(reaper.deferred_len(), 0, "fixture: no residue, so every visit is the scan's");
+        reaper.collect_orphans_if_due(t0).unwrap();
+        reaper.sweep_visits()
+    };
+
+    claim_live_extents(&f, N);
+    let at_n = first_due_pass();
+    claim_live_extents(&f, N);
+    let at_2n = first_due_pass();
+
+    assert!(at_n > 0, "the first due pass visited nothing, so it says nothing about its cost");
+    assert_eq!(
+        at_2n, at_n,
+        "doubling the live arenas ({N} -> {} new branches) moved one due pass from {at_n} to \
+         {at_2n} arena visits with no residue: the steady-state sweep is O(live arenas) (D221)",
+        2 * N
+    );
+}
+
+/// **D221 — the slice's detector reaches a reader.** An extent the steady-state slice frees is
+/// one no in-process producer recorded, so the first one is the finding, and `scan_once` must
+/// say so rather than leave it in a counter only tests read (the D127 pattern). Forced to fire
+/// with an orphan no producer records (an empty extent whose owner is marked `Reaped` outside the
+/// reaper), then held silent on a pass with nothing to find.
+#[test]
+fn d221_a_slice_find_is_printed_not_only_counted() {
+    let f = fixture();
+    let b = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+    let orphan = f.h.store.arena_for(b).unwrap();
+    f.h.catalog.set_state(b, BranchState::Live, BranchState::Reaped).unwrap();
+
+    let printed = Printed::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &Counters::default(), &|m| {
+        printed.push(m)
+    });
+    assert_eq!(f.h.store.arena_owner(orphan), None, "fixture: the slice did not collect it");
+    assert_eq!(f.reaper.slice_freed(), 1, "fixture: the slice's detector did not count it");
+    assert!(
+        printed.text().contains("slice freed 1 extent(s)"),
+        "the slice found an unrecorded orphan and no reader was told: {:?}",
+        printed.text()
+    );
+
+    // The control: a pass with nothing to find says nothing about the slice.
+    let g = fixture();
+    let quiet = Printed::default();
+    scan_once(&g.reaper, &g.runtime, &*TestGate::new(), &Counters::default(), &|m| quiet.push(m));
+    assert_eq!(g.reaper.slice_freed(), 0, "control: a clean store gave the slice something");
+    assert!(
+        !quiet.text().contains("slice freed"),
+        "control: a clean pass reported a slice find: {:?}",
+        quiet.text()
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// D232 — two more readings whose healthy value is zero, and which must reach a reader.
+// -------------------------------------------------------------------------------------------
+
+/// **D232.** An unreadable owner record makes the sweep leave an extent alone, and an arena a
+/// reaped branch's record lists but the store charges to another branch is skipped. Both are
+/// counted on the reaper and both must be printed, D127's rule: a counter only a test reads is a
+/// real event that reaches nobody. One pass forces both to fire; a second pass with nothing new
+/// prints neither.
+#[test]
+fn d232_unreadable_owners_and_foreign_arenas_are_printed_not_only_counted() {
+    use crate::branch::tests_faulty_catalog::FaultyCatalog;
+    let f = fixture();
+    let faulty = FaultyCatalog::new(Arc::clone(&f.h.catalog));
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&faulty) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+
+    // Y is live and owns a written extent; expired X's record also lists it (the alias).
+    let y = branch_with_pages(&f, FAR_FUTURE, 1);
+    let ya = f.h.catalog.get(y).unwrap().arenas[0];
+    let x = f.h.catalog.fork(BranchId::TRUNK, EXPIRED).unwrap().branch_id;
+    f.h.catalog.add_arena(x, ya).unwrap();
+    // Z is live with a fresh, empty extent, and its record cannot be read.
+    let z = f.h.catalog.fork(BranchId::TRUNK, FAR_FUTURE).unwrap().branch_id;
+    let za = f.h.store.arena_for(z).unwrap();
+    faulty.fail_get_raw_for(z.id);
+
+    let counters = Counters::default();
+    let printed = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| printed.push(m));
+    let text = printed.text();
+    assert_eq!(state_of(&f, x), BranchState::Reaped, "fixture: expired X was not reaped");
+    assert_eq!(reaper.foreign_arenas_skipped(), 1, "the foreign arena was not counted");
+    assert_eq!(f.h.store.arena_owner(ya), Some(y), "reaping X freed Y's extent");
+    assert_eq!(reaper.unreadable_owners(), 1, "the unreadable owner was not counted");
+    assert_eq!(f.h.store.arena_owner(za), Some(z), "the sweep freed Z's live extent");
+    assert!(
+        text.contains("1 arena(s) listed under a reaped branch were NOT freed"),
+        "the foreign-arena skip reached no reader: {text:?}"
+    );
+    assert!(
+        text.contains("could not read the owning branch's record"),
+        "the unreadable owner reached no reader: {text:?}"
+    );
+
+    let quiet = Printed::default();
+    scan_once(&reaper, &f.runtime, &*TestGate::new(), &counters, &|m| quiet.push(m));
+    let quiet = quiet.text();
+    assert!(!quiet.contains("NOT freed"), "a pass with nothing new reported: {quiet:?}");
+}

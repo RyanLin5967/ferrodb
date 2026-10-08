@@ -32,6 +32,8 @@ pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub mod tree_keys;
 mod group_commit;
 pub mod table_catalog;
+#[cfg(test)]
+pub(crate) mod tests_faulty_catalog;
 pub use table_catalog::TableBranchCatalog;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
 pub use reaper::{ReapOutcome, TwoTierReaper};

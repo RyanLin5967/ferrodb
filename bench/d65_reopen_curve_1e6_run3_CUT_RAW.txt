@@ -1,0 +1,16 @@
+CUT RUN — NOT A COUNT. Run pid 99994 (launched 01:32:42Z, curve start 01:33:11Z) was SIGTERMed at 2026-09-24T02:11:00Z by the LEAD on Ryan's "pause everything … no leftover processes"; it stopped the binary and released the lock (status file). Last complete row: 250000. Below: exactly the lines the run appended to bench/d65_reopen_curve_1e6_run2.txt (git diff), unedited.
+[HERE] 2026-09-24T01:33:10Z  binary built from 9e34cf6 (tree dirty=[])
+suite lock owner: 99994 d65-reopen 2026-09-24T01:32:42Z   measure lock: free 
+free before: 86Gi   load before: 18.94 16.86 16.14   other cargo pids: []
+
+free-space map persistence: OFF (historical default)
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   cat live@re   img B/branch   arena re ms   arena re pg    reload ctl
+  # reload-control negatives at N=1000: unloaded=Err("len")  kept-current=Err("len")  flipped-extent=Err("ext")
+      1000       180.8       4.1        4.2           4100             4248            336         1000       0.806          1001           48.0         0.381          1000            ok
+     10000       169.3      41.0       42.0           4096             4200            333        10000       0.973         10001           48.0         3.724         10000            ok
+    100000       162.6     409.6      419.5           4096             4195            334       100000       0.924        100001           48.0        36.600        100000            ok
+    250000       157.9    1024.0     1040.2           4096             4161            334       250000       1.124        250001           48.0       105.954        250000            ok

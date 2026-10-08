@@ -1,4 +1,5 @@
 use crate::error::FerroError;
+use crate::buffer::read_census::{self, Event};
 use crate::{buffer::buffer_pool::BufferPoolManager, storage::index_page::BPlusTreeLeafPage};
 use std::sync::Arc;
 use std::ops::Bound;
@@ -37,6 +38,8 @@ impl<K: Ord + Clone + BTreeSerialize, V: Clone + BTreeSerialize> RangeScanner<K,
     /// The latch is released when this returns, so a scan is not a repeatable read: entries
     /// inserted while it runs may or may not appear. Entries present when it started always do.
     pub fn load_leaf(&self, page_id: u32) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
+        // READ-VS-N: a leaf after the scan's first. Per-thread; see `read_census`.
+        read_census::bump(Event::ScanLeaf);
         let _latch = self.buffer_pool.page_latches.read(page_id);
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let node = {

@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::Path, sync::{Arc, atomic::Ordering}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::Path, sync::{Arc, atomic::Ordering}, time::{Duration, Instant}};
 
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
@@ -384,6 +384,25 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
 /// path. The CLI and three examples each used to declare their own.
 pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
+/// Wall time of each step of [`open_recovered`], in the order they run. **Observing only.**
+///
+/// READ-VS-N's restart arm (`bench/read_vs_n/PREREG.md`) times the whole production open, step by
+/// step, and D204 made this function the one place these steps run — so they are timed HERE, where
+/// every binary pays them, and handed back rather than re-measured around a copy. Nothing reads
+/// these to decide anything.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BootTimings {
+    /// The file, the buffer pool, the WAL and the transaction manager.
+    pub files: Duration,
+    /// [`recover`]: redo and undo of the heap records.
+    pub recover: Duration,
+    /// `Catalog::open`, or `Catalog::create` for a new file.
+    pub catalog: Duration,
+    /// [`rebuild_indexes`], the checkpoint after it and the stale-index marker's removal. Zero when
+    /// recovery replayed nothing and no marker was left, which is every open after a clean shutdown.
+    pub rebuild: Duration,
+}
+
 /// A database file, opened, recovered, and with every index rebuilt from the recovered heap.
 pub struct OpenedDatabase {
     pub bp: Arc<BufferPoolManager>,
@@ -392,6 +411,8 @@ pub struct OpenedDatabase {
     pub catalog: Catalog,
     /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
     pub recovered: bool,
+    /// How long each step took. See [`BootTimings`].
+    pub timings: BootTimings,
 }
 
 /// **D204 — THE way to open a database file.** Every binary calls this; none spells the sequence
@@ -433,6 +454,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             db_path.display()
         )));
     }
+    let mut timings = BootTimings::default();
+    let t = Instant::now();
     let existed = db_path.exists();
     let file = OpenOptions::new()
         .read(true)
@@ -447,18 +470,24 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let wal = Arc::new(WalManager::open_for_database(db_path, &bp.disk_manager)?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    timings.files = t.elapsed();
+    let t = Instant::now();
     let recovered = recover(&txn)?;
+    timings.recover = t.elapsed();
+    let t = Instant::now();
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
     } else {
         Catalog::create(bp.clone())?
     };
+    timings.catalog = t.elapsed();
     // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
     // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
     // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
     // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
     let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
     let stale = marker.exists();
+    let t = Instant::now();
     if recovered || stale {
         rebuild_indexes(&mut catalog, &bp)?;
         txn.checkpoint()?;
@@ -473,7 +502,8 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             }
         }
     }
-    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
+    timings.rebuild = t.elapsed();
+    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered, timings })
 }
 
 #[cfg(test)]
