@@ -1,0 +1,18 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-reads-limit-probe)
+    Finished `release` profile [optimized] target(s) in 0.50s
+     Running tests/probe_catalog_read_locality.rs (target/release/deps/probe_catalog_read_locality-7178b45ba748eb74)
+
+running 1 test
+test branch_root_resolution_loses_its_locality_when_the_catalog_outgrows_the_pool ... pool = 1024 frames x 4096 B = 4.19 MB (buffer_pool.rs:45, compile-time const)
+     N |  catalog MB | pool x |   SEQ us |  RAND us | RAND/SEQ
+ 10000 |         2.7 |    0.6 |   22.885 |   22.370 | x0.98
+100000 |        26.6 |    6.4 |   32.000 |   27.786 | x0.87
+
+control (resident) RAND/SEQ = x0.98
+test    (6x over)  RAND/SEQ = x0.87
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1088.25s
+
+
+[exited with code 0]

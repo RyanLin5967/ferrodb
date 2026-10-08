@@ -1,0 +1,27 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-reads-limit-probe)
+    Finished `release` profile [optimized] target(s) in 11.06s
+     Running tests/probe_read_concurrency.rs (target/release/deps/probe_read_concurrency-da8e21256a5eef97)
+
+running 1 test
+test concurrent_reads_on_distinct_branches_do_not_scale_with_threads ... tree: 20000 rows, 298 pages, height 3; 8 diverged branches
+buffer pool frames = 1024 (compile-time const, buffer_pool.rs:45)
+CONTROL cpu    : 1 thread    955091799 ops/s | 8 threads   8200519723 ops/s | x8.59
+READS          : 1 thread        41781 rd/s | 4 threads       153621 rd/s | 8 threads       232858 rd/s
+read scaling   : x3.68 at 4 threads, x5.57 at 8 threads
+cpu  scaling   : x8.59 at 8 threads
+
+thread 'concurrent_reads_on_distinct_branches_do_not_scale_with_threads' (345901500) panicked at tests/probe_read_concurrency.rs:157:5:
+reads scaled x5.57 with 8 threads -- the serialisation prediction is WRONG
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    concurrent_reads_on_distinct_branches_do_not_scale_with_threads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+
+error: test failed, to rerun pass `--test probe_read_concurrency`
+
+[exited with code 0]

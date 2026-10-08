@@ -1,0 +1,42 @@
+   Compiling cfg-if v1.0.4
+   Compiling getrandom v0.3.4
+   Compiling rustix v1.1.4
+   Compiling getrandom v0.4.2
+   Compiling zerocopy v0.8.56
+   Compiling bitflags v2.11.1
+   Compiling autocfg v1.5.1
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.4.1
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-reads-limit-probe)
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling bit-set v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling errno v0.3.14
+   Compiling wait-timeout v0.2.1
+   Compiling rand_core v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling tempfile v3.27.0
+   Compiling rand_chacha v0.9.0
+   Compiling rusty-fork v0.3.1
+   Compiling proptest v1.11.0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.25s
+     Running tests/probe_depth_wall.rs (target/debug/deps/probe_depth_wall-61ce2214703d4bdd)
+
+running 3 tests
+test collapse_fails_once_the_tree_outgrows_one_arena_extent ... BIG: reachable pages = 608, collapse = Err("branch error: arena error: arena a4 is exhausted (256 pages); ask arena_for for a fresh extent")
+ok
+test collapse_survives_a_tree_that_fits_in_one_extent ... SMALL: reachable pages = 21, collapse = Ok(1)
+ok
+test the_ninth_fork_is_refused_so_collapse_is_the_only_way_past_depth_eight ... NINTH FORK: branch error: branch b8@g0 is at ancestry depth 9, max is 8
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.94s
+
+
+[exited with code 0]
