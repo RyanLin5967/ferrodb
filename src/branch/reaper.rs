@@ -112,6 +112,10 @@ pub struct TwoTierReaper {
     sweep_descents: AtomicU64,
     /// Arenas the extent sweep has examined. See [`Self::sweep_visits`].
     sweep_visits: AtomicU64,
+    /// Fixed-point passes `drain_pending_seeded` has made. See [`Self::drain_passes`].
+    drain_passes: AtomicU64,
+    /// Pending-free entries those passes have walked. See [`Self::drain_entry_visits`].
+    drain_entry_visits: AtomicU64,
     /// **D83.** Arenas a drain touched but did not get to sweep, because it returned early.
     ///
     /// `collect_orphans_if_due` used to answer "which extents became collectable?" by scanning
@@ -146,6 +150,8 @@ impl TwoTierReaper {
             last_orphan_sweep_ms: AtomicU64::new(ORPHAN_SWEEP_NEVER),
             sweep_descents: AtomicU64::new(0),
             sweep_visits: AtomicU64::new(0),
+            drain_passes: AtomicU64::new(0),
+            drain_entry_visits: AtomicU64::new(0),
             deferred: Mutex::new(BTreeSet::new()),
             open_sweep_freed: AtomicU64::new(0),
             refused_reaps: AtomicU64::new(0),
@@ -304,6 +310,29 @@ impl TwoTierReaper {
     /// arenas a drain touched and descends only for those still live, so both must fall.
     pub fn sweep_visits(&self) -> u64 {
         self.sweep_visits.load(Ordering::Relaxed)
+    }
+
+    /// Fixed-point passes [`Self::drain_pending_seeded`] has made over the pending-free log.
+    ///
+    /// **D133.** One pass is one `take_pending` + one walk + one `put_pending`, and the reap that
+    /// contains it runs **inside the pgwire per-statement lock** (`lease_thread.rs:572`). Reported
+    /// beside [`Self::drain_entry_visits`] because neither number means anything alone: a length
+    /// alone cannot separate "short queue walked often" from "long queue walked once", and the
+    /// pass count alone cannot separate a cheap pass from an expensive one. The work is
+    /// `entry_visits`; `passes` is how it is distributed.
+    pub fn drain_passes(&self) -> u64 {
+        self.drain_passes.load(Ordering::Relaxed)
+    }
+
+    /// Pending-free entries the drain has walked, summed over every pass.
+    ///
+    /// **D133 — this is the integer the wall is made of.** `take_pending` is
+    /// `std::mem::take` of the WHOLE vec (`arena.rs:800`), so one pass visits every parked entry
+    /// in the store, not merely the ones belonging to the branch being reaped, and survivors are
+    /// put back to be re-walked by the next reap. Counted at the single site the walk begins so
+    /// it cannot drift from the loop it measures.
+    pub fn drain_entry_visits(&self) -> u64 {
+        self.drain_entry_visits.load(Ordering::Relaxed)
     }
 
     /// Is `arena` an extent whose owning branch no longer exists at that generation and which
@@ -492,6 +521,10 @@ impl TwoTierReaper {
             if entries.is_empty() {
                 break;
             }
+            // **D133.** Counted after the empty check, so a drain with nothing to do records a
+            // pass of zero rather than a pass at all — the two are different claims.
+            self.drain_passes.fetch_add(1, Ordering::Relaxed);
+            self.drain_entry_visits.fetch_add(entries.len() as u64, Ordering::Relaxed);
             let mut still_pinned = Vec::new();
             let mut moved = false;
             for (i, pf) in entries.iter().copied().enumerate() {

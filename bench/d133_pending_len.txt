@@ -1,0 +1,139 @@
+################################################################################################
+# ⛔⛔ DRAW 1 — **CONTAMINATED. DO NOT QUOTE ANY ms COLUMN FROM THIS FILE.**
+#
+# This run held /tmp/ferrodb-measure.lock and checked /tmp/ferrodb-suite.lock ONCE, at start,
+# where it was free. `tools/verify-suite.sh land21ae398` (pid 92075) then took the suite lock at
+# **11:57:51Z — 106 seconds into this 252-second run** (11:56:05Z -> 12:00:17Z). ARM 2, the
+# shipped-catalog arm, ran almost entirely underneath a full suite build.
+#
+# The measure lock could not have prevented it: `tools/verify-suite.sh` knows only
+# SUITE_LOCK=/tmp/ferrodb-suite.lock and never reads the measure lock, so the protection is
+# one-way — it deters measurers and no suite at all.
+#
+# ✅ **WHAT SURVIVES: every INTEGER column** — pend_end, pend_peak, passes, entry_visits. They are
+# counts, not durations, and a loaded box cannot change them. `bench/d133_check.py` verifies all
+# 30 rows against the closed form derived from the code. The ms and ms/reap columns are kept only
+# so this draw can be compared with the clean one; they are not evidence.
+#
+# ⇒ The quotable timings are in **DRAW 2**, `bench/d133_pending_len_draw2.txt`, produced by the
+#   hardened runner that samples the suite lock before and after every arm and exits 3 if it was
+#   ever taken.
+################################################################################################
+# D133 — pending-free queue length under a branching workload. RAW ARTIFACT.
+#
+# run at            2026-09-22T11:56:05Z UTC
+# worktree          /Users/idide/wt/ferrodb-d133-pending-len
+# branch            d133-pending-len
+# head              98a44efbc2963f4ac10ecc1836fbfdfa9462affa
+# tree state        4 modified/untracked path(s)
+#                    M src/branch/reaper.rs
+#                   ?? bench/d133_pending_len.txt
+#                   ?? bench/d133_run.sh
+#                   ?? examples/d133_pending_len.rs
+# binary mtime      2026-09-22T11:54:32Z
+# host              Darwin 25.6.0 arm64
+# measure lock      61248 d133-pending-len 2026-09-22T11:52:09Z
+# load before       6.82 9.42 6.44
+#
+# THE CONFIGURATION GATE, quoted from the code this harness invokes:
+#   arena.rs persist_if_configured —
+#         fn persist_if_configured(&self) -> Result<(), FerroError> {
+#             let path = self.checkpoint_path.lock().unwrap().clone();
+#             match path {
+#                 Some(p) => self.checkpoint(&p),
+#                 None => Ok(()),
+#             }
+#         }
+#   cli/cli.rs, the shipped server — this is why persist=on is the production row:
+#     120:    store.checkpoint_to(std::path::PathBuf::from(&arena_path));
+#   lease_thread.rs, the lock the reap loop runs inside:
+#     461:const REAP_CHUNK: usize = 1;
+#
+==============================================================================
+ARM 1 — the branch-count curve, in-memory catalog, both persist settings.
+==============================================================================
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=mem  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    off          100       400       400      100          20200        3.8      0.0380
+  fan    off          300      1200      1200      300         180600       19.6      0.0655
+  fan    off         1000      4000      4000     1000        2002000      102.7      0.1027
+  fan    off         3000     12000     12000     3000       18006000      676.2      0.2254
+  chain  off           99       396       396       99          19800        3.4      0.0344
+  chain  off          299      1196      1196      299         179400       15.2      0.0508
+  chain  off          999      3996      3996      999        1998000       94.5      0.0946
+  chain  off         2999     11996     11996     2999       17994000      679.1      0.2264
+  leaf   off          100         0         0        0              0        0.4      0.0041
+  leaf   off          300         0         0        0              0        1.0      0.0034
+  leaf   off         1000         0         0        0              0        1.8      0.0018
+  leaf   off         3000         0         0        0              0        4.4      0.0015
+
+  12 rows, every fan/chain row parked pages and every leaf row parked none.
+(arm 1 persist=off rc=0)
+
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=mem  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    on           100       400       400      100          20200     1634.9     16.3494
+  fan    on           300      1200      1200      300         180600     4715.1     15.7171
+  fan    on          1000      4000      4000     1000        2002000    17057.6     17.0576
+  chain  on            99       396       396       99          19800     1575.4     15.9135
+  chain  on           299      1196      1196      299         179400     4691.8     15.6918
+  chain  on           999      3996      3996      999        1998000    16739.5     16.7562
+  leaf   on           100         0         0        0              0     2303.3     23.0327
+  leaf   on           300         0         0        0              0     7008.0     23.3598
+  leaf   on          1000         0         0        0              0    24091.8     24.0918
+
+  9 rows, every fan/chain row parked pages and every leaf row parked none.
+(arm 1 persist=on rc=0 — N capped at 1000: every pass fsyncs the whole map)
+
+==============================================================================
+ARM 2 — the SHIPPED catalog, at counts it can reach. D99's rule: two catalogs
+must agree on the integers at a count both can reach, or one of them is the
+thing being measured.
+==============================================================================
+D133 — pending-free queue length and how often it is walked.
+
+  catalog=table  pages written per branch before its child forks=4
+  reap loop = `Reaper::reap` once per branch, which is what `lease_thread.rs:572`
+  calls inside the per-statement lock at REAP_CHUNK=1 (via `reap_if_still_expired`).
+  `checkpoint_to` is called AFTER padding, so setup does not pay for persistence.
+  pending_len is sampled inside the timed loop (one O(1) mutex read per reap).
+
+  shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  fan    off          100       400       400      100          20200     1039.1     10.3915
+  fan    off          300      1200      1200      300         180600     5462.0     18.2068
+  chain  off           99       396       396       99          19800     4933.1     49.8289
+  chain  off          299      1196      1196      299         179400   119277.4    398.9210
+  leaf   off          100         0         0        0              0     2787.9     27.8792
+  leaf   off          300         0         0        0              0     8342.6     27.8085
+
+  6 rows, every fan/chain row parked pages and every leaf row parked none.
+(arm 2 rc=0)
+
+==============================================================================
+ARM 3 — the PAGES axis, held against ARM 1's N=300 row. pending is pages
+parked, not branches reaped, so P must scale it linearly or the model is wrong.
+==============================================================================
+  P=1   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=1   fan    off          300       300       300      300          45150        7.8      0.0261
+  P=4   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=4   fan    off          300      1200      1200      300         180600       20.2      0.0674
+  P=16   shape  persist        N  pend_end pend_peak   passes   entry_visits   total_ms     ms/reap
+  P=16   fan    off          300      4800      4800      300         722400       67.9      0.2265
+
+# load after        5.73 7.16 6.13
+# arm rcs           0 0 0
+# every arm returned 0, i.e. every fan/chain row parked pages and every leaf row did not.
