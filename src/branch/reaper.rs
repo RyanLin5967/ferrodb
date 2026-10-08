@@ -465,11 +465,37 @@ impl TwoTierReaper {
         // So the residue drain is ADDITIVE, not a replacement: it returns work an early return had
         // dropped on the floor, promptly and at O(residue). The full scan keeps its own job.
         //
-        // ⚠ AND THE WALL D83 SET OUT TO REMOVE IS STILL THERE. The O(live arenas) scan still runs
-        // inside the per-statement lock. That is NOT this function's defect to fix — it is W4's
-        // open half, the outer `RuntimeLock` held across the whole of `scan_once`
-        // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
-        // lock, and no landed change touches it.
+        // ⛔ **THIS PARAGRAPH WAS WITHDRAWN BY D158 (2026-09-22). BOTH OF ITS CLAIMS ARE FALSE AT
+        // HEAD, AND THE SECOND ONE IS REFUTED 320 LINES BELOW, IN THIS FILE.** It read:
+        //
+        //   > ⚠ AND THE WALL D83 SET OUT TO REMOVE IS STILL THERE. The O(live arenas) scan still
+        //   > runs inside the per-statement lock. That is NOT this function's defect to fix — it
+        //   > is W4's open half, the outer `RuntimeLock` held across the whole of `scan_once`
+        //   > (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is
+        //   > the lock, and no landed change touches it.
+        //
+        // 1. **The O(live arenas) scan does NOT run inside that lock.** D88 moved it out, and this
+        //    file says so at the `drain_pending` boundary below: *"the orphan sweep is NOT run
+        //    here any more … It is now driven from `scan_once` AFTER the lock is released."*
+        // 2. **The outer lock is NOT held across the whole of `scan_once`.** D98 chunked it:
+        //    `scan_once` contains exactly ONE `with_lock`, inside `candidates.chunks(REAP_CHUNK)`
+        //    with `REAP_CHUNK == 1`, plus a `REAP_YIELD` stand-off between chunks so an unfair
+        //    mutex cannot let the sweep jump waiters. 51.6 s whole-sweep wait → 161.8 ms p99,
+        //    with a control arm (`bench/d98_outer_runtime_lock.txt`).
+        // 3. **The citation never resolved.** `lease_thread.rs:399-407` is `LeaseThread::start`'s
+        //    startup resume. `scan_once` begins at `:574`.
+        //
+        // ⚠ **Kept, struck through, rather than deleted — because the withdrawal is the finding.**
+        // This comment was copied out of `bench/w4/DECISION.md` addendum 1, a section whose own
+        // file head says *"do not quote a 'still open' list from addendum 1 or 3 without reading
+        // addendum 5 first"*, and the leading ⚠ made it read as MORE current than the refutation
+        // below it rather than less. A reader who deletes this block loses the only in-tree record
+        // of how a withdrawn claim reached the source and survived there.
+        //
+        // ⇒ **The live work is `W4-statement`, and it is not in this file**: every CONNECTION's
+        // hold of `ServerContext::catalog()`, taken outermost for one statement
+        // (`pgwire/extended.rs:283`, `:357`). `W4-sweep` — the lease thread's hold, which is what
+        // this paragraph was about — is closed. See `SCALE-DESIGN.md` D158 and amendment 1.
         // ⛔ **D128 SITE 3 — AND ITS FIX ALREADY EXISTED TWENTY LINES AWAY, UNUSED HERE.** This
         // was a bare `mem::take` followed by TWO `?`. Either one returning dropped the whole
         // deferred set on the floor: those arenas are then never swept by the cheap residue path,
