@@ -1,0 +1,15 @@
+2026-09-24T23:04:04Z d216-e_green252-d247 acquiring (5s poll), pid 60192
+2026-09-24T23:04:04Z d216-e_green252-d247 ACQUIRED: 60192 d216-e_green252-d247 2026-09-24T23:04:04Z
+2026-09-24T23:04:04Z d216-e_green252-d247 pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 576 files, 470.1MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.34s
+     Running tests/d247_arena_page_write_back_flushes_no_log.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d247_arena_page_write_back_flushes_no_log-7a34255449999040)
+
+running 1 test
+test writing_back_a_dirty_arena_page_does_not_flush_the_log ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+2026-09-24T23:04:14Z d216-e_green252-d247 rc=0
+2026-09-24T23:04:14Z d216-e_green252-d247 released (owner matched)
+rc=0

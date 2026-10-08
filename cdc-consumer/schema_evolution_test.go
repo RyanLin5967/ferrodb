@@ -116,7 +116,7 @@ func TestColumnLevelEventsAreCrossCheckedAgainstTheirOwnShape(t *testing.T) {
 }
 
 // **A declaration is re-emitted; news is not.** `bypassesCursor` exempts the ops whose idempotence
-// cannot come from the resume cursor because the source re-sends them at every checkpoint. The
+// cannot come from the resume cursor because the source re-sends them at every truncating checkpoint. The
 // column-level three are delivered exactly once, at the position the DDL occupied, so the cursor is
 // the right mechanism for them — and exempting them would be worse than useless: replaying a feed
 // would re-apply the rename.

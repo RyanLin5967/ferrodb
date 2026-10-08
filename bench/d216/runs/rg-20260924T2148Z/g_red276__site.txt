@@ -1,0 +1,10 @@
+2026-09-24T23:08:38Z d216-g_red276-site acquiring (5s poll), pid 5115
+2026-09-24T23:08:38Z d216-g_red276-site ACQUIRED: 5115 d216-g_red276-site 2026-09-24T23:08:38Z
+2026-09-24T23:08:38Z d216-g_red276-site pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 576 files, 467.5MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+error: could not parse/generate dep info at: /Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-47771b9bdb1087f3.d
+
+Caused by:
+  No such file or directory (os error 2)
+2026-09-24T23:08:45Z d216-g_red276-site rc=101
+2026-09-24T23:08:45Z d216-g_red276-site released (owner matched)

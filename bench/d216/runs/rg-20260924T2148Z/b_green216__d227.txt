@@ -1,0 +1,14 @@
+2026-09-24T22:03:13Z d216-b_green216-d227 acquiring (5s poll), pid 80294
+2026-09-24T22:03:13Z d216-b_green216-d227 ACQUIRED: 80294 d216-b_green216-d227 2026-09-24T22:03:13Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.91s
+     Running tests/d227_restart_keeps_declarations.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d227_restart_keeps_declarations-ea80bb72efbe4570)
+
+running 1 test
+test a_restarted_process_redeclares_every_table_and_no_run_it_did_not_bind ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+2026-09-24T22:03:27Z d216-b_green216-d227 rc=0
+2026-09-24T22:03:27Z d216-b_green216-d227 released (owner matched)
+rc=0

@@ -5,7 +5,7 @@
 //! off after a restart. That is a loop around those two pieces plus **one cursor rule**, and the
 //! cursor rule is the whole of the difficulty.
 //!
-//! # The cursor may only advance past a commit
+//! # The cursor may only advance past what has been decided
 //!
 //! After emitting a batch, the obvious move is to set the cursor to the durable frontier — the
 //! decode covered everything up to there, so everything up to there is done. **That is wrong, and
@@ -18,10 +18,18 @@
 //! never read. The rows are gone from the feed permanently, and nothing downstream can tell,
 //! because a feed that is missing records looks exactly like a feed that had none.
 //!
-//! So the cursor advances **only to the highest `commit_end_lsn` actually emitted**. If a pump
-//! emits nothing, the cursor does not move at all, however much log it just read. Re-reading the
-//! records of an in-flight transaction on the next pump is pure waste and is the correct waste:
-//! the alternative is losing them.
+//! So while a transaction is in flight the cursor advances **only to the highest `commit_end_lsn`
+//! the batch decided about** (emitted, or dropped by the publication or the snapshot boundary), and
+//! never past that transaction's first record. If such a batch decided about nothing, the cursor does
+//! not move at all, however much log it just read. Re-reading the records of an in-flight
+//! transaction on the next pump is pure waste and is the correct waste: the alternative is losing
+//! them.
+//!
+//! **With nothing in flight and nothing refused, the cursor moves to where the read stopped (D252).**
+//! Every record below there has been decided about, including those that yield no event: the
+//! `TxnEnd` after every commit, a rollback, a run declaration. A cursor that stopped at the last
+//! commit left every subscription, however caught up, pinning the log below its end, so no
+//! checkpoint truncated while any subscription lived.
 //!
 //! # The other rule, inherited
 //!
@@ -138,7 +146,8 @@ pub struct Pumped {
     ///
     /// Counts the offending event, every sibling of it in the same commit, and everything the batch
     /// held after it. All of them are replayed by the next pump — the cursor is deliberately left
-    /// behind the refused commit — so this is a *stall*, not a loss, and the two must not be
+    /// below the first row of every commit held back, the refused one included — so this is a
+    /// *stall*, not a loss, and the two must not be
     /// confused: a stalled feed is fixed by amending the publication, a lost row is not fixed by
     /// anything.
     pub refused: usize,
@@ -181,14 +190,38 @@ impl Pumped {
     ///
     /// **An upper bound, not an exact distance, and the difference is not pedantry.** The cursor
     /// tracks *commits* while the frontier is a byte position that includes records producing no
-    /// events at all — a `TxnEnd` sits above the final commit permanently. So a fully caught-up
-    /// consumer reports a small non-zero lag rather than zero, and code that waits for `lag == 0`
-    /// waits for ever. That mistake hung the CDC server until a Go consumer reading to EOF found
-    /// it; "nothing left to emit" is the caught-up test, not "lag is zero".
+    /// events at all. Until D252 a `TxnEnd` sat above the final commit permanently, so a fully
+    /// caught-up consumer reported a small non-zero lag, and code that waited for `lag == 0` waited
+    /// for ever. That mistake hung the CDC server until a Go consumer reading to EOF found it. A
+    /// caught-up cursor now passes that tail, but a transaction in flight still holds it at the
+    /// transaction's first record while the frontier moves on, so "nothing left to emit" is still
+    /// the caught-up test, not "lag is zero".
     pub fn lag_bytes(&self) -> u64 {
         self.frontier.saturating_sub(self.cursor)
     }
 }
+
+/// **D276: how far one pump may grow its window, in multiples of `max_bytes`.**
+///
+/// A pump reads at most `max_bytes` past its cursor, and the cursor never passes an open
+/// transaction's first row. So a transaction whose rows span more than one window never had its
+/// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
+/// rule took for the end of the feed. Now a pump that would neither write anything nor advance,
+/// because an open transaction holds the cursor, re-reads with its window doubled, up to this many
+/// batches (64 MiB at the default `max_bytes`), and past that refuses by name. Bound to
+/// `max_bytes` so that raising one raises the other.
+///
+/// **What the cap measures, exactly:** how far past its cursor one pump reads, other transactions'
+/// traffic included, not the open transaction's own size. The cursor sits at or below the oldest
+/// open transaction's first row (a `TxnEnd`, a `Begin` or a rolled-back transaction can lie
+/// between them and still count). So an idle
+/// open session holding one staged row stops the feed with an `Err` once this much log follows it
+/// (at `00f4c39` it wedged the feed silently after one window). A crashed transaction resolves at
+/// the next open, because recovery aborts every loser. Removing the bound on span needs a decoder
+/// that keeps open transactions' staged rows across pumps, so its read position can run ahead of
+/// its restart cursor (PostgreSQL's `restart_lsn` and `confirmed_flush`): a design change, not
+/// made here.
+const MAX_WINDOW_BATCHES: u64 = 64;
 
 /// Follows a WAL, emitting committed changes as JSON Lines.
 ///
@@ -199,7 +232,8 @@ impl Pumped {
 /// boundary with a cursor of one's own choosing loses data silently.
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
-    /// Largest batch of log to decode in one pump, in bytes.
+    /// A pump's first window of log, in bytes. It grows, up to `MAX_WINDOW_BATCHES` times this, only
+    /// when an open transaction would otherwise wedge the feed (D276).
     max_bytes: u64,
     /// The snapshot an initial read already delivered, when this streamer is following one.
     /// See [`FeedStreamer::resuming_after_snapshot`].
@@ -226,8 +260,12 @@ impl FeedStreamer {
         &self.publication
     }
 
-    /// Bound how much log one pump will decode. A consumer that has been away for a long time
-    /// should not cause one unbounded allocation.
+    /// Bound how much log one pump decodes in its first window. A consumer that has been away for
+    /// a long time should not cause one unbounded allocation.
+    ///
+    /// A single transaction larger than this is still read whole: the window grows until its
+    /// `Commit` or `Abort` is in reach, up to `MAX_WINDOW_BATCHES` times this bound, and a pump that
+    /// would need more refuses with an error naming it (D276).
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes.max(1);
         self
@@ -270,14 +308,32 @@ impl FeedStreamer {
     /// Decode everything committed between `cursor` and the durable frontier, write it, and return
     /// the new cursor.
     ///
-    /// See the module docs: the returned cursor is the highest `commit_end_lsn` emitted, **not**
-    /// the frontier, and it is unchanged when nothing was emitted.
+    /// See the module docs: the returned cursor is **not** the frontier. It never passes the first
+    /// record of a transaction still open, nor the first row of any commit a refusal holds back, and
+    /// while either holds it passes only the commits the batch decided about. With neither, it is
+    /// where the read stopped (D252).
     pub fn pump<W: Write>(
         &self,
         wal: &WalManager,
         cursor: u64,
         emitted_through: u64,
         w: &mut W,
+    ) -> Result<Pumped, FerroError> {
+        self.pump_window(wal, cursor, emitted_through, w, self.max_bytes)
+    }
+
+    /// The pump, reading at most `window` bytes past `cursor`. It recurses with the window doubled
+    /// while an open transaction holds the cursor where it started and there is nothing new to
+    /// write (D276, `MAX_WINDOW_BATCHES`),
+    /// and it writes nothing before the read it keeps: the decoder's history merges a re-read of
+    /// a superset range idempotently, and nothing else is changed before the write.
+    fn pump_window<W: Write>(
+        &self,
+        wal: &WalManager,
+        cursor: u64,
+        emitted_through: u64,
+        w: &mut W,
+        window: u64,
     ) -> Result<Pumped, FerroError> {
         use std::sync::atomic::Ordering;
 
@@ -308,12 +364,14 @@ impl FeedStreamer {
             });
         }
 
-        let to = frontier.min(cursor.saturating_add(self.max_bytes));
+        let to = frontier.min(cursor.saturating_add(window));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
-        // **The cursor rule**, and it has FOUR parts now. Three of the four have cost real data.
+        // **The cursor rule**, and it has FIVE parts now. Three of them have cost real data, and the
+        // fifth (D252, below) cost the log its truncation.
         //
-        // First: only past a commit that was actually decoded. An empty pump does not move.
+        // First: only past a commit that was actually decoded, or, by the fifth, past a tail that
+        // yields no event when nothing is open or refused. A pump that reads nothing does not move.
         //
         // Second: computed over every event the batch DECIDED about, before the delivery filters
         // below narrow it. A commit whose events were suppressed by the snapshot boundary, or
@@ -413,10 +471,80 @@ impl FeedStreamer {
             .max()
             .unwrap_or(cursor)
             .max(cursor);
-        let next = match decoded.open_from {
-            Some(open_from) => emitted_max.min(open_from),
-            None => emitted_max,
+        // Fifth, D252: with nothing open and nothing refused, everything the walk read has been
+        // decided about, including the records after the last commit that yield no event (its
+        // `TxnEnd`, a rollback, a run declaration), so the cursor passes them. Stopping at the last
+        // `commit_end_lsn` left every subscription, however caught up, pinning the log below its
+        // end, and no checkpoint truncated while one lived.
+        let next = match (decoded.open_from, refused_commit) {
+            (Some(open_from), _) => emitted_max.min(open_from),
+            (None, Some(_)) => emitted_max,
+            (None, None) => decoded.walked_to.max(emitted_max),
         };
+        // The fourth part's other half (found under D252): never past the first row of ANY commit the
+        // refusal holds back, which is the refused one and every one after it, exactly as never past
+        // an open transaction's. With transactions interleaved, a commit below the refused one can END
+        // above those rows; a cursor there replays their `Commit`s with nothing staged, and the rows
+        // are lost under a clean report
+        // (`a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it`,
+        // `every_commit_a_refusal_holds_back_keeps_its_rows`).
+        //
+        // Over EVERY decoded event, excluded and snapshot-suppressed ones included (review 4's
+        // second finding, kept on the lead's option): clamping over deliverable events only would let
+        // the cursor pass the excluded rows of a held-back commit, and an amendment publishing that
+        // table would then replay it torn. The edge that remains, stated: an excluded commit BELOW
+        // the refused one whose rows straddle this cursor is re-read in part, and if an amendment has
+        // published its table and no later delivered commit moved `emitted_through` past it, it is
+        // delivered with only its later rows. The `open_from` clamp had the same exposure. A
+        // watermark of everything decided about, filtering replays in place of `emitted_through`,
+        // would close it (lane report §9 (E)(2)).
+        let refused_from = refused_commit
+            .and_then(|c| decoded_events.iter().filter(|e| e.commit_lsn >= c).map(|e| e.lsn).min());
+        let next = refused_from.map_or(next, |first| next.min(first));
+
+        // **D276: a transaction larger than the window.** The cursor cannot pass an open
+        // transaction's first row, so if one holds it where it started and its `Commit` or `Abort`
+        // lies past this window, every later pump would read the same window and return the same
+        // nothing: a wedge a caught-up consumer cannot tell from the end of the feed. So read again
+        // with the window doubled, until that transaction resolves inside it (the cursor then
+        // moves), the window reaches the durable frontier (the transaction is really still in
+        // flight, which is caught up, not wedged), or the window reaches its cap, where the pump
+        // refuses by name rather than answer a quiet `Ok`. Never over a refusal: a refused commit
+        // stalls the feed on purpose and says so, and growing past it would report the wrong reason.
+        // The bytes held for one pump are bounded by the cap, measured from the cursor, which sits
+        // at or below the oldest open transaction's first row; an in-flight transaction already
+        // reaching past it is refused too, since delivering it whole would need more.
+        //
+        // Only when this pump would also write NOTHING (review 5): commits this window already
+        // holds are delivered first, and the next pump, where `emitted_through` filters them, grows.
+        // So each pump either delivers something new or grows, and a wedged one decodes the windows
+        // 1, 2, 4, …, at most twice its final one.
+        if next == cursor
+            && candidates.is_empty()
+            && decoded.open_from.is_some()
+            && refused_commit.is_none()
+            && to < frontier
+        {
+            let cap = self.max_bytes.saturating_mul(MAX_WINDOW_BATCHES);
+            if window >= cap {
+                return Err(FerroError::Wal(format!(
+                    "the change feed cannot advance past lsn {cursor}: the oldest open transaction's \
+                     first row is at lsn {}, and no Commit or Abort of it lies within {cap} bytes of \
+                     log from lsn {cursor} ({MAX_WINDOW_BATCHES} times max_bytes {}; other \
+                     transactions' records count toward it). Transactions open at the end of that \
+                     read: {:?}. The feed delivers a transaction only whole and skips nothing: end or \
+                     roll back that transaction, or raise max_bytes (FeedStreamer::with_max_bytes).",
+                    decoded.open_from.unwrap_or(cursor),
+                    self.max_bytes,
+                    decoded.open
+                )));
+            }
+            // This frame's decode is dropped before the larger one is made, so one pump holds one
+            // window's decode at a time, not the sum of them (review 6).
+            drop(candidates);
+            drop(decoded_events);
+            return self.pump_window(wal, cursor, emitted_through, w, window.saturating_mul(2).min(cap));
+        }
 
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
         // does, it errors rather than writing a denied column, which is the right way round.
@@ -469,6 +597,13 @@ impl FeedStreamer {
 /// its subscription is a log that never shrinks. That is the trade every replication slot makes,
 /// and it is the right one here — the alternative was measured too, and it is a feed that breaks
 /// every 256 commits.
+///
+/// **And because `truncate` discards the whole log or none of it, a checkpoint reclaims it only
+/// when every live subscription has read to its end.** A caught-up cursor does reach the end
+/// (D252). The automatic checkpoint, though, runs inside the commit that triggers it, before any
+/// subscriber can have read that commit, unless it wins the race to read it, so under a steady
+/// write load a subscription keeps the log until a checkpoint lands while every subscriber is
+/// caught up. Discarding the prefix below the oldest pin is what would remove that.
 pub struct Subscription {
     wal: std::sync::Arc<WalManager>,
     cursor: u64,
@@ -566,14 +701,13 @@ impl Subscription {
     /// discards precisely the records it is about to ask for — the same check-then-act shape that
     /// has produced most of the defects in this codebase.
     ///
-    /// **Moving the pin forward is not load-bearing today, and that is worth stating rather than
-    /// implying otherwise.** `truncate` discards the whole log rather than a prefix, so a pin held
-    /// at the subscription's *start* blocks reclamation exactly as effectively as one held at its
-    /// cursor — measured, by removing the forward move and watching every test still pass. What it
-    /// does change is `min_pinned_lsn`, which is the signal a prefix-truncating checkpoint would
-    /// consult, and which is asserted below. So this is the same kind of thing as the base
-    /// comparison in `read_from`: correct, cheap, and the piece that starts mattering the day
-    /// truncation learns to discard a prefix.
+    /// **Moving the pin forward is load-bearing since D252.** `truncate` discards the whole log or
+    /// none of it, so the log is reclaimed only once every pin has reached its end, and only a pin
+    /// that follows a caught-up cursor gets there (`tests/d252_caught_up_subscription_lets_the_log_truncate.rs`).
+    /// Before D252 the cursor stopped below every commit's `TxnEnd`, a pin at the subscription's
+    /// start blocked reclamation exactly as well as one at its cursor, and removing the forward
+    /// move passed every test. It also moves `min_pinned_lsn`, asserted below, and the newest pin,
+    /// which decides whether a checkpoint the pins keep re-declares the schema (D234).
     pub fn pump<W: Write>(
         &mut self,
         streamer: &FeedStreamer,
@@ -849,7 +983,7 @@ mod tests {
             w.append(i, 0, &RecKind::Commit).unwrap();
         }
         w.flush().unwrap();
-        w.truncate(99).unwrap();
+        let _ = w.truncate(99).unwrap();
 
         assert_eq!(
             w.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
@@ -877,7 +1011,7 @@ mod tests {
 
         // Dropping it releases the claim, so the log can be reclaimed again.
         drop(sub);
-        w.truncate(100).unwrap();
+        let _ = w.truncate(100).unwrap();
         assert!(
             w.base_lsn.load(std::sync::atomic::Ordering::SeqCst) > base_before,
             "the log was never reclaimed even after the subscription was dropped"
@@ -893,7 +1027,7 @@ mod tests {
         insert(&w, 1, 1, 1);
         w.append(1, 0, &RecKind::Commit).unwrap();
         w.flush().unwrap();
-        w.truncate(7).unwrap();
+        let _ = w.truncate(7).unwrap();
         let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         assert!(base > 1);
 
@@ -1088,7 +1222,7 @@ mod tests {
         insert(&w, 1, 1, 1);
         w.append(1, 0, &RecKind::Commit).unwrap();
         w.flush().unwrap();
-        w.truncate(9).unwrap();
+        let _ = w.truncate(9).unwrap();
         let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         assert!(base > 1, "the log did not truncate, so there is nothing to have lost");
 
@@ -1600,5 +1734,409 @@ mod tests {
         }
         assert_eq!(total, 20, "not every change was delivered across batches");
         assert!(rounds > 1, "the backlog came out in one batch, so bounding was never exercised");
+    }
+
+    /// **A pump's bound inside a record must not break the next pump (the D252 review's B1).**
+    ///
+    /// A bounded pump reads the record that straddles its bound whole, and the decoder's history
+    /// recorded the bound itself as covered: a position inside that record. When the next pump
+    /// started past the bound, its gap fill read from the middle of a record, failed, and failed on
+    /// every later pump of that decoder. At `00f4c39` a `Commit` straddling the bound did it, as here:
+    /// its event's `commit_end_lsn` carried the cursor past the bound. D252's cursor passes any
+    /// straddling record with nothing open, which made it routine
+    /// (`a_large_backlog_is_delivered_in_bounded_batches` fails that way without the fix).
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the second pump's `expect`.
+    #[test]
+    fn a_bound_inside_a_commit_does_not_break_the_next_pump() {
+        let (_d, w) = wal("straddle");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        let commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // The bound falls one byte into transaction 1's `Commit`.
+        let bound = commit + 1;
+        let s = streamer().with_max_bytes(bound - start);
+        let p1 = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: the first pump did not deliver the commit its bound cuts: {p1:?}");
+        assert!(
+            p1.cursor > bound,
+            "premise failed: the cursor {} did not pass the bound {bound}, so the next pump never starts inside the gap",
+            p1.cursor
+        );
+        let p2 = s
+            .pump(&w, p1.cursor, p1.emitted_through, &mut Vec::new())
+            .expect("the pump after a bound inside a record failed");
+        assert_eq!(p2.emitted, 1, "the second transaction did not arrive: {p2:?}");
+    }
+
+    /// **A refused transaction keeps its rows when another commits inside it (B7; found under D252).**
+    ///
+    /// A refusal is a stall, not a loss: the cursor stops behind the refused commit so the next
+    /// pump replays it. But it stopped at the last `commit_end_lsn` below that commit, and with
+    /// transactions interleaved that end can lie ABOVE the refused transaction's own rows: R writes,
+    /// A writes and commits, R commits and is refused. The cursor went to A's end, past R's row, and
+    /// when the publication was amended R's `Commit` arrived with nothing staged. The row was lost,
+    /// with a clean report. The cursor must not pass the refused transaction's first row, exactly as
+    /// it must not pass an open one's.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the last assertion (0 against 1).
+    #[test]
+    fn a_refused_transaction_is_not_stepped_over_by_one_that_committed_inside_it() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+
+        let (_d, w) = wal("interleaved_refusal");
+        // A second table, declared below the stream's start, so the decoder learns it from the log
+        // and no schema event of it is ever in a batch to be refused first.
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        let start = w.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+
+        // R writes the table no publication has decided about ...
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(1, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(5, 50) })
+            .unwrap();
+        // ... A writes a published one and commits inside R ...
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 1, 10);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        // ... and R commits.
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]);
+        let mut buf = Vec::new();
+        let p1 = narrow.pump(&w, start, 0, &mut buf).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: A's row was not delivered ahead of the refusal: {p1:?}");
+        assert!(p1.refused >= 1, "premise failed: R was not refused, so nothing needed replaying: {p1:?}");
+
+        // The operator decides about the table, and the stream resumes where the first pump said.
+        let amended = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics")
+                .publishing("inventory", ["id", "qty"])
+                .publishing("secret", ["id", "qty"]),
+        );
+        let mut buf2 = Vec::new();
+        let p2 = amended.pump(&w, p1.cursor, p1.emitted_through, &mut buf2).unwrap();
+        assert!(p2.is_clean(), "{p2:?}");
+        assert_eq!(
+            p2.emitted, 1,
+            "the refused transaction's row never arrived once the publication allowed it: the cursor {} \
+             stepped over it: {p2:?}",
+            p1.cursor
+        );
+    }
+
+    /// **Every commit a refusal holds back keeps its rows, not only the refused one (the third D252
+    /// review's BLOCKER).**
+    ///
+    /// A refusal holds back its own commit and every commit after it in the batch, and
+    /// `Pumped::refused` says all of them are replayed. Clamping the cursor to the refused
+    /// transaction's first row alone still stepped over a LATER-committing transaction whose rows
+    /// began earlier: B writes, R writes, A writes and commits, R writes again and commits
+    /// (refused), B commits. The cursor went to R's first row, above B's, and B's published row was
+    /// lost under a clean report. R writes on both sides of A's commit, so a clamp to R's LAST row
+    /// loses R's first. The replay is checked by content as well as by count.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the count assertion (1 against 3:
+    /// only R's second row), and at `809fbcb` (2 against 3: B's row is lost).
+    #[test]
+    fn every_commit_a_refusal_holds_back_keeps_its_rows() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+
+        let (_d, w) = wal("held_back");
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        let start = w.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let secret = |txn: u64, id: i32, qty: i32| {
+            w.append(txn, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(id, qty) })
+                .unwrap();
+        };
+
+        // B opens on the published table and commits LAST.
+        w.append(3, 0, &RecKind::Begin).unwrap();
+        insert(&w, 3, 2, 20);
+        // R writes the undecided table on both sides of A's commit.
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        secret(1, 5, 50);
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 1, 10);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        secret(1, 6, 60);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(3, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]);
+        let p1 = narrow.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        assert_eq!(p1.emitted, 1, "premise failed: A was not delivered ahead of the refusal: {p1:?}");
+        assert_eq!(p1.refused, 3, "premise failed: R's two rows and B's were not all held back: {p1:?}");
+
+        let amended = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics")
+                .publishing("inventory", ["id", "qty"])
+                .publishing("secret", ["id", "qty"]),
+        );
+        let mut buf = Vec::new();
+        let p2 = amended.pump(&w, p1.cursor, p1.emitted_through, &mut buf).unwrap();
+        let feed = String::from_utf8(buf).unwrap();
+        assert!(p2.is_clean(), "{p2:?}");
+        assert_eq!(p2.emitted, 3, "the held-back commits did not all arrive from cursor {}: {feed}", p1.cursor);
+        for (qty, what) in [("50", "R's first row"), ("60", "R's second row"), ("20", "B's row")] {
+            assert!(feed.contains(&format!("\"qty\":{qty}")), "{what} was lost: {feed}");
+        }
+        assert!(!feed.contains("\"qty\":10"), "A was delivered twice: {feed}");
+    }
+
+    /// **A resume cursor inside a record must not break the decoder for the cursors after it (the
+    /// second D252 review's finding 1).**
+    ///
+    /// A cursor handed in from outside (a client's resume position, `Subscription::new`) can lie
+    /// inside a record. The pump on it fails, as it should. But the gap fill before it recorded that
+    /// cursor itself as covered, so every later pump of the same decoder from a sound cursor above it
+    /// gap-filled from the middle of a record and failed too.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the second pump's `expect`.
+    #[test]
+    fn a_resume_cursor_inside_a_record_does_not_break_later_pumps() {
+        let (_d, w) = wal("bad_cursor");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let row = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 10) })
+            .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        let second = w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // One streamer, so one decoder and one history, as a server shares across its clients.
+        let s = streamer();
+        assert!(
+            s.pump(&w, row + 1, 0, &mut Vec::new()).is_err(),
+            "premise failed: a cursor inside a record was accepted, so nothing here is at stake"
+        );
+        let p = s
+            .pump(&w, second, 0, &mut Vec::new())
+            .expect("a sound cursor failed after an unsound one had been tried on the same decoder");
+        assert_eq!(p.emitted, 1, "{p:?}");
+    }
+
+    /// **D276: a transaction larger than `max_bytes` is delivered whole, and the drain does not read
+    /// the wedge as caught up.**
+    ///
+    /// The read window was fixed at `cursor + max_bytes`, and the cursor never passes an open
+    /// transaction's first row. So a transaction whose rows span more than one window never had its
+    /// `Commit` read: every pump returned nothing and the same cursor, which a consumer's caught-up
+    /// rule (`examples/cdc_server.rs`: nothing emitted AND the cursor did not move) took for the end
+    /// of the feed. The drain below is that rule.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the first assertion after the drain
+    /// (it stops below the frontier).
+    #[test]
+    fn a_transaction_larger_than_max_bytes_is_delivered_whole() {
+        const MAX: u64 = 200;
+        let (_d, w) = wal("oversized");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 101) })
+            .unwrap();
+        for id in 2..=10 {
+            insert(&w, 1, id, 100 + id);
+        }
+        let commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 11, 111);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(commit - first > MAX, "premise failed: the transaction fits in one window, so nothing is at stake");
+
+        let s = streamer().with_max_bytes(MAX);
+        let (mut cursor, mut through, mut feed, mut emitted) = (start, 0u64, Vec::new(), 0usize);
+        for _ in 0..100 {
+            let p = s.pump(&w, cursor, through, &mut feed).unwrap();
+            let moved = p.cursor != cursor;
+            cursor = p.cursor;
+            through = p.emitted_through;
+            emitted += p.emitted;
+            if p.emitted == 0 && !moved {
+                break;
+            }
+        }
+        let frontier = w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            cursor, frontier,
+            "the drain stopped at {cursor}, below the frontier {frontier}: a transaction larger than one \
+             window wedged the feed, and the caught-up rule read the wedge as the end"
+        );
+        assert_eq!(emitted, 11, "not every row arrived");
+        let feed = String::from_utf8(feed).unwrap();
+        for qty in 101..=111 {
+            assert_eq!(feed.matches(&format!("\"qty\":{qty}")).count(), 1, "row with qty {qty} did not arrive exactly once: {feed}");
+        }
+    }
+
+    /// **D276: past the window's cap the pump refuses, naming the transaction; it never answers
+    /// "nothing to do".**
+    ///
+    /// The window grows to at most `MAX_WINDOW_BATCHES` times `max_bytes`. A transaction whose rows
+    /// span more would need the whole of it held to deliver it whole, and an `Ok` with nothing
+    /// emitted is the silent wedge.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the `expect_err`.
+    #[test]
+    fn a_transaction_beyond_the_window_cap_is_refused_by_name() {
+        const MAX: u64 = 10;
+        let (_d, w) = wal("over_cap");
+        w.append(7, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(7, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 1) })
+            .unwrap();
+        for id in 2..=10 {
+            insert(&w, 7, id, id);
+        }
+        let commit = w.append(7, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(commit - first > 64 * MAX, "premise failed: the transaction fits under the cap");
+
+        let err = streamer()
+            .with_max_bytes(MAX)
+            .pump(&w, first, 0, &mut Vec::new())
+            .expect_err("a transaction larger than the window's cap was answered Ok, which a consumer reads as a quiet feed");
+        let text = err.to_string();
+        assert!(text.contains(&format!("lsn {first}")), "the refusal does not say where the feed is stuck: {text}");
+        assert!(text.contains("{7}"), "the refusal does not name the transaction: {text}");
+    }
+
+    /// **D276: a refusal inside an oversized transaction is reported as the refusal, not grown past
+    /// into a size error.** A refusal stalls the feed until the publication is amended and says so;
+    /// growing the window over it would turn that into "transaction too large".
+    ///
+    /// Passes at `00f4c39` (nothing grows there) and must keep passing. M37 is what it is for.
+    #[test]
+    fn a_refusal_inside_an_oversized_transaction_is_reported_not_grown_past() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+        const MAX: u64 = 300;
+
+        let (_d, w) = wal("refusal_in_oversized");
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "secret".into(),
+                dir_root: 9,
+                time_travel_root: 10,
+                columns: vec![("id".into(), DataType::Integer, false), ("qty".into(), DataType::Integer, true)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+        // X, on the published table, opens; R writes the undecided one and commits inside X, within
+        // one window; X runs on past the cap.
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 10) })
+            .unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        w.append(2, 0, &RecKind::HeapInsert { dir_root: 9, page_id: 2, slot: 0, tuple: tuple_bytes(5, 50) })
+            .unwrap();
+        let r_commit = w.append(2, 0, &RecKind::Commit).unwrap();
+        for id in 2..=260 {
+            insert(&w, 1, id, id);
+        }
+        let x_commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(r_commit - first < MAX, "premise failed: R's commit is not inside the first window");
+        assert!(x_commit - first > 64 * MAX, "premise failed: X fits under the cap, so growing past the refusal would not show");
+
+        let narrow = streamer_publishing_table("inventory", &["id", "qty"]).with_max_bytes(MAX);
+        let p = narrow
+            .pump(&w, first, 0, &mut Vec::new())
+            .expect("a refusal inside an oversized transaction was turned into an error");
+        assert!(p.refused >= 1, "the refusal was not reported: {p:?}");
+        assert_eq!(p.cursor, first, "the cursor passed the open transaction's first row: {p:?}");
+    }
+
+    /// **D276: a pump delivers what its window holds before it grows (review 5).**
+    ///
+    /// A small transaction A commits inside the first window of a large, still-open X. The pump
+    /// must write A and stop there: growing first would read past a bounded batch for nothing and,
+    /// at the cap, would have failed without delivering A. The next pump, with A already delivered,
+    /// grows and delivers X.
+    ///
+    /// Pre-registered from source, UNBUILT: FAILS at `00f4c39` at the assertion that X arrives (the
+    /// base wedges after A); the first pump's assertions hold there.
+    #[test]
+    fn a_pump_delivers_what_its_window_holds_before_growing() {
+        const MAX: u64 = 300;
+        let (_d, w) = wal("deliver_first");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let first = w
+            .append(1, 0, &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 201) })
+            .unwrap();
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 50, 250);
+        let a_commit = w.append(2, 0, &RecKind::Commit).unwrap();
+        for id in 2..=10 {
+            insert(&w, 1, id, 200 + id);
+        }
+        let x_commit = w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        assert!(
+            a_commit < first + MAX && x_commit > first + MAX,
+            "premise failed: A must commit inside the first window and X past it"
+        );
+
+        let s = streamer().with_max_bytes(MAX);
+        let mut feed = Vec::new();
+        let p1 = s.pump(&w, first, 0, &mut feed).unwrap();
+        assert_eq!(p1.emitted, 1, "the first pump did not deliver exactly A: {p1:?}");
+        assert_eq!(p1.cursor, first, "the cursor passed X's first row: {p1:?}");
+        let (mut cursor, mut through, mut emitted) = (p1.cursor, p1.emitted_through, p1.emitted);
+        for _ in 0..100 {
+            let p = s.pump(&w, cursor, through, &mut feed).unwrap();
+            let moved = p.cursor != cursor;
+            cursor = p.cursor;
+            through = p.emitted_through;
+            emitted += p.emitted;
+            if p.emitted == 0 && !moved {
+                break;
+            }
+        }
+        assert_eq!(emitted, 11, "X never arrived after A: the feed wedged behind it: {}", String::from_utf8_lossy(&feed));
     }
 }

@@ -91,6 +91,11 @@ impl Modify for Update {
         // and the tokens of changed text. The assignments are evaluated here too, still once per row, and the NOT
         // NULL check moves with them: it reads only the new values, and inside the loop it had
         // the same late-refusal shape.
+        //
+        // (Merge of D225 with D202: "an abort undoes only the heap" was written before D202. A
+        // rollback now also re-points a moved row's primary entry back at `rid`, recorded in the
+        // loop below by `TxnManager::record_primary_write`. D202 records primary-index writes only,
+        // and asking first still means a refused statement writes no row at all, so the check stays.)
         let secondary: Vec<usize> = self.secondary_indexes.iter().map(|h| h.col_index).collect();
         let fulltext: Vec<usize> = self.fulltext_indexes.iter().map(|ft| ft.col_index).collect();
         let mut planned = Vec::with_capacity(res.len());
@@ -164,6 +169,14 @@ impl Modify for Update {
                 // updated: `delete` returns `KeyNotFound` for a missing entry, and propagating
                 // that here aborted the statement with the index left disagreeing with the heap.
                 // `upsert` repairs the entry instead, which is the outcome that was wanted.
+                //
+                // **D202 — and a rollback must put it back.** The rollback frees `new_rid`
+                // (`undo_insert`) and restores the row at `rid` (`undo_delete`). Without this record
+                // the key was left on the freed slot while the row lived at `rid`: every lookup
+                // of it and every INSERT of it then failed with `SlotDeleted`.
+                if let Some(txn) = &self.heap.txn {
+                    txn.record_primary_write(self.heap.txn_id, self.primary_index.root_cell(), pk.clone(), Some(rid));
+                }
                 self.primary_index.upsert(pk.clone(), new_rid)?;
             }
 

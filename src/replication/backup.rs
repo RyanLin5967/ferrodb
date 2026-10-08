@@ -465,7 +465,7 @@ mod tests {
             .append(2, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 3, slot: 0, tuple: vec![2; 8] })
             .unwrap();
         p.wal.flush().unwrap();
-        p.wal.truncate(9).unwrap();
+        let _ = p.wal.truncate(9).unwrap();
         assert_eq!(
             p.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
             base_before,
@@ -477,7 +477,7 @@ mod tests {
         // Releasing it lets the next checkpoint reclaim. Without this the test would pass just as
         // well against a `truncate` that never truncates anything.
         drop(pin);
-        p.wal.truncate(10).unwrap();
+        let _ = p.wal.truncate(10).unwrap();
         assert!(
             p.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst) > base_before,
             "the log was never reclaimed even after the pin was dropped, so this test cannot tell \
@@ -493,7 +493,7 @@ mod tests {
             .append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![3; 8] })
             .unwrap();
         p.wal.flush().unwrap();
-        p.wal.truncate(5).unwrap();
+        let _ = p.wal.truncate(5).unwrap();
         let base = p.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
         assert!(base > 1, "the log did not advance, so there is nothing to have lost");
 
