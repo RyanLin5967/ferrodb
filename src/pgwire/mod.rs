@@ -100,6 +100,43 @@ pub struct ServerContext {
     pub runtime: Arc<crate::agent_sql::runtime::AgentRuntime>,
 }
 
+/// **E.6 — a census of exclusive catalog acquisitions. A COUNT, never a timing.**
+///
+/// [`ServerContext::catalog`] is the outermost lock `serve` documents: every statement that
+/// cannot run on the shared read path takes it, for the duration of that statement, and nothing
+/// beneath it takes it back. E.6 asks whether a fork issued by a real client is mediated by it,
+/// and the honest instrument for that is an integer, not a stopwatch — an integer is load-immune,
+/// so the answer does not depend on a quiet machine.
+///
+/// **Process-global on purpose, not a field of `ServerContext`.** The comparison arm drives
+/// `TableBranchCatalog::fork` directly and never constructs a `ServerContext` at all; a
+/// per-instance counter would report zero for that arm by construction and prove nothing. A
+/// process-global says something falsifiable: *during that arm, nothing anywhere in this process
+/// took the lock.*
+///
+/// **Inert.** Nothing in this crate reads it, no control flow branches on it, and `catalog()`
+/// behaves identically whether it is compiled in or out.
+#[cfg(feature = "lock_census")]
+static CATALOG_ACQUISITIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Exclusive acquisitions of [`ServerContext::catalog`] in this process, or `None` when the
+/// census was not compiled in (`--features lock_census`).
+///
+/// `Option`, not `u64`. "Not instrumented" and "zero acquisitions" are different facts, and a
+/// harness that cannot tell them apart reports *production never took the lock* for a build that
+/// simply was not measuring. A caller that gets `None` has collected nothing and must refuse.
+pub fn catalog_acquisitions() -> Option<u64> {
+    #[cfg(feature = "lock_census")]
+    {
+        Some(CATALOG_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "lock_census"))]
+    {
+        None
+    }
+}
+
 impl ServerContext {
     pub fn new(
         catalog: Catalog,
@@ -145,6 +182,10 @@ impl ServerContext {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // E.6 census — see `CATALOG_ACQUISITIONS`. One relaxed increment on a static, compiled
+        // out by default, read by nothing in this crate.
+        #[cfg(feature = "lock_census")]
+        CATALOG_ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // EVERY exclusive borrow drains the readers, not only the ones that free pages.
         // Deciding here which statements will free pages would be a second predicate that can
         // drift from what the executor actually does — the same trap `try_run_read` avoids by

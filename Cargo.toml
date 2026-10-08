@@ -4,6 +4,13 @@ name = "ferrodb"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# E.6 instrument. See `pgwire::catalog_acquisitions`. Off by default: the path it sits on is
+# published in NANOSECONDS by `examples/d99_statement_path_walls.rs` (`ns/catalog()`), and an
+# unconditional atomic RMW there would perturb a landed number to answer a question that is a
+# COUNT and does not need it perturbed.
+lock_census = []
+
 [dependencies]
 
 [dev-dependencies]
