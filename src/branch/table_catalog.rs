@@ -81,6 +81,9 @@ pub struct TableBranchCatalog {
     /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
     /// (measured x0.92, `bench/fork_concurrency_before.txt`).
     commit_group: CommitGroup,
+    /// FREE_ID keys `fork` skipped because the slot's record is not `Reaped` (D243). See
+    /// [`Self::stale_free_ids_skipped`].
+    stale_free_ids: AtomicU64,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -374,6 +377,17 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
+    /// FREE_ID keys `fork` skipped, counted once per skip (D233 review F5, ledger D243; review 2
+    /// G9): a slot `reusable_slot` refuses, a slot whose record cannot be read, or a key that does
+    /// not decode. Non-zero means a torn flush, or corruption, left a bad free-list entry.
+    ///
+    /// What it is not: it lives in memory only and restarts at zero when the catalog is reopened; it
+    /// counts SKIPS, so a phantom no descent can remove is counted again by every fork (forks ×
+    /// phantoms, not phantoms); and nothing outside tests reads it today.
+    pub fn stale_free_ids_skipped(&self) -> u64 {
+        self.stale_free_ids.load(Ordering::Relaxed)
+    }
+
     /// Run one mutation under `logical`, publish the root **on every exit**, then take a commit
     /// ticket. Every mutator goes through here — D244.
     ///
@@ -545,6 +559,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            stale_free_ids: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -569,6 +584,7 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            stale_free_ids: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -656,6 +672,33 @@ impl TableBranchCatalog {
         match self.tree.search(&keys::envelope(id))? {
             Some(b) => Ok(Some(CapabilityEnvelope::deserialize(&b).map_err(FerroError::from)?)),
             None => Ok(None),
+        }
+    }
+
+    /// **The one answer to "may slot `id` be handed out again?"** (D233 review 2, G2): its record
+    /// is `Reaped`, and no live child is listed under it. Returns the slot's generation if so.
+    ///
+    /// Both halves are needed. A branch that is not `Reaped` still owns its slot. So does a `Reaped`
+    /// one whose child is still live: CHILD keys carry the parent's id without its generation
+    /// (`tree_keys::child`), so a new occupant would inherit the old one's children, and that set
+    /// decides the fate of pages parked under this branch's name. `release_id` asks this before it
+    /// writes a FREE_ID key, and `fork` asks it again before reusing one, because a FREE_ID can
+    /// outlive the state it was written for (a torn flush, review 1 F5). Errors are the caller's to
+    /// judge. Call with `logical` held.
+    ///
+    /// Returns the RECORD it read, not just its generation (amendment 4, wall21 audit 4 A8), so a
+    /// caller that goes on to remove the slot's keys already holds the record and never reads it
+    /// after a removal: a read that failed there left the slot keyless and not free.
+    fn reusable_slot(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
+        match self.core(id)? {
+            Some(rec) if rec.state() == BranchState::Reaped => {
+                if self.has_live_children(id)? {
+                    Ok(None)
+                } else {
+                    Ok(Some(rec))
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1125,26 +1168,59 @@ impl BranchCatalog for TableBranchCatalog {
             // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
             // generation comes from the slot's history, never from zero — a reused id whose generation
             // restarted would make a stale handle look current.
+            //
+            // **Only a slot `reusable_slot` accepts is reused** (D233 review F5, ledger D243; review 2
+            // G2): `Reaped`, with no live child, which is exactly what `release_id` requires before it
+            // writes a FREE_ID key. So a FREE_ID over any other slot is stale. The tree has no WAL, and a torn flush can leave one:
+            // - a fork that reused the id became durable, and its FREE_ID removal did not;
+            // - an unlink of the FREE_ID leaf was torn, leaving a key that the chain still lists and no
+            //   descent reaches.
+            // Reusing a stale slot overwrites a live branch's record. So it is skipped, counted
+            // ([`Self::stale_free_ids_skipped`]), and removed if a descent can reach it. It is NOT
+            // refused: the same phantom would then refuse every later fork. A phantom no descent
+            // reaches cannot be removed by key, so it is skipped again by every fork until D229/D243
+            // repair the torn unlink.
             let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
-            let recycled = self
-                .tree
-                .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-                .next()
-                .transpose()?
-                .and_then(|(k, _)| keys::free_id_from_key(&k));
+            let mut recycled = None;
+            let mut stale = Vec::new();
+            for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+                let (k, _) = entry?;
+                let Some(id) = keys::free_id_from_key(&k) else {
+                    // Review 2 G9 (b): not a key this span can hold. Counted and removed like a stale one.
+                    stale.push(k);
+                    continue;
+                };
+                match self.reusable_slot(id) {
+                    Ok(Some(rec)) => {
+                        recycled = Some((id, rec));
+                        break;
+                    }
+                    // Stale, or (review 2 G9 (a)) unreadable: skipped, counted and removed. Never a
+                    // reason to fail this fork, and with it every later fork that meets the same entry.
+                    // Any `Err` counts, a transient I/O error included, so a VALID slot's FREE_ID can be
+                    // removed here: that slot then leaks, silently but for `stale_free_ids_skipped`. It
+                    // is the chosen side (review 3 L5): a leaked slot costs one record, and a refusal
+                    // would repeat on every later fork that met the same entry.
+                    Ok(None) | Err(_) => stale.push(k),
+                }
+            }
 
             // `reused` decides which writer runs below, and it is the whole safety condition for
             // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
             // deadline keys, so its keys are NOT new.
-            let (child_num, generation, reused) = match recycled {
-                Some(id) => {
-                    self.remove_if_present(&keys::free_id(id))?;
-                    let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
-                    (id, slot_gen, true)
-                }
+            // The record was read and the decision made above; every key removal comes after (A8).
+            let (child_num, generation, reused) = match &recycled {
+                Some((id, rec)) => (*id, rec.generation(), true),
                 None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
             };
             let child_id = BranchId::new(child_num, generation);
+            // Review 3 §6 N1: the child is BUILT before any key is removed. `fork_child_from_core`
+            // refuses a parent that is not `Live`, and fork's own gate (`check_readable`) accepts
+            // `Quarantined`, so a removal made before it stayed in the pool when it refused: the chosen
+            // slot was stranded, neither live nor free, one more per retried fork. After this point
+            // nothing refuses on the parent's state; what can still fail after a removal is the catalog
+            // tree's own I/O, which has no WAL (D229). A refused FRESH fork still burns the id number
+            // `fetch_add` took above; that writes no key and strands no slot, as at `9aa6968`.
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
@@ -1152,6 +1228,14 @@ impl BranchCatalog for TableBranchCatalog {
                 fork_epoch,
                 lease,
             )?;
+
+            for k in &stale {
+                self.stale_free_ids.fetch_add(1, Ordering::Relaxed);
+                self.remove_if_present(k)?;
+            }
+            if reused {
+                self.remove_if_present(&keys::free_id(child_num))?;
+            }
 
             if reused {
                 self.write_record(&child, None)?;
@@ -1507,10 +1591,8 @@ impl BranchCatalog for TableBranchCatalog {
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
         let staged = self.mutate(|| {
-            let reusable = match (self.core(id), self.has_live_children(id)) {
-                (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
-                _ => false,
-            };
+            // The one reuse predicate `fork` asks too (D233 review 2 G2).
+            let reusable = matches!(self.reusable_slot(id), Ok(Some(_)));
             if reusable {
                 let _ = self.upsert(keys::free_id(id), Vec::new());
             }
@@ -2265,6 +2347,120 @@ mod tests {
         let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
         let c = TableBranchCatalog::create(Arc::clone(&pool), 1).unwrap();
         (c, path, pool)
+    }
+
+    // ---- D233: FIFO lease churn must not leave a walk of empty leaves ------------------------
+
+    /// Leaves in the catalog tree's whole leaf chain that hold no entry, walked from the leftmost
+    /// leaf through `next`: the chain every range scan follows.
+    fn empty_leaves_in_chain(c: &TableBranchCatalog) -> usize {
+        let mut leaf = c.tree.leftmost_leaf().unwrap();
+        let mut empty = 0;
+        loop {
+            if leaf.key_arr.is_empty() {
+                empty += 1;
+            }
+            match leaf.next {
+                Some(n) => leaf = c.tree.read_leaf(n).unwrap(),
+                None => return empty,
+            }
+        }
+    }
+
+    /// Pages this thread reads for one `expired_before(0)`: a lease pass that expires nothing, so
+    /// it reads only what it must to reach the first live deadline. Counted by the pool's
+    /// test-only instrument over both read paths, latched and latch-free.
+    fn pages_per_lease_pass(c: &TableBranchCatalog) -> u64 {
+        let before = crate::buffer::page_reads::on_this_thread();
+        let expired = c.expired_before(0).unwrap();
+        let read = crate::buffer::page_reads::on_this_thread() - before;
+        assert!(expired.is_empty(), "every fixture deadline is after 0, so nothing expires");
+        read
+    }
+
+    /// Fork `live` branches, then reap the OLDEST and fork a new one, `checkpoints.last()` times,
+    /// so `live` branches always coexist and deadlines only move forward: the lease traffic the
+    /// D233 adversary modelled (`frontier/deadline_leaf_adversary.md` §5). Reaping is
+    /// `set_state(Live → Reaped)`, which removes the branch's DEADLINE key (`write_record`).
+    /// Returns `(reaps so far, pages per lease pass, empty leaves in the chain)` per checkpoint.
+    fn fifo_lease_churn(
+        c: &TableBranchCatalog,
+        live: usize,
+        checkpoints: &[usize],
+    ) -> Vec<(usize, u64, usize)> {
+        let mut deadline = 1_000u64;
+        let mut queue = std::collections::VecDeque::new();
+        for _ in 0..live {
+            queue.push_back(c.fork(BranchId::TRUNK, LeaseDeadline(deadline)).unwrap().branch_id);
+            deadline += 1;
+        }
+        let mut out = Vec::new();
+        let mut done = 0usize;
+        for &cp in checkpoints {
+            while done < cp {
+                let oldest = queue.pop_front().expect("live branches remain");
+                c.set_state(oldest, BranchState::Live, BranchState::Reaped).unwrap();
+                queue.push_back(c.fork(BranchId::TRUNK, LeaseDeadline(deadline)).unwrap().branch_id);
+                deadline += 1;
+                done += 1;
+            }
+            out.push((done, pages_per_lease_pass(c), empty_leaves_in_chain(c)));
+        }
+        out
+    }
+
+    /// ⛔ **D233, WRITTEN TO FAIL FIRST: a lease pass must not walk the leaves FIFO reaps emptied.**
+    ///
+    /// `BPlusTreeManager::delete` never unlinked a leaf. Deadlines only move forward, so the head
+    /// of the DEADLINE group is where every reap removes a key, and every leaf there that emptied
+    /// stayed in the chain. `expired_before` descends to the RECORD tail's leaf (no DEADLINE
+    /// separator is below `[0x01]`) and walks right through every one of them, every lease pass.
+    /// D2's falsifier ("the scan's node-touch count stays flat as N grows") was applied per ENTRY
+    /// and never per LEAF.
+    ///
+    /// Pre-registered (`frontier/lane_d233_free_at_empty.md` §3; the adversary's model): with 170
+    /// live branches, which is at least the 163 a leaf of 25-byte DEADLINE entries needs, one head
+    /// leaf empties per ~81 reaps. Before the fix, pages per pass ≈ h + E + 1 with E ≈ reaps/81,
+    /// so roughly (h or h+1, h+6, h+11) at (0, 405, 810) reaps, and the chain holds 0, ≥5, ≥10
+    /// empty leaves. After it, the chain holds no empty leaf and the pages per pass stay within 1
+    /// of the first checkpoint (1, not 0, in case the tree gains a level).
+    #[test]
+    fn a_lease_pass_does_not_walk_the_leaves_fifo_reaps_emptied() {
+        let (c, p, _pool) = cat("d233-fifo");
+        let arms = fifo_lease_churn(&c, 170, &[0, 405, 810]);
+        let _ = std::fs::remove_file(p);
+        let base = arms[0].1;
+        // Amendment 5: a counter that never counts reads 0 <= 1 and passes the bound below, so the
+        // instrument has to show it saw the pass at all. A lease pass reads at least the tree's
+        // height in pages.
+        assert!(base > 0, "premise: the page-read counter saw no read in the first lease pass: {arms:?}");
+        assert!(
+            arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
+            "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}: the lease pass \
+             reads more pages as reaps accumulate, or emptied leaves stay in the chain"
+        );
+    }
+
+    /// D233, the 64-hop cliff. Past 63 empty leaves the latch-free descent exceeds its right walk
+    /// on each of 16 attempts before the latched path answers, which is about 17h + E + 1025 page
+    /// reads per pass. Pre-registered: before the fix, ≥ 1,000 pages per pass at 5,500 reaps
+    /// (E ≈ 67); after it, within 1 of the first checkpoint. Ignored in the default run because it
+    /// performs about 11,000 durable catalog writes; FAN-QUEUE runs it by name.
+    #[test]
+    #[ignore]
+    fn a_lease_pass_stays_flat_past_the_64_hop_cliff() {
+        let (c, p, _pool) = cat("d233-cliff");
+        let arms = fifo_lease_churn(&c, 170, &[0, 5_500]);
+        let _ = std::fs::remove_file(p);
+        let base = arms[0].1;
+        // Amendment 5: a counter that never counts reads 0 <= 1 and passes the bound below, so the
+        // instrument has to show it saw the pass at all. A lease pass reads at least the tree's
+        // height in pages.
+        assert!(base > 0, "premise: the page-read counter saw no read in the first lease pass: {arms:?}");
+        assert!(
+            arms.iter().all(|&(_, pages, empty)| pages <= base + 1 && empty == 0),
+            "(reaps, pages per lease pass, empty leaves in the chain) = {arms:?}"
+        );
     }
 
     #[test]
@@ -3120,6 +3316,276 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(ids, sorted, "scan came back out of branch-id order");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **D233 review F5, ledger D243: fork must never reuse a slot whose record is not `Reaped`.**
+    /// Red first against `0eda6ca`.
+    ///
+    /// `release_id` writes a FREE_ID key only for a `Reaped` record, so a FREE_ID over any other
+    /// record is stale. The catalog tree has no WAL, and a torn flush can leave one: a fork that
+    /// reused the id became durable and its FREE_ID removal did not, or an unlink of the FREE_ID
+    /// leaf was torn and left a key that the chain still lists. `fork` popped the span's head and
+    /// reused it without looking, overwriting a live branch's record. Here a FREE_ID key is planted
+    /// over a Live record. The next fork must mint a fresh id and leave that record byte-identical.
+    #[test]
+    fn fork_never_reuses_a_free_id_whose_record_is_live() {
+        let (c, p, _pool) = cat("stale-free-id");
+        let live = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        assert!(
+            c.core(live.id).unwrap().unwrap().state() == BranchState::Live,
+            "premise: the planted slot's record is Live"
+        );
+        c.tree.upsert(keys::free_id(live.id), Vec::new()).unwrap();
+        let before = c.tree.search(&keys::record(live.id)).unwrap().expect("premise: the record exists");
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_ne!(child.branch_id.id, live.id, "fork reused id {} whose record is Live", live.id);
+        assert_eq!(
+            c.tree.search(&keys::record(live.id)).unwrap(),
+            Some(before),
+            "fork rewrote the Live record of branch {}",
+            live.id
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// D243's other half: a stale FREE_ID is skipped, counted and removed, and the fork goes on to
+    /// the next FREE_ID and reuses it if its record is `Reaped`. It is not refused. Uses the new
+    /// counter, so it cannot be red against `0eda6ca`; its mutant is `bench/d233/firecheck.sh`'s
+    /// F5 mutant, which reuses the head of the span without looking at its record.
+    #[test]
+    fn a_stale_free_id_is_skipped_counted_and_removed_and_the_next_is_reused() {
+        let (c, p, _pool) = cat("stale-free-id-skip");
+        let reaped = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let live = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let r = c.get(reaped).unwrap();
+        c.detach_child(BranchId::TRUNK.id, r.fork_epoch).unwrap();
+        c.set_state(reaped, BranchState::Live, BranchState::Reaped).unwrap();
+        c.release_id(reaped.id);
+        c.tree.upsert(keys::free_id(live.id), Vec::new()).unwrap();
+        assert!(
+            keys::free_id(live.id) < keys::free_id(reaped.id),
+            "premise: the stale FREE_ID sorts first, so the fork meets it before the good one"
+        );
+        let before = c.tree.search(&keys::record(live.id)).unwrap();
+        assert_eq!(c.stale_free_ids_skipped(), 0, "premise: nothing skipped yet");
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_eq!(child.branch_id.id, reaped.id, "the fork did not go on to reuse the Reaped slot");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the stale FREE_ID was not counted once");
+        assert_eq!(c.tree.search(&keys::free_id(live.id)).unwrap(), None, "the stale FREE_ID was not removed");
+        assert_eq!(c.tree.search(&keys::record(live.id)).unwrap(), before, "the Live record changed");
+        c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        assert_eq!(c.stale_free_ids_skipped(), 1, "a removed FREE_ID was skipped again");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 2 G2, red first against `f03e25d`: fork asks the same question `release_id` asks.**
+    /// `release_id` writes a FREE_ID only for a slot that is `Reaped` AND has no live child, because
+    /// a live child's CHILD entry sits under the parent's id with no generation
+    /// (`tree_keys::child`), so a new occupant of the slot would inherit it. `f03e25d`'s fork checked
+    /// `Reaped` only. Here X is reaped while its child Y is still live, and a FREE_ID for X is
+    /// planted (a phantom from a torn flush). The next fork must mint a fresh id, and Y's CHILD
+    /// entry under X must be untouched.
+    #[test]
+    fn fork_never_reuses_a_reaped_slot_that_still_has_a_live_child() {
+        let (c, p, _pool) = cat("free-id-live-child");
+        let x = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        let y = c.fork(x.branch_id, LeaseDeadline(9_000)).unwrap();
+        c.set_state(x.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        assert!(c.has_live_children(x.branch_id.id).unwrap(), "premise: the reaped slot still has a live child");
+        let child_key = keys::child(x.branch_id.id, y.fork_epoch.0);
+        let before = c.tree.search(&child_key).unwrap().expect("premise: the child's CHILD entry exists");
+        c.tree.upsert(keys::free_id(x.branch_id.id), Vec::new()).unwrap();
+
+        let z = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_ne!(
+            z.branch_id.id, x.branch_id.id,
+            "fork reused slot {} while its reaped record still has a live child",
+            x.branch_id.id
+        );
+        assert_eq!(c.tree.search(&child_key).unwrap(), Some(before), "the live child's CHILD entry changed");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 2 G9 (a), red first against `f03e25d`.** A FREE_ID whose record cannot be read is
+    /// skipped and counted like a stale one. `f03e25d` read it with `?` inside the scan, before any
+    /// removal, so every later fork failed on the same entry: the "would refuse every later fork"
+    /// outcome that skipping exists to avoid.
+    #[test]
+    fn a_free_id_whose_record_cannot_be_read_is_skipped_not_fatal() {
+        let (c, p, _pool) = cat("free-id-unreadable");
+        const BAD: u64 = 99;
+        c.tree.upsert(keys::record(BAD), vec![0u8; 3]).unwrap();
+        assert!(c.core(BAD).is_err(), "premise: the planted record does not deserialize");
+        c.tree.upsert(keys::free_id(BAD), Vec::new()).unwrap();
+
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("a FREE_ID over an unreadable record failed the fork");
+
+        assert_ne!(child.branch_id.id, BAD, "fork reused a slot whose record it could not read");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the unreadable slot's FREE_ID was not counted");
+        assert_eq!(c.tree.search(&keys::free_id(BAD)).unwrap(), None, "the unreadable slot's FREE_ID was not removed");
+        assert_eq!(c.tree.search(&keys::record(BAD)).unwrap(), Some(vec![0u8; 3]), "the unreadable record was rewritten");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 2 G9 (b), red first against `f03e25d`.** A key in the FREE_ID span that does not
+    /// decode to an id is counted and removed. `f03e25d` skipped it with `continue`, uncounted, so it
+    /// stayed for ever and every fork stepped over it in silence.
+    #[test]
+    fn a_malformed_free_id_key_is_counted_and_removed() {
+        let (c, p, _pool) = cat("free-id-malformed");
+        let malformed = vec![keys::tag::FREE_ID, 1, 2, 3];
+        assert_eq!(keys::free_id_from_key(&malformed), None, "premise: the key does not decode");
+        c.tree.upsert(malformed.clone(), Vec::new()).unwrap();
+
+        c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the malformed FREE_ID key was not counted");
+        assert_eq!(c.tree.search(&malformed).unwrap(), None, "the malformed FREE_ID key was not removed");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 3 §6 N1, red first against `f6909db`: a refused fork keeps the free slot it chose.**
+    /// fork's own gate (`check_readable`) accepts a `Quarantined` parent, but building the child
+    /// (`fork_child_from_core`) refuses any parent that is not `Live`. `f6909db` removed the chosen
+    /// slot's FREE_ID first and built the child second, so the refusal left the removal in the pool:
+    /// the slot was neither live nor free, and every retried refused fork stranded another. Here
+    /// slot X is released, a fork of quarantined P must fail with X's FREE_ID still present, and once
+    /// P is `Live` again the next fork reuses X.
+    #[test]
+    fn a_refused_fork_of_a_quarantined_parent_keeps_the_free_slot() {
+        let (c, p, _pool) = cat("refused-fork-keeps-free-slot");
+        let parent = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id;
+        let x = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        c.detach_child(BranchId::TRUNK.id, x.fork_epoch).unwrap();
+        c.set_state(x.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        c.release_id(x.branch_id.id);
+        let free = keys::free_id(x.branch_id.id);
+        assert!(c.tree.search(&free).unwrap().is_some(), "premise: slot X is free");
+        c.set_state(parent, BranchState::Live, BranchState::Quarantined).unwrap();
+
+        assert!(c.fork(parent, LeaseDeadline(9_000)).is_err(), "premise: a fork of a quarantined parent is refused");
+        assert!(
+            c.tree.search(&free).unwrap().is_some(),
+            "the refused fork removed slot {}'s FREE_ID: the slot is stranded, neither live nor free",
+            x.branch_id.id
+        );
+
+        c.set_state(parent, BranchState::Quarantined, BranchState::Live).unwrap();
+        let child = c.fork(parent, LeaseDeadline(9_000)).unwrap();
+        assert_eq!(child.branch_id.id, x.branch_id.id, "the next fork did not reuse the free slot");
+        assert_eq!(c.tree.search(&free).unwrap(), None, "the reused slot's FREE_ID was not removed");
+        let _ = std::fs::remove_file(p);
+    }
+
+    // ---- D233 review 4 A2: a refused FREE_ID removal must not refuse the fork -------------------
+
+    /// Rewrite one catalog-tree leaf in place through the pool: the catalog analogue of `index.rs`'s
+    /// `rewrite_leaf`, whose `write_page` is private to that module. Single-threaded tests only: no
+    /// page latch is taken.
+    fn rewrite_catalog_leaf(
+        c: &TableBranchCatalog,
+        pool: &BufferPoolManager,
+        page: u32,
+        edit: impl FnOnce(&mut crate::storage::index_page::BPlusTreeLeafPage<Vec<u8>, Vec<u8>>),
+    ) {
+        let mut leaf = c.tree.read_leaf(page).unwrap();
+        edit(&mut leaf);
+        let image = leaf.serialize().unwrap();
+        let frame = pool.fetch_page(page).unwrap();
+        pool.frame_write(frame).data = image;
+        pool.unpin_page(page, true);
+    }
+
+    /// Put `key` ALONE in a leaf of the catalog tree with neighbours on both sides, then break that
+    /// leaf's `prev` so an unlink of it is refused: `prev` becomes the leftmost leaf, whose `next` is
+    /// another page (V1's refusal, which `79eec23`, `f03e25d` and the fix all refuse rather than wait
+    /// on). Fillers with 1,900-byte values go in ascending key order on both sides of `key`, so a leaf
+    /// holds at most two of them. Returns the leaf's page id.
+    fn isolate_behind_a_broken_link(c: &TableBranchCatalog, pool: &BufferPoolManager, key: &[u8]) -> u32 {
+        const FILLER: u64 = 1 << 40;
+        for i in 0..4 {
+            c.tree.insert(keys::child(FILLER, i), vec![0xAB; 1_900]).unwrap();
+        }
+        c.tree.insert(key.to_vec(), vec![0xEE; 1_900]).unwrap();
+        for i in 0..4 {
+            c.tree.insert(keys::arena(FILLER, i), vec![0xCD; 1_900]).unwrap();
+        }
+        let mut chain = vec![c.tree.leftmost_leaf().unwrap()];
+        while let Some(n) = chain.last().unwrap().next {
+            chain.push(c.tree.read_leaf(n).unwrap());
+        }
+        let at = chain.iter().position(|l| l.key_arr.iter().any(|k| k == key)).expect("premise: the key is in the chain");
+        assert_eq!(chain[at].key_arr, vec![key.to_vec()], "premise: the key is alone in its leaf");
+        assert!(at >= 2 && chain[at].next.is_some(), "premise: its leaf is third or later in the chain ({at}) and has a next");
+        let (page, stranger) = (chain[at].page_id, chain[0].page_id);
+        assert_ne!(chain[0].next, Some(page), "premise: the leftmost leaf's next is another page");
+        rewrite_catalog_leaf(c, pool, page, |l| l.prev = Some(stranger));
+        page
+    }
+
+    /// **Review 4 A2, red first against `79eec23`: a stale FREE_ID whose removal is refused is skipped,
+    /// not fatal.** fork removes each stale FREE_ID it skipped, and `79eec23` did it with `?`. An unlink
+    /// refuses deterministically on an inconsistent chain (G6, L2, V1, V2), and this tree has no WAL,
+    /// so a torn flush can leave one (§8 F5). The refused key stays, so every later fork met it and was
+    /// refused too: the outcome that skipping stale keys exists to avoid. Here a stale FREE_ID (an id
+    /// with no record) is alone in a leaf whose `prev` no longer points back at it. Two forks must
+    /// succeed, and each counts the key it met.
+    #[test]
+    fn a_stale_free_id_whose_removal_is_refused_is_skipped_not_fatal() {
+        let (c, p, pool) = cat("stale-free-id-refused-removal");
+        const STALE: u64 = 1 << 30;
+        assert!(c.core(STALE).unwrap().is_none(), "premise: the slot has no record");
+        let stale = keys::free_id(STALE);
+        let leaf = isolate_behind_a_broken_link(&c, &pool, &stale);
+        let broken = c.tree.read_leaf(leaf).unwrap().prev;
+
+        let first = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("a refused removal of a stale FREE_ID failed the fork");
+        assert_ne!(first.branch_id.id, STALE, "fork reused a slot with no record");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the stale FREE_ID was not counted");
+        assert!(c.tree.search(&stale).unwrap().is_some(), "the key whose removal was refused is gone after all");
+
+        assert_eq!(c.tree.read_leaf(leaf).unwrap().prev, broken, "premise: the planted link is still broken");
+        let second = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("the next fork, meeting the same key, failed");
+        assert_ne!(second.branch_id.id, STALE, "fork reused a slot with no record");
+        assert_eq!(c.stale_free_ids_skipped(), 2, "the next fork did not count the key it met again");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **Review 4 A2, red first against `79eec23`: a free slot whose FREE_ID cannot be removed is not
+    /// reused, and the fork goes on.** `79eec23` removed the chosen slot's FREE_ID with `?`, so the same
+    /// refusal as above failed every fork that chose the slot, and the slot is the first one every fork
+    /// chooses. Reusing it anyway would leave a FREE_ID over a live slot. So the fork counts it, leaves
+    /// it `Reaped` and free, and mints a fresh id; the next fork tries it again.
+    #[test]
+    fn a_free_slot_whose_free_id_removal_is_refused_is_not_reused_and_not_fatal() {
+        let (c, p, pool) = cat("free-slot-refused-removal");
+        let x = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        c.detach_child(BranchId::TRUNK.id, x.fork_epoch).unwrap();
+        c.set_state(x.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        c.release_id(x.branch_id.id);
+        let free = keys::free_id(x.branch_id.id);
+        assert!(c.tree.search(&free).unwrap().is_some(), "premise: slot X is free");
+        // Taken out and put back among the fillers, so that it can be isolated. fork never reads its value.
+        c.tree.delete(&free).unwrap();
+        let leaf = isolate_behind_a_broken_link(&c, &pool, &free);
+        let broken = c.tree.read_leaf(leaf).unwrap().prev;
+
+        let first = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("a refused removal of the chosen FREE_ID failed the fork");
+        assert_ne!(first.branch_id.id, x.branch_id.id, "fork reused slot X although its FREE_ID could not be removed");
+        assert_eq!(c.stale_free_ids_skipped(), 1, "the slot whose FREE_ID could not be removed was not counted");
+        assert!(c.tree.search(&free).unwrap().is_some(), "slot X's FREE_ID is gone: the slot is neither live nor free");
+        assert_eq!(c.core(x.branch_id.id).unwrap().unwrap().state(), BranchState::Reaped, "slot X's record changed");
+
+        assert_eq!(c.tree.read_leaf(leaf).unwrap().prev, broken, "premise: the planted link is still broken");
+        let second = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).expect("the next fork, choosing the same slot, failed");
+        assert_ne!(second.branch_id.id, x.branch_id.id, "the next fork reused slot X");
+        assert_eq!(c.stale_free_ids_skipped(), 2, "the next fork did not count the slot it skipped again");
         let _ = std::fs::remove_file(p);
     }
 }

@@ -4,3 +4,4 @@ pub mod arc;
 pub mod page_table;
 pub mod touch_queue;
 pub(crate) mod fault_hooks;
+pub(crate) mod page_reads;

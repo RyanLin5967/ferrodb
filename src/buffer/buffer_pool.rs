@@ -828,6 +828,8 @@ impl BufferPoolManager {
     /// back to [`BufferPoolManager::fetch_page`], which is always correct. The returned stamp lets
     /// the caller ask later whether the page it read is still the page in that frame.
     pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
+        // D233's test instrument; empty outside tests. See `buffer::page_reads`.
+        crate::buffer::page_reads::count();
         let frame_i = self.page_table.lookup(page_id)?;
         self.read_frame_optimistic(frame_i, page_id)
     }
@@ -877,6 +879,8 @@ impl BufferPoolManager {
         // here down. The thread-local depth counter is re-entrant, so the nested `enter_pool` in
         // `new_page -> fetch_page` is fine. See src/storage/page_latch.rs.
         let _pool = enter_pool();
+        // D233's test instrument; empty outside tests. See `buffer::page_reads`.
+        crate::buffer::page_reads::count();
         for _attempt in 0..FETCH_ATTEMPTS {
             // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
             if let Some(frame_i) = self.try_pin_resident(page_id) {
