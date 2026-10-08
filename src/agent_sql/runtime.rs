@@ -4265,23 +4265,14 @@ impl AgentRuntime {
     /// next record over it, but a reopen before that replays it — a property of the store that
     /// predates D258.
     ///
-    /// **D115 instrument.** The body is [`Self::stage_all_measured`]; this wrapper exists only so
-    /// that `STAGE_NS` covers every early return, including the refusals, without a timer having
-    /// to be closed on each `?`. A missed refusal would understate the phase that refused, which
-    /// is the one direction of error that reads as a clean result.
-    fn stage_all(&self, branch: BranchId, batch: Vec<StagedTable>) -> Result<(), FerroError> {
-        let t = Instant::now();
-        let out = self.stage_all_measured(branch, batch);
-        stage_probe::bump(&stage_probe::STAGE_NS, t.elapsed().as_nanos() as u64);
-        stage_probe::bump(&stage_probe::STAGE_CALLS, 1);
-        out
-    }
-
-    fn stage_all_measured(
-        &self,
-        branch: BranchId,
-        mut batch: Vec<StagedTable>,
-    ) -> Result<(), FerroError> {
+    /// **D115 instrument.** `STAGE_NS` covers every exit, including the refusals, through
+    /// [`stage_probe::StageSpan`], which records when it drops, so no timer has to be closed on
+    /// each `?`. A missed refusal would understate the phase that refused, which is the one
+    /// direction of error that reads as a clean result. (D115 first did this with a wrapper around
+    /// a separate body function; the guard keeps the body in `stage_all`, which the capability
+    /// envelope's funnel test reads.)
+    fn stage_all(&self, branch: BranchId, mut batch: Vec<StagedTable>) -> Result<(), FerroError> {
+        let _stage = stage_probe::StageSpan::start();
         let t_decide = Instant::now();
         // ---- 1. decide ------------------------------------------------------------------------
         //
