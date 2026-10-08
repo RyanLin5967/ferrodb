@@ -181,3 +181,28 @@ Six walls, none of them per-statement, in two groups:
 
 W4 is the one to fix first. W1/W2 are a user waiting for a query they asked for; W4 is the whole
 database stopping for 39 seconds because a timer went off.
+=================================================================================================
+ERRATA (append-only; the lines above stand as written). Added 2026-10-08, when this artifact
+reached main through the merge of S15-runtime-at-1e6 (0ac1931, measured on parent 9986d4c).
+=================================================================================================
+
+E1. The PHASE 3 `syncs/op` column is NOT per op. It is catalog fsyncs across the whole rep block
+    divided by reps*3, while the block performs five catalog-mutating operations per rep
+    (cat.fork, begin_session, runtime.abandon, the BEGIN AGENT SESSION statement, ABANDON BRANCH).
+    Found and fixed in examples/runtime_curve.rs by 5bb234b, whose header says "Any previously
+    recorded `syncs/op` figure is that inflated quantity". So 1.67 means about 5.0 fsyncs per rep
+    block (1.67 x 3; derived, not re-measured), and this artifact never measured a per-op figure.
+    5bb234b measured 1.00 per timed op and 7.00 per block on its own tree (N=20, reps=2).
+    "fsyncs per op are 1.67 at every N" is withdrawn as a per-op claim; constant across N stands.
+
+E2. The three phase 3 arms run in a FIXED within-rep order (raw, rt, stmt) and `raw` never
+    abandons what it forked, so `rt-raw` and `stmt-rt` carry a same-sign position effect in every
+    rep (disclosed, deliberately not changed, in 5bb234b). Read those two columns as upper bounds
+    on the layer cost, not as the layer cost.
+
+E3. Line numbers above are at the measured tree, not at main. Since this run: W1 and W2 were
+    fixed by D28 (0e51bdf, which reproduced both with this harness first,
+    bench/d28_view_pushdown.txt), and W3 by the same commit for ferro_branches and
+    ferro_row_authors (ferro_quarantine and ferro_run_activity decline the hint by design);
+    W4's lease-sweep hold of the statement lock was closed by D98 (bench/w4/DECISION.md,
+    Addendum 5). W5 and W6 were not re-checked for this note.

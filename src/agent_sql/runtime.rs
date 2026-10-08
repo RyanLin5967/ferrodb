@@ -5890,7 +5890,7 @@ impl AgentRuntime {
     /// Measured in `bench/w4/statement-lock-FASTPATH.txt`: the reconciliation's wall time
     /// rises 91x across 100x open sessions (269 us -> 24.5 ms at 10⁵) while this call shows no
     /// trend. A larger figure for the same walk is reported on branch S15-runtime-at-1e6 (commit
-    /// 0ac1931, `bench/runtime_at_1e6.txt`, W4) — not in this worktree, and NOT reproduced here.
+    /// 0ac1931, `bench/runtime_at_1e6.txt`, W4) — in tree since the S15 merge, NOT reproduced here.
     ///
     /// **This is a fast path and NOT a replacement.** `reap_expired` can reap several branches and
     /// then return `Err`, discarding the ids it had already accumulated
