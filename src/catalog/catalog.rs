@@ -9,6 +9,7 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::{DataType, Value};
 use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_page::{entry_too_large, first_entry_over_bound, OPEN_TABLE_REMEDY};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
@@ -208,6 +209,56 @@ impl Catalog {
         self.get_table(name).ok_or_else(|| self.unknown_table(name))
     }
 
+    /// The refusal of an index whose backfill meets an entry over `MAX_ENTRY_BYTES`. D225, reviews 6
+    /// and 7.
+    ///
+    /// It names the row and says whether its tuple is deleted, because that decides the remedy,
+    /// and each arm opens with its own sentence ("The row is live." / "The row is deleted.") so a
+    /// test can tell them apart (review 7 K1).
+    ///
+    /// - A **live** row: UPDATE the value to fit, or, if the key is the cause, the table copy.
+    /// - A **deleted** row: its tuple stays in the table until its key is inserted again. On the
+    ///   tree D225 lands on, #16 (D202, `4296723`) then writes the new row into the dead version's
+    ///   slot and moves the dead version to the table's history. Nothing else removes it; there is
+    ///   no VACUUM. So when the key fits, inserting it again with values that fit (and deleting it
+    ///   again if unwanted) is the in-place remedy; when the key is the cause, only the table copy.
+    ///   On `d225-byte-split` alone, without #16, the in-place route does not work (review 7 K2).
+    fn backfill_refusal(table: &str, column: &str, key: &Value, deleted: bool, len: usize) -> FerroError {
+        let shown: String = format!("{key:?}").chars().take(60).collect();
+        let advice = if deleted {
+            format!(
+                "The row is deleted. Its tuple stays in the table until its key is inserted again, \
+                 which moves the dead version to the table's history; nothing else removes it \
+                 (there is no VACUUM), so until then this refusal repeats. If the key fits, INSERT \
+                 that key again with values whose index entries fit, remove the row again if it is \
+                 not wanted, and CREATE the index again. If the key is the cause: {OPEN_TABLE_REMEDY}"
+            )
+        } else {
+            format!(
+                "The row is live. If its indexed value is the cause, UPDATE it to fit; if its key \
+                 is: {OPEN_TABLE_REMEDY}"
+            )
+        };
+        FerroError::Constraint(format!(
+            "cannot build the index on '{table}.{column}': the row whose first column is {shown} \
+             makes {}. {advice}",
+            entry_too_large(len)
+        ))
+    }
+
+    /// Free an index tree whose backfill failed, and return the failure. D225.
+    ///
+    /// The tree is not in the catalog yet, so nothing else can hold a handle on it. If freeing it
+    /// fails too, both are reported, with the backfill's failure first because it is the cause.
+    fn abandon_backfill(tree: &BPlusTreeManager<(Value, Value), ()>, failure: FerroError) -> FerroError {
+        match tree.free_all() {
+            Ok(()) => failure,
+            Err(e) => FerroError::Internal(format!(
+                "{failure}; and freeing the half-built index tree failed too, leaking its pages: {e}"
+            )),
+        }
+    }
+
     // create a secondary B+ tree, push an IndexInfo onto the table, persist
     pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
         let (schema, first_dir_page_id, col_index) = {
@@ -233,12 +284,29 @@ impl Catalog {
         let sec_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        for item in hfm.scan() {
-            let (_, tuple) = item?;
-            let values = tuple.deserialize(&schema)?;
-            let sec_value = values[col_index].clone();
-            let primary_key = values[0].clone();   // first column = primary key
-            sec_tree.insert((sec_value, primary_key), ())?;
+        let backfill = (|| -> Result<(), FerroError> {
+            for item in hfm.scan() {
+                let (_, tuple) = item?;
+                let deleted = tuple.version_header()?.end_ts != 0;
+                let values = tuple.deserialize(&schema)?;
+                let sec_value = values[col_index].clone();
+                let primary_key = values[0].clone();   // first column = primary key
+                // D225, review 6 F2: asked here, so the refusal can say which row and whether it
+                // is deleted, which the tree's own refusal cannot. Dead tuples are NOT skipped: an
+                // older snapshot or AS OF may still need their entries.
+                // Measured through the one builder of entry shapes (review 7 K9).
+                if let Some((_, len)) = first_entry_over_bound(&values, false, &[col_index], &[])? {
+                    return Err(Self::backfill_refusal(table, column, &primary_key, deleted, len));
+                }
+                sec_tree.insert((sec_value, primary_key), ())?;
+            }
+            Ok(())
+        })();
+        // D225: a backfill that fails leaves a half-built tree nothing will ever name, and a row
+        // too wide for an index entry (legal in an unindexed VARCHAR column) now fails it by name,
+        // every time it is retried. Free the tree rather than leak one per attempt.
+        if let Err(e) = backfill {
+            return Err(Self::abandon_backfill(&sec_tree, e));
         }
         // D222 — the root is read AFTER the backfill. A backfill that splits the root moves it to a
         // new page, and the page `create` returned is left as the leftmost leaf: recording that
@@ -307,13 +375,26 @@ impl Catalog {
         let ft_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        for item in hfm.scan() {
-            let (_, tuple) = item?;
-            let values = tuple.deserialize(&schema)?;
-            let primary_key = values[0].clone();   // first column = primary key
-            if let Some(text) = indexed_text(&values[col_index])? {
-                post_tokens(&ft_tree, text, &primary_key)?;
+        let backfill = (|| -> Result<(), FerroError> {
+            for item in hfm.scan() {
+                let (_, tuple) = item?;
+                let deleted = tuple.version_header()?.end_ts != 0;
+                let values = tuple.deserialize(&schema)?;
+                let primary_key = values[0].clone();   // first column = primary key
+                // D225, review 6 F2: every posting asked first, as in `create_index`, through the
+                // one builder of entry shapes (review 7 K9).
+                if let Some((_, len)) = first_entry_over_bound(&values, false, &[], &[col_index])? {
+                    return Err(Self::backfill_refusal(table, column, &primary_key, deleted, len));
+                }
+                if let Some(text) = indexed_text(&values[col_index])? {
+                    post_tokens(&ft_tree, text, &primary_key)?;
+                }
             }
+            Ok(())
+        })();
+        // D225: as in `create_index`, a failed backfill frees its half-built tree.
+        if let Err(e) = backfill {
+            return Err(Self::abandon_backfill(&ft_tree, e));
         }
         // D222 — after the backfill, for the reason `create_index` gives.
         let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);

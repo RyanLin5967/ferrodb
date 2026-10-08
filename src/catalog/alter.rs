@@ -77,6 +77,7 @@ use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
+use crate::storage::index_page::{entry_too_large, first_entry_over_bound, is_over_bound, row_entry_sizes, EntryOf, MAX_ENTRY_BYTES, OPEN_TABLE_REMEDY};
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
 
@@ -398,7 +399,7 @@ impl AlterPlan {
 /// Refuse a row that cannot be written under `schema` — **every reason the write itself would
 /// refuse it for, asked while nothing has been written.**
 ///
-/// Three questions, one function, because a caller that asks only two of them has a merge that
+/// Four questions, one function, because a caller that asks only some of them has a merge that
 /// refuses halfway:
 ///
 /// - **arity and type**, from [`Tuple::serialize`] inside [`serialize_and_measure`], which is the
@@ -409,7 +410,17 @@ impl AlterPlan {
 ///   without ever refusing on it, so a `NULL` in a NOT NULL column is accepted when the agent
 ///   types it and refused by `InsertOp::execute` at publication — which, now that the schema is
 ///   applied first, is after the merge has already changed the table.
-/// - **page fit**, which is the question [`prepare_rewrite`] asks of the rows already there.
+/// - **page fit**, which is the question [`prepare_rewrite`] asks of the rows already there;
+/// - **the index entry bound** (D225, review 7 H2): every entry the published row makes in the
+///   target's indexes under the landing shape, the primary entry, each secondary entry and each
+///   posting, through the same builder and the same comparison the INSERT and UPDATE executors use
+///   (`index_page::first_entry_over_bound`). Those executors publish the merge's rows, and they
+///   refuse an entry over `MAX_ENTRY_BYTES`, but only after `apply_plan` has made the schema edits
+///   durable. So a row the bound refuses has to be refused here, or a staged `TYPE BIGINT` under a
+///   long key retypes the table and then fails to publish: E82's half-merge again. `secondary` and
+///   `fulltext` are the index column positions to ask, which ADD, RENAME and RETYPE leave where
+///   they are: every index of the target for a row the merge inserts, and for a row it updates the
+///   ones that UPDATE writes (`index_page::entries_an_update_writes`, the executor's own rule).
 ///
 /// **The second caller is why [`serialize_and_measure`] exists.** `AgentRuntime::merge` publishes
 /// a branch's rows into a table the same merge is altering, and "can this row be written in the
@@ -422,6 +433,8 @@ pub fn refuse_if_the_row_cannot_land(
     schema: &Schema,
     values: &[Value],
     which: &str,
+    secondary: &[usize],
+    fulltext: &[usize],
 ) -> Result<(), FerroError> {
     for (i, c) in schema.columns.iter().enumerate() {
         if c.nullable || !matches!(values.get(i), None | Some(Value::Null)) {
@@ -437,6 +450,23 @@ pub fn refuse_if_the_row_cannot_land(
     }
     let (tuple, fits) = serialize_and_measure(values, schema)?;
     if fits {
+        if let Some((of, len)) = first_entry_over_bound(values, true, secondary, fulltext)? {
+            let column = |p: usize| schema.columns.get(p).map(|c| c.name.as_str()).unwrap_or("?");
+            let entry = match of {
+                EntryOf::Primary => "primary-index entry".to_string(),
+                EntryOf::Secondary(p) => format!("entry in the index on '{}'", column(p)),
+                EntryOf::Posting(p) => format!("posting in the full-text index on '{}'", column(p)),
+            };
+            return Err(FerroError::Constraint(format!(
+                "this MERGE would publish a row into '{table}' whose {entry}, under the shape this \
+                 merge leaves '{table}' in, is {}: {which}. Nothing has been written — the schema \
+                 edits and the rows are decided together and refused together, because a merge \
+                 that applied one without the other is exactly the half-applied state a merge \
+                 exists to avoid. Change that row on the branch so its index entries fit, then \
+                 MERGE again.",
+                entry_too_large(len)
+            )));
+        }
         return Ok(());
     }
     let size = tuple.data.len();
@@ -576,7 +606,23 @@ impl Catalog {
         // `Integer(5)` to `Decimal("5")`, through the same [`Widening`] table.
         let carried = carried_stats(&old_schema, &new_schema, self.stats.get(table))?;
 
-        let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
+        // **D225, review 6 H1: the secondary indexes whose entries the chain widens.** A retype
+        // changes the bytes of every entry in an index on that column, and nothing else rewrites
+        // those entries until crash recovery rebuilds them from the heap, which asks the entry
+        // bound. So `prepare_rewrite` asks it first. Positions are stable through a chain (ADD
+        // COLUMN appends and there is no DROP COLUMN), so a column is retyped exactly when its type
+        // differs between the first shape and the last.
+        let widened: Vec<(String, usize)> = entry
+            .indexes
+            .iter()
+            .filter_map(|i| {
+                let p = old_schema.columns.iter().position(|c| c.name == i.column_name)?;
+                (old_schema.columns[p].data_type != new_schema.columns[p].data_type)
+                    .then(|| (i.column_name.clone(), p))
+            })
+            .collect();
+
+        let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov, &widened)?;
 
         Ok(AlterPlan {
             table: table.to_string(),
@@ -922,6 +968,7 @@ fn prepare_rewrite(
     shapes: &[Schema],
     actions: &[AlterAction],
     prov: Option<&Arc<dyn ProvenanceStore>>,
+    widened: &[(String, usize)],
 ) -> Result<Vec<Prepared>, FerroError> {
     // **A chain that cannot change a single byte of a single row does no heap work at all.**
     //
@@ -959,8 +1006,47 @@ fn prepare_rewrite(
         let mut header = [0u8; VERSION_HEADER_SIZE];
         header.copy_from_slice(&tuple.data[..VERSION_HEADER_SIZE]);
         let was = tuple.data.len();
+        let deleted = tuple.version_header()?.end_ts != 0;
         let mut values = tuple.deserialize(&shapes[0])?;
         let key = values.first().cloned();
+        // **D225 — every key's primary entry is asked the entry bound here, while nothing has been
+        // written.** `commit_rewrite` re-points the primary entry of each row the rewrite moves,
+        // through `upsert`, which refuses an entry over `MAX_ENTRY_BYTES`. Which rows move is not
+        // known until the heap is written, so every key is asked, and a refusal leaves the table
+        // exactly as it was. This build cannot write such a key; an earlier build could.
+        let shown: String = key.as_ref().map(|k| format!("{k:?}")).unwrap_or_default().chars().take(60).collect();
+        if key.is_some() {
+            // Measured through the one builder of entry shapes (`index_page::row_entry_sizes`,
+            // review 7 K9).
+            if let Some((_, len)) = first_entry_over_bound(&values, true, &[], &[])? {
+                return Err(FerroError::Constraint(format!(
+                    "this ALTER would re-point the primary-index entry of the row whose first \
+                     column is {shown}: {}. A build before D225 could store such a key; this one \
+                     cannot re-point it. Nothing has been written. {OPEN_TABLE_REMEDY} Then run \
+                     the ALTER again.",
+                    entry_too_large(len)
+                )));
+            }
+        }
+
+        // **D225, review 6 H1 — every entry the chain widens is asked the bound, while nothing has
+        // been written.** Crash recovery rebuilds each secondary index from the heap in the new
+        // shape and refuses an entry over `MAX_ENTRY_BYTES`, so a widening that pushed one over
+        // would leave a database this build wrote and its own recovery will not open. Every tuple
+        // is asked, deleted ones too, because the rebuild indexes every tuple the heap holds.
+        //
+        // **At every step, and only for growth** (review 7 K6, K5). Each step's entry is compared
+        // with the same entry one step earlier, the way the statements typed one at a time would be
+        // measured, so a chain is refused where its first refusable edit is, even if a later edit
+        // shrinks the entry again. Only an entry that GREW past the bound is refused: an edit that
+        // moves no byte (`VarcharWider`) over an entry an earlier build stored over the bound
+        // leaves it as it was, and refusing that would refuse a change that writes nothing new.
+        let positions: Vec<usize> = widened.iter().map(|(_, p)| *p).collect();
+        let mut before = if key.is_some() && !positions.is_empty() {
+            row_entry_sizes(&values, false, &positions, &[])?
+        } else {
+            Vec::new()
+        };
 
         let mut converted: Option<Tuple> = None;
         let mut over = false;
@@ -976,6 +1062,30 @@ fn prepare_rewrite(
                 // of the chain; the whole plan is about to be discarded.
                 over = true;
                 break;
+            }
+            if !before.is_empty() {
+                let after = row_entry_sizes(&values, false, &positions, &[])?;
+                for ((column, _), (&(_, old_len), &(_, len))) in widened.iter().zip(before.iter().zip(after.iter())) {
+                    if !(is_over_bound(len) && len > old_len) {
+                        continue;
+                    }
+                    let state = if deleted { "a deleted row" } else { "a live row" };
+                    let at = if actions.len() > 1 {
+                        let edit = actions.get(step - 1).map(|a| format!("{a:?}")).unwrap_or_default();
+                        format!(" at edit {step} of {}, {edit},", actions.len())
+                    } else {
+                        String::new()
+                    };
+                    let excess = len - MAX_ENTRY_BYTES;
+                    return Err(FerroError::Constraint(format!(
+                        "this ALTER would widen the entry of the row whose first column is {shown} \
+                         ({state}) in the index on '{table}.{column}'{at} to {}: the row's key must \
+                         be shorter by at least {excess} bytes before the column can be retyped. \
+                         Nothing has been written. {OPEN_TABLE_REMEDY} Then run the ALTER again.",
+                        entry_too_large(len)
+                    )));
+                }
+                before = after;
             }
             converted = Some(bytes);
         }

@@ -82,6 +82,7 @@ use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
+use crate::storage::index_page::entries_an_update_writes;
 use crate::tel::frame::TxnFrame;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::tel::guard::{ArithOp, CmpOp, Guard, GuardExpr};
@@ -5254,7 +5255,13 @@ impl AgentRuntime {
         // **What is still fallible after step 3, stated exactly rather than generously.** It is what
         // `catalog::alter` already calls environmental — a disk write that fails, a buffer pool with
         // no evictable frame, the arena floor exhausted by a relocation that `reserve_free_space`
-        // could not see coming. Two shapes of residue, and the second is not the first:
+        // could not see coming. Every refusal the DATA can earn is asked before step 3, by
+        // `conform_to`: NOT NULL, page fit, and (D225, review 7 H2) the index entry bound, which
+        // the publishing executors would otherwise raise only after the schema was durable. One
+        // exception is not decidable here: a no-cut refusal on an index leaf an earlier build left
+        // exactly full around an entry over the bound (`index_page::MAX_ENTRY_BYTES`'s list),
+        // which depends on the page, not the row. Two shapes of residue, and the second is not the
+        // first:
         //
         // - **one table**: its shape is applied and no row is published. The merge returns `Err`
         //   and the target is a table with the edit and none of the branch's rows.
@@ -5289,30 +5296,51 @@ impl AgentRuntime {
         // a table nobody altered would otherwise be refused by `Tuple::serialize` from inside the
         // publish transaction, after a DIFFERENT table's edits had already landed. One merge, one
         // decision, over every table it touches.
-        let mut landing: BTreeMap<String, (Schema, Schema)> = BTreeMap::new();
+        //
+        // With each table's index column positions (D225, review 7 H2), resolved by name against
+        // the table as it stands. ADD appends, RENAME renames in place and RETYPE retypes in place,
+        // so a position read here is the same column's position in the landing shape. A name that
+        // does not resolve is refused, not skipped: skipping it would leave that index's entries
+        // unasked.
+        let mut landing: BTreeMap<String, (Schema, Schema, Vec<usize>, Vec<usize>)> = BTreeMap::new();
         for w in &pending {
             let name = w.table();
             if landing.contains_key(name) {
                 continue;
             }
-            let from = ctx.catalog.require_table(name)?.schema.clone();
+            let entry = ctx.catalog.require_table(name)?;
+            let from = entry.schema.clone();
+            let position = |column: &str| {
+                from.columns.iter().position(|c| c.name == column).ok_or_else(|| {
+                    FerroError::Internal(format!(
+                        "an index on '{name}' names column '{column}', which '{name}' does not have"
+                    ))
+                })
+            };
+            let secondary =
+                entry.indexes.iter().map(|i| position(&i.column_name)).collect::<Result<Vec<_>, _>>()?;
+            let fulltext = entry
+                .fulltext_indexes
+                .iter()
+                .map(|i| position(&i.column_name))
+                .collect::<Result<Vec<_>, _>>()?;
             let to = plans
                 .iter()
                 .find(|(i, _)| schema_reports[*i].table == name)
                 .map(|(_, plan)| plan.final_shape().clone())
                 .unwrap_or_else(|| from.clone());
-            landing.insert(name.to_string(), (from, to));
+            landing.insert(name.to_string(), (from, to, secondary, fulltext));
         }
 
         let mut ready: Vec<PendingWrite> = Vec::with_capacity(pending.len());
         for w in pending {
-            let (from, to) = landing.get(w.table()).ok_or_else(|| {
+            let (from, to, secondary, fulltext) = landing.get(w.table()).ok_or_else(|| {
                 FerroError::Internal(format!(
                     "no landing shape for '{}', which this merge is about to write to",
                     w.table()
                 ))
             })?;
-            ready.push(w.conform_to(from, to)?);
+            ready.push(w.conform_to(from, to, secondary, fulltext)?);
         }
 
         // ---- the schema, applied while no row of this merge has been written -------------------
@@ -5423,7 +5451,8 @@ impl AgentRuntime {
         // avoid: the report says the merge landed or it says it did not.
         //
         // The rows are `ready` rather than `pending`: already carried into the shape the schema
-        // edits above left the table in, and already measured against it. `ALTER` is refused
+        // edits above left the table in, and already measured against it — its width, its NOT
+        // NULL columns, and every index entry it makes (D225, review 7 H2). `ALTER` is refused
         // inside a transaction, so the edits could never have run inside this one; they ran
         // before it opened.
         let publish_txn = ctx.txn.begin()?;
@@ -6855,19 +6884,30 @@ impl PendingWrite {
     /// altered (`catalog::alter::resulting_schema` refuses it), so the value it names means the
     /// same thing under both shapes. The key's column NAME can change, and `into_stmt` reads that
     /// from the catalog at the moment it builds the statement — which is after the rename landed.
-    fn conform_to(self, from: &Schema, to: &Schema) -> Result<PendingWrite, FerroError> {
+    fn conform_to(
+        self,
+        from: &Schema,
+        to: &Schema,
+        secondary: &[usize],
+        fulltext: &[usize],
+    ) -> Result<PendingWrite, FerroError> {
         match self {
             PendingWrite::Insert { table, row } => {
                 let row = conform_row(&row, from, to)?;
                 let which = format!("the row this merge inserts with key {:?}", row.first());
-                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
+                refuse_if_the_row_cannot_land(&table, to, &row, &which, secondary, fulltext)?;
                 Ok(PendingWrite::Insert { table, row })
             }
             PendingWrite::Update { table, schema: _, key, row, before } => {
                 let row = conform_row(&row, from, to)?;
                 let before = conform_row(&before, from, to)?;
                 let which = format!("the row this merge updates with key {key:?}");
-                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
+                // Asked exactly the entries the UPDATE that publishes it writes (review 7 H2): an
+                // entry it leaves alone is not re-inserted, so refusing it would refuse a merge
+                // whose publish succeeds. A column this merge retypes is asked on the trunk row by
+                // `prepare_rewrite`.
+                let (secondary, fulltext) = entries_an_update_writes(&before, &row, secondary, fulltext)?;
+                refuse_if_the_row_cannot_land(&table, to, &row, &which, &secondary, &fulltext)?;
                 // The landing shape, not the scored one: `into_stmt` builds the `UPDATE`'s
                 // assignments from these column names, and after a rename the scored shape names a
                 // column the table no longer has.
@@ -7284,6 +7324,43 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::column::Column;
+
+    /// **D225, review 7 H2 (A4.3b): a merged UPDATE is asked the index entries its UPDATE writes,
+    /// and no others.** `v` is indexed at position 1, and `'x' x 2100` makes the entry
+    /// (3 + 2100) + 5 = 2108 bytes, over `MAX_ENTRY_BYTES` = 2034, which only an earlier build could
+    /// have stored. An Update that leaves `v` alone writes no entry of `v`, so the merge must not
+    /// refuse it. An Update that changes `v` to that value writes it, so the merge must refuse it
+    /// before anything is written.
+    #[test]
+    fn a_merged_update_is_asked_only_the_index_entries_its_update_writes() {
+        let shape = Schema::new(vec![
+            Column::new("id".to_string(), DataType::Integer, false),
+            Column::new("v".to_string(), DataType::Varchar(3000), true),
+            Column::new("n".to_string(), DataType::Integer, true),
+        ]);
+        let long = Value::Varchar("x".repeat(2100));
+        let update = |before_v: Value, after_v: Value| PendingWrite::Update {
+            table: "t".to_string(),
+            schema: shape.clone(),
+            key: Value::Integer(2),
+            row: vec![Value::Integer(2), after_v, Value::Integer(5)],
+            before: vec![Value::Integer(2), before_v, Value::Integer(0)],
+        };
+
+        let kept = update(long.clone(), long.clone()).conform_to(&shape, &shape, &[1], &[]);
+        assert!(
+            kept.is_ok(),
+            "a merged UPDATE was refused for an index entry it does not write: {:?}",
+            kept.err()
+        );
+
+        let e = match update(Value::Varchar("short".to_string()), long).conform_to(&shape, &shape, &[1], &[]) {
+            Ok(_) => panic!("a merged UPDATE whose new entry is over the bound was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("index entry too large: 2108 bytes"), "not the landing check's refusal: {e}");
+    }
 
     /// A workspace with nothing in it but the two fields `txn_refs` indexes.
     fn ws(name: &str, txn: u64, inherited: &[u64]) -> Workspace {

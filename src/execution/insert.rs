@@ -57,6 +57,7 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::storage::index_fulltext::{indexed_text, post_tokens};
+use crate::storage::index_page::{entry_refusal, first_entry_over_bound};
 use crate::provenance::{ProvId, ProvenanceStore};
 use std::sync::Arc;
 
@@ -105,6 +106,22 @@ impl Modify for Insert {
                     col.name, self.table
                 )))
             }
+        }
+        // **D225 — every index entry this row will add must be one the trees admit, asked BEFORE
+        // any of the row is written.**
+        //
+        // Each tree refuses an entry over `MAX_ENTRY_BYTES` by name (`admit_entry`), but it would
+        // refuse too late: by the secondary and full-text writes below, the heap row and the
+        // primary entry are already written. The abort undoes only the heap, so the primary entry
+        // would be left pointing at a deleted slot, and every later INSERT of that key would fail
+        // reading it (`SlotDeleted`) — a key refused once could never be used again. So the same
+        // bound is asked here, for every entry the writes below will make, through the one builder
+        // of entry shapes (`index_page::row_entry_sizes`, review 7 K9): the primary entry, each
+        // secondary entry, and each posting of each distinct token.
+        let secondary: Vec<usize> = self.secondary_indexes.iter().map(|h| h.col_index).collect();
+        let fulltext: Vec<usize> = self.fulltext_indexes.iter().map(|h| h.col_index).collect();
+        if let Some((_, len)) = first_entry_over_bound(&vals, true, &secondary, &fulltext)? {
+            return Err(entry_refusal(len));
         }
         // **An index entry outlives the row it points at.** DELETE stamps `end_ts` on the version
         // in place and leaves the entry alone, so `search` finding a key does NOT mean the key is

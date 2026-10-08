@@ -1,0 +1,73 @@
+head=8aba419dd072c4962811d554a8b8d86627e8bd21 dirty=0 cmd=cargo test --test d225_byte_split start=2026-09-24T21:51:03Z
+2026-09-24T21:51:03Z d225 acquiring (5s poll), pid 40568
+2026-09-24T22:04:34Z d225 ACQUIRED: 40568 d225 2026-09-24T22:04:34Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d225-byte-split.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.62s
+     Running tests/d225_byte_split.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d225_byte_split-ab03c813b9e4bd22)
+
+running 28 tests
+test a_varchar_primary_key_over_the_entry_bound_is_refused_by_name ... ok
+test a_create_index_over_a_live_long_row_says_the_row_is_live ... ok
+test a_rebuild_over_a_legacy_oversized_primary_key_is_refused_before_anything_is_freed ... ok
+test a_create_fulltext_index_over_a_deleted_row_with_an_over_bound_posting_is_refused_by_the_backfill ... ok
+test a_chain_is_refused_at_the_step_that_widens_an_entry_past_the_bound ... ok
+test a_merge_whose_row_would_land_over_the_bound_is_refused_before_the_schema_moves ... ok
+test a_multi_row_update_refused_for_not_null_writes_no_row_first ... ok
+test a_branch_insert_over_the_bound_in_the_branch_shape_is_refused_when_typed ... FAILED
+test a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_builds ... FAILED
+test a_rebuild_over_a_row_an_earlier_build_indexed_is_refused_before_anything_is_freed ... ok
+test a_branch_update_over_the_bound_is_refused_when_typed ... FAILED
+test a_secondary_value_over_the_entry_bound_is_refused_by_name_and_writes_nothing ... ok
+test a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry ... FAILED
+test a_rebuild_over_a_legacy_oversized_posting_is_refused_before_anything_is_freed ... ok
+test a_varchar_widening_over_a_legacy_entry_it_does_not_grow_is_accepted ... ok
+test a_multi_row_update_is_refused_before_its_first_row_is_written ... ok
+test a_create_index_the_entry_bound_refuses_registers_nothing_and_leaks_nothing ... ok
+test an_update_of_a_row_under_a_legacy_oversized_key_is_refused_before_it_is_written ... ok
+test an_alter_that_would_repoint_a_legacy_oversized_key_is_refused_before_any_row_moves ... ok
+test an_alter_that_widens_an_indexed_column_past_the_bound_is_refused_before_any_row_moves ... ok
+test an_insert_whose_posting_is_over_the_bound_into_an_existing_full_text_index_writes_nothing ... ok
+test an_alter_that_widens_an_indexed_column_to_exactly_the_bound_is_accepted_and_recovers ... ok
+test an_update_to_a_value_over_the_entry_bound_is_refused_and_the_row_keeps_its_value ... ok
+test an_update_whose_new_posting_is_over_the_bound_is_refused_before_the_row_moves ... ok
+test a_create_index_over_a_deleted_long_row_names_the_table_copy_and_the_copy_works ... ok
+test the_32nd_insert_into_a_mixed_width_posting_tree_splits_by_bytes ... ok
+test the_32nd_insert_into_a_mixed_width_varchar_index_splits_by_bytes ... ok
+test random_widths_never_leave_a_page_at_or_over_the_threshold ... ok
+
+failures:
+
+---- a_branch_insert_over_the_bound_in_the_branch_shape_is_refused_when_typed stdout ----
+
+thread 'a_branch_insert_over_the_bound_in_the_branch_shape_is_refused_when_typed' (357359747) panicked at tests/d225_byte_split.rs:1214:18:
+the branch took a row whose index entry is over the bound in its own shape
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_builds stdout ----
+
+thread 'a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_builds' (357359754) panicked at tests/d225_byte_split.rs:101:33:
+`CREATE INDEX iv ON t (v);` failed: constraint error: cannot build the index on 't.v': the row whose first column is Integer(1) makes index entry too large: 2108 bytes (key and value as stored), over the B+tree entry limit MAX_ENTRY_BYTES = 2034. The row is deleted. Its tuple stays in the table until its key is inserted again, which moves the dead version to the table's history; nothing else removes it (there is no VACUUM), so until then this refusal repeats. If the key fits, INSERT that key again with values whose index entries fit, remove the row again if it is not wanted, and CREATE the index again. If the key is the cause: With this build: copy the table's live rows into a new table, each under a key and values whose index entries fit the bound (there is no INSERT ... SELECT, so SELECT the rows and INSERT each one), DROP the old table, CREATE it again under its old name, copy the rows back and CREATE its indexes again (there is no RENAME TABLE). The copy discards the table's history: DROP frees its time-travel heap and its dead versions, so no older snapshot can read them any more. No in-place change repairs a key over the bound: a primary key cannot be updated and one over the bound cannot be inserted again, so a deleted row under it stays in the table (there is no VACUUM).
+
+---- a_branch_update_over_the_bound_is_refused_when_typed stdout ----
+
+thread 'a_branch_update_over_the_bound_is_refused_when_typed' (357359748) panicked at tests/d225_byte_split.rs:1249:18:
+the branch took an UPDATE whose index entry is over the bound
+
+---- a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry stdout ----
+
+thread 'a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry' (357359760) panicked at tests/d225_byte_split.rs:101:33:
+`INSERT INTO t VALUES (1, 'short');` failed: the slot is delted
+
+
+failures:
+    a_branch_insert_over_the_bound_in_the_branch_shape_is_refused_when_typed
+    a_branch_update_over_the_bound_is_refused_when_typed
+    a_deleted_long_row_is_replaced_by_inserting_its_key_again_and_the_index_then_builds
+    a_no_cut_refusal_after_the_heap_write_leaves_no_dangling_primary_entry
+
+test result: FAILED. 24 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+
+error: test failed, to rerun pass `--test d225_byte_split`
+2026-09-24T22:04:49Z d225 rc=101
+2026-09-24T22:04:50Z d225 released (owner matched)
+exit=101 end=2026-09-24T22:04:50Z
