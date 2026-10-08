@@ -52,6 +52,21 @@ pub struct TableBranchCatalog {
     logical: Mutex<()>,
     next_id: AtomicU64,
     epoch: AtomicU64,
+    /// Child-span scans performed by `has_live_children`, counted at the single site that issues
+    /// them.
+    ///
+    /// **This is an instrument, not a statistic** — the same role `reaper::sweep_descents` plays
+    /// for D40, and for the same reason: the claim it exists to test is a COMPLEXITY CLASS, and an
+    /// integer proves a class directly while a wall clock only illustrates it. A clock moves when
+    /// the machine is loaded; a scan count does not.
+    ///
+    /// D166 asks whether `reaper::detach_from_parent` is merely O(depth) or worse. Its cascade
+    /// takes O(depth) STEPS, but each step calls `has_live_children`, whose own doc says the cost
+    /// "is still not O(1)" — a breadth-first walk of the reaped subtree, one `range_scan` per node
+    /// visited. As the cascade climbs, the subtree beneath the cursor GROWS. **Counting cascade
+    /// steps alone cannot see that; counting scans can**, which is why the counter is here and not
+    /// in the reaper.
+    child_scans: AtomicU64,
     /// The buffer pool, kept so the header page can be written without threading it through.
     pool: Arc<BufferPoolManager>,
     /// The fixed page naming the tree root. `0` means "none" - `create` builds a catalog with no
@@ -424,6 +439,7 @@ impl TableBranchCatalog {
             // which is 0, and seeds its counter with exactly that. Seeding 1 here would make the
             // first epoch this catalog hands out differ from the first the log hands out.
             epoch: AtomicU64::new(0),
+            child_scans: AtomicU64::new(0),
             pool,
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
@@ -447,6 +463,7 @@ impl TableBranchCatalog {
             logical: Mutex::new(()),
             next_id: AtomicU64::new(1),
             epoch: AtomicU64::new(1),
+            child_scans: AtomicU64::new(0),
             pool,
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
@@ -851,6 +868,15 @@ impl TableBranchCatalog {
     }
 
     /// Live branches, for parity with `LogBranchCatalog::live_count`.
+    /// Child spans scanned by `has_live_children` since this catalog was built.
+    ///
+    /// Read it twice around the operation under test and take the difference — the counter is
+    /// process-wide and monotonic, so an absolute value is meaningless without the pair. See the
+    /// field's own note for why this is an instrument rather than a statistic.
+    pub fn child_scans(&self) -> u64 {
+        self.child_scans.load(Ordering::Relaxed)
+    }
+
     pub fn live_count(&self) -> Result<usize, FerroError> {
         let (lo, hi) = keys::whole_state(BranchState::Live.as_u8());
         Ok(self.ids_in_span(lo, hi)?.len())
@@ -1283,6 +1309,10 @@ impl BranchCatalog for TableBranchCatalog {
         let mut pending = vec![parent_id];
         while let Some(id) = pending.pop() {
             let (lo, hi) = keys::children_of(id);
+            // One increment per node VISITED, which is one `range_scan` issued. Counted here
+            // rather than per entry: the question D166 asks is how many child spans this walk
+            // touches, and an entry count would answer a different one (how wide they are).
+            self.child_scans.fetch_add(1, Ordering::Relaxed);
             for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
                 let (k, v) = entry?;
                 match self.child_liveness(&k, &v)? {
