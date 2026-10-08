@@ -1,0 +1,21 @@
+# D192 smoke run, harness d0d7dbc (distinct identity per lifecycle), lock held 2026-09-23T22:01:47Z. Raw, unedited.
+lock acquired 2026-09-23T22:01:47Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d192-attest-size)
+    Finished `release` profile [optimized] target(s) in 10.18s
+build rc=0
+D192 attest footprint — arm=merge checkpoints=[100, 200, 400]
+size_of: HistoryEntry=96 usize=8 node=32 Vec<[u8;32]>=24 (BranchId,Vec<usize>)=40 (BranchId,Attestation)=48 GROUP(model)=8
+control: attested_len before any fork = 0; empty-log replay built=0 returned=0 footprint=AttestFootprint { entries_len: 0, entries_cap: 0, by_branch_keys: 0, by_branch_table_cap: 0, by_branch_idx_len: 0, by_branch_idx_cap: 0, heads_keys: 0, heads_table_cap: 0, levels: 0, levels_outer_cap: 0, level_nodes_len: 0, level_nodes_cap: 0 }
+
+      N  att_len    keys   live_model  alloc_model    allocator     resid     returned     proc_heap  alloc/N     secs
+    100      300     101        59586        98192        98192         0        98192        368796    981.9      5.5
+        footprint AttestFootprint { entries_len: 300, entries_cap: 512, by_branch_keys: 101, by_branch_table_cap: 112, by_branch_idx_len: 300, by_branch_idx_cap: 528, heads_keys: 101, heads_table_cap: 112, levels: 10, levels_outer_cap: 16, level_nodes_len: 603, level_nodes_cap: 1028 }
+    200      600     201       118986       195856       195856         0       195856        729380    979.3     10.8
+        footprint AttestFootprint { entries_len: 600, entries_cap: 1024, by_branch_keys: 201, by_branch_table_cap: 224, by_branch_idx_len: 600, by_branch_idx_cap: 1056, heads_keys: 201, heads_table_cap: 224, levels: 11, levels_outer_cap: 16, level_nodes_len: 1203, level_nodes_cap: 2052 }
+
+thread 'main' (315390194) panicked at examples/d192_attest_footprint.rs:235:57:
+merge failed: Provenance("page provenance dictionary full (255 entries); refusing to widen the per-version slot")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+smoke rc=101
+
+[exited with code 0]
