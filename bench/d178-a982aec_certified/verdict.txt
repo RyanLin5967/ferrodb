@@ -1,0 +1,2 @@
+d178-planspace: mode=per-target rc=0 passed=2545 failed=0 build_errors=0 head=a982aec log=/Users/idide/wt/artie-research/verify-out/d178-final2/suite-d178-planspace.log
+d178-planspace: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out/d178-final2/suite-d178-planspace.go.log

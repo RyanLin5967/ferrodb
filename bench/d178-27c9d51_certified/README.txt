@@ -72,3 +72,9 @@ fixture. Recorded as Amendment 2 in bench/d178_prereg.txt rather than fixed quie
 Full write-up: /Users/idide/wt/artie-research/frontier/d178_dml_index.md
 Pre-registration + amendments: bench/d178_prereg.txt
 Raws: bench/d178_run1_BEFORE_RAW.txt, _run2_MID_RAW.txt, _run3_AFTER_RAW.txt, _run4_MERGE_RAW.txt
+
+---
+SUPERSEDED BY bench/d178-a982aec_certified/ — two commits landed after 27c9d51 (the
+plan-space differential a982aec, which corrects a claim about the H1 fix, and this
+certification itself). This run was correct for the commit it names; it simply stopped
+covering the tip. The test total is unchanged at 2545.
