@@ -181,22 +181,37 @@ pub fn scan_table_seq_tuples() -> u64 {
     SCAN_TABLE_SEQ_TUPLES.load(AtomicOrdering::Relaxed)
 }
 
-/// **D191 instrument — how many `State::applied` entries `AgentRuntime::diff` VISITED.**
+/// **D191 instrument: how many entries of the published history `AgentRuntime::diff` VISITED to
+/// answer its `concurrent` flags.**
 ///
-/// `diff` answers each changed row's `concurrent` flag with `state.applied.iter().any(..)`, once
-/// PER CHANGED ROW, over a log that is global across branches and never pruned. D86's
-/// `applied_by_cell` index is keyed `(tbl, row, col)` and cannot serve this `(tbl, row)` question,
-/// so the read shape is O(delta x |applied|). This counter is what turns that reading into a
-/// measurement (`examples/d191_diff_applied_curve.rs`).
+/// ⚠ **What it counts changed with wall #17's fix. The name did not.** Quote the commit with any
+/// reading.
 ///
-/// Taken from INSIDE the `.any` closure, for the reason `ours_ops_on_cell` gives: a count computed
-/// as `applied.len()` from outside would be an assertion about the code rather than a reading of
-/// it, and it would miss the short-circuit — `.any` stops at the first concurrent entry, so a row
-/// the target DID move visits only up to that entry. Integers, like `OURS_SCAN_*`, because a count
-/// does not move when the box is loaded.
+/// * **Before the fix** (D191's branch at `0df2216`, and any tree without
+///   `State::applied_row_high`), `diff` answered each changed row with
+///   `state.applied.iter().any(..)`, once PER CHANGED ROW, over a log that is global across
+///   branches and never pruned. D86's `applied_by_cell` index is keyed `(tbl, row, col)` and
+///   cannot serve this `(tbl, row)` question, so the read shape was O(delta x |applied|). This
+///   counter was taken from INSIDE the `.any` closure, which is what
+///   `examples/d191_diff_applied_curve.rs` curves.
 ///
-/// ⚠ Counted per ROW, not per entry: one local increment inside the closure and one relaxed add
-/// per changed row, so the instrument cannot create the slope it measures.
+///   ⚠ That harness's pre-registered checks describe the BEFORE shape (`4·|applied|` and so on).
+///   On a tree with the fix, it prints `MISMATCH` and exits 2, which is the fix working, not the
+///   fix failing. Its AFTER shape, derived from its fixture, is 0 for arms A, P and Δ, and 1 for
+///   arm M at every checkpoint after merge #30. All of it is flat in K. Run the BEFORE arm from
+///   D191's own branch.
+/// * **After the fix**, `diff` asks [`State::applied_high_on_row`], and this counts the high-water
+///   entries that lookup FOUND. That is one per changed row that has any published history, and
+///   none for a row that has never been published. It is bounded by delta, with no `|applied|`
+///   term. `tests/d191_diff_does_not_scan_applied.rs` pins the exact integers.
+///
+/// Either way it is a reading, not a `len()`. Counted from outside, it would be an assertion about
+/// the code rather than a reading of it, for the reason `ours_ops_on_cell` gives. The old count saw
+/// `.any`'s short-circuit, and the new one sees which rows have history. Integers, like
+/// `OURS_SCAN_*`, because a count does not move when the box is loaded.
+///
+/// ⚠ One local increment per visit and one relaxed add per changed row, so the instrument cannot
+/// create the slope it measures.
 pub static DIFF_APPLIED_VISITED: AtomicU64 = AtomicU64::new(0);
 /// Changed rows `diff` examined — the delta, which a curve over `|applied|` must hold fixed.
 pub static DIFF_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -915,11 +930,78 @@ struct State {
     /// comparison a shared box cannot fake. Merge k cost O(k x delta); merging N branches was
     /// O(N^2).
     ///
-    /// ⚠ The Vec STAYS. Two other readers need it and neither is served by this key: the `txn`
-    /// filter in `REVERT` (`:4159`) and `highest_applied_seq` (`:3538`). This is an index beside
-    /// the log, not a replacement for it — which also means the two must be pushed together, and
-    /// `push_applied` is the only place that does either.
+    /// ⚠ The Vec STAYS. This is an index beside the log, not a replacement for it, so the two must
+    /// be pushed together, and `push_applied` is the only place that does either. Its readers that
+    /// this key does not serve, enumerated by symbol:
+    /// * `undo_txn`'s `txn` filter (REVERT): one full pass per reverted txn.
+    /// * `highest_applied_seq`: one full pass per merge, kept on purpose as an ordering guard
+    ///   (D182; do not replace it with `last()`).
+    /// * `RuntimeCherryLog::project`'s `at_seq` map: one full pass per cherry-pick.
+    /// * `pickable_ops`: returns the whole log, so it is output-sized.
+    ///
+    /// ⚠ That list used to say "two" and name only the first two. `AgentRuntime::diff` was a third,
+    /// scanning the whole log once per changed row, and nothing listed it (D191, branch-count wall
+    /// #17). It now reads [`State::applied_row_high`] instead. A worded list of readers is evidence
+    /// that its author modelled the hazard, not evidence that the list is complete. Re-derive it
+    /// before relying on it, with `grep -n '\.applied\([^_a-zA-Z]\|$\)' src/agent_sql/runtime.rs`.
+    /// The `$` arm is what catches the chains split across lines (`pickable_ops` is one); the
+    /// shorter `'state\.applied[^_]'` misses those. Read the hits: `r.applied` is
+    /// `RowMergeOutcome`'s, not this log.
     applied_by_cell: std::collections::HashMap<(u32, u64, u32), Vec<u32>>,
+    /// **Wall #17 / D191.** `(tbl, row)` -> the highest `seq` of any op EVER pushed onto `applied`
+    /// for that row, whole-row ops included. It lets `AgentRuntime::diff` stop scanning the whole
+    /// log once per changed row.
+    ///
+    /// `diff`'s question for each changed row is "was anything published on this row after I
+    /// forked?", i.e. `applied.iter().any(|a| a.seq > fork_seq && a.tbl == t && a.row == r)`. An
+    /// entry satisfies that iff the row's highest seq does, so a high-water mark answers it exactly
+    /// in one probe. Unlike D86's key, only `seq` is a range here, and nothing about the answer needs
+    /// more than its maximum.
+    ///
+    /// **What it must stay consistent with:** for every `(tbl, row)`, the value is
+    /// `max { a.seq : a pushed through push_applied, (a.tbl, a.row) == (tbl, row) }`, and the key is
+    /// absent iff no such `a` exists. Three properties make that hold by construction, not by
+    /// discipline:
+    /// * **One door.** It is maintained in `push_applied` and nowhere else, the same door as `applied`
+    ///   and `applied_by_cell`. `record_applied` is that door's only caller.
+    /// * **Every op shape.** Whole-row ops (`RowCreate`, `RowDelete`, which have `col == None`) are
+    ///   included. A published delete moves the row as surely as an assign does, and it is exactly
+    ///   the op D86's `(tbl, row, col)` key skips. That is why D86's index could not be reused.
+    /// * **`max`, not overwrite.** It is right for any push order, so it does not depend on the
+    ///   increasing-`seq` order that `highest_applied_seq` exists to distrust. Publishes into
+    ///   one database are serialised today (by the pgwire statement lock, and by the
+    ///   `&mut Catalog` in `ExecCtx`), so overwrite would give the same answer there. But `max`
+    ///   costs nothing more, and it keeps this map from resting on the invariant another guard in
+    ///   this file checks.
+    ///
+    /// **REVERT does not touch it, and does not need to.** At the time of writing, nothing removes
+    /// from `applied`. `undo_txn` only reads it, and its inverse writes go through
+    /// `PendingWrite::apply`, which has no access to `State`. The map is **monotone by design**, not
+    /// by accident: "something was published on this row after seq s" stays true after the log
+    /// entry that recorded it is gone. So if `applied` is ever pruned, or a revert ever removes the
+    /// entries it undoes, the retired scan would forget a move that this map still reports, and
+    /// this map is the one that matches `ChangeOutcome::PendingConcurrent`'s contract ("the target
+    /// has moved under this row"). What does NOT reach it is a revert's own inverse writes, because
+    /// they are not pushed. That was the retired scan's behaviour too, and it is kept, not decided,
+    /// here. `concurrent_op` on the merge path sees such a move only through its image fallback.
+    ///
+    /// **Why not `State::versions`,** which is also keyed `(tbl, row)` and also carries the seq:
+    /// * It is written LAST-writer-wins in `record_applied`, outside the door.
+    /// * It is the read-premise check's authority, and its own comments anticipate a purge (for
+    ///   example on `DROP TABLE`) that would silently turn `diff`'s answer from moved to not-moved.
+    ///
+    /// The two maps hold the same key space (one entry per distinct published row, never per op),
+    /// so the duplication costs O(rows ever published), with no branch or merge term.
+    ///
+    /// Prior art: the per-record latest-writer stamp that OCC validation compares against the
+    /// transaction's start, instead of intersecting the write-sets of everything committed since
+    /// then. Examples are Silo's per-record TID word (Tu et al., SOSP 2013) and Hekaton's version
+    /// timestamps (Larson et al., VLDB 2011). The retired scan WAS that write-set intersection
+    /// (Kung & Robinson, TODS 1981, which Härder 1984 calls backward-oriented validation). It is
+    /// also snapshot isolation's first-committer-wins test (Berenson et al., SIGMOD 1995).
+    /// Precision locking (Jordan et al., SIGMOD 1981) is the predicate generalisation. It is not
+    /// needed here, because `diff` asks about a row KEY, not a predicate.
+    applied_row_high: std::collections::HashMap<(u32, u64), u64>,
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id SLOT.
     ///
@@ -997,6 +1079,10 @@ impl State {
                 .or_default()
                 .push(at);
         }
+        // Wall #17: every op, whole-row ones included, and `max` rather than overwrite. See
+        // `State::applied_row_high` for why each of those is load-bearing.
+        let high = self.applied_row_high.entry((op.tbl.0, op.row.0)).or_insert(op.seq);
+        *high = (*high).max(op.seq);
         self.applied.push(op);
     }
 
@@ -1007,6 +1093,12 @@ impl State {
             .get(&(tbl.0, row.0, col.0))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The highest `seq` ever published on one row, by any op shape. `None` when the row has
+    /// never been published, which is the common case. One hash probe, whatever `|applied|` is.
+    fn applied_high_on_row(&self, tbl: TableId, row: RowId) -> Option<u64> {
+        self.applied_row_high.get(&(tbl.0, row.0)).copied()
     }
 
     /// Insert a workspace, taking the txn references it holds. One of the two doors into
@@ -3338,10 +3430,17 @@ impl AgentRuntime {
                             })
                             .cloned()
                             .collect();
-                        let concurrent = state.applied.iter().any(|a| {
+                        // **Wall #17: one high-water probe, not a scan of the log.** This was
+                        // `state.applied.iter().any(|a| a.seq > ws.fork_seq && a.tbl == t &&
+                        // a.row == r)`. That is O(|applied|) per changed row, over a log every
+                        // merge of every branch appends to and nothing prunes. The row's highest
+                        // published seq exceeds `fork_seq` iff some entry does, so the answer is
+                        // the same. See `State::applied_row_high` for what keeps it the same.
+                        let high = state.applied_high_on_row(TableId(*t), RowId(*r));
+                        if high.is_some() {
                             applied_visited += 1;
-                            a.seq > ws.fork_seq && a.tbl.0 == *t && a.row.0 == *r
-                        });
+                        }
+                        let concurrent = high.map_or(false, |seq| seq > ws.fork_seq);
                         DIFF_APPLIED_VISITED.fetch_add(applied_visited, AtomicOrdering::Relaxed);
                         DIFF_FRAME_VISITED.fetch_add(frame_visited, AtomicOrdering::Relaxed);
                         DIFF_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3633,9 +3732,14 @@ impl AgentRuntime {
     ///
     /// # What it costs
     ///
-    /// O(picked + ops on the picked cells). The divergence question is read through D86's
-    /// `applied_by_cell` index — the one that already exists — rather than by scanning the log,
-    /// which is the contract [`CherryLog::ops_on_cell`] states. Nothing walks `State::applied`.
+    /// The divergence question is O(picked + ops on the picked cells). It is read through D86's
+    /// `applied_by_cell` index (the one that already exists) rather than by scanning the log, which
+    /// is the contract [`CherryLog::ops_on_cell`] states.
+    ///
+    /// ⚠ Not "nothing walks `State::applied`", which this sentence used to say.
+    /// `RuntimeCherryLog::project` builds its `at_seq` map with one full pass over the log per pick,
+    /// so a pick costs O(|applied|) on top of the bound above. The divergence question does not
+    /// walk the log; the projection does (wall #17's reader audit).
     pub fn cherry_pick(
         &self,
         ctx: &mut ExecCtx,
@@ -7467,5 +7571,59 @@ mod tests {
             "a range leaked by a failed publication only shifts later versions upward, which \
              over-reports rather than corrupts, so it must not be refused"
         );
+    }
+
+    /// **Wall #17.** `diff` asks `State::applied_row_high` instead of scanning `applied`. So the
+    /// map has to give the scan's answer for every push ORDER, every op SHAPE and every KEY,
+    /// including the ones SQL cannot reach today. Publishes are serialised, which makes an
+    /// out-of-order push invisible to `tests/d191_diff_does_not_scan_applied.rs`, and with it any
+    /// mutant that overwrites instead of taking the max. This test plants one.
+    ///
+    /// The oracle is the retired predicate itself, evaluated over the same log, so no expected value
+    /// here comes from the map under test.
+    #[test]
+    fn the_row_high_water_is_the_max_over_every_push_on_that_row() {
+        let mut state = State::default();
+        assert_eq!(state.applied_high_on_row(TableId(1), RowId(1)), None, "nothing published yet");
+
+        // Whole-row ops (`applied_at` builds a `RowDelete`), pushed out of seq order on purpose.
+        for seq in [1, 3, 2] {
+            state.push_applied(applied_at(seq));
+        }
+        assert_eq!(
+            state.applied_high_on_row(TableId(1), RowId(1)),
+            Some(3),
+            "an overwrite answers 2 here: the LAST push, not the highest seq"
+        );
+
+        // A cell op on the same row, then ops on keys that share exactly one coordinate with it.
+        state.push_applied(AppliedOp {
+            col: Some(ColId(1)),
+            kind: OpKind::Assign(Value::Integer(0)),
+            ..applied_at(5)
+        });
+        state.push_applied(AppliedOp { tbl: TableId(2), table: "other".into(), ..applied_at(9) });
+        state.push_applied(AppliedOp { row: RowId(2), ..applied_at(4) });
+        let high = |t: u32, r: u64| state.applied_high_on_row(TableId(t), RowId(r));
+        assert_eq!(high(1, 1), Some(5), "a cell op moves the row");
+        assert_eq!(high(2, 1), Some(9), "same row id, other table");
+        assert_eq!(high(1, 2), Some(4), "same table, other row");
+        assert_eq!(high(2, 2), None, "never published");
+
+        // Differential against the predicate `diff` used to evaluate, at every fork point on both
+        // sides of every seq in the log, each seq itself included (the `>` boundary).
+        for fork_seq in 0..=10u64 {
+            for (t, r) in [(1u32, 1u64), (2, 1), (1, 2), (2, 2)] {
+                let scan = state
+                    .applied
+                    .iter()
+                    .any(|a| a.seq > fork_seq && a.tbl.0 == t && a.row.0 == r);
+                let from_map = high(t, r).map_or(false, |seq| seq > fork_seq);
+                assert_eq!(
+                    from_map, scan,
+                    "({t}, {r}) at fork_seq {fork_seq}: the high-water map and the retired scan disagree"
+                );
+            }
+        }
     }
 }
