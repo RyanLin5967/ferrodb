@@ -1340,14 +1340,36 @@ impl BufferPoolManager {
         true
     }
 
-    // allocate new page on disk using disk manager, load into a frame, return page id
+    /// Allocate a page on disk, zero it, load it into a frame, and return its id **UNPINNED**.
+    ///
+    /// **The caller holds no pin on what this returns, so it must not unpin it (D260).**
+    /// `HeapFileManager::new`, `add_empty_page` and `TableBranchCatalog::create_with_header` each
+    /// did, from when this returned the page pinned (before `575147f`). The pin count stops at zero,
+    /// so alone that did nothing; but anyone else holding the page at that moment lost their pin,
+    /// and a page with no pin can be evicted or freed under the holder still reading it. To keep the
+    /// page, take a pin with [`Self::pin`], which gives it back on drop.
+    /// `tests/d260_new_page_is_returned_unpinned.rs` pins both halves: this call takes back its own
+    /// pin and nobody else's, and none of the three callers takes another.
+    ///
+    /// **A page this cannot write or load is given back (D262).** `allocate` has already written
+    /// the page's bitmap bit to disk, and an `Err` from here carries no id, so no caller could free
+    /// it: it stayed allocated and owned by nothing for good. Every pinned frame (`NotEnoughSpace`
+    /// from the load) is the ordinary way in. [`Self::free_page`] refuses a page someone else has
+    /// pinned, which leaves it allocated rather than freed under them; a failed free leaves it
+    /// allocated too, and the caller gets the original error either way.
     pub fn new_page(&self) -> Result<u32, FerroError>{
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.
         let _pool = enter_pool();
         let page_id = self.disk_manager.allocate()?;
-        self.disk_manager.write(page_id, &[0u8; PAGE_SIZE])?;
-        self.fetch_page(page_id)?;
+        if let Err(e) = self
+            .disk_manager
+            .write(page_id, &[0u8; PAGE_SIZE])
+            .and_then(|()| self.fetch_page(page_id))
+        {
+            let _ = self.free_page(page_id);
+            return Err(e);
+        }
         self.unpin_page(page_id, false);
         Ok(page_id)
     }
