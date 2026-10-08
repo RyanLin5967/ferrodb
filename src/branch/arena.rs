@@ -2699,8 +2699,10 @@ impl ArenaPageStore {
                     //
                     // By key: the entries this record names, every copy of each, and nothing
                     // else. This used to be a `retain` over the WHOLE log, including for a record
-                    // that names nothing, which `put_pending` writes on every drain that
-                    // released nothing.
+                    // that names nothing. `put_pending` used to write one on every drain that
+                    // released nothing; since the drain elision it writes one only for such a
+                    // drain that owes a recycled list, but files written before it still hold
+                    // them, and replay walks those.
                     for key in removed {
                         pending.remove_key(key);
                     }
