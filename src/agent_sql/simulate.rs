@@ -408,6 +408,9 @@ impl AgentRuntime {
         // a loser queryable for as long as its branch is alive, which is the point of leaving it
         // alive, while bounding what a server that runs simulations all day retains.
         self.forget_reaped_branches();
+        // D212 (a'): the candidates are forked before any id is minted through a context, so the
+        // history's counters have to be read first or their txn ids could repeat an earlier run's.
+        self.attach_history(&ctx.read())?;
 
         // ---- 1. fork K, and prove the fork copied nothing ---------------------------------
         let pages_before_fork = self.live_page_count()?;

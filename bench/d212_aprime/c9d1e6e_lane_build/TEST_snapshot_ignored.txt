@@ -1,0 +1,29 @@
+# 2026-09-24T21:56:11Z HEAD=c9d1e6e dirty=0
+# cmd: timeout 900 cargo test --no-fail-fast --test d212_history_snapshot -- --ignored
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d212-history-store.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.18s
+     Running tests/d212_history_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d212_history_snapshot-64f115416671443d)
+
+running 1 test
+test an_install_carries_the_senders_revert_history ... FAILED
+
+failures:
+
+---- an_install_carries_the_senders_revert_history stdout ----
+
+thread 'an_install_carries_the_senders_revert_history' (356403469) panicked at tests/d212_history_snapshot.rs:93:5:
+assertion `left == right` failed: the follower's REVERT history is not the leader's after an install
+  left: []
+ right: [HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 1, body: [97, 32, 112, 117, 98, 108, 105, 115, 104] }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    an_install_carries_the_senders_revert_history
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `--test d212_history_snapshot`
+error: 1 target failed:
+    `--test d212_history_snapshot`
+# rc=101 end=2026-09-24T21:56:14Z

@@ -1172,9 +1172,17 @@ impl LogicalDecoder {
                 // data, and neither does `HeapRelease`: it is a committed transaction freeing bytes
                 // its delete kept for a rollback that did not happen (D213), and the delete itself
                 // was already decoded. Nor does `HeapInitPage` (D268): a page was made, and no row
-                // moved. None of them produce events.
-                RecKind::Begin | RecKind::TxnEnd | RecKind::Checkpoint | RecKind::Clr { .. }
-                | RecKind::HeapRelease { .. } | RecKind::HeapInitPage { .. } => {}
+                // moved. A `RevertHistory` part is REVERT's own bookkeeping (D212 (a'), `wal::history`)
+                // and describes no row of any table, and an `IncarnationDecl` only names the database
+                // the history belongs to. None of them produce events.
+                RecKind::Begin
+                | RecKind::TxnEnd
+                | RecKind::Checkpoint
+                | RecKind::Clr { .. }
+                | RecKind::HeapRelease { .. }
+                | RecKind::HeapInitPage { .. }
+                | RecKind::RevertHistory { .. }
+                | RecKind::IncarnationDecl { .. } => {}
             }
 
             if next <= lsn {

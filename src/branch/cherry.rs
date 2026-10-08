@@ -70,15 +70,16 @@
 //!
 //! ## Why `revert_merge`'s undo machinery is the wrong shape for the rollback
 //!
-//! **In one line, as asked:** `undo_txn` (`runtime.rs:4213`) is a *compensating* undo keyed by
-//! `TxnId` that writes inverses **after** the fact, so driving cherry-pick's rollback with it
-//! would mean applying the picks and then un-applying them — which *is* the half-applied window
-//! the atomicity requirement exists to forbid, and it inherits two refusals of its own
-//! (`"cannot revert a delete with no before-image"`, `"row is gone; cannot revert"`) that would
-//! strand a rollback halfway.
+//! **In one line, as asked:** `REVERT`'s undo (`plan_undo` in `runtime.rs`; `undo_txn` before
+//! D218) is a *compensating* undo keyed by `TxnId` that writes inverses **after** the fact, so
+//! driving cherry-pick's rollback with it would mean applying the picks and then un-applying them
+//! — which *is* the half-applied window the atomicity requirement exists to forbid. It also brings
+//! two refusals of its own (`"cannot revert a delete with no before-image"`, `"row is gone; cannot
+//! revert"`). D218 moved those ahead of a REVERT's first write, which does not help a rollback: by
+//! then the picks it would have to remove are already applied.
 //!
 //! What this module *does* reuse from it is the **primitive it is built out of**:
-//! [`crate::agent_sql::merge_engine::invert`], the same function `undo_txn` calls, via
+//! [`crate::agent_sql::merge_engine::invert`], the same function `plan_undo` calls, via
 //! [`CherryPlan::inverse`]. Undoing a *landed* pick therefore goes through one undo path rather
 //! than a second one — and it goes through `commit_all`, so the undo is atomic on the same terms
 //! the pick was.
@@ -326,7 +327,7 @@ impl CherryPlan {
         self.writes.len()
     }
 
-    /// The plan that undoes this one, built from [`invert`] — **the same primitive `undo_txn`
+    /// The plan that undoes this one, built from [`invert`] — **the same primitive `plan_undo`
     /// calls**, so a landed pick is undone by the machinery `REVERT` already uses rather than by
     /// a second undo path.
     ///
@@ -341,7 +342,7 @@ impl CherryPlan {
             out.push(match w {
                 CherryWrite::Cell { table, tbl, row, col, value, before } => {
                     // `invert` is asked for the inverse of the *Assign this write performed*, with
-                    // the pre-image as its witness. That is the identical call `undo_txn` makes.
+                    // the pre-image as its witness. That is the identical call `plan_undo` makes.
                     let back = invert(&OpKind::Assign(value.clone()), before.as_ref())?;
                     let restored = match back {
                         OpKind::Assign(v) => v,
@@ -2060,7 +2061,7 @@ mod tests {
 
     // -- Reuse of the REVERT machinery ---------------------------------------------------------
 
-    /// A landed pick is undone through [`invert`] — the same primitive `undo_txn` calls — and the
+    /// A landed pick is undone through [`invert`] — the same primitive `plan_undo` calls — and the
     /// undo goes through the same single door, so it is atomic on the same terms.
     #[test]
     fn a_landed_pick_is_undone_by_the_inverse_plan_through_the_same_door() {

@@ -49,18 +49,13 @@ use std::sync::Arc;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::{BranchCatalog, TableBranchCatalog};
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::provenance::{
     MemProvenanceStore, ProvId, ProvenanceStore, RunEntity, MAX_PAGE_DICT_ENTRIES,
 };
-use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::tel::{EffectLog, MemEffectLog};
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::txn::TxnManager;
 
 /// Writes inside one agent session. Three, as D129, so the fixture is the one whose breaking
 /// point is being turned into a curve rather than a differently-shaped workload.
@@ -220,18 +215,14 @@ fn build(dir: &std::path::Path, tag: &str, rows: i64) -> Server {
     let d = dir.join(tag);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(d.join("main.db"))
-        .unwrap();
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-    let catalog = Catalog::create(bp.clone()).unwrap();
-    let wal = Arc::new(WalManager::new(d.join("main.wal")).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
+    // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+    // carries REVERT's history store and pays for it as production does; a runtime on
+    // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+    // (forgotten below), and its file goes with this scratch directory.
+    let db_path = (d.join("main.db")).to_path_buf();
+    let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+    let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+    let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
     let cat = Arc::new(TableBranchCatalog::open_sidecar(&d.join("b.branchcat"), 1).unwrap());
     let branches: Arc<dyn BranchCatalog> = cat.clone();
     // Same fixed floor and the same reason as D68/D114/D129: taking `high_water()` here would put
@@ -242,14 +233,19 @@ fn build(dir: &std::path::Path, tag: &str, rows: i64) -> Server {
     // ⚠ `with_storage`, NOT `with_catalog`: `with_catalog` leaves `storage: None`, so the branch
     // engine is absent and agent writes never reach arena pages. D67 withdrew numbers over that.
     let log = Arc::new(MemEffectLog::new());
-    let runtime = Arc::new(
+    let runtime = opened.attach_runtime(
         AgentRuntime::with_storage(
             branches,
             Arc::clone(&log) as Arc<dyn EffectLog>,
             Arc::clone(&store) as Arc<dyn PageStore>,
         )
         .expect("attach arena storage"),
-    );
+        // D250 review 3: the door takes the provenance backing; in memory, as pgserver's.
+        ferrodb::wal::recovery::ProvenanceBacking::InMemory,
+    )
+    .expect("attach the runtime");
+    let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+    std::mem::forget(lock);
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), Arc::clone(&runtime)));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

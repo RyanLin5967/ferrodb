@@ -21,7 +21,6 @@
 //! ⚠ ONE fsync per commit dominates each individual UPDATE, so the ABSOLUTES here are fsync, not
 //! lookup. The question is only whether the cost GROWS WITH THE TABLE, and an fsync floor is a
 //! constant that cannot manufacture a slope.
-use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,16 +29,14 @@ use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::cow::PageStore;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
-use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::wal::log::{fsync_counters, WalManager};
+use ferrodb::wal::log::fsync_counters;
 use ferrodb::wal::txn::TxnManager;
 
 /// ⛔ **D101 — WHAT THE FIRST VERSION OF THIS HARNESS MEASURED, AND WHY IT IS NOT WHAT IT SAID.**
@@ -67,14 +64,14 @@ struct Db {
 impl Db {
     fn new(rows: i64) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(dir.path().join("p.db")).unwrap();
-        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-        let catalog = Catalog::create(bp.clone()).unwrap();
-        let wal = Arc::new(WalManager::new(dir.path().join("p.wal")).unwrap());
-        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-        bp.attach_wal(wal);
+        // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+        // carries REVERT's history store and pays for it as production does; a runtime on
+        // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+        // (forgotten below), and its file goes with this scratch directory.
+        let db_path = (dir.path().join("p.db")).to_path_buf();
+        let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+        let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+        let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
         let cat = Arc::new(TableBranchCatalog::open_sidecar(&dir.path().join("b.branchcat"), 1).unwrap());
         let branches: Arc<dyn BranchCatalog> = cat;
         // The arena floor must sit ABOVE where the ordinary table grows to, or the build runs out
@@ -86,14 +83,19 @@ impl Db {
         // only ADD cost to a staged write (the free-space map is persisted rather than dropped),
         // never remove it, so it cannot flatter the STAGED arm this harness is testing.
         store.checkpoint_to(dir.path().join("p.arena"));
-        let runtime = Arc::new(
+        let runtime = opened.attach_runtime(
             AgentRuntime::with_storage(
                 branches,
                 Arc::new(MemEffectLog::new()),
                 store as Arc<dyn PageStore>,
             )
             .expect("attach arena storage"),
-        );
+            // D250 review 3: the door takes the provenance backing; in memory, as pgserver's.
+            ferrodb::wal::recovery::ProvenanceBacking::InMemory,
+        )
+        .expect("attach the runtime");
+        let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+        std::mem::forget(lock);
         let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
         Db { ctx, bp, txn, _dir: dir }
     }

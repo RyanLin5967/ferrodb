@@ -1,0 +1,474 @@
+# 2026-09-24T21:55:36Z HEAD=c9d1e6e dirty=0
+# cmd: timeout 1800 cargo test --no-fail-fast --lib -- wal:: agent_sql:: consensus::snapshot replication::
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d212-history-store.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.44s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-f00599e56bad7502)
+
+running 369 tests
+test agent_sql::changeset::tests::an_empty_merge_is_clean ... ok
+test agent_sql::escrow::tests::an_unbounded_cell_is_not_escrowed_and_writes_pass_through ... ok
+test agent_sql::escrow::tests::a_branch_cannot_spend_against_a_claim_it_never_made ... ok
+test agent_sql::escrow::tests::the_counter_cannot_be_driven_below_its_floor ... ok
+test agent_sql::escrow::tests::a_batch_that_only_overdraws_in_aggregate_is_refused ... ok
+test agent_sql::escrow::tests::a_negative_or_zero_claim_is_refused ... ok
+test agent_sql::escrow::tests::a_recycled_id_slot_does_not_inherit_the_dead_branchs_escrow ... ok
+test agent_sql::escrow::tests::releasing_a_branch_returns_its_unspent_claim_to_the_pool ... ok
+test agent_sql::escrow::tests::settling_consumes_only_what_was_actually_spent ... ok
+test agent_sql::escrow::tests::a_write_beyond_the_branchs_claim_is_refused_at_write_time ... ok
+test agent_sql::escrow::tests::two_agents_cannot_both_reserve_twelve_out_of_twenty ... ok
+test agent_sql::escrow::tests::reopening_a_pool_is_refused_rather_than_resizing_it ... ok
+test agent_sql::gate::tests::a_cheap_check_that_almost_never_fires_sorts_last ... ok
+test agent_sql::changeset::tests::a_lossy_row_makes_the_whole_merge_lossy_never_clean ... ok
+test agent_sql::dispatch::tests::a_row_id_past_i64_max_is_not_reported_as_negative ... ok
+test agent_sql::gate::tests::tier_order_is_computed_from_cost_over_rejection_probability ... ok
+test agent_sql::changeset::tests::a_conflicting_row_outranks_a_commuting_one ... ok
+test agent_sql::gate::tests::every_check_in_a_tier_runs_even_after_one_has_fired ... ok
+test agent_sql::gate::tests::a_sound_finding_carries_the_violated_predicate ... ok
+test agent_sql::gate::tests::a_later_tier_does_not_run_once_an_earlier_one_has_fired ... ok
+test agent_sql::gate::tests::the_most_severe_status_in_a_tier_decides ... ok
+test agent_sql::gate::tests::outcome_follows_epistemic_status_not_severity ... ok
+test agent_sql::gate::tests::an_empty_gate_and_a_gate_where_nothing_fires_both_pass ... ok
+test agent_sql::gate::tests::an_assertion_that_examined_no_rows_is_a_hard_reject_not_a_pass ... ok
+test agent_sql::gate::tests::an_assertion_fires_when_it_is_false_and_stays_quiet_when_it_holds ... ok
+test agent_sql::gate::tests::a_row_that_could_not_be_evaluated_outranks_every_row_that_held ... ok
+test agent_sql::gate::tests::every_broken_assertion_reaches_the_caller_in_one_round_trip ... ok
+test agent_sql::gate::tests::the_blind_write_metric_quarantines_and_cannot_reject ... ok
+test agent_sql::merge_engine::tests::a_replayed_frame_contributes_its_increments_once ... ok
+test agent_sql::merge_engine::tests::a_guard_that_fails_against_merged_state_returns_its_predicate ... ok
+test agent_sql::merge_engine::tests::an_unevaluable_guard_is_not_reported_as_a_failed_one ... ok
+test agent_sql::merge_engine::tests::concurrent_assigns_are_forbidden_by_default_not_silently_lww ... ok
+test agent_sql::dispatch::tests::only_an_empty_diff_returns_no_rows ... ok
+test agent_sql::dispatch::tests::every_agent_output_row_matches_its_declared_column_count ... ok
+test agent_sql::merge_engine::tests::identical_concurrent_writes_are_not_a_conflict ... ok
+test agent_sql::merge_engine::tests::lww_succeeds_but_reports_the_discarded_write ... ok
+test agent_sql::merge_engine::tests::invert_refuses_an_assign_with_no_before_image ... ok
+test agent_sql::merge_engine::tests::composing_two_identical_adds_does_not_collapse_them ... ok
+test agent_sql::merge_engine::tests::two_decrements_compose_arithmetically ... ok
+test agent_sql::paged_rows::tests::split_rejects_a_wrong_length_key ... ok
+test agent_sql::paged_rows::tests::an_empty_row_round_trips ... ok
+test agent_sql::paged_rows::tests::a_truncated_row_is_refused_rather_than_panicking ... ok
+test agent_sql::paged_rows::tests::the_last_table_id_still_has_a_usable_upper_bound ... ok
+test agent_sql::paged_rows::tests::an_unknown_tag_is_refused ... ok
+test agent_sql::paged_rows::tests::a_table_range_excludes_its_neighbours ... ok
+test agent_sql::paged_rows::tests::trailing_bytes_are_refused ... ok
+test agent_sql::merge_engine::tests::merger_trait_reports_commuting_for_two_branch_decrements ... ok
+test agent_sql::paged_rows::tests::each_wide_variant_round_trips_on_its_own ... ok
+test agent_sql::paged_rows::tests::every_value_variant_round_trips ... ok
+test agent_sql::paged_rows::tests::keys_sort_in_numeric_row_order ... ok
+test agent_sql::mem_catalog::tests::reading_a_reaped_branch_is_a_hard_error_not_stale_data ... ok
+test agent_sql::mem_catalog::tests::fork_records_the_child_in_the_parent_and_shares_the_root ... ok
+test agent_sql::designated::tests::refuses_only_a_runtime_that_is_not_designated ... ok
+test agent_sql::persistent_map::tests::a_no_op_insert_if_absent_shares_the_whole_tree ... ok
+test agent_sql::persistent_map::tests::a_chain_of_clones_sees_its_ancestry_at_fork_time_and_nothing_later ... ok
+test agent_sql::persistent_map::tests::empty_map_answers_without_panicking ... ok
+test agent_sql::persistent_map::tests::insert_if_absent_is_first_touch_wins ... ok
+test agent_sql::persistent_map::tests::a_clone_does_not_see_writes_made_through_the_original_afterwards ... ok
+test agent_sql::persistent_map::tests::a_write_after_a_clone_shares_every_subtree_it_did_not_touch ... ok
+test agent_sql::persistent_map::tests::size_hint_is_exact_so_collect_preallocates ... ok
+test agent_sql::persistent_map::tests::string_keys_borrow_for_lookup ... ok
+test agent_sql::persistent_map::tests::siblings_are_invisible_to_each_other ... ok
+test agent_sql::revert_store::tests::a_merge_id_is_read_by_its_shape ... ok
+test agent_sql::persistent_map::tests::range_agrees_with_btreemap_on_every_window ... ok
+test agent_sql::revert_store::tests::a_publish_record_round_trips_every_field ... ok
+test agent_sql::revert_store::tests::the_attach_view_takes_the_counters_and_the_newest_version_per_row ... ok
+test agent_sql::persistent_map::tests::one_write_allocates_a_path_not_a_tree ... ok
+test agent_sql::runtime::tests::the_ordinary_reservation_and_a_leaked_range_are_both_allowed ... ok
+test agent_sql::persistent_map::tests::the_original_does_not_see_writes_made_through_a_clone ... ok
+test agent_sql::runtime::tests::the_index_scan_assertion_fires_on_a_desynchronised_index - should panic ... ok
+test agent_sql::revert_store::tests::a_revert_marker_round_trips ... ok
+test agent_sql::runtime::tests::a_recycled_slot_does_not_strand_the_displaced_workspaces_capture ... ok
+test agent_sql::runtime::tests::a_recycled_slot_installs_the_new_workspace_before_releasing_the_old ... ok
+test agent_sql::runtime::tests::a_reservation_that_would_re_issue_a_version_sequence_is_refused ... ok
+test agent_sql::runtime::tests::the_door_audit_fires_on_a_desynchronised_index - should panic ... ok
+test agent_sql::runtime::tests::the_txn_ref_index_tracks_a_scan_of_the_workspaces ... ok
+test consensus::snapshot::tests_snapshot::a_checkpoint_above_what_the_engine_has_applied_is_refused ... ok
+test consensus::snapshot::tests_snapshot::a_checkpoint_keeps_the_digests_of_the_rounds_it_keeps ... ok
+test consensus::snapshot::tests_snapshot::a_checkpoint_at_or_below_the_floor_is_a_no_op ... ok
+test consensus::snapshot::tests_snapshot::a_chunk_fits_a_frame_and_the_first_one_carries_the_whole_header ... ok
+test consensus::snapshot::tests_snapshot::a_completed_transfer_is_judged_on_its_length_and_then_on_its_bytes ... ok
+test consensus::snapshot::tests_snapshot::a_chunk_that_would_run_past_the_declared_length_is_refused ... ok
+test consensus::snapshot::tests_snapshot::a_completed_transfer_moves_next_and_never_matched ... ok
+test agent_sql::persistent_map::tests::ascending_inserts_stay_balanced_rather_than_degenerating_into_a_list ... ok
+test agent_sql::persistent_map::tests::descending_inserts_stay_balanced_too ... ok
+test consensus::snapshot::tests_snapshot::a_header_claiming_an_unbounded_sidecar_section_is_refused ... ok
+test consensus::snapshot::tests_snapshot::a_leader_refuses_a_snapshot_whose_base_digest_is_not_its_own ... ok
+test consensus::snapshot::tests_snapshot::a_header_whose_page_count_contradicts_its_image_length_is_refused ... ok
+test consensus::snapshot::tests_snapshot::a_leader_refuses_to_serve_a_snapshot_above_what_its_engine_has_applied ... ok
+test consensus::snapshot::tests_snapshot::a_payload_header_that_is_not_one_is_refused_rather_than_guessed_at ... ok
+test consensus::snapshot::tests_snapshot::a_leader_refuses_a_snapshot_whose_term_disagrees_with_its_own_log ... ok
+test consensus::snapshot::tests_snapshot::a_payload_round_trips_and_its_header_describes_its_own_body ... ok
+test consensus::snapshot::tests_snapshot::a_payload_whose_body_digest_does_not_match_is_refused_before_the_driver_is_told ... ok
+test agent_sql::persistent_map::tests::it_behaves_like_a_btreemap_over_a_random_looking_workload ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_at_round_zero_is_refused ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_of_a_round_this_node_already_holds_is_not_installed ... ok
+test consensus::snapshot::tests_snapshot::a_peer_below_the_floor_is_sent_state_and_never_entries ... ok
+test agent_sql::paged_rows::tests::a_row_survives_a_round_trip_through_pages ... ok
+test consensus::snapshot::tests_snapshot::a_refused_snapshot_does_not_change_this_nodes_office ... ok
+test consensus::snapshot::tests_snapshot::a_restart_above_a_snapshot_floor_comes_back_at_the_floor_and_not_at_zero ... ok
+test agent_sql::paged_rows::tests::the_last_table_scans_its_own_rows ... ok
+test agent_sql::paged_rows::tests::a_write_under_one_root_is_invisible_from_another_root ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_claiming_an_implausible_size_is_refused_before_anything_is_allocated_for_it ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_older_than_this_nodes_floor_is_acknowledged_whole_and_not_installed ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_whose_configuration_is_damage_is_refused_before_anything_is_spent ... ok
+test consensus::snapshot::tests_snapshot::a_snapshot_with_no_configuration_is_refused_because_its_receiver_could_not_count_a_majority ... ok
+test consensus::snapshot::tests_snapshot::a_zero_page_image_is_refused_because_installing_it_would_look_like_success ... ok
+test consensus::snapshot::tests_snapshot::an_answer_from_a_removed_node_does_not_resurrect_its_progress ... ok
+test consensus::snapshot::tests_snapshot::an_envelope_and_a_payload_that_disagree_are_refused ... ok
+test consensus::snapshot::tests_snapshot::an_install_discards_the_whole_log_and_the_floor_moves_with_it ... ok
+test consensus::snapshot::tests_snapshot::an_installed_snapshot_anchors_the_digest_chain_where_the_leader_is ... ok
+test consensus::snapshot::tests_snapshot::completing_an_install_sets_the_watermark_and_leaves_unjoined_to_the_next_append ... ok
+test consensus::snapshot::tests_snapshot::nothing_moves_until_the_install_is_reported_durable ... ok
+test replication::backup::tests::a_backup_older_than_the_primarys_log_is_refused_by_name ... ok
+test consensus::snapshot::tests_snapshot::a_receiver_that_lost_a_transfer_rewinds_it_rather_than_deadlocking_it ... ok
+test agent_sql::paged_rows::tests::a_scan_returns_only_the_requested_table_in_row_order ... ok
+test replication::backup::tests::a_label_round_trips_through_text ... ok
+test replication::backup::tests::a_label_that_is_not_one_is_refused ... ok
+test replication::backup::tests::a_label_without_the_version_header_is_refused_rather_than_guessed_at ... ok
+test consensus::snapshot::tests_snapshot::a_transfer_ack_resets_the_peers_silence_so_a_slow_install_does_not_cost_the_leader_its_lease ... ok
+test replication::jsonl::tests::a_bare_json_number_would_lose_these_values_which_is_why_they_are_strings ... ok
+test replication::jsonl::tests::a_declaration_carries_no_alteration ... ok
+test agent_sql::paged_rows::tests::a_delete_removes_only_its_own_row ... ok
+test replication::jsonl::tests::a_create_table_shape_omits_the_denied_column ... ok
+test replication::jsonl::tests::a_delete_projects_its_only_image ... ok
+test replication::jsonl::tests::a_delete_line_carries_before_and_a_null_after ... ok
+test consensus::snapshot::tests_snapshot::a_chunk_at_the_wrong_offset_is_answered_with_the_resume_point_and_never_buffered ... ok
+test replication::jsonl::tests::a_denied_column_is_named_nowhere_in_the_line ... ok
+test replication::jsonl::tests::a_feed_with_nothing_withheld_is_unchanged ... ok
+test replication::jsonl::tests::a_mixed_row_keeps_narrow_types_as_numbers_and_wide_types_as_strings ... ok
+test replication::jsonl::tests::a_null_column_is_present_and_null_not_absent ... ok
+test replication::jsonl::tests::a_null_wide_column_is_json_null_not_a_quoted_null ... ok
+test replication::jsonl::tests::a_refusal_minted_inside_the_renderer_still_writes_nothing ... ok
+test replication::jsonl::tests::a_rename_line_carries_the_old_name_the_new_shape_cannot ... ok
+test replication::jsonl::tests::a_retype_line_gives_both_type_spellings ... ok
+test consensus::snapshot::tests_snapshot::a_transfer_that_claims_to_be_done_at_the_wrong_length_is_refused ... ok
+test consensus::snapshot::tests_snapshot::receiving_state_adopts_the_sender_as_leader_so_a_long_transfer_is_not_an_election ... ok
+test consensus::snapshot::tests_snapshot::a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not ... ok
+test consensus::snapshot::tests_snapshot::a_second_snapshot_supersedes_the_one_in_flight ... ok
+test replication::jsonl::tests::a_snapshot_read_projects_its_row ... ok
+test replication::jsonl::tests::a_row_whose_present_values_are_all_withheld_is_refused ... ok
+test replication::jsonl::tests::a_table_dump_is_projected_and_refused_by_the_same_policy ... ok
+test replication::jsonl::tests::a_whole_numbered_float_keeps_its_decimal_point ... ok
+test replication::jsonl::tests::a_withheld_first_column_leaves_valid_json ... ok
+test replication::jsonl::tests::an_add_column_line_names_the_added_column_and_the_new_shape ... ok
+test replication::jsonl::tests::an_insert_line_carries_after_and_a_null_before ... ok
+test replication::jsonl::tests::an_undecided_table_is_refused_by_the_renderer ... ok
+test replication::backup::tests::pinning_an_lsn_the_log_has_already_dropped_is_refused ... ok
+test replication::jsonl::tests::an_update_line_carries_both_images ... ok
+test replication::jsonl::tests::column_names_are_escaped_too ... ok
+test replication::jsonl::tests::every_character_json_requires_escaping_is_escaped ... ok
+test replication::jsonl::tests::integer_extremes_survive_exactly ... ok
+test replication::jsonl::tests::both_images_of_an_update_are_projected ... ok
+test replication::jsonl::tests::floats_round_trip_bit_for_bit ... ok
+test replication::jsonl::tests::non_ascii_passes_through_as_utf8 ... ok
+test replication::jsonl::tests::non_finite_floats_become_strings_rather_than_invalid_json ... ok
+test replication::jsonl::tests::surplus_values_get_visible_synthetic_names_rather_than_vanishing ... ok
+test replication::jsonl::tests::the_wide_types_are_emitted_as_quoted_strings ... ok
+test replication::jsonl::tests::write_feed_reports_how_many_lines_it_wrote ... ok
+test replication::jsonl::tests::write_feed_writes_nothing_at_all_when_any_event_is_refused ... ok
+test replication::backup::tests::a_checkpoint_may_not_discard_a_pinned_range ... ok
+test replication::logical::tests::a_change_to_an_unknown_table_is_reported_rather_than_dropped ... ok
+test replication::backup::tests::a_truncated_image_is_refused_rather_than_restored ... ok
+test replication::backup::tests::the_image_holds_the_primarys_pages ... ok
+test replication::logical::tests::a_committed_insert_becomes_a_typed_row_event ... ok
+test replication::logical::tests::a_null_column_decodes_as_null ... ok
+test replication::logical::tests::sql_type_contract_is_exhaustive ... ok
+test replication::logical::tests::an_update_carries_the_row_before_and_after ... ok
+test replication::logical::tests::a_heap_update_that_revives_a_dead_version_is_an_insert ... ok
+test replication::logical::tests::a_decoder_with_no_tables_reports_everything_as_unresolved ... ok
+test replication::publication::tests::a_column_name_the_format_cannot_express_is_withheld_never_published ... ok
+test replication::logical::tests::an_aborted_transaction_emits_nothing ... ok
+test replication::publication::tests::a_create_table_shape_is_masked_like_a_row ... ok
+test replication::logical::tests::a_second_session_of_one_run_is_not_a_conflicting_actor ... ok
+test replication::backup::tests::a_backup_records_the_lsn_window_its_pages_sit_in ... ok
+test replication::logical::tests::events_are_ordered_by_commit_not_by_write ... ok
+test replication::publication::tests::a_declaration_with_no_header_is_refused ... ok
+test replication::logical::tests::one_provenance_slot_naming_two_actors_is_refused ... ok
+test replication::publication::tests::a_drop_table_is_decided_by_the_table_and_not_by_its_columns ... ok
+test replication::publication::tests::a_line_the_parser_cannot_read_is_refused_rather_than_skipped ... ok
+test replication::publication::tests::a_duplicate_column_is_refused ... ok
+test replication::logical::tests::an_open_transaction_is_withheld_and_reported ... ok
+test replication::publication::tests::a_header_with_no_name_is_refused_as_a_nameless_header ... ok
+test replication::publication::tests::a_name_containing_the_comment_character_is_refused_rather_than_shortened ... ok
+test replication::publication::tests::a_refusal_says_which_publication_refused_what ... ok
+test replication::publication::tests::a_name_that_is_not_an_identifier_is_refused ... ok
+test replication::publication::tests::a_table_published_with_no_columns_is_refused_like_an_absent_one ... ok
+test replication::logical::tests::a_ddl_record_whose_alteration_is_not_in_its_shape_is_refused ... ok
+test replication::publication::tests::a_publication_that_names_no_table_is_refused_at_parse ... ok
+test replication::publication::tests::a_table_declared_twice_is_refused ... ok
+test replication::logical::tests::a_declaration_names_a_run_without_attributing_anybodys_commit ... ok
+test replication::publication::tests::a_table_that_is_both_published_and_excluded_is_refused_either_way_round ... ok
+test replication::publication::tests::a_table_with_no_columns_is_refused_at_parse ... ok
+test replication::publication::tests::a_value_with_no_column_name_is_refused_under_an_allowlist ... ok
+test replication::publication::tests::an_event_whose_every_column_is_withheld_is_refused ... ok
+test replication::publication::tests::an_excluded_table_is_decided_against_rather_than_undecided ... ok
+test replication::publication::tests::a_table_that_is_not_in_the_publication_is_refused ... ok
+test replication::publication::tests::both_images_of_an_update_are_covered_by_the_value_check ... ok
+test replication::publication::tests::mask_for_decides_a_bare_table_and_column_list ... ok
+test replication::publication::tests::parse_narrows_to_exactly_what_it_names ... ok
+test replication::publication::tests::two_columns_with_one_name_are_refused_rather_than_guessed ... ok
+test replication::publication::tests::unrestricted_publishes_everything ... ok
+test replication::publication::tests::whole_line_comments_and_blank_lines_are_ignored ... ok
+test replication::logical::tests::time_travel_records_are_counted_as_internal_not_as_lost ... ok
+ferrodb: AUDIT_TXN_REFS_DOWNGRADED — 1025 open workspaces exceeds AUDIT_FULL_MAX (1024), so the debug re-derive of `txn_refs` is no longer running at every door. It ran for the first 1024 crossings, which is where a door that bypasses insert_workspace/remove_workspace would have shown itself. A door that is correct below 1024 and wrong above it is NOT covered.
+test replication::logical::tests::relocating_a_dead_version_is_bookkeeping_not_a_second_delete ... ok
+test replication::logical::tests::an_mvcc_delete_is_reported_as_a_delete_not_an_update ... ok
+test replication::snapshot::tests::a_snapshot_writes_read_events_and_reports_its_handoff ... ok
+test replication::snapshot::tests::a_quiet_database_hands_off_exactly ... ok
+test replication::snapshot::tests::a_failed_scan_yields_no_handoff ... ok
+test replication::stream::tests::a_large_backlog_is_delivered_in_bounded_batches ... ok
+test replication::stream::tests::a_batch_that_is_entirely_refused_does_not_advance_the_cursor ... ok
+test replication::snapshot::tests::the_handoff_lsn_is_taken_before_the_scan_not_after ... ok
+test replication::snapshot::tests::the_boundary_covers_exactly_the_tables_that_were_delivered ... ok
+test replication::snapshot::tests::an_empty_table_still_yields_a_handoff_point ... ok
+test replication::stream::tests::a_batch_that_is_entirely_suppressed_still_advances_the_cursor ... ok
+test replication::backup::tests::a_restore_keeps_only_the_history_committed_before_the_backups_end ... ok
+test replication::stream::tests::a_refused_event_is_replayed_after_the_publication_is_widened ... ok
+test replication::stream::tests::a_schema_event_survives_the_snapshot_filter ... ok
+test replication::snapshot::tests::an_exact_snapshot_writes_its_rows_and_pins_its_resume_point ... ok
+test replication::stream::tests::a_refusal_leaves_a_subscriptions_claim_below_the_refused_commit ... ok
+test replication::stream::tests::a_pump_emits_committed_changes_and_advances_past_them ... ok
+test replication::stream::tests::a_long_open_transaction_does_not_cause_endless_redelivery ... ok
+test replication::stream::tests::a_cursor_below_the_logs_base_is_refused_by_name ... ok
+test replication::snapshot::tests::a_scan_that_fails_after_writing_reports_the_rollback_too ... ok
+test replication::stream::tests::a_streamer_without_a_snapshot_boundary_suppresses_nothing ... ok
+test replication::snapshot::tests::a_snapshot_whose_resume_point_cannot_be_pinned_leaves_no_reader_behind ... ok
+test replication::snapshot::tests::a_failed_exact_scan_closes_its_reader_and_yields_no_handoff ... ok
+test replication::stream::tests::an_excluded_tables_events_are_dropped_and_the_cursor_keeps_moving ... ok
+test replication::stream::tests::an_already_delivered_event_does_not_wedge_the_cursor_when_it_later_becomes_unpublishable ... ok
+test replication::stream::tests::a_transaction_that_was_in_flight_at_snapshot_time_is_still_delivered ... ok
+test replication::stream::tests::a_subscription_holds_the_log_across_a_checkpoint ... ok
+test replication::stream::tests::changes_that_are_not_durable_yet_are_not_emitted ... ok
+test replication::stream::tests::an_in_flight_transaction_does_not_move_the_cursor_and_is_emitted_after_it_commits ... ok
+test replication::stream::tests::events_the_snapshot_already_contained_are_not_re_delivered ... ok
+test replication::stream::tests::lag_shrinks_as_a_consumer_catches_up ... ok
+test replication::stream::tests::an_open_transaction_is_not_stepped_over_when_a_later_one_commits ... ok
+test replication::stream::tests::following_takes_its_cursor_from_the_boundary_and_refuses_without_one ... ok
+test replication::stream::tests::resuming_from_a_commit_position_alone_loses_an_in_flight_transaction ... ok
+test replication::sync::tests::a_hello_above_the_primarys_frontier_must_not_poison_the_retained_mark ... ok
+test replication::sync::tests::a_target_already_acked_does_not_wait ... ok
+test replication::sync::tests::acktracker_still_implements_default ... ok
+test replication::sync::tests::an_ack_never_goes_backwards ... ok
+test replication::sync::tests::an_ack_survives_the_replica_disconnecting ... ok
+test replication::stream::tests::resuming_from_the_returned_cursor_does_not_repeat_events ... ok
+test replication::sync::tests::the_furthest_replica_satisfies_the_wait ... ok
+test replication::tests::a_frame_too_short_for_its_own_fields_is_refused ... ok
+test replication::tests::an_empty_records_batch_is_distinct_from_no_batch ... ok
+test replication::tests::an_oversized_length_is_refused_without_allocating ... ok
+test replication::tests::every_message_round_trips ... ok
+test replication::tests::a_truncated_frame_is_refused_rather_than_misread ... ok
+test replication::tests::the_length_covers_the_body_only ... ok
+test replication::tests::the_handshake_rejects_a_stranger_and_a_version_mismatch ... ok
+test replication::stream::tests::withholding_a_column_still_ships_the_row_and_advances_the_cursor ... ok
+test wal::history::tests::a_transaction_that_began_before_the_records_is_dropped_not_refused ... ok
+test wal::history::tests::a_transaction_that_began_before_the_records_keeps_a_whole_record ... ok
+test wal::history::tests::interleaved_parts_of_two_records_reassemble_into_two ... ok
+test wal::history::tests::a_file_that_is_not_a_history_image_is_refused_not_read_as_empty ... ok
+test wal::history::tests::parts_reassemble_in_order_and_a_missing_part_is_refused ... ok
+test replication::stream::tests::subscribing_below_the_base_is_refused_immediately ... ok
+test wal::log::tests::a_heap_release_round_trips_under_its_own_tag ... ok
+test replication::sync::tests::a_replica_that_reconnects_inside_the_deadline_still_satisfies_the_commit ... ok
+test wal::log::tests::a_run_identity_record_that_names_no_run_is_refused ... ok
+test wal::log::tests::a_revert_history_part_round_trips_and_a_truncated_one_is_refused ... ok
+test replication::sync::tests::an_ack_that_reaches_the_target_releases_the_waiter ... ok
+test agent_sql::runtime::tests::the_reconciliation_crosses_its_chunk_boundary_and_forgets_every_branch ... ok
+test wal::log::tests::a_truncated_run_identity_record_is_refused_rather_than_panicking ... ok
+test wal::log::tests::a_truncated_alteration_is_refused_rather_than_panicking ... ok
+test wal::log::tests::an_incarnation_declaration_round_trips_under_tag_14 ... ok
+test wal::log::tests::an_older_logs_records_still_decode_after_the_new_tag_was_added ... ok
+test wal::log::tests::an_unknown_alteration_tag_is_refused ... ok
+test wal::log::tests::deserialize_rejects_empty_and_unknown_tag ... ok
+test wal::log::tests::create_and_drop_records_keep_their_byte_layout ... ok
+test wal::log::tests::every_column_alteration_survives_the_log_round_trip ... ok
+test replication::sync::tests::with_no_replica_it_refuses_rather_than_degrading_silently ... ok
+test wal::history::tests::a_failed_write_keeps_the_queue_and_forces_a_rewrite ... ok
+test wal::log::tests::test_crc32_val ... ok
+test wal::log::tests::a_record_whose_bytes_were_corrupted_is_refused ... ok
+test wal::log::tests::test_reckind_roundtrip ... ok
+test wal::log::tests::test_flush_up_to_stops_when_durable ... ok
+test wal::log::tests::test_lsns_are_monotonic ... ok
+test wal::log::tests::test_corrupted_last_record_detected ... ok
+test wal::log::tests::test_read_buffer_before_flush ... ok
+test wal::log::tests::the_recovery_scan_stops_at_a_corrupted_record ... ok
+test wal::log::tests::test_survives_flush_and_reopen ... ok
+test wal::history::tests::enqueue_skips_what_is_already_held_by_hseq ... ok
+ferrodb: the log refuses every write from now on (the DROP of `t` could not make its record durable (wal error: injected: the log's write failed); the next open decides from what reached disk whether the table was dropped); reopen the database, and every index is rebuilt then
+ferrodb: the log refuses every write from now on (the DROP of `t` was logged but did not complete (internal error (this is a bug in ferrodb): injected: the drop failed before it freed anything); the next open completes ittest wal::recovery::tests::a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them ... ok
+); reopen the database, and every index is rebuilt then
+ferrodb: the rollback of transaction 2 could not undo its primary-index writes (io error: eof before finished reading); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open
+ferrodb: finished the DROP of `t`, which the log records but the catalog on disk did not; any of its pages the DROP had not freed yet are leaked
+test wal::recovery::tests::a_drop_whose_record_cannot_be_written_leaves_no_later_write_to_lose ... ok
+test wal::history::tests::a_missing_record_older_than_the_tail_is_queued_by_membership ... ok
+ferrodb: a checkpoint flushed every page but kept the log: REVERT's history could not be written to /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpRhWsSe/h.history (io error: writing /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpRhWsSe/h.history: injected rename failure); it stays queued, and the next checkpoint retries
+ferrodb: the log refuses every write from now on (the DROP of `t` was logged but did not complete (internal error (this is a bug in ferrodb): injected: the drop failed before it freed anything); the next open completes it); reopen the database, and every index is rebuilt then
+test wal::recovery::tests::a_drop_whose_mutation_fails_after_its_record_is_durable_poisons_the_log_and_the_next_open_completes_it ... ok
+test wal::recovery::tests::a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_holds_no_heap_or_clr_record ... ferrodb: the log refuses every write from now on (okthe DROP of `t` was logged but did not complete (internal error (this is a bug in ferrodb): injected: the second drop failed before it freed anything); the next open completes it); reopen the database, and every index is rebuilt then
+
+ferrodb: finished the DROP of `t`, which the log records but the catalog on disk did not; any of its pages the DROP had not freed yet are leaked
+ferrodb: finished the DROP of `t`, which the log records but the catalog on disk did not; any of its pages the DROP had not freed yet are leaked
+ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in the log; recovery skips them, because the DROP's record follows them
+test wal::recovery::tests::a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree ... ok
+test wal::recovery::tests::a_runtime_attached_to_an_open_that_completed_a_drop_forgets_that_tables_provenance_and_no_other ... ok
+test wal::recovery::tests::a_table_recreated_at_the_dropped_root_and_then_altered_survives_a_crash ... ok
+test wal::recovery::tests::a_table_dropped_twice_at_one_root_is_completed_once_and_the_database_opens ... ok
+test wal::recovery::tests::a_table_recreated_at_the_dropped_root_whose_create_failed_to_sync_keeps_its_row ... ok
+test wal::recovery::tests::a_table_recreated_at_the_dropped_root_under_a_pin_survives_a_crash ... ok
+ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in the log; recovery skips them, because the DROP's record follows them
+test wal::history::tests::a_torn_tail_is_rewritten_away_by_the_first_write_after_a_reopen ... ok
+test wal::recovery::tests::after_a_drop_whose_checkpoint_failed_and_a_crash_redo_writes_no_page_the_drop_freed ... ok
+test wal::history::tests::drained_records_survive_a_reopen_and_queued_ones_do_not ... ok
+ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in the log; recovery skips them, because the DROP's record follows them
+ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in the log; recovery skips them, because the DROP's record follows them
+test wal::recovery::tests::open_recovered_refuses_a_lock_for_another_database_and_opens_with_its_own ... ferrodb: transaction 3ok committed, but slot 1 of page 5 could not be released (io error: injected release failure
+); it is retried at every checkpoint, and none truncates the log until it succeeds
+test wal::history::tests::a_pruned_record_is_not_resurrected_by_the_catch_up ... ok
+test wal::recovery::tests::a_table_recreated_elsewhere_under_the_dropped_name_survives_a_crash ... ok
+test wal::recovery::tests::test_insert_survives_crash ... ok
+ferrodb: checkpoints now flush every page but keep the log: 1 release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per test wal::recovery::tests::test_uncommited_rolled_back ... ok
+256test replication::sync::tests::a_concurrent_forget_does_not_take_the_ack_with_it ...  commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+ferrodb: transaction 3 committed, but slot 1 of page 5 could not be released (io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+ok
+test wal::recovery::tests::after_a_pinned_drop_and_a_crash_redo_writes_no_page_the_drop_freed ... ok
+test wal::history::tests::a_torn_last_record_is_dropped_and_a_bad_middle_one_is_refused ... ferrodb: DROP discarded 1ok
+ release(s) owed on the dropped table: its pages are freed, so nothing is left to release
+test wal::recovery::tests::sql_crash_recover_rebuild_query ... ok
+test wal::recovery::tests::after_a_pinned_drop_whose_freed_pages_a_new_table_took_and_a_crash_the_new_table_holds_only_its_own_row ... ok
+test wal::txn::tests::a_checkpoint_cannot_run_between_the_commit_flush_and_the_history_push ... ok
+test wal::history::tests::a_failed_hook_write_refuses_the_truncation_and_keeps_the_history_in_the_log ... ok
+ferrodb: transaction 2 committed, but slot 0 of page 2 could not be released (test wal::txn::tests::a_committed_history_record_carries_its_commit_records_lsn ... ok
+io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+test wal::recovery::tests::an_open_whose_release_fails_retryably_flushes_so_the_next_open_rebuilds_cleanly ... ok
+ferrodb: finished the DROP of `t`, which the log records but the catalog on disk did not; any of its pages the DROP had not freed yet are leaked
+test wal::recovery::tests::test_update_delete_redo_after_checkpoint ... ok
+ferrodb: transaction 2 committed, but slot test wal::history::tests::a_failing_store_is_retried_on_the_commit_path_only_as_the_queue_doubles ... ok
+0 of page 2 does not match the log (wal error: slot 0 holds a live tuple, not a retired one; the page does not match the release being applied), and its record could not be written to test wal::txn::tests::a_checkpoint_that_a_pin_kept_answers_kept_by_pin ... ok
+/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpakaa6t/txn.wal.release-quarantine (Is a directory (os error 21)); it stays owed, so the log keeps the record of it, and every checkpoint tries again
+test wal::txn::tests::a_checkpoint_that_a_pin_kept_is_counted_and_replays_nothing ... ferrodb: checkpoints now flush every page but keep the log: 1ok release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per 
+256 commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+test wal::txn::tests::a_fresh_log_starts_a_fresh_quarantine ... ferrodb: the log refuses every write from now on (test: a Commit record could not be made durable); reopen the database, and every index is rebuilt then
+ok
+test wal::txn::tests::a_fresh_log_whose_quarantine_could_not_be_moved_moves_it_at_the_next_open ... ok
+test wal::txn::tests::a_history_binding_with_no_registered_store_is_refused ... ok
+ferrodb: a WAL pin cancelled this DROP's truncation, so the dropped table's records stay in the log; recovery skips them, because the DROP's record follows them
+test wal::txn::tests::a_moved_quarantine_never_replaces_an_earlier_copy ... okferrodb: transaction 2 committed, but slot 0 of page 2 does not match the log (wal error: 
+test wal::recovery::tests::an_empty_table_recreated_at_the_dropped_root_by_a_failed_create_is_forgotten_and_its_pages_leak ... ok
+slot 0 holds a live tuple, not a retired one; the page does not match the release being appliedtest wal::txn::tests::a_create_runs_while_a_release_is_owed_and_defers_the_truncation ... ok
+; the slot is live), so it can never be released; it is recorded in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpakaa6t/txn.wal.release-quarantinetest wal::recovery::tests::redo_after_dropping_the_table_that_owed_a_release_touches_no_freed_page ... ok
+, dropped, not retried, and its bytes stay out of use
+test wal::history::tests::a_prune_keeps_the_newest_w_publishes_and_everything_after_the_oldest ... okferrodb: transaction 2
+ committed, but slot 0 of page test wal::txn::tests::a_drop_under_a_pin_succeeds_and_keeps_the_log ... 2 does not match the log (wal error: okslot 0 holds a live tuple, not a retired one; the page does not match the release being applied
+; the slot is livetest wal::txn::tests::a_drop_is_refused_before_its_mutation_on_a_poisoned_log ... ok
+), so it can never be released; it is recorded in test wal::txn::tests::a_quiet_database_resumes_at_the_readers_own_begin ... ok/var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpyI7tqP/txn.wal.release-quarantine, dropped, not retried, and its bytes stay out of use
+ferrodb: transaction 2 committed, but slot 0 of page 2 does not match the log (wal error: 
+slot 0 holds a live tuple, not a retired one; the page does not match the release being applied), and its record could not be written to test wal::txn::tests::a_reader_is_not_leaked_when_its_txn_end_cannot_be_written ... ok
+test wal::txn::tests::a_refused_binding_leaves_nothing_behind_for_the_commit_to_write ... /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmp0LrnQb/txn.wal.release-quarantine (Is a directory (os error 21ok
+)test wal::txn::tests::a_second_session_of_one_run_is_the_same_actor_however_the_clock_moved ... ok
+); it stays owed, so the log keeps the record of it, and every checkpoint tries again
+test wal::txn::tests::a_drop_refuses_to_discard_a_mismatch_it_could_not_record ... okferrodb: transaction 3 committed, but slot 1 of page 8 could not be released (io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+
+ferrodb: transaction test wal::history::tests::two_racing_drains_write_each_record_once ... ok
+2 committed, but slot test wal::txn::tests::a_snapshot_read_resumes_at_the_oldest_transaction_it_excluded ... ok0
+ of page 2 could not be released (io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+test wal::txn::tests::a_snapshot_reader_that_writes_is_refused_and_rolled_back ... okferrodb: transaction 2 committed, but slot 0 of page 
+2 does not match the log (test wal::txn::tests::abort_undoes_recorded_primary_writes_newest_first_and_commit_forgets_them ... ok
+test wal::txn::tests::a_snapshot_reader_is_not_leaked_when_its_handoff_cannot_be_pinned ... ok
+test wal::txn::tests::declaring_one_slot_as_two_actors_is_refused ... ok
+test wal::txn::tests::a_commit_path_drain_and_a_concurrent_checkpoint_both_finish ... ok
+test wal::txn::tests::binding_a_run_with_an_empty_named_field_is_refused ... ok
+test wal::txn::tests::a_mismatch_that_later_releases_does_not_block_a_drop ... ok
+wal error: slot 0 holds a live tuple, not a retired one; the page does not match the release being applied), and its record could not be written to /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpINEBA8/txn.wal.release-quarantine (Is a directory (os error 21)); it stays owed, so the log keeps the record of it, and every checkpoint tries again
+ferrodb: transaction 2 committed, but slot 0 of page 2 does not match the log (wal error: slot 0 holds a live tuple, not a retired one; the page does not match the release being applied; the slot is live), so it can never be released; it is recorded in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpyI7tqP/txn.wal.release-quarantine, dropped, not retried, and its bytes stay out of use
+ferrodb: the rollback of transaction 1 could not undo its primary-index writes (io error: eof before finished readingtest wal::txn::tests::checkpoint_truncates_and_preserves_data ... ); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next openok
+test wal::txn::tests::a_mismatch_found_again_is_recorded_once ... ok
+test wal::txn::tests::gate_covers_flush_all ... ok
+test wal::txn::tests::test_begin_creates_snapshot ... ok
+test wal::txn::tests::gate_flushed_wal_before_page_write ... ok
+test wal::txn::tests::history_parts_are_written_from_the_binding_just_before_the_commit ... ok
+test wal::txn::tests::test_visibility_matrix ... ok
+test wal::txn::tests::the_high_water_mark_is_exclusive ... ok
+
+ferrodb: checkpoints now flush every page but keep the log: 1 release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per 256test wal::visibility::tests::an_uncontended_version_and_my_own_write_are_both_writable ...  commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+ok
+ferrodb: the rollback of transaction 1 could not undo its primary-index writes (io error: eof before finished reading); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open
+test wal::txn::tests::interrupted_truncation_self_heals_on_open ... ferrodb: checkpoints now flush every page but keep the log: 1 release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per 256 commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+ferrodb: slot 0 of page 2 could not be read again (io error: injected release failure); its earlier page/log mismatch is now recorded in /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpINEBA8/txn.wal.release-quarantine, and the release stays owed
+ok
+test wal::txn::tests::test_abort_delete_restores_row ... ok
+ferrodb: DROP discarded test wal::visibility::tests::overwriting_a_version_an_in_flight_transaction_created_is_a_conflict ... ok
+1test wal::txn::tests::an_index_undo_failure_does_not_fail_an_abort_that_ended_the_transaction ... ok release(s) owed on the dropped table: its pages are freed, so nothing is left to release
+
+test wal::txn::tests::a_drop_while_another_table_owes_a_release_succeeds_and_keeps_the_log ... ok
+ferrodb: transaction test wal::txn::tests::test_abort_insert_removes_rows ... 3 committed, but slot 1 of page 8 could not be released (io error: injected release failureok
+); it is retried at every checkpoint, and none truncates the log until it succeeds
+test wal::visibility::tests::overwriting_a_version_an_in_flight_transaction_deleted_is_a_conflict ... ferrodb: the owed releases are settled, and checkpoints truncate the log again
+ok
+test wal::txn::tests::an_index_undo_failure_is_counted ... ferrodb: transaction 2 committed, but slot 0 of page 2 could not be released (io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+ok
+test wal::txn::tests::torn_tail_trimmed_on_open ... ok
+test wal::txn::tests::sql_insert_commits_through_run ... ok
+test wal::txn::tests::transaction_ids_never_start_at_zero ... ok
+test wal::txn::tests::test_commit_writes_chain_and_flushes ... ok
+test wal::txn::tests::the_run_identity_record_is_the_last_record_before_its_own_commit ... ok
+test wal::txn::tests::a_release_that_fails_retryably_is_kept_pending_and_the_checkpoint_flushes_but_keeps_the_log ... ok
+test wal::txn::tests::a_retry_that_fails_before_reading_the_page_does_not_let_a_drop_discard_an_unrecorded_mismatch ... ok
+ferrodb: checkpoints now flush every page but keep the log: 1 release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per 256 commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+ferrodb: transaction 3 committed, but slot 1 of page 8 could not be released (io error: injected release failure); it is retried at every checkpoint, and none truncates the log until it succeeds
+ferrodb: checkpoints now flush every page but keep the log: 1 release(s) owed by committed transactions still fail. The automatic checkpoint retries them once per 256 commits, every DDL and explicit checkpoint retries them, and every open attempts them again from the log. This is printed again when they clear; `deferred_checkpoints` counts every checkpoint that kept the log meanwhile
+ferrodb: DROP discarded 1 release(s) owed on the dropped table: its pages are freed, so nothing is left to release
+test wal::txn::tests::create_index_succeeds_while_a_release_is_owed_and_the_index_serves_lookups ... ok
+test wal::txn::tests::while_a_release_is_owed_the_automatic_checkpoint_flushes_once_per_interval ... ok
+test wal::txn::tests::dropping_the_table_that_owes_a_release_discards_it_and_truncates ... ok
+test wal::recovery::tests::a_crash_rebuild_of_multi_level_trees_leaves_every_cell_on_its_new_root ... ok
+
+test result: ok. 369 passed; 0 failed; 0 ignored; 0 measured; 1373 filtered out; finished in 7.97s
+
+# rc=0 end=2026-09-24T21:56:11Z

@@ -19,6 +19,44 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         return Ok(false);
     }
 
+    // **D212 (a') AMENDED 3, item 4: a log that holds REVERT history is recovered only with the
+    // store attached**, refused here before recovery writes anything. Such a log was written by a
+    // manager that had one (`bind_history` refuses without), and recovering it without one would let
+    // the next checkpoint discard the history's only copy. `open_recovered`, the one open path,
+    // attaches `<db>.history` before calling this.
+    if txn.history_store().is_none() {
+        let history = records.iter().filter(|r| matches!(r.kind, RecKind::RevertHistory { .. })).count();
+        if history > 0 {
+            return Err(FerroError::Internal(format!(
+                "the log holds {history} REVERT history record(s) and no history store is attached, so \
+                 the next checkpoint would discard them; open the database through \
+                 wal::recovery::open_recovered, which attaches <db>.history before recovering"
+            )));
+        }
+    }
+    // **AMENDED 3, item 10a: the store must be this database's.** For every attached store, with or
+    // without history (review of `c9d1e6e`, F1), the log declares its incarnation after every
+    // truncation and at an open that finds none (`TxnManager::declare_history`); a store that names
+    // another is refused here, before recovery writes anything. Not checked, stated: a log with no
+    // declaration — written before this build, or cut by a crash between a truncation and its
+    // declaration, whose next open then declares the store it finds; a history file copied from a
+    // fork of this database, which shares its incarnation by construction; and a plain
+    // `replication::backup::restore` over a path whose earlier database had history, whose log and
+    // store both still name that database, so the restored rows inherit its history (the history
+    // twin of the limit `start_fresh_quarantine` states for plain `restore`).
+    if let (Some(store), Some(declared)) =
+        (txn.history_store(), crate::wal::history::declared_incarnation(&records))
+    {
+        store.adopt_or_check(declared)?;
+        txn.note_history_declared();
+    }
+    // A log that holds nothing but incarnation declarations has nothing to recover (review of
+    // `a71d3ed`, F1): every truncation and every open writes one, and reading one as "recovered"
+    // would rebuild every index at every open.
+    if records.iter().all(|r| matches!(r.kind, RecKind::IncarnationDecl { .. })) {
+        return Ok(false);
+    }
+
     // F1: a log written before D213 (format 2) is replayed with ITS meaning: a forward `HeapDelete`
     // frees its slot, and nothing is owed a release. See `wal::log::VERSION`.
     let legacy = wal.is_legacy();
@@ -144,6 +182,28 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             snapshot: None
         });
         txn.abort(id)?;
+    }
+
+    // **D212 (a'): REVERT history the store does not hold.** A transaction's history records are in
+    // the log beside its rows; if a crash beat the checkpoint that writes them into the store, this
+    // is their only copy. Only a transaction with a `Commit` counts — `ended` would also admit one
+    // that aborted, since `abort` writes `TxnEnd` too — and the store queues a record only if it does
+    // not already hold its `hseq`, wherever it falls at or above the store's prune floor (AMENDED 2,
+    // F9; AMENDED 3, item 3). The open's checkpoint writes them. Each record carries its
+    // transaction's `Commit` LSN (AMENDED 3, item 2); a transaction without one is not committed.
+    // With no store attached, a log holding any was refused above (AMENDED 3, item 4).
+    let (history, dropped) = crate::wal::history::committed_in(&records)?;
+    if dropped > 0 {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "ferrodb: {dropped} committed REVERT history record(s) in the log begin before it and \
+             cannot be read back from it; unless the history store already holds them, REVERT of \
+             those merges will be refused"
+        );
+    }
+    if let Some(store) = txn.history_store() {
+        store.enqueue(history);
     }
 
     // repair directory
@@ -279,6 +339,8 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
         | RecKind::Checkpoint
         | RecKind::Ddl { .. }
         | RecKind::RunIdentity { .. }
+        | RecKind::RevertHistory { .. }
+        | RecKind::IncarnationDecl { .. }
         | RecKind::Clr { .. } => unreachable!(),
     }
     page.lsn = lsn;
@@ -517,6 +579,10 @@ pub struct OpenedDatabase {
     /// database's provenance file; [`OpenedDatabase::attach_runtime`] forgets them in an in-memory
     /// store. PRIVATE for the same reason.
     dropped_tables: Vec<String>,
+    /// **D212 (a') AMENDED 3, item 4 — REVERT's history store**, `<db>.history`, opened by
+    /// [`open_recovered`] and registered with `txn` before `recover`. [`OpenedDatabase::attach_runtime`]
+    /// hands it to the runtime. PRIVATE, so a runtime reaches it only through the door.
+    history: Arc<crate::wal::history::HistoryStore>,
     /// The database's provenance file, when this open opened it to forget `dropped_tables` in it
     /// (D250 review 3's A). Handed to the runtime by [`OpenedDatabase::attach_runtime`]. Held here so
     /// the store stays live from the open to the attach: [`DurableProvenanceStore::shared`] keeps one
@@ -577,6 +643,10 @@ impl OpenedDatabase {
     /// public and used across the test suite, so a runtime can still be built without this door.
     ///
     /// `&self` and no drain: every runtime attached to one open is attached the same way.
+    ///
+    /// **D212 (a') AMENDED 3, item 4: it also hands the runtime this database's REVERT history
+    /// store**, so the runtime is refused over any other database's log
+    /// (`AgentRuntime::attach_history`).
     pub fn attach_runtime(&self, runtime: AgentRuntime, backing: ProvenanceBacking) -> Result<Arc<AgentRuntime>, FerroError> {
         let runtime = match backing {
             ProvenanceBacking::Durable => {
@@ -593,6 +663,7 @@ impl OpenedDatabase {
                 runtime
             }
         };
+        runtime.bind_history_store(Arc::clone(&self.history));
         Ok(Arc::new(runtime))
     }
 }
@@ -757,6 +828,13 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
     let wal = Arc::new(WalManager::open_for_database(db_path, &bp.disk_manager)?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
+    // **D212 (a') AMENDED 3, item 4: REVERT's history store, opened HERE and registered BEFORE
+    // `recover`.** The open's catch-up puts the committed history a crash left only in the log into
+    // it, and the checkpoint below drains it before truncating that log. This is the one open path,
+    // and between the manager's construction and `recover` is the only moment a store can be
+    // registered in time; `recover` refuses a log holding history with none.
+    let history = crate::wal::history::HistoryStore::open_for_database(db_path, existed)?;
+    txn.attach_history_store(Arc::clone(&history))?;
     let recovered = recover(&txn)?;
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
@@ -854,7 +932,11 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         // rebuild's on-disk frees and the sync (D229's window; lane §21.2). A kept log is counted,
         // and printed when the log-keeping state begins (`TxnManager::checkpoint_or_keep_held`).
         let kept = txn.checkpoint_after_frees()?;
-        if !matches!(kept, crate::wal::txn::CheckpointOutcome::KeptForOwed(_)) && stale {
+        if !matches!(
+            kept,
+            crate::wal::txn::CheckpointOutcome::KeptForOwed(_) | crate::wal::txn::CheckpointOutcome::KeptForHistory
+        ) && stale
+        {
             if let Err(e) = std::fs::remove_file(&marker) {
                 let _ = writeln!(
                     std::io::stderr(),
@@ -864,6 +946,12 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
             }
         }
     }
+    // D212 (a') AMENDED 3, item 10a (review of `a71d3ed`, F5): the log this open leaves declares the
+    // history's incarnation when the store holds history and the retained log has no declaration,
+    // so a log a pin kept since a store was attached is checked at the next open. A log holding only
+    // declarations is not "recovered" (`recover`), so this costs the next open nothing, and an open
+    // that finds a declaration appends none.
+    txn.declare_history_if_missing()?;
     Ok(OpenedDatabase {
         bp,
         wal,
@@ -875,6 +963,7 @@ pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, F
         dropped_tables,
         provenance,
         provenance_path,
+        history,
     })
 }
 

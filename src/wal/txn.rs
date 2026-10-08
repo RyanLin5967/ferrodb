@@ -6,6 +6,7 @@ use crate::cluster::GrantedCounter;
 use crate::storage::atomic_file::{FileOps, OsFileOps};
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, FencedTruncation, RecKind, WalManager, WalPin}}};
+use crate::wal::history::{HistoryRecord, HistoryStore};
 
 /// Commits between automatic checkpoints.
 ///
@@ -107,6 +108,32 @@ pub struct TxnManager {
     /// Held here rather than written when it is bound, and that is the whole correctness property.
     /// See [`TxnManager::bind_run`].
     run_bindings: Mutex<HashMap<u64, RunEntity>>,
+    /// **D212 (a') — the REVERT history store, when one is attached** (`wal::history`).
+    ///
+    /// Attached by `wal::recovery::open_recovered`, the one open path, BEFORE `recover` (AMENDED 3,
+    /// item 4): the open's catch-up queues committed history records into it, and the open's
+    /// checkpoint drains them before any runtime exists. Set once. A manager built directly on
+    /// `TxnManager::new` has none, keeps no durable history, and refuses every history binding.
+    ///
+    /// **This handle is the checkpoint hook** (AMENDED 3, item 5): the store owns nothing but its
+    /// records and its file, and `wal::history` imports nothing from `agent_sql`, so the hook cannot
+    /// reach runtime state. **Lock order: `att` → `release_retry` → the store's mutex (F3) →
+    /// `atomic_file`'s `REPLACE_LOCK`.** The hook takes F3 under `release_retry` (and under `att` in
+    /// `ddl_unit`); `commit` pushes and runs its bounded drain with NOTHING held and before
+    /// `release_retired` takes `release_retry`. F3 is taken only inside `HistoryStore`'s methods and no
+    /// method returns its guard, so no caller can hold it into another lock: the order is enforced by
+    /// construction rather than checked.
+    history: std::sync::OnceLock<Arc<HistoryStore>>,
+    /// Open transaction -> the history records it wrote to the log, moved onto the store's queue
+    /// the moment its `Commit` is durable and dropped by its abort. See
+    /// [`TxnManager::bind_history`].
+    history_bindings: Mutex<HashMap<u64, Vec<HistoryRecord>>>,
+    /// **D212 (a') AMENDED 3, item 10a — whether the retained log already declares the history's
+    /// incarnation**: set when `recover` finds a declaration the store matches, and when
+    /// [`TxnManager::declare_history`] writes one; cleared by every truncation, which discards it. The
+    /// open declares only when it is clear, so an open that changes nothing appends nothing (review
+    /// of `0d3fbb9`, N4).
+    history_declared: std::sync::atomic::AtomicBool,
     /// Open transaction -> every primary-index entry it moved, oldest first. D202.
     ///
     /// Index pages are not logged, so the heap undo in [`TxnManager::abort`] cannot reach them,
@@ -148,6 +175,10 @@ pub struct TxnManager {
     /// decision 3: the stderr line is printed when this CHANGES (owed, then clear again), not at every
     /// checkpoint that keeps the log. `DEFERRED_CHECKPOINTS` counts every one.
     keeping_log: std::sync::atomic::AtomicBool,
+    /// Whether the last checkpoint kept the log because REVERT's history could not be written to its
+    /// store (D212 (a') AMENDED 3, item 1). The stderr line is printed when this CHANGES, as for
+    /// [`TxnManager::keeping_log`] (review of `c9d1e6e`, F2); `DEFERRED_CHECKPOINTS` counts every one.
+    keeping_log_for_history: std::sync::atomic::AtomicBool,
     /// Owed releases that are page/log MISMATCHES whose quarantine record could not be written, so
     /// they stay owed (review 3's decision 6). Review 4's finding 4: a DROP must not discard one of
     /// these, because its truncation would remove the only record of it; see
@@ -303,6 +334,12 @@ pub enum CheckpointOutcome {
     /// A WAL pin below the log's end cancelled the truncation (`WalManager::truncate_fenced` keeps
     /// the log while one is held, and says so).
     KeptByPin,
+    /// **D212 (a') AMENDED 3, item 1:** REVERT's history could not be written to its store, so the
+    /// log, which holds the only other copy of what the store's queue holds, was KEPT. The queue keeps
+    /// every record and the next write is a full replace (`HistoryStore::drain`). A deferral like
+    /// `KeptForOwed`, not a failure: the open continues over the queue, whose records the runtime
+    /// reads with the store's (`HistoryStore::records`), and the explicit `checkpoint` refuses it.
+    KeptForHistory,
     /// **D253.** A record was appended after the checkpoint's fence: `next_lsn`, read in the same
     /// attach-table hold that found no transaction. Its page change may be in no page this
     /// checkpoint flushed, or its uncommitted change in one it did, so the truncation kept the whole
@@ -376,9 +413,9 @@ pub(crate) enum CheckpointPausePoint {
     /// In `checkpoint_or_keep_locked`, after the fence is read and `att` is let go, before the
     /// flush. Holds `release_retry`. (Not the function's entry: the retry and the fence come first.)
     AtEntry,
-    /// In `checkpoint_or_keep_held`, after the sync, before the owed-release check and the
-    /// truncation. Holds `release_retry`; on the DDL path also `att`, and for a DROP the pin
-    /// fence's write guard.
+    /// In `checkpoint_or_keep_held`, after the sync, before D212's history drain, the owed-release
+    /// check and the truncation. Holds `release_retry`; on the DDL path also `att`. (A DROP held #16's
+    /// pin fence's write guard here too, until D250 removed that fence.)
     BeforeTruncate,
 }
 
@@ -387,6 +424,12 @@ pub(crate) enum CheckpointPausePoint {
 /// file, like the release seam above and for its reason (nothing test-only above the tests module).
 #[cfg(not(test))]
 fn checkpoint_pause(_txn: u64, _at: CheckpointPausePoint) {}
+
+/// The history push's park seam, production half: never parks. The test half, which parks one
+/// manager's next commit so a test can run a checkpoint at exactly that point (AMENDED 3, item 7),
+/// is defined after the tests module for the reason [`FAIL_RELEASES`] is.
+#[cfg(not(test))]
+fn park_before_history_push(_manager: u64) {}
 
 /// How a release failed. A mismatch between the page and the log can never succeed; anything else
 /// (an I/O error, a poisoned log) may on a retry.
@@ -559,7 +602,77 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()), index_undo: Mutex::new(HashMap::new()), retired: Mutex::new(HashMap::new()), pending_releases: Mutex::new(Vec::new()), release_retry: Mutex::new(()), keeping_log: std::sync::atomic::AtomicBool::new(false), keeping_log_for_history: std::sync::atomic::AtomicBool::new(false), unrecorded: Mutex::new(Vec::new()), history: std::sync::OnceLock::new(), history_bindings: Mutex::new(HashMap::new()), history_declared: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// **D212 (a') — attach the REVERT history store.** Before [`crate::wal::recovery::recover`],
+    /// or the open's catch-up has nowhere to put what the log holds; `open_recovered` is the caller
+    /// that matters, and `recover` refuses a log holding committed history with no store attached.
+    /// Refuses a second store: one database has one history.
+    pub fn attach_history_store(&self, store: Arc<HistoryStore>) -> Result<(), FerroError> {
+        self.history.set(store).map_err(|_| {
+            FerroError::Internal("a REVERT history store is already attached to this log".into())
+        })
+    }
+
+    /// The attached REVERT history store, if any.
+    pub fn history_store(&self) -> Option<Arc<HistoryStore>> {
+        self.history.get().cloned()
+    }
+
+    /// **D212 (a') — bind a REVERT history record to transaction `txn_id`.**
+    ///
+    /// Held here, and written by [`TxnManager::commit`] FROM this binding, as `RunIdentity` is
+    /// (AMENDED 3, item 6): one copy of the bytes, so the log and the store cannot disagree. `commit`
+    /// appends it as `RecKind::RevertHistory` parts just before the `RunIdentity`/`Commit` pair, so the
+    /// `Commit` decides for the rows and the history together, and moves it onto the store's queue
+    /// right after the `Commit` flush — before the transaction leaves `att`, before `TxnEnd`, and
+    /// before the automatic checkpoint `commit` may run. An abort drops it.
+    ///
+    /// Refuses when no store is attached (the record would be written to the log and never kept)
+    /// and for a transaction that is not active.
+    pub fn bind_history(&self, txn_id: u64, record: HistoryRecord) -> Result<(), FerroError> {
+        if self.history.get().is_none() {
+            return Err(FerroError::Internal(format!(
+                "cannot bind REVERT history to txn {txn_id}: no history store is attached"
+            )));
+        }
+        if !self.att_read().contains_key(&txn_id) {
+            return Err(FerroError::Txn(format!(
+                "cannot bind REVERT history to txn {txn_id}: it is not active"
+            )));
+        }
+        self.history_bindings.lock().unwrap().entry(txn_id).or_default().push(record);
+        Ok(())
+    }
+
+    /// Append `record` to `txn_id`'s log as `RevertHistory` parts of at most
+    /// [`crate::wal::log::REVERT_HISTORY_PART_BYTES`] each, the last one marked.
+    fn append_history(&self, txn_id: u64, record: &HistoryRecord) -> Result<(), FerroError> {
+        let parts: Vec<&[u8]> = if record.body.is_empty() {
+            vec![&record.body[..]]
+        } else {
+            record.body.chunks(crate::wal::log::REVERT_HISTORY_PART_BYTES).collect()
+        };
+        let n = parts.len();
+        for (i, bytes) in parts.into_iter().enumerate() {
+            let part = u32::try_from(i).map_err(|_| FerroError::Unrepresentable {
+                what: "a REVERT history record's part count".to_string(),
+                len: n,
+                limit: u32::MAX as usize,
+            })?;
+            self.append_chained(
+                txn_id,
+                &RecKind::RevertHistory {
+                    hseq: record.hseq,
+                    ordinal: record.ordinal,
+                    part,
+                    last: i + 1 == n,
+                    bytes: bytes.to_vec(),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -939,6 +1052,42 @@ impl TxnManager {
         self.run_log.lock().unwrap().len()
     }
 
+    /// **D212 (a') AMENDED 3, item 10a — declare the REVERT history's incarnation into the log**, after
+    /// every truncation, as `replay_runs` declares runs: a transaction-0 `IncarnationDecl` record
+    /// (tag 14) carrying the store's incarnation (`HistoryStore::incarnation`, drawn before the first
+    /// image or declaration). The open reads the last one back and refuses a store that names another
+    /// (`HistoryStore::adopt_or_check`). Nothing without a store. Cost: one fixed-size record (a
+    /// u64 payload) and one flush per truncation.
+    ///
+    /// **For every attached store, whether or not it holds history** (review of `c9d1e6e`, F1; the
+    /// lead's decision). A database that has never published still declares its own incarnation, so
+    /// a history file copied in beside it is refused at its next open instead of being declared as
+    /// its own. Review of `0d3fbb9`'s N2 limited this to a store holding history, because the
+    /// declaration leaves a log that is otherwise empty with one record: `recover` reads a log of
+    /// declarations alone as nothing to recover, and `tests/wal_format_upgrade.rs`'s header-only
+    /// premise is the lane's ⚖ for it.
+    pub(crate) fn declare_history(&self) -> Result<(), FerroError> {
+        let Some(store) = self.history.get() else { return Ok(()) };
+        let incarnation = store.incarnation();
+        self.wal.append(0, 0, &RecKind::IncarnationDecl { incarnation })?;
+        self.wal.flush()?;
+        self.history_declared.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// [`TxnManager::declare_history`], unless the retained log already declares it. The open's call.
+    pub(crate) fn declare_history_if_missing(&self) -> Result<(), FerroError> {
+        if self.history_declared.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.declare_history()
+    }
+
+    /// `recover` found a declaration the store matches.
+    pub(crate) fn note_history_declared(&self) {
+        self.history_declared.store(true, Ordering::SeqCst);
+    }
+
     /// Re-declare every known run at the head of the log, after a truncation discarded them.
     ///
     /// Transaction id 0, matching [`TxnManager::append_ddl`]: a declaration says "this run exists",
@@ -959,6 +1108,13 @@ impl TxnManager {
         // D211: a transaction whose rollback began may not commit its half-undone rows.
         if self.is_aborting(txn_id) {
             return Err(Self::rolling_back(txn_id));
+        }
+        // D212 (a'): the history records bound to it, written FROM the binding (AMENDED 3, item 6),
+        // after every other record of the transaction and ahead of the identity pair. Read rather
+        // than removed, so a failed append leaves them for the abort that follows.
+        let history = self.history_bindings.lock().unwrap().get(&txn_id).cloned();
+        for record in history.iter().flatten() {
+            self.append_history(txn_id, record)?;
         }
         // **Immediately before the `Commit`, with no append between them.** See `bind_run` for what
         // any other position costs. Read rather than removed, so a failed append leaves the binding
@@ -985,6 +1141,30 @@ impl TxnManager {
                 "{why}. The log now refuses every write, and the database must be reopened: recovery \
                  decides from what reached disk whether transaction {txn_id} committed"
             )));
+        }
+        // **D212 (a'): onto the store's queue HERE — the `Commit` is durable, and nothing has yet
+        // run that can truncate the log.** The automatic checkpoint below, and any explicit one
+        // (refused while this transaction is still in `att`), drains the queue into the store
+        // before its truncation. Queued any later, that checkpoint would discard the record's only
+        // copy while its rows became durable.
+        // Taken out first, so no other transaction's commit or abort waits on this map while a
+        // bounded drain below fsyncs.
+        park_before_history_push(self.id);
+        let bound = self.history_bindings.lock().unwrap().remove(&txn_id);
+        if let Some(mut records) = bound {
+            // AMENDED 3, item 2: each carries its `Commit`'s LSN, which only exists now.
+            for r in &mut records {
+                r.commit_lsn = commit_lsn;
+            }
+            if let Some(store) = self.history.get() {
+                store.enqueue(records);
+                // AMENDED 2, F7: an idle open transaction blocks every checkpoint, so the queue is
+                // bounded here too — one drain, one fsync, per `QUEUE_DRAIN_BYTES`. A store ahead of
+                // the log is safe (the open keys on `hseq`). A failed drain leaves the queue for the
+                // checkpoint hook, which refuses its truncation until a write succeeds; it is not
+                // this committed transaction's failure.
+                let _ = store.drain_if_due();
+            }
         }
         // **D213: decided, so the space its deletes held for their undo is free now.** After the
         // flush, never before: a slot freed while the `Commit` could still be lost would let
@@ -1071,7 +1251,8 @@ impl TxnManager {
                 Ok(
                     CheckpointOutcome::KeptForOwed(_)
                     | CheckpointOutcome::KeptByPin
-                    | CheckpointOutcome::KeptByFence,
+                    | CheckpointOutcome::KeptByFence
+                    | CheckpointOutcome::KeptForHistory,
                 ) => {
                     self.commits_since_checkpoint.store(0, Ordering::SeqCst)
                 }
@@ -1215,6 +1396,9 @@ impl TxnManager {
                  ended anyway, and every undo it made is already logged"
             );
         }
+        // D212 (a'): its history records are in the log, under a transaction with no `Commit`, so
+        // the open's catch-up never takes them; the in-memory copy goes too.
+        self.history_bindings.lock().unwrap().remove(&txn_id);
         Ok(())
     }
 
@@ -1970,6 +2154,12 @@ impl TxnManager {
             CheckpointOutcome::Truncated
             | CheckpointOutcome::KeptByPin
             | CheckpointOutcome::KeptByFence => Ok(()),
+            CheckpointOutcome::KeptForHistory => Err(FerroError::Wal(
+                "checkpoint refused: REVERT's history could not be written to its store, and truncating \
+                 the log would lose the only other copy of it; every page was flushed and the log is kept, \
+                 and the next checkpoint retries the write"
+                    .into(),
+            )),
             CheckpointOutcome::KeptForOwed(owed) => Err(FerroError::Wal(format!(
                 "checkpoint refused: {owed} release(s) owed by committed transactions still fail, and \
                  truncating the log would lose the record of the bytes they hold; every page was \
@@ -2058,7 +2248,8 @@ impl TxnManager {
     ///
     /// A kept log is counted in `DEFERRED_CHECKPOINTS`. The stderr line is printed only when the
     /// log-keeping state CHANGES: once when a checkpoint first keeps the log, and once when one
-    /// truncates again (review 3's decision 3).
+    /// truncates again (review 3's decision 3). REVERT's history has its own state and its own pair of
+    /// lines, printed the same way (D212 (a'), review of `c9d1e6e`, F2).
     ///
     /// `fence` is `next_lsn` as the caller read it in that hold; the truncation keeps the log if
     /// anything was appended after it (D253).
@@ -2068,6 +2259,37 @@ impl TxnManager {
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
         checkpoint_pause(self.id, CheckpointPausePoint::BeforeTruncate);
+        // **D212 (a'): REVERT's history is made durable in its store BEFORE the log that holds its
+        // only other copy is truncated**, and before the owed-release keep below, so a log kept for
+        // owed releases still drains the queue (review of `816321d`, finding 3). A failed write KEEPS
+        // the log, as an owed release does (AMENDED 3, item 1): the flushes above have run, the queue
+        // keeps every record, and the answer is a counted deferral, not an error, so the open that
+        // hits it continues over the queue rather than failing.
+        // With no store there is no history in the log: `bind_history` refuses without one, and
+        // `recover` refuses a log that holds some (AMENDED 3, item 4, which deleted AMENDED 2's
+        // count of unstored records).
+        if let Some(store) = self.history.get() {
+            if let Err(e) = store.drain() {
+                DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+                if !self.keeping_log_for_history.swap(true, Ordering::SeqCst) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ferrodb: checkpoints now flush every page but keep the log: REVERT's history could \
+                         not be written to {} ({e}); it stays queued, every checkpoint retries it, and this \
+                         is printed again when a write succeeds",
+                        store.path().display()
+                    );
+                }
+                return Ok(CheckpointOutcome::KeptForHistory);
+            }
+            if self.keeping_log_for_history.swap(false, Ordering::SeqCst) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: REVERT's history is written to {} again",
+                    store.path().display()
+                );
+            }
+        }
         if owed > 0 {
             DEFERRED_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             if !self.keeping_log.swap(true, Ordering::SeqCst) {
@@ -2115,6 +2337,10 @@ impl TxnManager {
         // And every run declaration, for the same reason: a reader starting at the new base would
         // otherwise have no way to name the database's writers.
         self.replay_runs()?;
+        // And the REVERT history's incarnation (AMENDED 3, item 10a), so the next open can tell this
+        // database's history from another's. The truncation discarded any earlier declaration.
+        self.history_declared.store(false, Ordering::SeqCst);
+        self.declare_history()?;
         Ok(CheckpointOutcome::Truncated)
     }
 
@@ -2358,27 +2584,56 @@ pub fn stale_indexes_marker(wal_path: &Path) -> PathBuf {
 /// (`replication::backup::restore` on its own) does not carry the quarantine and does not move it, so
 /// the file left at the path is the REPLACED database's.
 pub(crate) fn start_fresh_quarantine(wal_path: &Path) -> std::io::Result<()> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    start_fresh_quarantine_at(wal_path, nanos)
+    start_fresh_quarantine_at(wal_path, aside_clock())
 }
 
 /// [`start_fresh_quarantine`] with the clock passed in: the seam a test uses to move twice at one
 /// clock reading through the caller (review 7's F5).
 fn start_fresh_quarantine_at(wal_path: &Path, nanos: u128) -> std::io::Result<()> {
-    let current = release_quarantine(wal_path);
-    match std::fs::symlink_metadata(&current) {
+    move_aside_at(&release_quarantine(wal_path), nanos)
+}
+
+/// **D212 (a') AMENDED 3, item 10: a fresh log starts a fresh REVERT history**, for the reason
+/// [`start_fresh_quarantine`] gives: a fresh log is a new database at this path, and the history
+/// beside it (`<db>.history` for a log at `<db>.wal`, `HistoryStore::path_for_wal`) belongs to the
+/// one it replaces. Inherited, an earlier incarnation's merge ids would be revertible against the new
+/// database's rows. Moved aside, not deleted, and called from the same place, before the fresh log's
+/// header. A log not named `<db>.wal` has no history by that convention, and nothing moves.
+pub(crate) fn start_fresh_history(wal_path: &Path) -> std::io::Result<()> {
+    match crate::wal::history::HistoryStore::path_for_wal(wal_path) {
+        Some(history) => move_aside(&history),
+        None => Ok(()),
+    }
+}
+
+/// Move `current` to the first free [`aside_path`], durably, or do nothing when it does not exist.
+/// Shared by the release quarantine and the REVERT history (D212).
+fn move_aside(current: &Path) -> std::io::Result<()> {
+    move_aside_at(current, aside_clock())
+}
+
+/// The clock reading an aside name carries: nanoseconds since 1970, or 0 before it (review 6's
+/// finding 5 is why 0 must still find a free name).
+fn aside_clock() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// [`move_aside`] at a given clock reading (review 7's F5 seam, through
+/// [`start_fresh_quarantine_at`]).
+fn move_aside_at(current: &Path, nanos: u128) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(current) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
         Ok(_) => {}
     }
-    std::fs::rename(&current, aside_path(&current, nanos)?)?;
-    sync_directory_of(&current)
+    std::fs::rename(current, aside_path(current, nanos)?)?;
+    sync_directory_of(current)
 }
 
-/// Where [`start_fresh_quarantine`] moves `current`: the first of `<current>.before-<nanos>`,
+/// Where [`move_aside`] moves `current` (the quarantine, and D212's history): the first of `<current>.before-<nanos>`,
 /// `<current>.before-<nanos>-1`, `-2`, ... that does not exist. Review 6's finding 5: a clock before
 /// 1970 gives `nanos == 0` every time, and `rename` silently replaces an existing target, which would
 /// lose the earlier copy.
@@ -4260,6 +4515,204 @@ use super::*;
         );
         FAIL_RELEASES.with(|f| f.set(0));
     }
+
+    /// A manager over `setup()`'s files with a REVERT history store beside them.
+    fn with_history() -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, Arc<HistoryStore>, tempfile::TempDir) {
+        let (bp, wal, txn, dir) = setup();
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        (bp, wal, txn, store, dir)
+    }
+
+    /// **D212 (a') AMENDED 3, item 6: `commit` writes a transaction's history FROM its binding, as it
+    /// writes `RunIdentity`** — one copy of the bytes, after every other record of the transaction
+    /// and immediately before its `Commit`, so the log and the store cannot hold two versions of it.
+    ///
+    /// Mutant: `bind_history` appends the parts itself, at bind time — the part lands before the
+    /// record the transaction wrote after binding.
+    #[test]
+    fn history_parts_are_written_from_the_binding_just_before_the_commit() {
+        let (_bp, wal, txn, _store, _dir) = with_history();
+        let t = txn.begin().unwrap();
+        let record = HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() };
+        txn.bind_history(t, record).unwrap();
+        // A record the transaction writes AFTER binding its history.
+        txn.append_chained(t, &RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 0, tuple: vec![7; 8] })
+            .unwrap();
+        txn.commit(t).unwrap();
+        let kinds: Vec<RecKind> =
+            walk_log(&wal).into_iter().filter(|r| r.txn_id == t).map(|r| r.kind).collect();
+        let parts: Vec<usize> = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| matches!(k, RecKind::RevertHistory { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(parts.len(), 1, "one binding must be written exactly once: {kinds:?}");
+        let commit = kinds.iter().position(|k| matches!(k, RecKind::Commit)).expect("no Commit in the log");
+        assert_eq!(parts[0] + 1, commit, "the history part is not the transaction's last record before its Commit: {kinds:?}");
+        match &kinds[parts[0]] {
+            RecKind::RevertHistory { hseq, ordinal, part, last, bytes } => assert_eq!(
+                (*hseq, *ordinal, *part, *last, bytes.as_slice()),
+                (1, 1, 0, true, &b"a publish"[..]),
+                "the part is not the bound record"
+            ),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// **D212 (a') AMENDED 3, item 2: a committed history record carries the LSN of its
+    /// transaction's `Commit` record**, when `commit` queues it and when the open's catch-up takes it
+    /// back from the log after a crash. That LSN is what an install or a restore compares with an
+    /// image's `end_lsn`. The expected value is read from the log, never from the store.
+    ///
+    /// Mutants: `commit` does not stamp it (the queued record carries 0); `recover` does not (the
+    /// re-queued one carries 0).
+    #[test]
+    fn a_committed_history_record_carries_its_commit_records_lsn() {
+        let (bp, wal, txn, store, dir) = with_history();
+        let t = txn.begin().unwrap();
+        txn.bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .unwrap();
+        txn.commit(t).unwrap();
+        let commit_lsn = walk_log(&wal)
+            .into_iter()
+            .find(|r| r.txn_id == t && matches!(r.kind, RecKind::Commit))
+            .expect("fixture: the Commit is in the log")
+            .lsn;
+        assert!(commit_lsn > 0, "premise: a real LSN, not the unstamped 0");
+        let held = store.records();
+        assert_eq!(held.len(), 1, "fixture: the committed record is queued");
+        assert_eq!(held[0].commit_lsn, commit_lsn, "the queued record does not carry its Commit's LSN");
+
+        // The crash: nothing drained the queue, so the log is the record's only copy.
+        drop((bp, wal, txn, store));
+        let file = OpenOptions::new().read(true).write(true).open(dir.path().join("txn.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp.clone());
+        bp.attach_wal(wal);
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        assert!(crate::wal::recovery::recover(&txn).unwrap(), "premise: the log held records to recover");
+        let held = store.records();
+        assert_eq!(held.len(), 1, "the open's catch-up did not take the committed record back");
+        assert_eq!(held[0].commit_lsn, commit_lsn, "the re-queued record does not carry its Commit's LSN");
+    }
+
+    /// Reopen `setup()`'s files after a crash — nothing checkpointed, every handle dropped — with a
+    /// history store beside them, through `recover`, as an entry point does.
+    fn reopened_with_history(dir: &tempfile::TempDir) -> (TxnManager, Arc<HistoryStore>) {
+        let file = OpenOptions::new().read(true).write(true).open(dir.path().join("txn.db")).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
+        let txn = TxnManager::new(wal.clone(), bp.clone());
+        bp.attach_wal(wal);
+        let store = HistoryStore::open(dir.path().join("txn.db.history"), 8).unwrap();
+        txn.attach_history_store(store.clone()).unwrap();
+        crate::wal::recovery::recover(&txn).unwrap();
+        (txn, store)
+    }
+
+    /// **D212 (a') AMENDED 3, item 7 (N3): the history push happens before the transaction leaves
+    /// `att`.** So no checkpoint can run between the `Commit` flush and the push: one that did would
+    /// drain a queue that does not hold the record yet and then truncate the log that does, and the
+    /// crash after it would keep the rows and lose their history.
+    ///
+    /// Two threads: T commits and parks immediately before its push; the other runs `checkpoint()`.
+    /// A GUARD: green wherever the push precedes `self.att_write().remove(&txn_id)`.
+    ///
+    /// Mutant: the push (with this park) moved below `self.att_write().remove(&txn_id)` — the
+    /// checkpoint runs while T is parked, and the crash loses T's history.
+    #[test]
+    fn a_checkpoint_cannot_run_between_the_commit_flush_and_the_history_push() {
+        let (bp, wal, txn, store, dir) = with_history();
+        let t = txn.begin().unwrap();
+        txn.bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .unwrap();
+        let (arrived, resume) = park_next_history_push(&txn);
+        let committer = {
+            let txn = Arc::clone(&txn);
+            std::thread::spawn(move || txn.commit(t))
+        };
+        arrived.wait();
+        // T's Commit is durable and its history is not yet queued.
+        let during = txn.checkpoint();
+        resume.wait();
+        committer.join().unwrap().unwrap();
+
+        // The crash: no checkpoint after the push, so the queue's copy dies with the process.
+        drop((bp, wal, txn, store));
+        let (_txn, store) = reopened_with_history(&dir);
+        let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(held, [1], "a checkpoint between T's Commit and its push lost T's history");
+        assert!(during.is_err(), "a checkpoint ran while a committed transaction's history was not yet queued");
+    }
+
+    /// **D212 (a') AMENDED 3, item 5: the commit-path drain and a concurrent checkpoint both
+    /// finish.** One thread commits records large enough that its commit path drains the queue (F7)
+    /// while another loops checkpoints, whose hook takes the same store mutex under
+    /// `release_retry`. A GUARD, green by construction (see `TxnManager::history`): no one-line
+    /// mutant can invert the lock order, because the store holds no handle to `att` or
+    /// `release_retry`. The deadline is generous; passing costs nothing.
+    #[test]
+    fn a_commit_path_drain_and_a_concurrent_checkpoint_both_finish() {
+        let (_bp, _wal, txn, store, _dir) = with_history();
+        let big = crate::wal::history::QUEUE_DRAIN_BYTES / 3;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let committer = {
+            let (txn, done) = (Arc::clone(&txn), done_tx.clone());
+            std::thread::spawn(move || {
+                for h in 1..=8u64 {
+                    let t = txn.begin().unwrap();
+                    txn.bind_history(t, HistoryRecord { hseq: h, ordinal: h, commit_lsn: 0, body: vec![h as u8; big] })
+                        .unwrap();
+                    txn.commit(t).unwrap();
+                }
+                done.send("committer").unwrap();
+            })
+        };
+        let checkpointer = {
+            let (txn, done) = (Arc::clone(&txn), done_tx);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    // Refused whenever the committer has a transaction open; that is fine.
+                    let _ = txn.checkpoint_keeping_owed();
+                }
+                done.send("checkpointer").unwrap();
+            })
+        };
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a commit-path drain and a checkpoint deadlocked (neither finished within 60 s)");
+        }
+        committer.join().unwrap();
+        checkpointer.join().unwrap();
+        assert!(store.counters().drains > 0, "premise: nothing drained, so the two never contended");
+        let held: Vec<u64> = store.records().iter().map(|r| r.hseq).collect();
+        assert_eq!(held, (1..=8).collect::<Vec<u64>>(), "a record went missing under the contention");
+    }
+
+    /// **D212 (a') AMENDED 3, item 4: a history binding with no registered store REFUSES**, so a
+    /// publish fails before its `Commit` instead of writing history into a log whose next
+    /// checkpoint discards it. A GUARD (so since `669022e`).
+    ///
+    /// Mutant: `bind_history` skips the store check — the binding is accepted.
+    #[test]
+    fn a_history_binding_with_no_registered_store_is_refused() {
+        let (_bp, wal, txn, _dir) = setup();
+        let t = txn.begin().unwrap();
+        let err = txn
+            .bind_history(t, HistoryRecord { hseq: 1, ordinal: 1, commit_lsn: 0, body: b"a publish".to_vec() })
+            .expect_err("a manager with no history store accepted a history binding");
+        assert!(err.to_string().contains("no history store"), "refused, but not for the store: {err}");
+        txn.abort(t).unwrap();
+        assert!(
+            !walk_log(&wal).iter().any(|r| r.txn_id == t && matches!(r.kind, RecKind::RevertHistory { .. } | RecKind::Commit)),
+            "the refused binding left history or a Commit in the log"
+        );
+    }
 }
 
 // **The seam's test half, BELOW the tests module on purpose.** `tests/d53_private_root_allowlist.rs`
@@ -4315,5 +4768,39 @@ impl TxnManager {
     /// thread. D253's tests use it to aim a second thread at the checkpoint's window exactly.
     pub(crate) fn set_checkpoint_pause(&self, at: CheckpointPausePoint, hook: Box<dyn FnOnce() + Send>) {
         CHECKPOINT_PAUSES.lock().unwrap_or_else(|e| e.into_inner()).push((self.id, at, hook));
+    }
+}
+
+/// **Test-only: the manager whose next commit parks immediately before its history push**, and the
+/// two barriers it waits on there (arrived, then resume). Keyed by manager id, so a test running
+/// beside it never parks. Taken by the parked commit, so it parks once.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static HISTORY_PUSH_PARK: Mutex<Option<(u64, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>> =
+    Mutex::new(None);
+
+/// Park `txn`'s next commit immediately before its history push (AMENDED 3, item 7). The caller
+/// waits on the first barrier to know the commit is there, and on the second to let it go.
+#[cfg(test)]
+pub(crate) fn park_next_history_push(txn: &TxnManager) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+    let arrived = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *HISTORY_PUSH_PARK.lock().unwrap() = Some((txn.id, arrived.clone(), resume.clone()));
+    (arrived, resume)
+}
+
+/// The history push's park seam, test half. See [`park_next_history_push`].
+#[cfg(test)]
+fn park_before_history_push(manager: u64) {
+    let parked = {
+        let mut p = HISTORY_PUSH_PARK.lock().unwrap();
+        match p.as_ref() {
+            Some((id, _, _)) if *id == manager => p.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, arrived, resume)) = parked {
+        arrived.wait();
+        resume.wait();
     }
 }
