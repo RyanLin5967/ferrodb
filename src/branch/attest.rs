@@ -129,6 +129,12 @@
 //!    deliberately no `ContentId::from_page_id`.
 //! 4. **Nothing here is durable.** [`AttestedHistory`] is in-memory. Persisting it, and deciding
 //!    who publishes roots and where, is not in this module and is not claimed by it.
+//!    **Resident cost (wall #19, D192): the log is Θ(lifecycle events) and that is the contract**
+//!    — every entry stays provable, so an append-only Merkle log cannot drop one (CT and Trillian
+//!    never do; git prunes only objects nothing reaches, and every leaf here is reached by the
+//!    current head). What is O(live branches) is the per-branch index, since a reap removes its
+//!    branch from it. Moving the log itself off the heap means tiles on storage (tlog-tiles,
+//!    Trillian's subtree storage), which needs the persistence decision this item leaves open.
 //! 5. **No signatures.** A root proves *what* the log said, never *who* said it. CT logs sign
 //!    their tree heads; this does not. [`crate::consensus::signing`] has the HMAC that would.
 
@@ -507,6 +513,53 @@ impl From<TamperFinding> for FerroError {
     }
 }
 
+/// Why [`AttestedHistory::append`] or [`AttestedHistory::append_fork`] wrote nothing.
+///
+/// **Wall #19.** Every branch but trunk begins with a `Fork`, so a non-trunk branch with no live
+/// head is one of two things: a branch this log never saw forked, or one a `Reap` sealed. An entry
+/// for it needs a `prev` the log does not have, and the only value on hand is genesis. Writing
+/// that would root the entry at the start of history, cut a reaped branch's ancestry walk at its
+/// reap (`verify_branch` → `Ok(1)`), and give a fork from a sealed parent an ancestry of nothing.
+/// So the writer refuses rather than invent a link, and counts the refusal
+/// ([`AttestedHistory::refused`]).
+///
+/// [`AttestedHistory::load_untrusted`] does not come through here, on purpose: a verifier has to
+/// be able to load exactly the shapes this refuses to write, or it cannot report them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendRefused {
+    /// `branch` is not trunk and has no live head.
+    NoLiveHead { branch: BranchId },
+    /// A fork's `parent` is not trunk and has no live head.
+    NoLiveParent { parent: BranchId },
+    /// A `Reap` on trunk. Trunk is the one branch allowed to begin without a `Fork`, so sealing
+    /// it would reopen, for trunk, the hole the other two variants close.
+    TrunkReap,
+}
+
+impl Display for AppendRefused {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppendRefused::NoLiveHead { branch } => write!(
+                f,
+                "branch {branch} has no live attested head: this log never saw it forked, or a \
+                 reap sealed it, and an entry for it would have to invent its predecessor"
+            ),
+            AppendRefused::NoLiveParent { parent } => write!(
+                f,
+                "cannot attest a fork from {parent}: it has no live attested head (never forked \
+                 in this log, or reaped), so the child's ancestry would be invented"
+            ),
+            AppendRefused::TrunkReap => write!(f, "trunk is never reaped"),
+        }
+    }
+}
+
+impl From<AppendRefused> for FerroError {
+    fn from(r: AppendRefused) -> FerroError {
+        FerroError::Branch(format!("attestation refused: {r}"))
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Proofs — the types a third party receives
 // ---------------------------------------------------------------------------------------------
@@ -725,22 +778,52 @@ pub fn verify_consistency(
 /// this ground and the table is the reason it was right to.
 pub struct AttestedHistory {
     entries: Vec<HistoryEntry>,
-    /// Entry indices per branch, ascending.
+    /// Latest attestation per **live** branch: one whose most recent entry is not a
+    /// [`BranchOp::Reap`]. Derived from `entries` by [`Self::push`] and nothing else.
     ///
-    /// ⛔ **Keyed by the whole [`BranchId`], generation included, and an earlier draft keyed it by
-    /// the raw `u64` slot.** That draft's stated reason — "a reader asking what happened under id
-    /// 7 wants both generations" — is a fine answer to a *reporting* question and the wrong key
-    /// for a *linkage* one. With the slot as the key, a generation-1 branch inherited generation
-    /// 0's head and chained straight onto the reaped branch's last attestation, which is the
-    /// exact inverse of the property this module's header claims. The digest had the generation
-    /// in it; the structure did not, and only the structure decides what links to what.
-    by_branch: HashMap<BranchId, Vec<usize>>,
-    /// Latest attestation per branch.
-    heads: HashMap<BranchId, Attestation>,
+    /// ⛔ **Keyed by the whole [`BranchId`], generation included, and an earlier draft keyed the
+    /// per-branch index by the raw `u64` slot.** That draft's stated reason — "a reader asking
+    /// what happened under id 7 wants both generations" — is a fine answer to a *reporting*
+    /// question and the wrong key for a *linkage* one. With the slot as the key, a generation-1
+    /// branch inherited generation 0's head and chained straight onto the reaped branch's last
+    /// attestation, which is the exact inverse of the property this module's header claims. The
+    /// digest had the generation in it; the structure did not, and only the structure decides
+    /// what links to what.
+    ///
+    /// ⛔ **Wall #19 (D192): a reap REMOVES the branch from this map.** It used to keep a head for
+    /// every branch ever seen, beside a `by_branch: HashMap<BranchId, Vec<usize>>` holding the
+    /// position of every entry of every branch, so this struct's per-branch part grew with
+    /// branches ever forked and with every event, not with branches alive. Nothing needs either
+    /// after a reap. A reaped branch is never again written to: the catalog makes its id a hard
+    /// error and `LogBranchCatalog::fork` refuses it as a parent through `check_readable`, and
+    /// [`Self::append`] / [`Self::append_fork`] refuse it again here ([`AppendRefused`]), because
+    /// without its head the only link on hand is genesis.
+    /// Every reader of its history goes through `entries`: the chain walks, both proofs,
+    /// `verify_against`, and the runtime's `attested_entries`. The only reader of `by_branch` was
+    /// `verify_branch`, which used one element per key and now tracks it in the one O(n) pass it
+    /// already makes over the log. Size: O(live branches), including trunk.
+    heads: HashMap<BranchId, Tip>,
     /// Merkle levels; `levels[0]` is the leaf hashes. Maintained incrementally so that `append` is
     /// O(log n) rather than O(n) — rebuilding the tree per append would make loading 100k entries
     /// quadratic, which is the difference between a benchmark that runs and one that does not.
     levels: Vec<Vec<[u8; 32]>>,
+    /// How many [`Self::append`] / [`Self::append_fork`] calls this log refused. An observing
+    /// counter: nothing reads it to decide anything. It exists because a refusal the runtime does
+    /// not propagate (a merge or reap that already committed) must still leave a trace.
+    refused: u64,
+}
+
+/// A live branch's entry in [`AttestedHistory`]'s per-branch index. Derived from `entries` by
+/// `push`, like the rest of the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tip {
+    /// The attestation of the branch's latest entry.
+    head: Attestation,
+    /// The epoch of the branch's FIRST entry in this log: its `Fork`'s epoch for every branch but
+    /// trunk, since the writer refuses anything else first. Kept so that a reap recorded after the
+    /// catalog has let go of the branch's record still carries its fork epoch, as `seal`'s Reap
+    /// entries do (D199). 8 bytes per live branch.
+    opened: Epoch,
 }
 
 /// Lengths and capacities of every collection inside an [`AttestedHistory`] — see
@@ -753,12 +836,17 @@ pub struct AttestedHistory {
 pub struct AttestFootprint {
     pub entries_len: usize,
     pub entries_cap: usize,
+    /// ⚠ **Always 0 since wall #19**, which removed `by_branch` (see the `heads` field). The four
+    /// `by_branch_*` fields are kept, reading 0, so D192's harness keeps compiling and its model
+    /// shows the index gone rather than a field that silently vanished.
     pub by_branch_keys: usize,
     pub by_branch_table_cap: usize,
-    /// Sum over branches of `by_branch[b].len()`.
+    /// Sum over branches of `by_branch[b].len()` while that index existed; 0 since wall #19.
     pub by_branch_idx_len: usize,
-    /// Sum over branches of `by_branch[b].capacity()`.
+    /// Sum over branches of `by_branch[b].capacity()` while that index existed; 0 since wall #19.
     pub by_branch_idx_cap: usize,
+    /// Live branches only since wall #19, each holding a `Tip` (an `Attestation` plus the fork
+    /// `Epoch`) where it used to hold an `Attestation`.
     pub heads_keys: usize,
     pub heads_table_cap: usize,
     /// `levels.len()`: Merkle levels, leaves included.
@@ -780,10 +868,15 @@ impl AttestedHistory {
     pub fn new() -> Self {
         AttestedHistory {
             entries: Vec::new(),
-            by_branch: HashMap::new(),
             heads: HashMap::new(),
             levels: Vec::new(),
+            refused: 0,
         }
+    }
+
+    /// How many writes this log has refused. See [`AppendRefused`].
+    pub fn refused(&self) -> u64 {
+        self.refused
     }
 
     pub fn len(&self) -> usize {
@@ -806,16 +899,18 @@ impl AttestedHistory {
     /// an allocator — `examples/d192_attest_footprint.rs` does that — not baked into an accessor
     /// whose output would then look like a measurement.
     ///
-    /// O(branches), because it sums every per-branch index `Vec`. Fine for a harness; do not put
-    /// it on a request path.
+    /// O(levels) since wall #19 removed the per-branch index it used to sum (it was O(branches)).
+    /// Fine for a harness; do not put it on a request path.
     pub fn footprint(&self) -> AttestFootprint {
         AttestFootprint {
             entries_len: self.entries.len(),
             entries_cap: self.entries.capacity(),
-            by_branch_keys: self.by_branch.len(),
-            by_branch_table_cap: self.by_branch.capacity(),
-            by_branch_idx_len: self.by_branch.values().map(Vec::len).sum(),
-            by_branch_idx_cap: self.by_branch.values().map(Vec::capacity).sum(),
+            // Merge fixup: wall #19 removed `by_branch`, so the structure these four describe has
+            // no entries and no capacity.
+            by_branch_keys: 0,
+            by_branch_table_cap: 0,
+            by_branch_idx_len: 0,
+            by_branch_idx_cap: 0,
             heads_keys: self.heads.len(),
             heads_table_cap: self.heads.capacity(),
             levels: self.levels.len(),
@@ -825,12 +920,26 @@ impl AttestedHistory {
         }
     }
 
-    /// The latest attestation for a branch, if it has any history.
+    /// The latest attestation for a **live** branch.
+    ///
+    /// `None` for a branch with no history, **and for one whose history a
+    /// [`BranchOp::Reap`] sealed** (wall #19). A sealed branch's terminal attestation is its reap
+    /// entry's, read from [`Self::entries`]; it is not kept here, because nothing may extend it.
     ///
     /// Takes a whole [`BranchId`]: a reaped slot and its recycled successor are different
-    /// branches and must not share a head. See [`Self::by_branch`]'s note.
+    /// branches and must not share a head. See the note on the `heads` field.
     pub fn head_of(&self, branch: BranchId) -> Option<Attestation> {
-        self.heads.get(&branch).copied()
+        self.heads.get(&branch).map(|t| t.head)
+    }
+
+    /// The epoch a **live** branch's history opened at in this log: its `Fork`'s epoch, which
+    /// `AgentRuntime::attest_fork` takes from the branch's catalog record. `None` exactly when
+    /// [`Self::head_of`] is `None`.
+    ///
+    /// D199 reads it to stamp a lease-expiry `Reap` with the same epoch `seal` stamps, at a point
+    /// where the catalog record may already belong to a branch that recycled the slot.
+    pub fn opened_at(&self, branch: BranchId) -> Option<Epoch> {
+        self.heads.get(&branch).map(|t| t.opened)
     }
 
     /// The Merkle tree head over all `len()` entries. `MTH({})` for an empty log.
@@ -856,29 +965,72 @@ impl AttestedHistory {
     /// its ancestry instead of stopping at its own first entry, and therefore what lets a third
     /// party be shown that a row-version descends from a particular state of trunk.
     ///
-    /// If the parent has no history yet, its genesis is used — a log that begins mid-life is a real
-    /// situation and refusing it here would only push the caller into faking an entry.
+    /// Trunk alone may be forked from before it has a head: it is the one branch that begins
+    /// without a `Fork`, so its first link is genesis.
+    ///
+    /// ⛔ **Refused ([`AppendRefused::NoLiveParent`]) for any other parent with no live head**
+    /// (wall #19). That parent was reaped, or this log never saw it forked, and either way the
+    /// child's first link would have to be invented. This used to fall back to genesis, as "a log
+    /// that begins mid-life". Once a reap started removing heads, that same fallback gave a fork
+    /// from a reaped parent an ancestry of nothing, and [`Self::verify_chain`] cannot see it,
+    /// because a `Fork` entry does not carry its parent's id. The catalog already refuses a reaped
+    /// parent (`LogBranchCatalog::fork` → `BranchRecord::check_readable`), and this refuses it
+    /// again at the only layer that knows what the log holds.
     pub fn append_fork(
         &mut self,
         child: BranchId,
         parent: BranchId,
         epoch: Epoch,
         content_cid: ContentId,
-    ) -> Attestation {
-        let prev = self.heads.get(&parent).copied().unwrap_or_else(Attestation::genesis);
-        self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork })
+    ) -> Result<Attestation, AppendRefused> {
+        let prev = match self.heads.get(&parent).map(|t| t.head) {
+            Some(head) => head,
+            None if parent.is_trunk() => Attestation::genesis(),
+            None => return self.refuse(AppendRefused::NoLiveParent { parent }),
+        };
+        Ok(self.push(HistoryEntry { prev, branch: child, content_cid, epoch, op: BranchOp::Fork }))
     }
 
     /// Record any non-fork operation on `branch`, linked to that branch's own head.
+    ///
+    /// ⛔ **Refused ([`AppendRefused::NoLiveHead`]) for a non-trunk branch with no live head**
+    /// (wall #19): a reap sealed it, or this log never saw it forked. It used to link to genesis.
+    /// After a reap that rooted the new entry at the start of history, and cut the reaped
+    /// branch's ancestry walk at that entry: `verify_branch` answered `Ok(1)` and the reap, with
+    /// everything before it, dropped out of the walk. **A `Reap` on trunk is refused too**
+    /// ([`AppendRefused::TrunkReap`]): trunk's exemption from beginning with a `Fork` would
+    /// otherwise reopen the same hole for trunk.
     pub fn append(
         &mut self,
         branch: BranchId,
         epoch: Epoch,
         op: BranchOp,
         content_cid: ContentId,
-    ) -> Attestation {
-        let prev = self.heads.get(&branch).copied().unwrap_or_else(Attestation::genesis);
-        self.push(HistoryEntry { prev, branch, content_cid, epoch, op })
+    ) -> Result<Attestation, AppendRefused> {
+        if op == BranchOp::Reap && branch.is_trunk() {
+            return self.refuse(AppendRefused::TrunkReap);
+        }
+        let prev = match self.heads.get(&branch).map(|t| t.head) {
+            Some(head) => head,
+            None if branch.is_trunk() => Attestation::genesis(),
+            None => return self.refuse(AppendRefused::NoLiveHead { branch }),
+        };
+        Ok(self.push(HistoryEntry { prev, branch, content_cid, epoch, op }))
+    }
+
+    /// Count a refused write and return it.
+    fn refuse(&mut self, why: AppendRefused) -> Result<Attestation, AppendRefused> {
+        self.count_refusal();
+        Err(why)
+    }
+
+    /// Count a lifecycle event that was NOT recorded, whether this log refused the write or the
+    /// caller could not establish the entry's facts. The second case is D199: a reaped branch
+    /// whose catalog record could not be read, so whether its reap had landed was unknown and the
+    /// caller wrote nothing rather than guess. Observing only: nothing reads it to decide. **The
+    /// one place [`Self::refused`] moves.**
+    pub fn count_refusal(&mut self) {
+        self.refused += 1;
     }
 
     /// Append one already-built entry verbatim. **The single append path**, called by
@@ -889,9 +1041,17 @@ impl AttestedHistory {
     /// one standing in for the production path inside a test.
     fn push(&mut self, e: HistoryEntry) -> Attestation {
         let att = e.attestation();
-        let idx = self.entries.len();
-        self.by_branch.entry(e.branch).or_default().push(idx);
-        self.heads.insert(e.branch, att);
+        // Wall #19: a reap seals the branch, so it leaves the index here, the single append path.
+        // The entry itself stays in the log and in the tree like every other one: every proof
+        // about it survives, and only the pointer to a head nothing may extend is dropped. Keyed
+        // on the op rather than told by a caller, so `load_untrusted` derives the same index from
+        // the same entries.
+        if e.op == BranchOp::Reap {
+            self.heads.remove(&e.branch);
+        } else {
+            let opened = self.heads.get(&e.branch).map_or(e.epoch, |t| t.opened);
+            self.heads.insert(e.branch, Tip { head: att, opened });
+        }
         self.extend_tree(e.leaf_hash());
         self.entries.push(e);
         att
@@ -975,7 +1135,7 @@ impl AttestedHistory {
         produced.insert(genesis.0);
 
         // Keyed by the whole BranchId. Keying this by the id slot let a recycled slot chain onto
-        // the reaped branch's head — see the note on `AttestedHistory::by_branch`.
+        // the reaped branch's head — see the note on `AttestedHistory::heads`.
         let mut branch_head: HashMap<BranchId, Attestation> = HashMap::new();
 
         for (i, e) in self.entries.iter().enumerate() {
@@ -1082,7 +1242,15 @@ impl AttestedHistory {
     ///
     /// The walk crosses fork boundaries: reaching a [`BranchOp::Fork`] continues at whichever entry
     /// produced the attestation it names, which is an entry of the **parent** branch. That is the
-    /// ancestry property, and it is O(depth of that branch's history), not O(log).
+    /// ancestry property. The walk is O(depth of that branch's history).
+    ///
+    /// **The function is O(n) in the whole log, and has to be.** Resolving a `prev` to the entry
+    /// that produced it needs an attestation → index map over every entry, since a walk can cross
+    /// into any ancestor. That map is built here, one hash per entry, because keeping it resident
+    /// would cost Θ(n) memory, the class wall #19 removed. The branch's last entry is found in
+    /// **the same pass** rather than through a per-branch index: a reaped branch has no entry in
+    /// the live index, and a positions index over every branch is exactly what wall #19 removed.
+    /// So no second scan exists (the lead's audit of `79b49de` found `rposition` as one).
     /// ⛔ **A branch with no entries is a finding, not a walk of length zero.** This used to
     /// return `Ok(0)` for an unknown branch, so `history.verify_branch(b)?` — the obvious way to
     /// ask "has b's history been tampered with" — answered *yes, verified* for a branch whose
@@ -1091,11 +1259,16 @@ impl AttestedHistory {
     pub fn verify_branch(&self, branch: BranchId) -> Result<usize, TamperFinding> {
         let genesis = Attestation::genesis();
         let mut produced: HashMap<[u8; 32], usize> = HashMap::new();
+        // The branch's last entry, tracked in the one pass that is required anyway (see above).
+        let mut last: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             produced.insert(e.attestation().0, i);
+            if e.branch == branch {
+                last = Some(i);
+            }
         }
-        let last = match self.by_branch.get(&branch).and_then(|idxs| idxs.last()) {
-            Some(&last) => last,
+        let last = match last {
+            Some(last) => last,
             None => return Err(TamperFinding::NoSuchBranch { branch }),
         };
 
@@ -1207,6 +1380,18 @@ impl AttestedHistory {
         let k = largest_power_of_two_below(n);
         node_hash(&self.mth_range(lo, lo + k), &self.mth_range(lo + k, hi))
     }
+
+    /// Wall #19's instrument: every element held in a collection keyed by branch — the map
+    /// entries, plus anything nested under them. An element count, never bytes.
+    ///
+    /// The destructuring is exhaustive on purpose: a field added to [`AttestedHistory`] is a
+    /// compile error here until someone decides whether it is keyed by branch, so the pin that
+    /// reads this cannot silently stop seeing a new per-branch collection.
+    #[cfg(test)]
+    fn per_branch_elements(&self) -> usize {
+        let AttestedHistory { entries: _, heads, levels: _, refused: _ } = self;
+        heads.len()
+    }
 }
 
 /// The largest power of two **strictly** less than `n`, for `n >= 2`. RFC 6962's `k`.
@@ -1234,9 +1419,11 @@ mod tests {
     /// A log of `n` entries on one branch forked from trunk, plus the entries.
     fn linear_log(n: usize) -> AttestedHistory {
         let mut h = AttestedHistory::new();
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(1), cid(0));
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(1), cid(0))
+            .expect("a legitimate append must not be refused");
         for i in 1..n {
-            h.append(bid(1, 0), Epoch(i as u64 + 1), BranchOp::Commit, cid(i as u64));
+            h.append(bid(1, 0), Epoch(i as u64 + 1), BranchOp::Commit, cid(i as u64))
+                .expect("a legitimate append must not be refused");
         }
         h
     }
@@ -1349,7 +1536,8 @@ mod tests {
         let mut h = AttestedHistory::new();
         assert_eq!(h.root(), empty_root(), "empty log");
         for i in 0..300usize {
-            h.append(bid(1, 0), Epoch(i as u64), BranchOp::Commit, cid(i as u64));
+            h.append(BranchId::TRUNK, Epoch(i as u64), BranchOp::Commit, cid(i as u64))
+                .expect("trunk may append without a fork");
             let n = h.len();
             assert_eq!(
                 h.root(),
@@ -1625,12 +1813,18 @@ mod tests {
     #[test]
     fn an_honest_history_verifies() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3));
-        h.append_fork(bid(2, 0), bid(1, 0), Epoch(4), cid(4));
-        h.append(bid(2, 0), Epoch(5), BranchOp::RowVersion, cid(5));
-        h.append(bid(1, 0), Epoch(6), BranchOp::Commit, cid(6));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(2, 0), bid(1, 0), Epoch(4), cid(4))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(2, 0), Epoch(5), BranchOp::RowVersion, cid(5))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(6), BranchOp::Commit, cid(6))
+            .expect("a legitimate append must not be refused");
         h.verify_chain().expect("an honest history must verify");
 
         // Ancestry: branch 2's walk crosses two forks and reaches genesis.
@@ -1690,16 +1884,19 @@ mod tests {
     fn verification_does_not_fire_on_legitimate_histories() {
         // A deterministic spread of branch shapes: linear, wide fan-out, deep chains, reaps.
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
         let mut epoch = 2u64;
         for parent in 0..8u64 {
             for child in 0..8u64 {
                 let id = parent * 8 + child + 1;
-                h.append_fork(bid(id, 0), bid(parent, 0), Epoch(epoch), cid(epoch));
+                h.append_fork(bid(id, 0), bid(parent, 0), Epoch(epoch), cid(epoch))
+                    .expect("a legitimate append must not be refused");
                 epoch += 1;
                 for k in 0..4 {
                     let op = if k % 2 == 0 { BranchOp::RowVersion } else { BranchOp::Commit };
-                    h.append(bid(id, 0), Epoch(epoch), op, cid(epoch));
+                    h.append(bid(id, 0), Epoch(epoch), op, cid(epoch))
+                        .expect("a legitimate append must not be refused");
                     epoch += 1;
                 }
             }
@@ -1795,9 +1992,12 @@ mod tests {
     #[test]
     fn replaying_a_fork_entry_cannot_truncate_a_branchs_ancestry() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(1, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        h.append(bid(1, 0), Epoch(3), BranchOp::RowVersion, cid(3))
+            .expect("a legitimate append must not be refused");
         let honest_steps = h.verify_branch(bid(1, 0)).expect("control");
 
         let mut forged: Vec<HistoryEntry> = h.entries().to_vec();
@@ -1863,24 +2063,51 @@ mod tests {
 
     /// ⛔ REVIEW FINDING 3. `heads` was keyed by the raw id slot, so a recycled slot chained onto
     /// the reaped branch's head — the exact inverse of the property the header claims.
+    ///
+    /// ⚠ **Rewritten for wall #19, deliberately: the one existing test whose assertions changed.**
+    /// It had the writer append a generation-1 `Commit` with no `Fork`, then checked that the
+    /// entry did not link to generation 0's reap and that `verify_chain` reported it. The writer
+    /// now refuses that append outright, because generation 1 has no live head. That is the
+    /// property in its strongest form: nothing chains, because nothing is written. Both halves are
+    /// kept: the writer's refusal, and the verifier's report on the shape the writer can no longer
+    /// produce, forged through `load_untrusted` with each link that could have been made — the
+    /// slot-keyed bug's (generation 0's reap) and the old fallback's (genesis).
     #[test]
     fn a_recycled_id_slot_does_not_inherit_the_reaped_branchs_chain() {
         let mut h = AttestedHistory::new();
-        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1));
-        h.append_fork(bid(7, 0), BranchId::TRUNK, Epoch(2), cid(2));
-        let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3));
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, cid(1))
+            .expect("a legitimate append must not be refused");
+        h.append_fork(bid(7, 0), BranchId::TRUNK, Epoch(2), cid(2))
+            .expect("a legitimate append must not be refused");
+        let reap_att = h.append(bid(7, 0), Epoch(3), BranchOp::Reap, cid(3))
+            .expect("a legitimate append must not be refused");
 
-        // Generation 1 takes over the slot and writes without ever being forked.
-        h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4));
-        let last = *h.entries().last().unwrap();
-        assert_ne!(
-            last.prev, reap_att,
-            "generation 1 chained onto generation 0's reap attestation"
+        // Generation 1 takes over the slot and tries to write without ever being forked.
+        assert_eq!(
+            h.append(bid(7, 1), Epoch(4), BranchOp::Commit, cid(4)),
+            Err(AppendRefused::NoLiveHead { branch: bid(7, 1) }),
+            "generation 1 wrote an entry with no Fork of its own"
         );
-        assert!(
-            h.verify_chain().is_err(),
-            "a generation-1 branch with no Fork entry must be reported, not inherited"
-        );
+        assert_eq!(h.len(), 3, "the refused entry reached the log");
+        h.verify_chain().expect("control: the log the writer produced verifies");
+
+        for prev in [reap_att, Attestation::genesis()] {
+            let mut forged = h.entries().to_vec();
+            forged.push(HistoryEntry {
+                prev,
+                branch: bid(7, 1),
+                content_cid: cid(4),
+                epoch: Epoch(4),
+                op: BranchOp::Commit,
+            });
+            assert!(
+                matches!(
+                    AttestedHistory::load_untrusted(forged).verify_chain(),
+                    Err(TamperFinding::DanglingBranch { index: 3, .. })
+                ),
+                "a generation-1 branch with no Fork, linked to {prev}, was not reported"
+            );
+        }
     }
 
     /// ⛔ REVIEW FINDING 6. `verify_consistency` short-circuited on `size == 0` without looking
@@ -1938,6 +2165,202 @@ mod tests {
             }
             other => panic!("expected a DanglingLink naming the real value, got {other:?}"),
         }
+    }
+
+    /// ⛔ **WALL #19 (D192), WRITTEN TO FAIL FIRST.** After N reaped branches the per-branch index
+    /// must hold only the branches that can still be written to, while the log keeps every entry
+    /// and every proof.
+    ///
+    /// The shape is the production lifecycle `integration_branch_attestation` pins: a fork from
+    /// trunk, a merge entry on trunk, a reap entry on the worker. `L` branches are forked first and
+    /// never reaped, so the bound is `1 + L` (trunk plus the live ones), not zero.
+    ///
+    /// Every expected value is worked by hand from the structure, never read back from it:
+    /// * log entries: `L + 3N`, one per fork, merge and reap. The log is the contract, and nothing
+    ///   here asks it to shrink.
+    /// * `verify_branch` steps for worker `i` (1-based): its Reap, its Fork, trunk's merges
+    ///   `i-1 .. 1`, then genesis, so `i + 1`. Trunk: `N`. A live branch forked before trunk had a
+    ///   head: `1`.
+    /// * per-branch index elements while every branch stays indexed: `L + N + 1` `by_branch` keys,
+    ///   `L + 3N` positions under them and `L + N + 1` `heads` keys, so `3L + 5N + 2`, which is
+    ///   177 at N=32 and 337 at N=64 with L=5. Once a reap drops its branch: `1 + L` = 6 at both.
+    ///
+    /// The index count is asserted LAST, so a failing run's panic line also proves that every
+    /// proof and walk above it passed on the same log.
+    #[test]
+    fn reaped_branches_leave_the_per_branch_index_and_every_proof_survives() {
+        const L: u64 = 5;
+        const N: u64 = 64;
+        const MID: u64 = 32;
+        let worker = |i: u64| bid(1000 + i, 0);
+
+        let mut h = AttestedHistory::new();
+        let mut epoch = 1u64;
+        let mut live_heads: Vec<(BranchId, Attestation)> = Vec::new();
+        for j in 1..=L {
+            let att = h.append_fork(bid(j, 0), BranchId::TRUNK, Epoch(epoch), cid(epoch))
+                .expect("a legitimate append must not be refused");
+            live_heads.push((bid(j, 0), att));
+            epoch += 1;
+        }
+        let mut mid_head: Option<TreeHead> = None;
+        let mut mid_elements = 0usize;
+        let mut last_merge: Option<Attestation> = None;
+        for i in 1..=N {
+            h.append_fork(worker(i), BranchId::TRUNK, Epoch(epoch), cid(epoch))
+                .expect("a legitimate append must not be refused");
+            last_merge = Some(
+                h.append(BranchId::TRUNK, Epoch(epoch + 1), BranchOp::Merge, cid(epoch + 1))
+                    .expect("a legitimate append must not be refused"),
+            );
+            h.append(worker(i), Epoch(epoch + 2), BranchOp::Reap, cid(epoch + 2))
+                .expect("a legitimate append must not be refused");
+            epoch += 3;
+            if i == MID {
+                mid_head = Some(h.head());
+                mid_elements = h.per_branch_elements();
+            }
+        }
+        let mid_head = mid_head.expect("the loop passes MID");
+        let head = h.head();
+
+        // The log keeps every event. That is the contract, and the fix must not touch it.
+        assert_eq!(h.len(), (L + 3 * N) as usize, "log length");
+        assert_eq!(mid_head.size, (L + 3 * MID) as usize, "log length at the mid checkpoint");
+
+        // Every entry, the reaped branches' included, still proves its inclusion...
+        for i in 0..h.len() {
+            let p = h.inclusion_proof(i).expect("a proof for every logged index");
+            assert!(
+                verify_inclusion(&h.entries()[i], &p, &head),
+                "entry {i} lost its inclusion proof"
+            );
+        }
+        // ...a head published halfway through still proves the log only grew...
+        let cp = h.consistency_proof(mid_head.size).expect("the mid size is within the log");
+        assert!(
+            verify_consistency(&mid_head, &head, &cp),
+            "the head published at N={MID} lost its consistency proof"
+        );
+        // ...and every chain still walks, the reaped ones included.
+        h.verify_chain().expect("the honest log must verify");
+        for i in 1..=N {
+            assert_eq!(
+                h.verify_branch(worker(i)),
+                Ok((i + 1) as usize),
+                "reaped worker {i}'s walk"
+            );
+        }
+        assert_eq!(h.verify_branch(BranchId::TRUNK), Ok(N as usize), "trunk's walk");
+        for (b, att) in &live_heads {
+            assert_eq!(h.verify_branch(*b), Ok(1), "live branch {b}'s walk");
+            assert_eq!(h.head_of(*b), Some(*att), "live branch {b} lost its head");
+        }
+        assert_eq!(h.head_of(BranchId::TRUNK), last_merge, "trunk's head is not its last merge");
+
+        // THE BOUND. The same count at N=32 and at N=64: it follows the live branches, not N.
+        assert_eq!(
+            (mid_elements, h.per_branch_elements()),
+            ((1 + L) as usize, (1 + L) as usize),
+            "per-branch index elements at N={MID} and N={N}: reaped branches are still indexed"
+        );
+        for i in 1..=N {
+            assert_eq!(h.head_of(worker(i)), None, "reaped worker {i} still has a head");
+        }
+    }
+
+    /// ⛔ **WALL #19 REGRESSION (the lead's review of `7ea940d`), WRITTEN TO FAIL FIRST.**
+    ///
+    /// Once a reap drops a branch's head, the writer's old fallback (a missing head means genesis)
+    /// turns a write after the reap into an entry rooted at the start of history. That entry cut
+    /// the reaped branch's ancestry walk at itself (`verify_branch` → `Ok(1)`), and a fork from the
+    /// reaped branch got an ancestry of nothing. Every non-trunk branch begins with a `Fork`, so a
+    /// non-trunk branch with no live head has nothing a new entry can honestly link to, whether a
+    /// reap sealed it or this log never saw it forked. The writer must refuse, and count it.
+    ///
+    /// Hand-worked: the log is `Merge 1 (trunk), Fork w, Reap w`, 3 entries. The worker's walk is
+    /// Reap, Fork, Merge 1, then genesis: 3 steps. Refusals: the two writes after the reap, the two
+    /// for a branch never forked here, and the trunk reap: 5.
+    ///
+    /// The walk is asserted FIRST, after both writes were attempted: on the unfixed writer it reads
+    /// `Ok(1)`, which is the hole itself rather than a symptom of it.
+    #[test]
+    fn a_branch_with_no_live_head_is_refused_and_a_reaped_walk_keeps_its_reap() {
+        let worker = bid(1, 0);
+        let mut h = AttestedHistory::new();
+        h.append(BranchId::TRUNK, Epoch(1), BranchOp::Merge, cid(1))
+            .expect("trunk may open the log");
+        h.append_fork(worker, BranchId::TRUNK, Epoch(2), cid(2)).expect("a fork from trunk");
+        h.append(worker, Epoch(3), BranchOp::Reap, cid(3)).expect("a live worker may be reaped");
+
+        // The fork is attempted before the extension so that, on the unfixed writer, it links to
+        // the reaped parent's missing head and not to the head the extension would have given it.
+        let forked = h.append_fork(bid(2, 0), worker, Epoch(4), cid(4));
+        let extended = h.append(worker, Epoch(5), BranchOp::Merge, cid(5));
+
+        assert_eq!(
+            h.verify_branch(worker),
+            Ok(3),
+            "a write after the reap cut the reaped branch's walk short of its reap"
+        );
+        assert_eq!(
+            forked,
+            Err(AppendRefused::NoLiveParent { parent: worker }),
+            "a fork from a reaped parent was written"
+        );
+        assert_eq!(
+            extended,
+            Err(AppendRefused::NoLiveHead { branch: worker }),
+            "an entry after a reap was written"
+        );
+
+        // A branch this log never saw forked is refused the same way, for the same reason.
+        let stranger = bid(9, 0);
+        assert_eq!(
+            h.append(stranger, Epoch(6), BranchOp::Commit, cid(6)),
+            Err(AppendRefused::NoLiveHead { branch: stranger }),
+            "an entry for a branch with no Fork was written"
+        );
+        assert_eq!(
+            h.append_fork(bid(3, 0), stranger, Epoch(7), cid(7)),
+            Err(AppendRefused::NoLiveParent { parent: stranger }),
+            "a fork from a branch with no Fork was written"
+        );
+        // Trunk is the one branch that may begin without a Fork, so it is the one never sealed.
+        assert_eq!(
+            h.append(BranchId::TRUNK, Epoch(8), BranchOp::Reap, cid(8)),
+            Err(AppendRefused::TrunkReap),
+            "trunk was reaped"
+        );
+
+        // Nothing refused was written, each refusal was counted, and the log still verifies.
+        assert_eq!(h.len(), 3, "a refused write reached the log");
+        assert_eq!(h.refused(), 5, "refusals counted");
+        h.verify_chain().expect("the log the writer produced must verify");
+        assert_eq!(
+            h.verify_branch(bid(2, 0)),
+            Err(TamperFinding::NoSuchBranch { branch: bid(2, 0) }),
+            "the refused child left history behind"
+        );
+        // And trunk, still live, takes a legitimate write after all of that.
+        h.append(BranchId::TRUNK, Epoch(9), BranchOp::Merge, cid(9)).expect("trunk is live");
+    }
+
+    /// D199: `opened_at` is the epoch of the branch's FORK, not of its latest entry, and it leaves
+    /// with the head. The difference shows only on a branch with a second entry (a parent session
+    /// its child merged into), so a `Fork`-then-`Reap` lifecycle cannot pin it, and the lease
+    /// tests are all that shape. Hand-worked: fork at 3, a merge into it at 9, so 3. After its
+    /// reap, `None` for both head and opening.
+    #[test]
+    fn opened_at_is_the_fork_epoch_and_leaves_with_the_head() {
+        let b = bid(4, 0);
+        let mut h = AttestedHistory::new();
+        h.append_fork(b, BranchId::TRUNK, Epoch(3), cid(3)).expect("a fork from trunk");
+        h.append(b, Epoch(9), BranchOp::Merge, cid(9)).expect("a merge into a live branch");
+        assert_eq!(h.opened_at(b), Some(Epoch(3)), "opened_at followed the latest entry");
+        assert_eq!(h.opened_at(bid(5, 0)), None, "a branch never forked here has an opening");
+        h.append(b, Epoch(12), BranchOp::Reap, cid(12)).expect("reap a live branch");
+        assert_eq!((h.head_of(b), h.opened_at(b)), (None, None), "a reaped branch kept its opening");
     }
 
     /// ⛔ REVIEW FINDING 10. The third-party story is "you hold 85 bytes and a proof", so those
