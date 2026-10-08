@@ -1034,14 +1034,14 @@ pub fn stamp_page_lsn(bp: &BufferPoolManager, page_id: u32, lsn: u64) -> Result<
 
 pub fn with_page<F>(bp: &BufferPoolManager, page_id: u32, lsn: u64, f: F) -> Result<(), FerroError> 
 where F: FnOnce(&mut Page) -> Result<(), FerroError> {
-    let frame_i = bp.fetch_page(page_id)?;
-    let mut frame = bp.frame_write(frame_i);
+    let pin = bp.pin(page_id)?;
+    let mut frame = pin.write();
     let mut page = Page::deserialize(frame.data)?;
     f(&mut page)?;
     page.lsn = lsn;
     frame.data = page.serialize()?;
     drop(frame);
-    bp.unpin_page(page_id, true);
+    pin.unpin(true);
     Ok(())
 }
 
