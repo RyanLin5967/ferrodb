@@ -1,0 +1,245 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> tests/integration_branch_attestation.rs:548:9
+    |
+548 |     let mut run_sql = |sql: &str, s: &mut Session, catalog: &mut Catalog| {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_branch_attestation") generated 1 warning (run `cargo fix --test "integration_branch_attestation" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.42s
+     Running tests/adv_f5_probe.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/adv_f5_probe-68c5843e4ccb02b0)
+
+running 5 tests
+test p5_an_update_on_a_sealed_branch_now_reports_a_read_error ... ok
+test p2_agent_session_reads_another_live_branch_as_of ... ok
+test p1_non_agent_as_of_branch_reads_fine_and_retains_nothing ... ok
+test p3_supervisor_merge_by_name_leaves_the_agent_connection_inert ... ok
+test p4_a_read_on_a_branch_the_reaper_took_is_not_refused_and_pins_revert_forever ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/adv_f6_dropped_capture.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/adv_f6_dropped_capture-dab99c539ab9b0b9)
+
+running 3 tests
+test reaping_a_parent_whose_child_published_its_write_loses_the_dependent ... ok
+test control_merging_the_parent_keeps_the_same_dependent ... ok
+test abandoning_a_parent_whose_child_published_its_write_loses_the_dependent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/d124_owner_record_refusal.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d124_owner_record_refusal-5e2fdccc71358212)
+
+running 4 tests
+test log_catalog_drain_pending_refuses_an_unreadable_owner ... ok
+test log_catalog_free_page_refuses_an_unreadable_owner ... ok
+test table_catalog_free_page_refuses_an_unreadable_owner ... ok
+test table_catalog_drain_pending_refuses_an_unreadable_owner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/d126_atomic_upsert.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d126_atomic_upsert-afd33fa128f9476a)
+
+running 4 tests
+test insert_still_does_not_replace ... ok
+test a_growing_rewrite_that_splits_is_still_never_absent ... ok
+test a_rewritten_key_is_never_absent_to_a_concurrent_reader ... ok
+test the_primary_index_rewrite_is_never_absent_either ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+     Running tests/d15_concurrent_fork_and_reap.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d15_concurrent_fork_and_reap-f616b8a3d4946baa)
+
+running 2 tests
+test log_catalog_survives_a_concurrent_reaper ... ok
+test table_catalog_survives_a_concurrent_reaper ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.37s
+
+     Running tests/d16_transitive_visibility.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d16_transitive_visibility-1fb58af419bef1e7)
+
+running 2 tests
+test log_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+test table_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/d18_reaper_asks_the_catalog.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d18_reaper_asks_the_catalog-6471ae76bebde910)
+
+running 2 tests
+test log_catalog_reap_must_not_free_what_a_live_child_reads ... ok
+test table_catalog_reap_must_not_free_what_a_live_child_reads ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/d19_leak_is_a_race.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d19_leak_is_a_race-10fc0f339fa6471c)
+
+running 1 test
+test the_control_that_says_race_or_logic has been running for over 60 seconds
+test the_control_that_says_race_or_logic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 235.47s
+
+     Running tests/d33_add_arena_must_be_durable.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d33_add_arena_must_be_durable-41f3e506fff8c65a)
+
+running 3 tests
+test add_arena_refuses_a_stale_generation ... ok
+test log_catalog_add_arena_survives_a_reopen ... ok
+test table_catalog_add_arena_survives_a_reopen ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/d40_reserved_pages_return_to_baseline.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d40_reserved_pages_return_to_baseline-89f3dd1e73d7a053)
+
+running 2 tests
+test a_forked_chain_returns_every_reserved_page_without_the_global_scan ... ok
+test flat_fanout_returns_every_reserved_page_without_the_global_scan ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.16s
+
+     Running tests/d41_narrow_ops_close_the_window.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d41_narrow_ops_close_the_window-cf36684da6956c61)
+
+running 4 tests
+test control_a_restriction_with_no_racer_is_applied ... ok
+test a_restriction_may_not_be_widened_by_one_that_raced_it ... ok
+test control_quarantine_with_no_racer_leaves_the_budget_unspent ... ok
+test a_row_write_charge_is_not_discarded_by_quarantine ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/d45_log_catalog_rmw.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d45_log_catalog_rmw-b05ae16bf4179c54)
+
+running 3 tests
+test the_same_writes_serially_reach_the_same_state ... ok
+test a_concurrent_renewal_does_not_discard_a_published_root ... ok
+test concurrent_attaches_do_not_drop_children_from_the_parent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/d60_depth_is_not_capped.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d60_depth_is_not_capped-9dff8d4ad9bec11d)
+
+running 5 tests
+test a_core_record_written_with_a_one_byte_depth_still_loads ... ok
+test a_full_record_written_before_the_depth_widened_still_decodes ... ok
+test a_chain_far_past_the_old_cap_forks_and_still_reads_what_the_root_wrote ... ok
+test reclamation_walks_a_long_reaped_chain_without_recursing_per_level has been running for over 60 seconds
+test the_reaper_cascades_up_a_deep_chain_of_reaped_ancestors has been running for over 60 seconds
+test reclamation_walks_a_long_reaped_chain_without_recursing_per_level ... ok
+test the_reaper_cascades_up_a_deep_chain_of_reaped_ancestors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 90.67s
+
+     Running tests/integration_branch_attestation.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_branch_attestation-70b4c2161ab68568)
+
+running 8 tests
+test a_childs_chain_walks_into_the_parent_it_forked_from ... ok
+test a_fork_a_merge_and_a_reap_each_leave_an_attested_entry ... ok
+test a_reap_through_an_attached_reaper_is_attested_too ... ok
+test a_published_head_catches_a_rewrite_that_the_chain_walk_accepts ... ok
+test the_merge_entry_commits_to_the_rows_it_published ... ok
+test an_auditor_can_check_every_entry_against_a_published_head ... ok
+test altering_one_entry_breaks_the_chain ... ok
+test attesting_a_fork_does_not_read_the_tree ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+     Running tests/integration_cluster_grants.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_grants-67065c5a27dc5eca)
+
+running 35 tests
+test a_lease_tick_never_moves_the_clusters_clock_backwards ... ok
+test a_member_with_no_lease_tick_refuses_to_answer_what_time_it_is ... ok
+test a_node_with_no_cluster_configured_still_begins_transactions ... ok
+test a_node_with_no_cluster_configured_grants_itself_everything ... ok
+test a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases ... ok
+test a_standalone_node_reaps_on_its_own_clock_exactly_as_before ... ok
+test a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join ... ok
+test a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out ... ok
+test a_replicated_tick_and_not_the_wall_clock_decides_a_reap ... ok
+test a_standalone_node_refuses_a_grant_it_was_never_supposed_to_get ... ok
+test a_recycled_extent_start_from_a_previous_authority_is_not_handed_out_again ... ok
+test a_granted_extent_is_filled_without_any_further_consensus ... ok
+test a_member_begins_transactions_from_its_granted_range_and_no_further ... ok
+test a_member_with_no_txn_grant_refuses_to_begin_a_transaction ... ok
+test a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued ... ok
+test a_replicated_checkpoint_command_is_what_truncates_on_a_member ... ok
+test a_standalone_node_refuses_a_lease_tick ... ok
+test a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter ... ok
+test a_grant_addressed_to_another_node_is_refused_by_this_one ... ok
+test a_standalone_node_still_checkpoints_on_its_own_commit_counter ... ok
+test the_infallible_lease_clock_aborts_rather_than_inventing_a_time - should panic ... ok
+test two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live ... ok
+test an_authority_change_is_noticed_by_the_counters_and_not_merely_survived ... ok
+test an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name ... ok
+test a_redelivered_grant_does_not_hand_out_the_same_extent_twice ... ok
+test a_member_with_no_extent_grant_refuses_to_allocate_an_arena ... ok
+test is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick ... ok
+test space_a_node_self_granted_while_standalone_is_revoked_when_it_joins ... ok
+test an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards ... ok
+test recovery_raises_the_transaction_watermark_without_inventing_a_grant ... ok
+test the_three_appliers_take_exactly_the_frozen_commands_shape ... ok
+test the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote ... ok
+test the_reaper_trait_is_the_path_under_test ... ok
+test two_nodes_with_disjoint_grants_never_hand_out_the_same_physical_page ... ok
+test two_nodes_with_disjoint_grants_never_issue_the_same_transaction_id ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.23s
+
+     Running tests/integration_server_reaps.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_server_reaps-2fe130781ef8f38a)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... FAILED
+test a_healthy_database_resumes_nothing_on_startup ... FAILED
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... FAILED
+test a_live_lease_survives_a_server_that_scans_continuously ... FAILED
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... FAILED
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+
+failures:
+
+---- both_binaries_refuse_to_start_on_an_unusable_scan_interval stdout ----
+
+thread 'both_binaries_refuse_to_start_on_an_unusable_scan_interval' (363447621) panicked at tests/integration_server_reaps.rs:108:13:
+/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver is missing (No such file or directory (os error 2)); run: cargo build --examples
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_healthy_database_resumes_nothing_on_startup stdout ----
+
+thread 'a_healthy_database_resumes_nothing_on_startup' (363447617) panicked at tests/integration_server_reaps.rs:108:13:
+/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver is missing (No such file or directory (os error 2)); run: cargo build --examples
+
+---- the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything stdout ----
+
+thread 'the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything' (363447623) panicked at tests/integration_server_reaps.rs:108:13:
+/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver is missing (No such file or directory (os error 2)); run: cargo build --examples
+
+---- a_live_lease_survives_a_server_that_scans_continuously stdout ----
+
+thread 'a_live_lease_survives_a_server_that_scans_continuously' (363447618) panicked at tests/integration_server_reaps.rs:108:13:
+/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver is missing (No such file or directory (os error 2)); run: cargo build --examples
+
+---- the_server_reaps_an_abandoned_branch_without_one_socket_being_opened stdout ----
+
+thread 'the_server_reaps_an_abandoned_branch_without_one_socket_being_opened' (363447624) panicked at tests/integration_server_reaps.rs:108:13:
+/Users/idide/wt/ferrodb-lane-target.noindex/debug/examples/pgserver is missing (No such file or directory (os error 2)); run: cargo build --examples
+
+
+failures:
+    a_healthy_database_resumes_nothing_on_startup
+    a_live_lease_survives_a_server_that_scans_continuously
+    both_binaries_refuse_to_start_on_an_unusable_scan_interval
+    the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything
+    the_server_reaps_an_abandoned_branch_without_one_socket_being_opened
+
+test result: FAILED. 3 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+error: test failed, to rerun pass `--test integration_server_reaps`
+rc=101

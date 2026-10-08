@@ -23,7 +23,7 @@
 //!
 //! See `SCALE-DESIGN.md` D2b.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,127 @@ pub struct TableBranchCatalog {
     /// FREE_ID keys `fork` skipped because the slot's record is not `Reaped` (D243). See
     /// [`Self::stale_free_ids_skipped`].
     stale_free_ids: AtomicU64,
+    /// Range scans issued over a CHILD span, by any of the three liveness readers
+    /// (`has_live_children` once per node it visits, `max_live_child`, `live_child_in_epoch_range`).
+    ///
+    /// **An instrument, not a statistic** — the role `reaper::sweep_descents` plays for D40. Wall
+    /// #21's claim is a COMPLEXITY CLASS: under a chain of reaped interior branches with a live
+    /// leaf, one liveness question visits every span down to the leaf. An integer proves a class
+    /// directly; a wall clock only illustrates it on a box that never goes quiet. Shape taken from
+    /// the parked D166 branch (`3cc71be`), widened from `has_live_children` alone to every CHILD
+    /// span reader, because the drain and the write path reach the walk through the other two.
+    child_spans: AtomicU64,
+    /// **Wall #21.** For a branch whose liveness question once found something alive below it:
+    /// which live branch that was. A HINT — the same standing D3 gave the CHILD entries — and
+    /// deliberately in memory, not in the tree.
+    ///
+    /// # What it replaces
+    ///
+    /// A REAPED child is a pin iff anything below it is alive (D16), and nothing durable records
+    /// that, so `has_live_children` re-derived it by walking the reaped subtree on every question.
+    /// Under a reaped chain with a live leaf that is Θ(depth) per question, asked three times per
+    /// reap in deepest-first order and once per parked or shadowed page. A valid witness answers
+    /// the same question with one point lookup: the live branch's own record.
+    ///
+    /// # Why not a durable live-descendant counter (ZFS clone counts, btrfs backrefs)
+    ///
+    /// That is the standard shape, and there the count changes in the same transaction group or
+    /// transaction as the reference it counts (from memory; not re-checked here). **This catalog
+    /// has no such unit.** `durable()` is `flush_all` + one sync over pages updated in place,
+    /// `flush_all` writes dirty pages in ascending page id so a crash keeps a prefix, and there is
+    /// no log underneath (`create_with_header`'s note: the WAL gate is a no-op here). A counter
+    /// key and the CHILD or RECORD key it counts sit on different pages, so a crash can keep
+    /// either without the other. Trusted both ways, a count left too low reads as "not pinned"
+    /// and frees pages under a live branch. Trusted only as YES, with every zero re-walked, a
+    /// count left too high still pins a parent for ever, and ruling that out needs every increment
+    /// ordered after, and every decrement before, the change it counts: a second sync on the fork
+    /// path and on the reap flip. Every crash argument in
+    /// this file is an ORDERING argument between two `durable()` calls, which is why D3 made the
+    /// entries hints. SCALE-DESIGN D1's falsifier ("deleted in the same atomic unit that marks it
+    /// reaped") was never met — D3 routed around it — and this wall is the price of the route.
+    ///
+    /// # Why a witness needs no crash argument at all
+    ///
+    /// It is never durable, it is re-validated against the authority on every use
+    /// (`valid_witness`), and it is only ever allowed to answer YES. A restart empties it; the
+    /// first question under each chain then walks once and refills it.
+    ///
+    /// # What it can change, stated exactly
+    ///
+    /// Only two answers, both towards pinning, never towards freeing: (1) YES where the walk
+    /// would have met a dangling entry deeper down first and refused (D124) — the witnessed
+    /// branch is alive, so YES is true; (2) YES where the live branch is no longer reachable
+    /// through CHILD entries while its own record is unchanged. Nothing in `src/` removes a
+    /// pinning child's entry below a reaped node: `detach_from_parent` detaches only a child with
+    /// nothing alive below it, `AgentRuntime`'s reaper-less arm detaches only under a READABLE
+    /// parent, and `reparent` moves no CHILD entry at all. So (2) is reachable only by a caller
+    /// that edits entries directly, which today means a test — or by a future re-parent, below.
+    ///
+    /// # ⚠ Blind spot: a move that keeps the fork epoch
+    ///
+    /// `valid_witness` checks the live branch's IDENTITY (slot and fork epoch) and STATE, never
+    /// its ANCESTRY. It notices a move only when the move changes the fork epoch, and `reparent`
+    /// writes whatever epoch its caller passes. Nothing in `src/` calls `reparent` today. But the
+    /// one mover this project has designed, D16 option 2's **epoch-preserving splice**
+    /// (SCALE-DESIGN, "NON-STANDARD — epoch-preserving splice"), re-parents a reaped node's live
+    /// children onto the grandparent at the reaped node's OLD epoch, by design. After such a move,
+    /// a witness filed on a node that is no longer the moved branch's ancestor stays valid for as
+    /// long as that branch lives. That node then over-pins: it stays attached, and its parked
+    /// pages, and those of every ancestor it pins, stay parked. The cost is **a space leak for the
+    /// moved branch's lifetime, never a wrong free**, because a witness can only ever answer YES.
+    ///
+    /// ⇒ **Any future re-parent, the splice included, must do one of two things.**
+    /// - Invalidate the witnesses of the old ancestry. Do it by epoch, not by enumeration: the
+    ///   mover bumps a catalog-wide move counter AFTER its CHILD entries have moved; each witness
+    ///   records the counter as read BEFORE its walk began; a witness is valid only while the two
+    ///   match. Dropping entries alone is not enough: a lockless walk that began before the move
+    ///   can file a witness from the old entries after the drop.
+    /// - Or make `valid_witness` re-check ancestry.
+    ///
+    /// ⚠ **F7 (wall21 review audit): the D200 flip makes a stale YES DURABLE.** The `Reaped` flip
+    /// asks `has_live_children`, and a pinned answer deletes the slot's UNRELEASED key in the same
+    /// sync. Before that, a wrongly pinned slot stayed keyed, and the next open re-asked with an
+    /// empty (in-memory) witness map. Now a stale witness YES at the flip turns a session-scoped
+    /// over-pin into a permanent keyless leak. It is latent, like the blind spot above: only an
+    /// epoch-preserving move produces a stale YES, and nothing in `src/` moves a branch. **A splice
+    /// must invalidate witnesses before any flip can consult them.**
+    ///
+    /// Bounded by the nodes currently pinned through a reaped subtree: a witness is dropped when
+    /// it fails validation, and when a walk from its node answers NO — which `detach_from_parent`
+    /// asks of every node before it detaches it.
+    witnesses: Mutex<HashMap<u64, Witness>>,
+    /// **D200.** Id-bearing keys `unreleased_reaped_candidates` has read, over this catalog's
+    /// life. The instrument for the open sweep's cost class: a healthy open must read only the
+    /// slots that are genuinely unreleased, never one per branch ever reaped.
+    candidate_keys: AtomicU64,
+    /// **C1 (wall21 review audit 2), test-only failpoint.** Fails the next FREE_ID write inside
+    /// `release_id` once. It is the only way to reach the write-side partial, because `upsert`
+    /// does not fail on demand, and it does not exist outside `cfg(test)`.
+    #[cfg(test)]
+    fail_next_free_id_upsert: std::sync::atomic::AtomicBool,
+    /// **A1 (wall21 review audit 4), test-only failpoint.** Every `core(id)` of this id returns
+    /// `Io`, until reset to `u64::MAX`: what one unreadable B-tree leaf under one record looks
+    /// like, since a page failure is `Corruption` or `Io`, never `Branch`. Injected INSIDE `core`,
+    /// so every reader of the record meets it: the candidate query, the build, `get_raw`,
+    /// `release_id`.
+    #[cfg(test)]
+    io_fault_core_of: AtomicU64,
+    /// **A5 (audit 4), test-only.** A `has_live_children` walk that enters more than this many
+    /// nodes returns `Err` instead of going on; 0 = no limit. It turns a walk that would not
+    /// terminate into a failing test instead of a hung one.
+    #[cfg(test)]
+    liveness_walk_budget: AtomicU64,
+    /// **D264 (wall21 review audit 5), test-only failpoint.** Fails the next upsert of a RECORD key
+    /// once, with `Io`: the one write `write_record` makes between moving a branch's STATE key and
+    /// finishing, which is where a torn flip leaves its state.
+    #[cfg(test)]
+    fail_next_record_upsert: std::sync::atomic::AtomicBool,
+    /// **E3/E4 (wall21 review audit 6), test-only failpoints.** Fail the next upsert, or the next
+    /// removal, of a DEADLINE key once, with `Io`: the two tear points of a deadline move.
+    #[cfg(test)]
+    fail_next_deadline_upsert: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_deadline_remove: std::sync::atomic::AtomicBool,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -160,6 +281,9 @@ impl TableBranchCatalog {
         let cat = Self::open(pool, root)?;
         cat.header_page.store(header_page, Ordering::SeqCst);
         cat.published_root.store(root, Ordering::SeqCst);
+        // D200, after `header_page` is set: the build writes, and a root split it causes must be
+        // published like any other mutation's (D33).
+        cat.build_unreleased_index_if_missing()?;
         Ok(cat)
     }
 
@@ -350,6 +474,18 @@ impl TableBranchCatalog {
         cat.next_id.store(max_id + 1, Ordering::SeqCst);
         cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
 
+        // D200: every reaped slot that is not clearly pinned goes on the UNRELEASED span BEFORE the
+        // releases below, as the `Reaped` flip would have left it. `release_id` takes each one it
+        // frees off again. **F5 (wall21 review audit):** without this, a release that FAILS (it
+        // swallows its errors, D124's `Corrupt` included) left the slot with no key and no text,
+        // because the migrated catalog is born with the build marker and the open sweep reads only
+        // the span. A pinned slot needs no key: a later cascade that frees it runs for an
+        // originator whose own key covers it. One liveness question per reaped record, once.
+        for id in &reaped {
+            if !matches!(cat.has_live_children(*id), Ok(true)) {
+                cat.upsert(keys::unreleased(*id), Vec::new())?;
+            }
+        }
         // Free ids last: `release_id` refuses while a slot still has live children, so it has to
         // see the child entries that were just attached.
         for id in reaped {
@@ -388,6 +524,19 @@ impl TableBranchCatalog {
         self.stale_free_ids.load(Ordering::Relaxed)
     }
 
+    /// CHILD-span range scans issued since this catalog was built. See the field's note.
+    ///
+    /// Read it twice around the operation under test and take the difference: it is
+    /// process-lifetime and monotonic, so an absolute value means nothing without the pair.
+    pub fn child_spans_scanned(&self) -> u64 {
+        self.child_spans.load(Ordering::Relaxed)
+    }
+
+    /// **D200.** Id-bearing keys the open sweep's candidate query has read. Difference two reads.
+    pub fn candidate_keys_scanned(&self) -> u64 {
+        self.candidate_keys.load(Ordering::Relaxed)
+    }
+
     /// Run one mutation under `logical`, publish the root **on every exit**, then take a commit
     /// ticket. Every mutator goes through here — D244.
     ///
@@ -411,6 +560,17 @@ impl TableBranchCatalog {
         let out = out?;
         published?;
         Ok((out, self.commit_group.ticket()))
+    }
+
+    /// **Test-only.** The pre-D244 `stage()`: publish the root, then take a commit ticket. **Call
+    /// under the logical lock, after the LAST mutation.** Kept so the wall21 fixtures that hold
+    /// `logical` by hand around a raw key edit compile as written; every production writer goes
+    /// through [`Self::mutate`], which publishes on every exit, and nothing outside `cfg(test)` can
+    /// call this.
+    #[cfg(test)]
+    fn stage(&self) -> Result<u64, FerroError> {
+        self.publish_root()?;
+        Ok(self.commit_group.ticket())
     }
 
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
@@ -560,10 +720,27 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             stale_free_ids: AtomicU64::new(0),
+            child_spans: AtomicU64::new(0),
+            witnesses: Mutex::new(HashMap::new()),
+            candidate_keys: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            io_fault_core_of: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            liveness_walk_budget: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_remove: std::sync::atomic::AtomicBool::new(false),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
         cat.tree.insert(keys::state(trunk.state.as_u8(), trunk.branch_id.id), Vec::new())?;
+        // D200: a new catalog has no unreleased slot, so its UNRELEASED span is complete now.
+        cat.tree.insert(keys::unreleased_index_built(), Vec::new())?;
         // Trunk is deliberately absent from the DEADLINE span: it is excluded from every reap
         // query, so an entry for it would sit at the head of the range for ever and every scan
         // would step over it.
@@ -585,6 +762,21 @@ impl TableBranchCatalog {
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
             stale_free_ids: AtomicU64::new(0),
+            child_spans: AtomicU64::new(0),
+            witnesses: Mutex::new(HashMap::new()),
+            candidate_keys: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_free_id_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            io_fault_core_of: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            liveness_walk_budget: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_record_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_upsert: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_deadline_remove: std::sync::atomic::AtomicBool::new(false),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -637,10 +829,28 @@ impl TableBranchCatalog {
     /// [`BPlusTreeManager::upsert`] closes the window at the layer that owns the latch.
     /// SCALE-DESIGN D126; probe in `tests/d126_atomic_upsert.rs` and `mod d126_record_key_probe`.
     fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), FerroError> {
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::RECORD)
+            && self.fail_next_record_upsert.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the RECORD upsert failed".into()));
+        }
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::DEADLINE)
+            && self.fail_next_deadline_upsert.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the DEADLINE upsert failed".into()));
+        }
         self.tree.upsert(key, value)
     }
 
     fn remove_if_present(&self, key: &Vec<u8>) -> Result<bool, FerroError> {
+        #[cfg(test)]
+        if key.first() == Some(&keys::tag::DEADLINE)
+            && self.fail_next_deadline_remove.swap(false, Ordering::SeqCst)
+        {
+            return Err(FerroError::Io("injected: the DEADLINE removal failed".into()));
+        }
         match self.tree.delete(key) {
             Ok(()) => Ok(true),
             Err(FerroError::KeyNotFound) => Ok(false),
@@ -702,7 +912,18 @@ impl TableBranchCatalog {
         }
     }
 
+    /// A5's test-only walk budget: has a walk that has entered `entered` nodes gone past it?
+    #[cfg(test)]
+    fn walk_over_budget(&self, entered: usize) -> bool {
+        let budget = self.liveness_walk_budget.load(Ordering::Relaxed);
+        budget != 0 && entered as u64 > budget
+    }
+
     fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
+        #[cfg(test)]
+        if id == self.io_fault_core_of.load(Ordering::SeqCst) {
+            return Err(FerroError::Io(format!("injected: the record of slot {id} cannot be read")));
+        }
         match self.tree.search(&keys::record(id))? {
             Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
             None => Ok(None),
@@ -825,34 +1046,85 @@ impl TableBranchCatalog {
     ///
     /// ⚠ **D126 made the RECORD key's rewrite atomic. It did NOT make this method atomic, and the
     /// difference is worth stating so the guarantee is not over-read.** The state and deadline
-    /// index keys are not rewritten in place, they MOVE: `remove_if_present(old)` below, then
-    /// `upsert(new)` a few lines later. Between those two a branch is in NEITHER state span and
-    /// neither deadline span, and `live_count`, `in_state` and `expired_before` scan exactly those
-    /// spans without the `logical` lock. No per-key primitive can close that window — the two keys
-    /// are different keys, in general on different pages — so it needs multi-key exclusion or an
-    /// ordering argument, and it is a separate row. The direction it fails in is benign for the
-    /// reaper (`expired_before` missing an entry means "not expired yet", and
-    /// `reap_if_still_expired` re-reads the record anyway), which is why it is noted here rather
-    /// than treated as the same defect.
+    /// index keys are not rewritten in place, they MOVE, and the two keys are different keys, in
+    /// general on different pages, so no per-key primitive can make the move atomic. There is no
+    /// journal, and an error returns before the caller's `stage`, while whatever was already
+    /// written stays in the pool, where any later `durable` flushes it.
+    ///
+    /// **D264 (wall21 review audit 5, B2): so the move is ADDITIVE-FIRST.** The new STATE key, the
+    /// new DEADLINE key and the RECORD are written first, in that order, and only then are the old
+    /// index keys removed. This used to remove STATE(old) first, so an error before the RECORD
+    /// upsert left a record that NO state key named. A `Reaping` one torn that way was never
+    /// resumed (the resume enumerates the STATE span), never offered, never expired, and its parent
+    /// read it as a live child for ever. **Every ERROR point now leaves at least one STATE key**:
+    /// - before the RECORD is written: the record is in its OLD state, with both STATE keys, so a
+    ///   `Reaping` one is still resumed;
+    /// - after it: the record is in its NEW state, and the old key is stale. A stale `Reaping` key
+    ///   on a `Reaped` record is audit 5's B5 shape: the resume refuses it (A3), and the sweep
+    ///   releases the slot if it is keyed.
+    ///
+    /// ⚠ **Crash points (audit 6 E5): the same holds only after a COMPLETE flush.** This orders
+    /// writes in the pool. A torn `flush_all` keeps a page-id prefix, and a concurrent
+    /// group-commit `durable` samples each page at its own moment, so either can persist STATE(old)'s
+    /// removal without STATE(new). That is the pre-existing class this file already states: every
+    /// crash argument here is an ordering argument between two `durable()` calls.
+    ///
+    /// **DEADLINE(new) comes BEFORE the RECORD (audit 6 E4).** A move INTO `Live` from an unindexed
+    /// state (`release_from_quarantine`, a fork's recycle) then never tears into a `Live` record
+    /// with no DEADLINE key, which would never expire. A DEADLINE key naming a record still in an
+    /// unindexed state is filtered by `expired_before`'s `in_deadline_index` re-check.
+    ///
+    /// An old key EQUAL to its new key is never removed, since removing it after the upsert would
+    /// delete the new one: `set_root`, `put` and a `renew_lease` that keeps its deadline rewrite
+    /// with the state unchanged.
+    ///
+    /// **The costs of the order.**
+    /// - A torn index move leaves a stale EXTRA key where the old order left none.
+    /// - **A stale DEADLINE key is PERMANENT** (audit 6 E3). The old one's removal is keyed on the
+    ///   previous RECORD's deadline, so a key left by a torn renew is never named again. It costs
+    ///   one record read per lease scan. `expired_before` dedups by id, so it never duplicates a
+    ///   candidate row, which would otherwise be a spurious refusal on a healthy reap.
+    /// - A stale STATE key lasts until the record next enters that state and leaves it.
+    ///   `in_state` re-checks the record's state (E6); the resume refuses (A3); and the candidate
+    ///   query and the build re-check `Reaped`.
+    /// - `live_count` does not re-check, so it can over-count after a tear. It has no production
+    ///   consumer.
+    /// - The unlocked readers can see a branch in BOTH spans mid-move where they used to see it in
+    ///   NEITHER. The reaper re-reads the record either way.
+    ///
+    /// ⚠ Merge note (audit 6 Q5): only lease-grace rewrites this method's body; D233, D235 and D244
+    /// leave it as at `9aa6968`. At that merge:
+    /// - compute the new keys from the STORED record;
+    /// - compare deadline keys as `index_key` values;
+    /// - keep the order and the equal-key guard. No old STATE or DEADLINE removal may come before
+    ///   the RECORD upsert.
     fn write_record(
         &self,
         rec: &BranchRecord,
         old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
+        // Main's envelope check first (D225's entry bound): it reads and refuses, writing nothing,
+        // so an envelope too large for a page refuses before any index key moves.
         let envelope = self.envelope_write(rec)?;
-        if let Some(prev) = old {
-            self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
-            if Self::in_deadline_index(prev.state(), prev.branch_id()) {
-                self.remove_if_present(&keys::deadline(
-                    prev.lease_deadline().0,
-                    prev.branch_id().id,
-                ))?;
-            }
+        let new_state = keys::state(rec.state.as_u8(), rec.branch_id.id);
+        let new_deadline = Self::in_deadline_index(rec.state, rec.branch_id)
+            .then(|| keys::deadline(rec.lease_deadline.0, rec.branch_id.id));
+        self.upsert(new_state.clone(), Vec::new())?;
+        if let Some(k) = &new_deadline {
+            self.upsert(k.clone(), Vec::new())?;
         }
         self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.upsert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
-        if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+        if let Some(prev) = old {
+            let old_state = keys::state(prev.state().as_u8(), prev.branch_id().id);
+            if old_state != new_state {
+                self.remove_if_present(&old_state)?;
+            }
+            if Self::in_deadline_index(prev.state(), prev.branch_id()) {
+                let old_deadline = keys::deadline(prev.lease_deadline().0, prev.branch_id().id);
+                if new_deadline.as_ref() != Some(&old_deadline) {
+                    self.remove_if_present(&old_deadline)?;
+                }
+            }
         }
         match envelope {
             EnvelopeWrite::Unchanged => {}
@@ -970,14 +1242,19 @@ impl TableBranchCatalog {
         if value.len() != 8 {
             // An entry written before the value carried an id. There is no id to resolve, so it
             // cannot be verified; treat it as LIVE, which is the parking (safe) direction.
-            return Ok(ChildLiveness::Live);
+            return Ok(ChildLiveness::Live(None));
         }
         let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
         Ok(match self.core(child_id)? {
-            Some(rec) if rec.state() != BranchState::Reaped => ChildLiveness::Live,
+            Some(rec) if rec.state() != BranchState::Reaped => {
+                ChildLiveness::Live(Some(BranchAt { id: child_id, fork_epoch: rec.fork_epoch() }))
+            }
             // **D16 — a reaped branch that still has live children is a PIN, not a stale hint.**
             // Its subtree is explored by the caller (see `has_live_children`), not from here.
-            Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
+            Some(rec) => ChildLiveness::ReapedWithSubtree(BranchAt {
+                id: child_id,
+                fork_epoch: rec.fork_epoch(),
+            }),
             // **D124.** This used to be `ChildLiveness::Gone`, which `has_live_children` then
             // skipped entirely — so the entry pinned nothing and the parent became reclaimable.
             // `dangling_child` has the reason. It used to be "a concurrent `set_root` on this
@@ -1012,21 +1289,21 @@ impl TableBranchCatalog {
             // is the semantically correct one: a grandchild's root is the interior node's root at
             // fork time, which is the grandparent's root at *that* epoch.
             //
-            // ⛔ **COST, STATED CORRECTLY — an earlier version of this comment said "O(1) in N"
-            // and that was WRONG.** Recursion depth WAS bounded by the cap D60 removed, but the
-            // WORK is not: `has_live_children` scans a node's whole CHILD span and recurses into
-            // every REAPED child, so this explores the reaped subtree breadth-first with an early
-            // exit on the first live descendant. A parent with 10^6 reaped children and one live
-            // child at the end of the span scans all 10^6.
+            // ⛔ **COST — an earlier version of this comment said "O(1) in N" and that was
+            // WRONG.** Without a witness this explores the reaped subtree (`has_live_children`,
+            // iterative since D60) down to the first live descendant. Under a chain of reaped
+            // interior nodes with a live leaf that is every span down to the leaf, and this arm
+            // runs once per parked page (the drain, the slow path) and once per page shadowed
+            // (`cow_page` via `max_live_child`) — wall #21.
             //
-            // It is therefore O(explored reaped subtree), cheap in the common case (few reaped
-            // children, early exit) and NOT bounded by 8. It is still not the global reachability
-            // walk `mod.rs:13` forbids -- it never leaves this branch's own subtree -- but the
-            // honest bound is the subtree, not a constant.
-            // The subtree walk is `has_live_children`'s now (iterative, D60), and this arm asks it
-            // for the one entry it was handed — so a single-entry answer keeps the D16 rule while
-            // the depth-unbounded exploration happens on a heap stack, not the call stack.
-            Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
+            // **Wall #21: a valid witness answers first, in one point lookup** (see
+            // `reaped_child_pins` and the `witnesses` field). It can only say YES; every NO here
+            // still comes from the exact walk, so the answer in the direction that frees pages is
+            // unchanged. The walk is still not the global reachability walk `mod.rs:13` forbids
+            // -- it never leaves this branch's own subtree.
+            Some(rec)
+                if self.reaped_child_pins(BranchAt { id: child_id, fork_epoch: rec.fork_epoch() })? =>
+            {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
             // Reaped with nothing under it: a stale hint, and LEGITIMATELY not a live child. This
@@ -1041,6 +1318,77 @@ impl TableBranchCatalog {
         }
     }
 
+    /// Does the REAPED branch `child` still pin its parent, i.e. is anything below it alive?
+    ///
+    /// **Wall #21.** A valid witness answers YES in one point lookup. Otherwise the exact walk
+    /// decides, and files a witness if it finds something, so the next question about this
+    /// subtree is one lookup again. Every NO comes from the walk.
+    fn reaped_child_pins(&self, child: BranchAt) -> Result<bool, FerroError> {
+        if self.valid_witness(child).is_some() {
+            return Ok(true);
+        }
+        BranchCatalog::has_live_children(self, child.id)
+    }
+
+    /// The live branch witnessed below `of`, if the witness still holds. A stale one is dropped.
+    ///
+    /// Valid means: filed under THIS incarnation of `of` (its fork epoch; a recycled id is forked
+    /// at a fresh one), and naming a branch whose own record, read now, is the same incarnation
+    /// and not `Reaped`. A `reparent` whose caller passes a new epoch fails this; ⚠ one that
+    /// keeps the epoch does NOT, and neither does any move of an unchanged branch — this checks
+    /// identity, never ancestry (the blind spot on the `witnesses` field). That record is the
+    /// authority `child_liveness` consults for a live child, so a valid witness rests on the same
+    /// fact the walk stops on, read from the same place. (When the two can still differ is stated
+    /// on the `witnesses` field.)
+    ///
+    /// A record that cannot be read makes the witness invalid rather than an error: the walk that
+    /// follows then runs exactly as it did before witnesses existed, so it reports whatever it
+    /// finds, and no question that used to be answered now fails.
+    fn valid_witness(&self, of: BranchAt) -> Option<BranchAt> {
+        let w = *self.witnesses.lock().unwrap().get(&of.id)?;
+        if w.of == of.fork_epoch {
+            if let Ok(Some(rec)) = self.core(w.live.id) {
+                if rec.state() != BranchState::Reaped && rec.fork_epoch() == w.live.fork_epoch {
+                    return Some(w.live);
+                }
+            }
+        }
+        // Stale. Remove only the entry that was judged: a concurrent walk may have filed a newer
+        // one under the same id while the record was being read.
+        let mut map = self.witnesses.lock().unwrap();
+        if map.get(&of.id) == Some(&w) {
+            map.remove(&of.id);
+        }
+        None
+    }
+
+    /// File `live` as the witness of every node on the walk's path from `visited[from]` back to
+    /// the root. Best effort, and never able to change the answer the walk is about to give.
+    fn file_witness(&self, visited: &[Visited], from: usize, live: BranchAt) {
+        let mut filed = Vec::new();
+        let mut i = from;
+        loop {
+            let v = visited[i];
+            // The root was named by id alone, so its fork epoch costs one lookup here; a root
+            // whose record cannot be read simply gets no witness.
+            let epoch = match v.fork_epoch {
+                Some(e) => Some(e),
+                None => self.core(v.id).ok().flatten().map(|r| r.fork_epoch()),
+            };
+            if let Some(of) = epoch {
+                filed.push((v.id, Witness { of, live }));
+            }
+            match v.up {
+                Some(up) => i = up,
+                None => break,
+            }
+        }
+        let mut map = self.witnesses.lock().unwrap();
+        for (id, w) in filed {
+            map.insert(id, w);
+        }
+    }
+
     /// Only `Live`, non-trunk branches are in the deadline index.
     ///
     /// A quarantined branch keeps its record for as long as an operator wants to look at it and its
@@ -1051,6 +1399,173 @@ impl TableBranchCatalog {
     /// `BranchRecord` alike without either having to be converted to satisfy it.
     fn in_deadline_index(state: BranchState, branch_id: BranchId) -> bool {
         state == BranchState::Live && !branch_id.is_trunk()
+    }
+
+    /// **New-wall audit round 2.** Is anything alive below each of `roots`, all answered in ONE
+    /// memoised pass: an iterative post-order DFS in which each CHILD span is scanned at most once,
+    /// so O(slots reached + CHILD entries) however the roots nest. Only the one-time build calls it.
+    ///
+    /// Same question as `has_live_children`, with the precedence stated:
+    /// - `Pin` if any entry below resolves to a live branch, a pre-id entry included.
+    /// - `Unknown` if none does but resolving one ERRED (a dangling entry, D124). The caller keys
+    ///   such a slot, which is conservative: a stray candidate costs the sweep one visit.
+    /// - `Clear` otherwise.
+    ///
+    /// A pin found anywhere wins over an error. `has_live_children` could answer `Err` for a slot
+    /// whose live descendant sat after a dangling entry in scan order.
+    ///
+    /// **The canonical keying rule (audit 4 A4): a slot is keyed unless a pin below it is KNOWN.**
+    /// This said "a genuinely pinned slot must never be keyed", which is stronger than the rule the
+    /// code follows. A key never frees anything, because the sweep and `release_id` both re-read
+    /// the state and ask liveness again before acting. So an UNKNOWN answer keys: `release_id`'s
+    /// liveness-error arm (C1, W7), `migrate_from`, and `Unknown` here. A KNOWN pin does not:
+    /// the `Reaped` flip, and pin-over-error here. A slot keyed while pinned costs reads, not
+    /// pages. Pinned by `the_one_time_build_scans_each_child_span_once` for the known pin.
+    ///
+    /// A back-edge, which only a cycle of stale entries through a recycled slot can make, counts
+    /// as nothing below it, so a cycle member with nothing else below it is keyed (the safe
+    /// direction; `the_build_keys_a_cycle_member_with_nothing_below` kills the mutant that counts
+    /// it as a pin, which leaves it keyless). The pass terminates on any graph: each id is entered
+    /// once. Since A5, so does `has_live_children`, which the open's sweep then asks of each
+    /// keyed member.
+    fn liveness_below(&self, roots: &[u64]) -> HashMap<u64, Below> {
+        let mut memo: HashMap<u64, Below> = HashMap::new();
+        // Nodes entered but not yet finished: exactly the current DFS path, so a kid found here is
+        // a back-edge.
+        let mut open: HashMap<u64, Frame> = HashMap::new();
+        let mut stack: Vec<(u64, bool)> = Vec::new();
+        for &root in roots {
+            stack.push((root, false));
+            while let Some((id, exiting)) = stack.pop() {
+                if !exiting {
+                    if memo.contains_key(&id) || open.contains_key(&id) {
+                        continue;
+                    }
+                    let mut frame = Frame { err: false, kids: Vec::new() };
+                    let mut pin = false;
+                    let (lo, hi) = keys::children_of(id);
+                    self.child_spans.fetch_add(1, Ordering::Relaxed);
+                    match self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi)) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                match entry.and_then(|(k, v)| self.child_liveness(&k, &v)) {
+                                    Ok(ChildLiveness::Live(_)) => {
+                                        pin = true;
+                                        break;
+                                    }
+                                    Ok(ChildLiveness::ReapedWithSubtree(at)) => frame.kids.push(at.id),
+                                    Err(_) => frame.err = true,
+                                }
+                            }
+                        }
+                        Err(_) => frame.err = true,
+                    }
+                    if pin {
+                        memo.insert(id, Below::Pin);
+                        continue;
+                    }
+                    stack.push((id, true));
+                    for &k in &frame.kids {
+                        if !memo.contains_key(&k) && !open.contains_key(&k) {
+                            stack.push((k, false));
+                        }
+                    }
+                    open.insert(id, frame);
+                } else if let Some(frame) = open.remove(&id) {
+                    let mut pin = false;
+                    let mut err = frame.err;
+                    for k in &frame.kids {
+                        match memo.get(k) {
+                            Some(Below::Pin) => pin = true,
+                            Some(Below::Unknown) => err = true,
+                            // `Clear`, or a back-edge that never finished: nothing below it here.
+                            _ => {}
+                        }
+                    }
+                    let verdict = if pin {
+                        Below::Pin
+                    } else if err {
+                        Below::Unknown
+                    } else {
+                        Below::Clear
+                    };
+                    memo.insert(id, verdict);
+                }
+            }
+        }
+        memo
+    }
+
+    /// **D200.** Give a catalog written before the UNRELEASED span existed its span — once.
+    ///
+    /// Such a catalog can hold `Reaped` slots that were never released (the pre-D200 cascade left
+    /// one per pruned interior) with no key naming them, and the open sweep reads only the span.
+    /// So its first open finds them the expensive way: the `Reaped` STATE span merged against the
+    /// FREE_ID span, plus one liveness question for each slot in the first and not the second —
+    /// only a RELEASABLE one goes on the span, as `set_state` would have left it — plus the
+    /// `Reaping` span. It writes one key per slot found, then the marker, in one sync.
+    ///
+    /// **One-time cost: O(slots ever reaped and not recycled + their CHILD entries), once per
+    /// catalog** — a migration, not a per-open cost. The liveness answers come from ONE memoised
+    /// pass (`liveness_below`). Before new-wall audit round 2 each slot asked its own
+    /// `has_live_children`, which is D(D+1)/2 over a dead chain. Every later open reads the marker and
+    /// returns; a catalog made by `create` has the marker from birth.
+    fn build_unreleased_index_if_missing(&self) -> Result<(), FerroError> {
+        if self.tree.search(&keys::unreleased_index_built())?.is_some() {
+            return Ok(());
+        }
+        // Under `mutate` (D244), so the root is published on every exit of the migration, a failed
+        // one included, like every other writer here.
+        let ((), seq) = self.mutate(|| {
+            let (flo, fhi) = keys::whole_group(keys::tag::FREE_ID);
+            let mut free: Vec<u64> = Vec::new();
+            for entry in self.tree.range_scan(Bound::Included(flo), Bound::Excluded(fhi))? {
+                let (k, _) = entry?;
+                if let Some(id) = keys::free_id_from_key(&k) {
+                    free.push(id);
+                }
+            }
+            free.sort_unstable();
+            let (lo, hi) = keys::whole_state(BranchState::Reaped.as_u8());
+            let mut reaped = Vec::new();
+            let mut unreadable = Vec::new();
+            for id in self.ids_in_span(lo, hi)? {
+                if id == 0 || free.binary_search(&id).is_ok() {
+                    continue;
+                }
+                // Re-read: a STATE key that outlived its state (pre-F4 recycling) names a live slot.
+                match self.core(id) {
+                    Ok(Some(rec)) if rec.state() == BranchState::Reaped => reaped.push(id),
+                    Ok(_) => {}
+                    // W3 (wall21 review audit 3): keyed, not a failed open, as `release_id` keys a
+                    // slot whose record it cannot read. The sweep records the refusal. A1 (audit 4):
+                    // of any error type, because this read is about one slot; the span scans above
+                    // stay `?`.
+                    Err(_) => unreadable.push(id),
+                }
+            }
+            for id in unreadable {
+                self.upsert(keys::unreleased(id), Vec::new())?;
+            }
+            // Only a RELEASABLE slot: a pinned one stays off until its last pin goes. **New-wall
+            // audit round 2:** this asked `has_live_children` per slot, a DFS over everything reaped
+            // below it, and a NO files no witness. So a dead chain that is still attached cost
+            // D(D+1)/2 span scans, wall #21 again at the migration. `liveness_below` answers every
+            // slot in one memoised pass, scanning each CHILD span at most once.
+            let below = self.liveness_below(&reaped);
+            for id in reaped {
+                if below.get(&id) != Some(&Below::Pin) {
+                    self.upsert(keys::unreleased(id), Vec::new())?;
+                }
+            }
+            let (rlo, rhi) = keys::whole_state(BranchState::Reaping.as_u8());
+            for id in self.ids_in_span(rlo, rhi)? {
+                self.upsert(keys::unreleased(id), Vec::new())?;
+            }
+            self.upsert(keys::unreleased_index_built(), Vec::new())?;
+            Ok(())
+        })?;
+        self.durable(seq)
     }
 
     /// Ids of every entry in a span whose key ends with an 8-byte branch id.
@@ -1235,10 +1750,18 @@ impl BranchCatalog for TableBranchCatalog {
             }
             if reused {
                 self.remove_if_present(&keys::free_id(child_num))?;
+                // D200: a free slot was taken off the UNRELEASED span when it was released; this
+                // only makes a recycled slot's absence from it unconditional.
+                self.remove_if_present(&keys::unreleased(child_num))?;
             }
 
             if reused {
-                self.write_record(&child, None)?;
+                // The slot's OLD record is passed as `old`, so the keys derived from it go: its
+                // `Reaped` STATE key above all. With `None` that key outlived the recycle, and
+                // `in_state(Reaped)` went on returning this live branch — which also put every
+                // slot ever recycled into the D200 open-time sweep's span, at every open. The old
+                // record is the one `reusable_slot` read before any removal (D233 A8).
+                self.write_record(&child, recycled.as_ref().map(|(_, rec)| rec))?;
             } else {
                 self.write_record_new(&child)?;
             }
@@ -1370,6 +1893,12 @@ impl BranchCatalog for TableBranchCatalog {
                 // here.)
                 return Ok(false);
             }
+            // D200: asked BEFORE any write, so an error here leaves nothing half-written.
+            let releasable = if to == BranchState::Reaped {
+                Some(!BranchCatalog::has_live_children(self, branch.id)?)
+            } else {
+                None
+            };
             let old = core.clone();
             // HYDRATED: `write_record` rewrites the arena span from the record it is handed, so a core
             // record would silently drop every extent this branch owns.
@@ -1383,6 +1912,23 @@ impl BranchCatalog for TableBranchCatalog {
                 rec.state = to;
             }
             self.write_record(&rec, Some(&old))?;
+            // **D200 — the UNRELEASED span holds a slot only while it may be RELEASABLE.**
+            // - Into `Reaping`: on it. Nothing is settled yet, and a crash mid-reap must leave the slot
+            //   where the open sweep looks; the resumed reap's flip settles it.
+            // - Into `Reaped` with nothing alive below it: on it, until `release_id` takes it off.
+            // - Into `Reaped` while PINNED: OFF it. It cannot be released while anything below it
+            //   lives, and a span holding every pinned interior made every open pay for all of them,
+            //   under the statement lock (lead audit of `17cbd4c`). It needs no key when its last pin
+            //   goes: the cascade that frees it runs for an originator whose own key covers it.
+            match (to, releasable) {
+                (BranchState::Reaping, _) | (BranchState::Reaped, Some(true)) => {
+                    self.upsert(keys::unreleased(branch.id), Vec::new())?;
+                }
+                (BranchState::Reaped, Some(false)) => {
+                    self.remove_if_present(&keys::unreleased(branch.id))?;
+                }
+                _ => {}
+            }
             Ok(true)
         })?;
         if wrote {
@@ -1435,6 +1981,12 @@ impl BranchCatalog for TableBranchCatalog {
             }
         }
         out.sort_unstable_by_key(|r| r.branch_id().id);
+        // **E3 (wall21 review audit 6).** A torn renew leaves a stale DEADLINE key that nothing
+        // ever removes (`write_record`), and the re-check above reads the RECORD's deadline, not
+        // the key's, so both keys name the same live, expired record. One row per id: a second
+        // row would reach `reap_if_still_expired` after the first reap bumped the generation, and
+        // come back as a spurious refusal.
+        out.dedup_by_key(|r| r.branch_id().id);
         Ok(out)
     }
 
@@ -1443,11 +1995,26 @@ impl BranchCatalog for TableBranchCatalog {
         let mut out = Vec::new();
         for id in self.ids_in_span(lo, hi)? {
             if let Some(rec) = self.core(id)? {
-                out.push(self.hydrate(rec)?);
+                // **E6 (wall21 review audit 6):** a STATE key can outlive its state (a torn move,
+                // D264), so the record is asked. Without this, `in_state(Quarantined)` (the
+                // `ferro_quarantine` view) listed a `Live` or a reaped branch as held. One
+                // comparison per row, as in `expired_before` and the candidate query.
+                if rec.state() == state {
+                    out.push(self.hydrate(rec)?);
+                }
             }
         }
         out.sort_unstable_by_key(|r| r.branch_id.id);
         Ok(out)
+    }
+
+    /// The STATE span's ids alone (W3): no record is decoded, so an undecodable one is left for
+    /// the caller to meet, per slot.
+    fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
+        let (lo, hi) = keys::whole_state(state.as_u8());
+        let mut ids = self.ids_in_span(lo, hi)?;
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     fn scan(&self)
@@ -1507,6 +2074,7 @@ impl BranchCatalog for TableBranchCatalog {
         // consuming every child trunk has.
         // Entries are newest-first, so the first LIVE one is the maximum. Stale entries are
         // skipped rather than trusted; they are bounded by crashes and removed by the next reap.
+        self.child_spans.fetch_add(1, Ordering::Relaxed);
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
             let (k, v) = entry?;
             if let Some(e) = self.live_child_at(&k, &v)? {
@@ -1526,6 +2094,7 @@ impl BranchCatalog for TableBranchCatalog {
             // An empty window pins nothing.
             return Ok(false);
         };
+        self.child_spans.fetch_add(1, Ordering::Relaxed);
         for entry in self.tree.range_scan(Bound::Included(klo), Bound::Included(khi))? {
             let (k, v) = entry?;
             if self.live_child_at(&k, &v)?.is_some() {
@@ -1545,27 +2114,91 @@ impl BranchCatalog for TableBranchCatalog {
     /// unbounded. MCTS prunes interior nodes, which is exactly how a long reaped chain forms, so
     /// the recursion had to go before the cap could.
     ///
-    /// The cost is unchanged and is still not O(1): `live_child_at` returns `None` for a reaped
-    /// node so that its own children are explored here instead, and the walk is breadth-first over
-    /// the reaped subtree with an early exit on the first live descendant.
+    /// # Wall #21 — the walk's cost, and the witness that ends it
+    ///
+    /// Without a witness this walk visits every reaped node down to the first live descendant.
+    /// Under a chain of reaped interior nodes whose leaf is live, a question about a node k levels
+    /// above the leaf costs k span scans — and the reaper asks it three times per reap, deepest
+    /// first (`expired_candidates`), so reaping the chain's interiors costs Θ(D²) scans, while the
+    /// drain and the write path pay Θ(k) per page through `live_child_at`.
+    /// `tests/wall21_reaped_chain_liveness.rs` counts all three.
+    ///
+    /// A REAPED child with a valid witness now ends the walk as a pin without being explored, and
+    /// a walk that finds something alive files a witness on every node of the path it came down.
+    /// Every other step is the walk above, in the same order. So the witness can only turn the
+    /// answer into YES earlier, never into NO: **every NO is still the exhaustive walk**, and
+    /// nothing that frees pages is decided by anything new.
+    ///
+    /// # A5 (wall21 review audit 4): each slot is explored at most once
+    ///
+    /// A cycle of stale CHILD entries (one needs an entry naming a recycled slot) made this walk
+    /// run for ever, and the open's sweep asks it of every keyed slot, so a cycle would hang the
+    /// open. No producer is known. The walk now keeps the ids it has pushed and never pushes one
+    /// twice, the root included. That is exact, not an approximation: a slot is resolved by id to
+    /// its one current record, and a first visit either found something alive (the walk has
+    /// returned) or scanned the whole span and pushed everything below it. `HashSet::new` does not
+    /// allocate, so a parent with no reaped child pays nothing.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
-        let mut pending = vec![parent_id];
-        while let Some(id) = pending.pop() {
-            let (lo, hi) = keys::children_of(id);
-            // One increment per node VISITED, which is one `range_scan` issued. Counted here
-            // rather than per entry: the question D166 asks is how many child spans this walk
-            // touches, and an entry count would answer a different one (how wide they are).
+        let mut visited: Vec<Visited> = Vec::new();
+        let mut pushed: HashSet<u64> = HashSet::new();
+        let mut pending = vec![Visited { id: parent_id, fork_epoch: None, up: None }];
+        while let Some(node) = pending.pop() {
+            let here = visited.len();
+            visited.push(node);
+            // The same `#[cfg(test)] if` shape as `wal/log.rs`'s `fail_next_append`.
+            #[cfg(test)]
+            if self.walk_over_budget(visited.len()) {
+                return Err(FerroError::Io(format!(
+                    "test walk budget exceeded: {} nodes entered below slot {parent_id}",
+                    visited.len()
+                )));
+            }
+            let (lo, hi) = keys::children_of(node.id);
+            // One per node VISITED, i.e. one range scan issued: wall #21 asks how many spans a
+            // liveness question touches, not how wide they are.
+            self.child_spans.fetch_add(1, Ordering::Relaxed);
+            // D166's counter, the same scans for this walk only (`child_spans` above also counts the
+            // other two CHILD span readers); both are kept, each has its own consumers
+            // (`examples/d166_reap_depth_curve.rs` reads this one). One increment per node VISITED,
+            // which is one `range_scan` issued. Counted here rather than per entry: the question
+            // D166 asks is how many child spans this walk touches, and an entry count would answer
+            // a different one (how wide they are).
             self.child_scans.fetch_add(1, Ordering::Relaxed);
             for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
                 let (k, v) = entry?;
-                match self.child_liveness(&k, &v)? {
-                    ChildLiveness::Live => return Ok(true),
+                let found = match self.child_liveness(&k, &v)? {
+                    ChildLiveness::Live(child) => Some(child),
                     // A reaped child is not itself a pin, but anything live BELOW it is — D16.
-                    // Explored here rather than by recursing, so the stack cannot grow with depth.
-                    ChildLiveness::ReapedWithSubtree(child) => pending.push(child),
+                    // Explored here rather than by recursing, so the stack cannot grow with depth
+                    // — unless a witness already says what is alive below it.
+                    ChildLiveness::ReapedWithSubtree(child) => match self.valid_witness(child) {
+                        Some(live) => Some(Some(live)),
+                        None => {
+                            // A5: never the root again, and never a slot already pushed.
+                            if child.id != parent_id && pushed.insert(child.id) {
+                                pending.push(Visited {
+                                    id: child.id,
+                                    fork_epoch: Some(child.fork_epoch),
+                                    up: Some(here),
+                                });
+                            }
+                            None
+                        }
+                    },
+                };
+                if let Some(live) = found {
+                    // A pre-id entry names no branch, so there is nothing to file.
+                    if let Some(live) = live {
+                        self.file_witness(&visited, here, live);
+                    }
+                    return Ok(true);
                 }
             }
         }
+        // Nothing below `parent_id` is alive. Every other node visited was pushed only because
+        // its witness was missing or stale, and `valid_witness` has already dropped a stale one;
+        // the root is the one node whose witness this walk never looked at.
+        self.witnesses.lock().unwrap().remove(&parent_id);
         Ok(false)
     }
 
@@ -1590,19 +2223,116 @@ impl BranchCatalog for TableBranchCatalog {
         // parked under this branch's name. Errors are swallowed to match the inherent method's
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
+        // ⚠ D200: "recoverable" was FALSE until the open-time sweep existed — nothing ever asked
+        // again. It is true now: `TwoTierReaper::reclaim_unreleased_slots` finds the slot at the
+        // next open through `unreleased_reaped_candidates` below.
         let staged = self.mutate(|| {
-            // The one reuse predicate `fork` asks too (D233 review 2 G2).
-            let reusable = matches!(self.reusable_slot(id), Ok(Some(_)));
-            if reusable {
-                let _ = self.upsert(keys::free_id(id), Vec::new());
-            }
-            Ok(reusable)
+            // **C1 (wall21 review audit 2), completed by W1 and W2 (audit 3): a swallowed error must
+            // still leave the slot where the open sweep looks.** Errors are swallowed because the
+            // trait returns `()`, so an error that writes no key ends the slot keyless and not free:
+            // stranded, silently. The rule, under `logical` and in this call's one sync, with no trait
+            // change: **every error KEYS the slot, whatever it held before**; only a successful
+            // FREE_ID write takes the key off.
+            // - WRITE side: the FREE_ID upsert failed. C1 only skipped the key's removal, which is not
+            //   enough for a slot that holds NO key: a cascade ancestor lost its key at its pinned
+            //   flip, and the originator's release then removed the last key a sweep could follow to
+            //   it (W1). So the failure WRITES the key.
+            // - READ side, liveness: a `Reaped` slot whose liveness read ERRED is keyed, so the sweep
+            //   retries it and records a D127 refusal with its reason.
+            // - READ side, the record itself (W2): its state is unknown, so it is keyed the same way.
+            //   A key frees nothing by itself: the sweep and this method both re-read before acting.
+            // None of these fires on `Ok(true)`: `release_id` does not key a readable, pinned slot
+            // (the lead audit of 17cbd4c), though one keyed earlier stays keyed. What is left is a
+            // failure of the key write or the sync itself, which no write in this method can cover.
+            // A key written here on a non-`Branch` error used to fail every later open, because the
+            // open read the slot again with `?` (audit 4 A1). Since A1, each open-time read of one
+            // slot turns any error into that slot's refusal, so the key costs a refusal per open, not
+            // the open.
+            //
+            // The three arms are `reusable_slot`'s three answers, the one reuse predicate `fork` asks
+            // too (D233 review 2 G2): `Ok(Some)` is a readable `Reaped` record with nothing alive
+            // below it; `Err` is an unreadable record, or a `Reaped` one whose liveness read erred
+            // (it asks liveness only of a `Reaped` record); `Ok(None)` is anything else.
+            let wrote = match self.reusable_slot(id) {
+                Ok(Some(_)) => {
+                    #[cfg(test)]
+                    let freed = if self.fail_next_free_id_upsert.swap(false, Ordering::SeqCst) {
+                        Err(FerroError::Io("injected: the FREE_ID write failed".into()))
+                    } else {
+                        self.upsert(keys::free_id(id), Vec::new())
+                    };
+                    #[cfg(not(test))]
+                    let freed = self.upsert(keys::free_id(id), Vec::new());
+                    if freed.is_ok() {
+                        // D200: off the UNRELEASED span, under the same lock and in the same sync as
+                        // the free-list entry.
+                        let _ = self.remove_if_present(&keys::unreleased(id));
+                    } else {
+                        // W1: ON it, whether or not it was before.
+                        let _ = self.upsert(keys::unreleased(id), Vec::new());
+                    }
+                    true
+                }
+                Err(_) => {
+                    let _ = self.upsert(keys::unreleased(id), Vec::new());
+                    true
+                }
+                Ok(None) => false,
+            };
+            Ok(wrote)
         });
         // Same as the others: `mutate` released the lock before this fsync, and errors stay
-        // swallowed for the reason above.
+        // swallowed for the reason above: a failure here leaks an id slot, which the open sweep
+        // now recovers, while propagating would abort a reap midway.
         if let Ok((true, seq)) = staged {
             let _ = self.durable(seq);
         }
+    }
+
+    /// **D200.** One range scan of the UNRELEASED span: O(releasable), never O(ever reaped), and
+    /// O(pinned) only in the slots a failed read left keyed (W7, wall21 review audit 3: a slot
+    /// whose liveness read failed at its release is keyed even if it later proves pinned, and one
+    /// whose record cannot be read stays keyed, and refused, at every open).
+    ///
+    /// History, both versions found by review:
+    /// - The first merged the whole `Reaped` STATE span against the whole FREE_ID span at every
+    ///   open. A released slot stays `Reaped` until recycled, so a healthy open paid one key per
+    ///   branch ever reaped.
+    /// - The second held every PINNED reaped interior, up to live branches × chain depth, read
+    ///   under the statement lock at every start.
+    ///
+    /// Now the span of a catalog only ever reaped by a reaper is EMPTY (`tag::UNRELEASED` says who
+    /// puts a slot on it and who takes it off). A crash can leave the slots it interrupted, and a
+    /// release whose read or write failed leaves its slot (`release_id`). After reaper-less use it
+    /// holds every branch sealed without a reaper, until the first open with one (F6 of the
+    /// wall21 review audit). Pinned by
+    /// `d200_reap_releases_id_slots::a_healthy_open_reads_no_released_and_no_pinned_slot`. Each
+    /// entry's record is re-read, so a readable slot is offered only if `Reaped`; `Reaping` ones
+    /// belong to the resume, which runs first. An unreadable one is offered (W3).
+    fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
+        let (lo, hi) = keys::whole_group(keys::tag::UNRELEASED);
+        let mut out = Vec::new();
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, _) = entry?;
+            // The marker is not a slot.
+            let Some(id) = keys::unreleased_id_from_key(&k) else { continue };
+            self.candidate_keys.fetch_add(1, Ordering::Relaxed);
+            match self.core(id) {
+                Ok(Some(rec)) if rec.state() == BranchState::Reaped => out.push(id),
+                Ok(_) => {}
+                // **W3 (wall21 review audit 3): offered, not propagated.** This was `core(id)?`, so
+                // one undecodable keyed record failed every open. A candidate list may be a
+                // superset: the sweep's own `get_raw` meets the same error per slot and records it
+                // as a refusal with its reason (D127).
+                // **A1 (audit 4): of ANY error type.** W3 still propagated a non-`Branch` error
+                // here as "the tree's, not one slot's". But a page failure is `Corruption` or `Io`,
+                // never `Branch`, so one bad leaf under one keyed record failed every open. A point
+                // lookup is about one slot whatever its error says. The range scan's own `entry?`
+                // above is the catalog-wide read, and it stays.
+                Err(_) => out.push(id),
+            }
+        }
+        Ok(out)
     }
 
     fn attach_child(
@@ -1639,6 +2369,22 @@ impl BranchCatalog for TableBranchCatalog {
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let (removed, seq) = self.mutate(|| {
             let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
+            // D200: this does NOT put a reaped parent whose last pin it removed back on the
+            // UNRELEASED span (`b7e8d4e` did; `23d8e97` removed it). Every cascade that detaches here
+            // runs on behalf of an ORIGINATOR whose own key covers it: set at `Reaping`, kept by the
+            // flip because the originator is releasable, and removed only by its `release_id`, which
+            // runs after the cascade.
+            //
+            // ⛔ RETRACTED (F1, wall21 review audit): `23d8e97` called the parent mark "a second guard
+            // that nothing could fire". Two schedules fire it at `23d8e97`:
+            // - the cascade released each ancestor mid-walk, so after a crash a fork could recycle a
+            //   released slot, the originator's re-walk stopped there, and every ancestor above it
+            //   was stranded with no key;
+            // - `get_raw` errors were swallowed as "not Reaped", so the originator was released anyway.
+            // The covering argument holds only since `reaper::detach_cascade` detaches everything first,
+            // releases top-down after the loop, and propagates errors. Then the unreleased ancestors are
+            // always a contiguous run next to the still-keyed originator. Red tests in
+            // `tests/d200_reap_releases_id_slots.rs` (the two `a_cascade_that_…` tests).
             Ok(removed)
         })?;
         self.durable(seq)?;
@@ -3588,15 +4334,816 @@ mod tests {
         assert_eq!(c.stale_free_ids_skipped(), 2, "the next fork did not count the slot it skipped again");
         let _ = std::fs::remove_file(p);
     }
+
+    /// **Wall #21 — the witness, made to fire against each check it may not skip.**
+    ///
+    /// The integration test (`tests/wall21_reaped_chain_liveness.rs`) proves the cost. This
+    /// proves the guards, one at a time, because in production they mask each other:
+    /// `detach_from_parent` and `release_id` both ask `has_live_children` before they act, and a
+    /// NO drops the root's witness — so a mutant of `valid_witness`'s identity check can never
+    /// be reached through the reaper. Each step below drives one check directly, and re-files the
+    /// witnesses first so an earlier drop cannot pass a later step for it.
+    #[test]
+    fn a_witness_answers_only_for_the_incarnations_it_names_and_is_dropped_when_they_die() {
+        let (c, p, _pool) = cat("w21witness");
+        let t = BranchId::TRUNK.id;
+        // trunk → a → b → leaf, with a and b reaped by the catalog's own transition.
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        let leaf = c.fork(b.branch_id, LeaseDeadline(100)).unwrap();
+        for r in [&b, &a] {
+            c.set_state(r.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(r.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        let at = |r: &BranchRecord| BranchAt { id: r.branch_id.id, fork_epoch: r.fork_epoch };
+        let held = || c.witnesses.lock().unwrap().len();
+        // Since the D200 audit fix, the `Reaped` flip itself asks the liveness question (to decide
+        // the UNRELEASED span), and that files witnesses: the two flips above file one each. Emptied
+        // here so that step 1 proves the WALK files them. ⚠ CORRECTED (F4, wall21 review audit):
+        // this comment first said the leftovers "would pass step 1 for a walk that filed nothing".
+        // The actual failure was earlier: at `b7e8d4e` this test FAILED at the `held() == 0`
+        // assertion below (2 witnesses held), and `1a2853c` repaired it. That repair was not
+        // pre-registered.
+        c.witnesses.lock().unwrap().clear();
+        assert_eq!(held(), 0, "fixture: nothing has been asked yet");
+
+        // 1. FILED. A walk that reaches the leaf files it on every node it came down.
+        assert!(c.has_live_children(t).unwrap(), "fixture: trunk must see the leaf (D16)");
+        for r in [&a, &b] {
+            assert_eq!(c.valid_witness(at(r)), Some(at(&leaf)), "{:?} has no witness", r.branch_id);
+        }
+
+        // 2. THE WITNESSED NODE'S INCARNATION. A witness filed under another fork epoch of the
+        //    same slot — a recycled id — must not answer, and must be dropped.
+        let other = BranchAt { id: a.branch_id.id, fork_epoch: Epoch(a.fork_epoch.0 + 1_000) };
+        assert_eq!(c.valid_witness(other), None, "a witness answered for another incarnation");
+        assert!(!c.witnesses.lock().unwrap().contains_key(&a.branch_id.id), "stale witness kept");
+
+        // 3. THE LIVE BRANCH'S INCARNATION. This `reparent` passes a NEW epoch, so a witness
+        //    naming the old one names a branch that no longer exists as filed. (A move that keeps
+        //    the epoch is not caught — the blind spot on `witnesses` — and is not tested here.)
+        assert!(c.has_live_children(t).unwrap());
+        c.reparent(leaf.branch_id, BranchId::TRUNK, c.next_epoch(), 321).unwrap();
+        assert_eq!(c.valid_witness(at(&b)), None, "a witness answered for a reparented branch");
+
+        // 4. THE LIVE BRANCH'S STATE. Re-filed against the leaf as it is now, then the leaf dies:
+        //    the witness must stop answering, and the walk must decide NO.
+        assert!(c.has_live_children(t).unwrap(), "the leaf's CHILD entry under b still pins");
+        assert!(c.valid_witness(at(&b)).is_some(), "fixture: the walk did not re-file b");
+        c.set_state(leaf.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(leaf.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert_eq!(c.valid_witness(at(&b)), None, "a witness outlived the branch it names");
+        assert!(!c.has_live_children(t).unwrap(), "a dead chain still pins trunk");
+
+        // 5. NOTHING LEFT. Trunk's witness is the one only a NO can drop: no walk ever validates
+        //    the root it starts from.
+        assert_eq!(held(), 0, "witnesses outlived their subtree");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **D200 — a catalog from before the UNRELEASED span gets it at its first open, and once.**
+    ///
+    /// The open sweep reads only that span, so a catalog written before it existed would hide
+    /// every slot the pre-D200 cascade leaked. The fixture builds the three shapes such a catalog
+    /// holds — leaked, freed, pinned — then deletes the span and its marker, which is exactly what
+    /// a pre-D200 file looks like, and reopens it from the file alone.
+    #[test]
+    fn a_catalog_from_before_the_unreleased_span_builds_it_once_at_open() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d200-unreleased-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = BranchId::TRUNK.id;
+        let reap = |c: &TableBranchCatalog, b: BranchId| {
+            c.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+        };
+        let (leaked, pinned) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let leaked = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            reap(&c, leaked.branch_id);
+            assert!(c.detach_child(t, leaked.fork_epoch).unwrap());
+            let freed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            reap(&c, freed.branch_id);
+            assert!(c.detach_child(t, freed.fork_epoch).unwrap());
+            c.release_id(freed.branch_id.id);
+            let pinned = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            let _kid = c.fork(pinned.branch_id, LeaseDeadline(100)).unwrap();
+            reap(&c, pinned.branch_id);
+
+            // Make it a pre-D200 file: no UNRELEASED key and no marker, durably.
+            let _g = c.logical.lock().unwrap();
+            for k in [keys::unreleased(leaked.branch_id.id), keys::unreleased_index_built()] {
+                assert!(c.remove_if_present(&k).unwrap(), "fixture: set_state wrote no such key");
+            }
+            // The pinned slot may or may not hold a key, depending on the build; a pre-D200 file
+            // holds none either way.
+            let _ = c.remove_if_present(&keys::unreleased(pinned.branch_id.id));
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            assert!(
+                c.unreleased_reaped_candidates().unwrap().is_empty(),
+                "fixture: the span must be empty, as in a catalog from before it"
+            );
+            (leaked.branch_id.id, pinned.branch_id.id)
+        };
+
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let mut got = c.unreleased_reaped_candidates().unwrap();
+        got.sort_unstable();
+        // Only the RELEASABLE slot. The pinned one cannot be released while its child lives, and
+        // a span that held it would make every later open pay for it (§8.6's amendment: this
+        // expected `[leaked, pinned]` at `17cbd4c`).
+        let _ = pinned;
+        assert_eq!(got, vec![leaked], "the first open did not put exactly the releasable slot on the span");
+        assert!(c.tree.search(&keys::unreleased_index_built()).unwrap().is_some(), "no marker");
+
+        // ONCE: with the marker in place the build returns without writing.
+        let syncs = c.syncs_issued();
+        c.build_unreleased_index_if_missing().unwrap();
+        assert_eq!(c.syncs_issued(), syncs, "the build ran again on a catalog that already has it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sidecar catalog path, removed first. The tests below REOPEN the file before they assert,
+    /// so a key they check is shown WRITTEN TO THE FILE and not merely present in the pool (W9,
+    /// wall21 review audit 3). Not that it was fsynced: a same-process reopen reads through the OS
+    /// cache, so this proves `flush_all` ran, not `sync` (audit 4 A7, recorded as a known limit).
+    fn sidecar(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-w21-{tag}-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn keyed(c: &TableBranchCatalog, id: u64) -> bool {
+        c.unreleased_reaped_candidates().unwrap().contains(&id)
+    }
+
+    /// A cascade ancestor's state: fork S with a child K, flip S `Reaped` while K pins it (so the
+    /// flip takes S's key off), then detach K from S and S from trunk. S is `Reaped`, detached,
+    /// has nothing below it, and holds no key.
+    fn keyless_detached_ancestor(c: &TableBranchCatalog) -> BranchRecord {
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let k = c.fork(s.branch_id, LeaseDeadline(100)).unwrap();
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(s.branch_id.id, k.fork_epoch).unwrap(), "fixture: K had no entry");
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap(), "fixture: S had no entry");
+        assert!(!keyed(c, s.branch_id.id), "fixture: S was flipped while pinned, so it holds no key");
+        s
+    }
+
+    /// **C1 (wall21 review audit 2), read side: a release that cannot read liveness must leave the
+    /// slot where the open sweep looks.** `release_id` swallows its errors. When the liveness read
+    /// ERRS on a `Reaped` slot with no key (a pinned interior loses its key at its flip), it wrote
+    /// nothing, so the slot ended keyless and not free: stranded, silently. Here the error is a
+    /// dangling CHILD entry (D124). PRE-REGISTERED (lane §8.10): fails at the final assertion at
+    /// `fd7b5e0`, passes after the fix. **W9 (audit 3):** it asserts after a REOPEN, so a key
+    /// that never reached the disk fails it too.
+    #[test]
+    fn a_release_whose_liveness_read_fails_keeps_the_slot_keyed() {
+        let path = sidecar("c1-readfail");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            // A dangling entry under S: S's liveness now ERRS.
+            let ghost = 4242u64;
+            assert!(c.core(ghost).unwrap().is_none(), "fixture: the ghost must have no record");
+            c.upsert(keys::child(s.branch_id.id, c.next_epoch().0), ghost.to_be_bytes().to_vec())
+                .unwrap();
+            assert!(c.has_live_children(s.branch_id.id).is_err(), "fixture: S's liveness must err");
+            c.release_id(s.branch_id.id);
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, sid),
+            "C1: a release whose liveness read failed left the slot keyless and not free (or its \
+             key did not survive a reopen), so no sweep will ever retry it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **C1, write side: the key comes off only once the slot is on the free list.** Uses the
+    /// `cfg(test)` failpoint, so it is new API and is added with the fix (lane §8.10). It is not
+    /// red at any earlier commit, and it is M31's killer. **W9 (audit 3):** both assertions follow
+    /// a REOPEN.
+    #[test]
+    fn a_failed_free_list_write_leaves_the_slot_keyed() {
+        let path = sidecar("c1-freefail");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+            assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+            assert!(keyed(&c, s.branch_id.id), "fixture: a releasable flip keeps the key");
+            c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
+            c.release_id(s.branch_id.id);
+            assert!(
+                !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
+                "fixture: the injected FREE_ID failure never fired"
+            );
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(keyed(&c, sid), "C1: the key came off although the slot never reached the free list");
+
+        // And a release that succeeds takes it off, durably.
+        c.release_id(sid);
+        drop(c);
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(!keyed(&c, sid), "a successful release left the key on");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W1 (wall21 review audit 3): a KEYLESS slot whose FREE_ID write fails must be keyed.** A
+    /// cascade ancestor lost its key at its pinned flip. C1's write side only SKIPPED the key's
+    /// removal, so such an ancestor stayed keyless and not free, and the originator's release then
+    /// removed the last key a sweep could have followed to it. PRE-REGISTERED (lane §8.14): fails
+    /// at the final assertion at `9d5934f`; M36's killer.
+    #[test]
+    fn a_failed_free_list_write_keys_a_keyless_slot() {
+        let path = sidecar("w1-keyless");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            assert!(!c.has_live_children(s.branch_id.id).unwrap(), "fixture: nothing below S lives");
+            c.fail_next_free_id_upsert.store(true, Ordering::SeqCst);
+            c.release_id(s.branch_id.id);
+            assert!(
+                !c.fail_next_free_id_upsert.load(Ordering::SeqCst),
+                "fixture: the injected FREE_ID failure never fired"
+            );
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, sid),
+            "W1: a keyless slot whose FREE_ID write failed is still keyless and not free: stranded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W2 (wall21 review audit 3): a release that cannot read the slot's own record must key it.**
+    /// Its state is unknown, and a key frees nothing by itself: the sweep and `release_id` both
+    /// read the record again before acting. PRE-REGISTERED (lane §8.14): fails at the final
+    /// assertion at `9d5934f`; M37's killer.
+    #[test]
+    fn a_release_that_cannot_read_its_record_keys_the_slot() {
+        let path = sidecar("w2-coreerr");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = keyless_detached_ancestor(&c);
+            c.upsert(keys::record(s.branch_id.id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            assert!(c.core(s.branch_id.id).is_err(), "fixture: S's record must not decode");
+            c.release_id(s.branch_id.id);
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, sid),
+            "W2: a slot whose own record could not be read was left keyless and not free"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **W3 (wall21 review audit 3): one undecodable record must not fail an open.** D127's rule
+    /// held only per resumed reap. Two `?`s ran before any per-slot handling: `in_state(Reaping)`
+    /// decoded every `Reaping` record, and the candidate query decoded every keyed one. So one
+    /// corrupt record in either span failed EVERY open. PRE-REGISTERED (lane §8.14): fails at "the
+    /// open is Ok" at `9d5934f`; after the fix each is a refusal with its reason. M38 and M39.
+    #[test]
+    fn an_unreadable_record_at_open_is_a_refusal_not_a_failed_open() {
+        use crate::branch::arena::ArenaPageStore;
+        use crate::branch::reaper::TwoTierReaper;
+        let path = sidecar("w3-open");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        // R: interrupted mid-reap, so `Reaping`, and keyed since it entered `Reaping`.
+        let r = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_state(r.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        // S: reaped with nothing below it, so keyed, and detached.
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+        for id in [r.branch_id.id, s.branch_id.id] {
+            // The key itself: the candidate query offers only `Reaped` records, and R is `Reaping`.
+            assert!(
+                c.tree.search(&keys::unreleased(id)).unwrap().is_some(),
+                "fixture: slot {id} must be on the UNRELEASED span"
+            );
+            c.upsert(keys::record(id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            assert!(c.core(id).is_err(), "fixture: record {id} must not decode");
+        }
+
+        let main = std::env::temp_dir().join(format!("ferro-w21-w3-main-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&main);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&main).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+        let base = pool.disk_manager.high_water().unwrap();
+        let catalog: Arc<dyn BranchCatalog> = c.clone();
+        let store =
+            Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap());
+        let reaper = TwoTierReaper::new(catalog, store);
+
+        let resumed = reaper
+            .resume_interrupted_reaps()
+            .expect("W3: one undecodable record failed the whole open");
+        assert!(resumed.is_empty(), "an unreadable record was reported as resumed: {resumed:?}");
+        assert_eq!(reaper.refused_reaps(), 1, "R's declined resume was not counted");
+        let why = reaper.open_slot_refusals();
+        let r_tag = format!("interrupted reap of slot {}", r.branch_id.id);
+        let s_tag = format!("slot {}:", s.branch_id.id);
+        assert!(why.iter().any(|w| w.starts_with(&r_tag)), "R's refusal has no reason: {why:?}");
+        assert!(why.iter().any(|w| w.starts_with(&s_tag)), "S's refusal has no reason: {why:?}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **W3 (wall21 review audit 3), the one-time build: one undecodable `Reaped` record must not
+    /// stop the build, and with it the open.** `open_from_header` runs the build and propagates its
+    /// error, and the build re-read each `Reaped`-indexed slot with `core(id)?`. So a catalog from
+    /// before the UNRELEASED span with one corrupt `Reaped` record could not be opened at all.
+    /// PRE-REGISTERED (lane §8.14 amendment 1): fails at the reopen at `9d5934f`; M43's killer.
+    #[test]
+    fn an_unreadable_reaped_record_does_not_stop_the_one_time_build() {
+        let path = sidecar("w3-build");
+        let sid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+            assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+            // A pre-D200 file holding one corrupt `Reaped` record, durably.
+            let _g = c.logical.lock().unwrap();
+            assert!(
+                c.remove_if_present(&keys::unreleased(s.branch_id.id)).unwrap(),
+                "fixture: a releasable flip keys S"
+            );
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            c.upsert(keys::record(s.branch_id.id), vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            s.branch_id.id
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1)
+            .expect("W3: one undecodable Reaped record failed the one-time build, and so the open");
+        assert!(c.core(sid).is_err(), "fixture: S's record must still not decode");
+        assert!(keyed(&c, sid), "W3: the build left an unreadable Reaped slot off the span");
+        assert!(c.tree.search(&keys::unreleased_index_built()).unwrap().is_some(), "no marker");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `TwoTierReaper` over `c`, with a fresh main file of its own, as an open builds one. Returns
+    /// the main file's path too, for the caller to remove.
+    fn reaper_over(
+        c: &Arc<TableBranchCatalog>,
+        tag: &str,
+    ) -> (crate::branch::reaper::TwoTierReaper, std::path::PathBuf) {
+        let main =
+            std::env::temp_dir().join(format!("ferro-w21-{tag}-main-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&main);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&main).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+        let base = pool.disk_manager.high_water().unwrap();
+        let catalog: Arc<dyn BranchCatalog> = c.clone();
+        let store = Arc::new(
+            crate::branch::arena::ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base)
+                .unwrap(),
+        );
+        (crate::branch::reaper::TwoTierReaper::new(catalog, store), main)
+    }
+
+    /// T → A → B, both flipped `Reaped` while nothing below them lives (so both are keyed), then a
+    /// stale CHILD entry under B naming A: a cycle. Planted AFTER the flips, because before A5 a
+    /// liveness question over a cycle need not terminate. Returns (A, B).
+    fn cycle_of_two(c: &TableBranchCatalog) -> (u64, u64) {
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        for x in [&b, &a] {
+            c.set_state(x.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(x.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        c.upsert(keys::child(b.branch_id.id, c.next_epoch().0), a.branch_id.id.to_be_bytes().to_vec())
+            .unwrap();
+        (a.branch_id.id, b.branch_id.id)
+    }
+
+    /// **A3 (wall21 review audit 4): a `Reaping` state key whose record is not `Reaping` is
+    /// refused, never reaped.** The resume took every record a `Reaping` STATE key named, and
+    /// `reap` compare-and-sets from the state it READ, so a stale key on a `Live` record flipped
+    /// and freed a live branch. The producers are corruption-class (a torn flush; a record-less key
+    /// whose id is later minted), and the answer must still never be the destructive one.
+    /// PRE-REGISTERED (lane §8.16): fails at "A3: … reaped a Live branch" at `0e3c36a`; M50's
+    /// killer.
+    #[test]
+    fn a_stale_reaping_key_on_a_live_record_is_refused_not_reaped() {
+        let path = sidecar("a3-stale");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        let lid = l.branch_id.id;
+        c.upsert(keys::state(BranchState::Reaping.as_u8(), lid), Vec::new()).unwrap();
+        assert_eq!(
+            c.ids_in_state(BranchState::Reaping).unwrap(),
+            vec![lid],
+            "fixture: exactly L's stale key must be in the Reaping index"
+        );
+
+        let (reaper, main) = reaper_over(&c, "a3-stale");
+        let resumed = reaper.resume_interrupted_reaps().expect("a stale key must not fail the open");
+        assert_eq!(
+            c.get_raw(lid).unwrap().state,
+            BranchState::Live,
+            "A3: a stale Reaping key made the open reap a Live branch"
+        );
+        assert!(resumed.is_empty(), "a refused record was reported as resumed: {resumed:?}");
+        assert_eq!(reaper.refused_reaps(), 1, "the refusal was not counted");
+        let why = reaper.open_slot_refusals();
+        let tag = format!("interrupted reap of slot {lid}");
+        assert!(
+            why.iter().any(|w| w.starts_with(&tag) && w.contains("Live")),
+            "the refusal does not name L and the state its record is in: {why:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **A4 (wall21 review audit 4): the build keys a cycle member with nothing below it.** The pass
+    /// counts a back-edge as nothing below. Counting it as a pin (M51) leaves both members keyless:
+    /// the LEAK direction, since nothing else would ever lead a sweep to them. PRE-REGISTERED (lane
+    /// §8.16): passes at `0e3c36a`; it exists to kill M51.
+    #[test]
+    fn the_build_keys_a_cycle_member_with_nothing_below() {
+        let path = sidecar("a4-cycle");
+        let (a, b) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let (a, b) = cycle_of_two(&c);
+            // The pre-D200 state: no key and no marker, written to the file.
+            let _g = c.logical.lock().unwrap();
+            for id in [a, b] {
+                assert!(
+                    c.remove_if_present(&keys::unreleased(id)).unwrap(),
+                    "fixture: slot {id} was flipped releasable, so it was keyed"
+                );
+            }
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            (a, b)
+        };
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        assert!(
+            keyed(&c, a) && keyed(&c, b),
+            "A4: the build left a cycle member with nothing below it keyless (M51, the leak direction)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A1 (wall21 review audit 4): an `Io` error reading one keyed record is that slot's
+    /// refusal, at every per-slot read at open.** A page failure is `Corruption` or `Io`, never
+    /// `Branch`, so this is what one bad leaf under one record looks like. Uses the
+    /// `io_fault_core_of` failpoint, which is new API, so the test is added with the fix and is red
+    /// only under the mutants it kills (lane §8.16): M48 (the candidate query), M49 (the build) and
+    /// M46 (the sweep's read).
+    #[test]
+    fn an_io_error_reading_one_keyed_record_is_that_slots_refusal() {
+        let path = sidecar("a1-io");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let s = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let sid = s.branch_id.id;
+        c.set_state(s.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        c.set_state(s.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        assert!(c.detach_child(BranchId::TRUNK.id, s.fork_epoch).unwrap());
+        assert!(keyed(&c, sid), "fixture: a releasable flip keys S");
+        c.io_fault_core_of.store(sid, Ordering::SeqCst);
+        assert!(matches!(c.core(sid), Err(FerroError::Io(_))), "fixture: S's record read must fail with Io");
+
+        // The candidate query offers S (M48).
+        let offered =
+            c.unreleased_reaped_candidates().expect("A1: the candidate query failed on one slot's Io");
+        assert!(offered.contains(&sid), "A1: the candidate query dropped the unreadable slot: {offered:?}");
+
+        // The one-time build keys S (M49). S's key and the marker go first, so the build runs.
+        {
+            let _g = c.logical.lock().unwrap();
+            assert!(c.remove_if_present(&keys::unreleased(sid)).unwrap(), "fixture: S was keyed");
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+        }
+        c.build_unreleased_index_if_missing().expect("A1: the one-time build failed on one slot's Io");
+        assert!(
+            c.tree.search(&keys::unreleased(sid)).unwrap().is_some(),
+            "A1: the build left the unreadable slot off the span"
+        );
+
+        // The open refuses S, with its reason, and frees nothing (M46).
+        let (reaper, main) = reaper_over(&c, "a1-io");
+        let resumed = reaper.resume_interrupted_reaps().expect("A1: one slot's Io failed the whole open");
+        assert!(resumed.is_empty(), "nothing was Reaping, so nothing may be resumed: {resumed:?}");
+        let why = reaper.open_slot_refusals();
+        let tag = format!("slot {sid}:");
+        assert!(
+            why.iter().any(|w| w.starts_with(&tag) && w.contains("injected: the record of slot")),
+            "A1: S's refusal is missing or lost its reason: {why:?}"
+        );
+        assert!(c.tree.search(&keys::free_id(sid)).unwrap().is_none(), "an unreadable slot was freed");
+        c.io_fault_core_of.store(u64::MAX, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **A5 (wall21 review audit 4): a cycle of stale CHILD entries cannot hang an open.**
+    /// `has_live_children` had no visited set, and the open's sweep asks it of every keyed slot, so
+    /// a cycle hung the open one step after the build (whose pass already tolerated it). No
+    /// producer is known; the hang is made unrepresentable instead. The `liveness_walk_budget`
+    /// failpoint (new API, so this is added with the fix) turns a walk that goes round into an
+    /// `Err`, so M54, which removes the visited set, FAILS here instead of hanging (lane §8.16).
+    #[test]
+    fn a_cycle_of_stale_entries_cannot_hang_an_open() {
+        let path = sidecar("a5-cycle");
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let (a, b) = cycle_of_two(&c);
+        assert!(keyed(&c, a) && keyed(&c, b), "fixture: both flips were releasable, so both are keyed");
+        // An exact walk here enters at most 2 nodes; one that goes round passes 64 at once.
+        c.liveness_walk_budget.store(64, Ordering::SeqCst);
+        for id in [a, b] {
+            let got = c.has_live_children(id);
+            assert!(matches!(got, Ok(false)), "A5: the liveness walk from slot {id} did not end: {got:?}");
+        }
+
+        let (reaper, main) = reaper_over(&c, "a5-cycle");
+        reaper.resume_interrupted_reaps().expect("A5: the open failed over a cycle");
+        let why = reaper.open_slot_refusals();
+        assert!(why.is_empty(), "the open refused a cycle member: {why:?}");
+        for id in [a, b] {
+            assert!(
+                c.tree.search(&keys::free_id(id)).unwrap().is_some(),
+                "A5: the open did not give back cycle member {id}"
+            );
+        }
+        c.liveness_walk_budget.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **D264 (wall21 review audit 5, B2): a failed record write must leave the slot in a STATE
+    /// span.** `write_record` removed STATE(old) before it upserted the new RECORD, so an error
+    /// between them left a `Reaping` record that no STATE key names: the resume enumerates the STATE
+    /// span, so nothing ever resumes it, and its parent reads it as a live child for ever. Any later
+    /// `durable` flushes that state, as the next unit's does at open or in a lease scan. Uses the
+    /// `fail_next_record_upsert` failpoint, which the red commit adds with this test.
+    /// PRE-REGISTERED (lane §8.18): fails at "D264: … no STATE key names it" at the red commit;
+    /// kills M62, and its `set_root` part kills M63.
+    #[test]
+    fn a_failed_record_write_leaves_the_slot_in_a_state_span() {
+        use crate::branch::types::BranchState::{Live, Reaped, Reaping};
+        let path = sidecar("d264");
+        let rid = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let r = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            c.set_state(r.branch_id, Live, Reaping).unwrap();
+            c.fail_next_record_upsert.store(true, Ordering::SeqCst);
+            assert!(
+                c.set_state(r.branch_id, Reaping, Reaped).is_err(),
+                "fixture: the injected RECORD failure must fail the flip"
+            );
+            assert!(
+                !c.fail_next_record_upsert.load(Ordering::SeqCst),
+                "fixture: the injected RECORD failure never fired"
+            );
+            let rid = r.branch_id.id;
+            let named = [Live, Reaping, Reaped]
+                .into_iter()
+                .any(|s| c.ids_in_state(s).unwrap().contains(&rid));
+            assert!(
+                named,
+                "D264: the failed flip removed R's STATE key before rewriting its record, so no \
+                 STATE key names it: nothing will ever resume it"
+            );
+            // Any later `durable` flushes the pool, as any unit's would.
+            c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+            rid
+        };
+        let c = Arc::new(TableBranchCatalog::open_sidecar(&path, 1).unwrap());
+        let (reaper, main) = reaper_over(&c, "d264");
+        let resumed = reaper.resume_interrupted_reaps().expect("the open must succeed");
+        assert!(
+            resumed.iter().any(|b| b.id == rid),
+            "D264: the torn flip's record was not resumed: resumed {resumed:?}, refusals {:?}",
+            reaper.open_slot_refusals()
+        );
+        assert_eq!(c.get_raw(rid).unwrap().state, Reaped, "the resumed reap did not finish");
+
+        // M63: a rewrite whose state and deadline are unchanged must keep both index keys.
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        c.set_root(l.branch_id, 7).unwrap();
+        assert!(
+            c.ids_in_state(Live).unwrap().contains(&l.branch_id.id),
+            "an unchanged state's STATE key was removed by its own rewrite"
+        );
+        assert!(
+            c.expired_before(1_000).unwrap().iter().any(|r| r.branch_id().id == l.branch_id.id),
+            "an unchanged deadline's DEADLINE key was removed by its own rewrite"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&main);
+    }
+
+    /// **B3 (wall21 review audit 5): a liveness question asked from ABOVE a cycle ends.** A5's test
+    /// asks only from inside the cycle, where the root check alone ends the walk, so M54′ (which
+    /// keeps only the root check and drops `pushed`) survived it. From P above A ↔ B, only `pushed`
+    /// stops the walk. The flips run BEFORE the cycle is planted, so no fixture step can loop under
+    /// the mutant. PRE-REGISTERED (lane §8.18): passes at `0c64402`; kills M54′ through the budget.
+    #[test]
+    fn a_question_from_above_a_cycle_ends() {
+        let path = sidecar("b3-above");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let p = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let a = c.fork(p.branch_id, LeaseDeadline(100)).unwrap();
+        let b = c.fork(a.branch_id, LeaseDeadline(100)).unwrap();
+        for x in [&b, &a, &p] {
+            c.set_state(x.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+            c.set_state(x.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+        }
+        c.upsert(keys::child(b.branch_id.id, c.next_epoch().0), a.branch_id.id.to_be_bytes().to_vec())
+            .unwrap();
+        c.liveness_walk_budget.store(64, Ordering::SeqCst);
+        let got = c.has_live_children(p.branch_id.id);
+        assert!(matches!(got, Ok(false)), "B3: a question from above the cycle did not end: {got:?}");
+        c.liveness_walk_budget.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E3 (wall21 review audit 6): a `Live` record re-deadlined twice appears ONCE in
+    /// `expired_before`.** A torn renew (the new DEADLINE key written, the old one's removal failed)
+    /// leaves a stale key that no later rewrite names, because the removal is keyed on the previous
+    /// record's deadline. `expired_before` pushed the record once per key it scanned, so while the
+    /// record was `Live` and expired the reaper saw it twice, and the second row became a spurious
+    /// refusal. Uses the `fail_next_deadline_remove` failpoint, which the red commit adds.
+    /// PRE-REGISTERED (lane §8.20): fails at the first count at the red commit; kills M66.
+    #[test]
+    fn a_live_record_re_deadlined_twice_appears_once() {
+        let path = sidecar("e3-dedup");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let lid = l.branch_id.id;
+        let rows = |c: &TableBranchCatalog| {
+            c.expired_before(1_000).unwrap().iter().filter(|r| r.branch_id().id == lid).count()
+        };
+        c.fail_next_deadline_remove.store(true, Ordering::SeqCst);
+        assert!(
+            c.renew_lease(l.branch_id, LeaseDeadline(200)).is_err(),
+            "fixture: the injected removal must fail the renew"
+        );
+        assert!(
+            !c.fail_next_deadline_remove.load(Ordering::SeqCst),
+            "fixture: the injected DEADLINE removal never fired"
+        );
+        assert_eq!(rows(&c), 1, "E3: a torn renew left two DEADLINE keys, and L was named once per key");
+        c.renew_lease(l.branch_id, LeaseDeadline(300)).unwrap();
+        assert_eq!(rows(&c), 1, "E3: after a second renew the stale key still duplicated L");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E4 (wall21 review audit 6): a failed move INTO `Live` never leaves a `Live` record without
+    /// its DEADLINE key.** `write_record` upserted DEADLINE(new) after the RECORD, so a move from an
+    /// unindexed state (`release_from_quarantine`, a fork's recycle) that failed there left a `Live`
+    /// record that never expires and is never reaped. Uses the `fail_next_deadline_upsert`
+    /// failpoint, which the red commit adds. PRE-REGISTERED (lane §8.20): fails at the first
+    /// assertion at the red commit; kills M67.
+    #[test]
+    fn a_move_into_live_that_fails_never_leaves_a_live_record_unindexed() {
+        let path = sidecar("e4-deadline");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let lid = l.branch_id.id;
+        let indexed =
+            |c: &TableBranchCatalog| c.expired_before(1_000).unwrap().iter().any(|r| r.branch_id().id == lid);
+        c.set_state(l.branch_id, BranchState::Live, BranchState::Quarantined).unwrap();
+        assert!(!indexed(&c), "fixture: a Quarantined branch is not in the deadline index");
+        c.fail_next_deadline_upsert.store(true, Ordering::SeqCst);
+        assert!(
+            c.set_state(l.branch_id, BranchState::Quarantined, BranchState::Live).is_err(),
+            "fixture: the injected DEADLINE failure must fail the move"
+        );
+        assert!(
+            !c.fail_next_deadline_upsert.load(Ordering::SeqCst),
+            "fixture: the injected DEADLINE upsert failure never fired"
+        );
+        let state = c.get_raw(lid).unwrap().state;
+        assert!(
+            state != BranchState::Live || indexed(&c),
+            "E4: the failed move left a Live record with no DEADLINE key: it never expires"
+        );
+        assert_eq!(state, BranchState::Quarantined, "the failed move must leave the record in its old state");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **E6 (wall21 review audit 6): a stale STATE key must not list a record that is in another
+    /// state.** Since D264 a torn move can leave a stale STATE key, and `in_state` did not re-check
+    /// the record, so `in_state(Quarantined)` (the `ferro_quarantine` view) could list a `Live` or
+    /// even a reaped branch as held. PRE-REGISTERED (lane §8.20): fails at `04aab74`; kills M68.
+    #[test]
+    fn a_stale_quarantined_key_does_not_list_a_live_branch() {
+        let path = sidecar("e6-stale");
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let l = c.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+        let lid = l.branch_id.id;
+        c.upsert(keys::state(BranchState::Quarantined.as_u8(), lid), Vec::new()).unwrap();
+        assert!(
+            c.ids_in_state(BranchState::Quarantined).unwrap().contains(&lid),
+            "fixture: the stale Quarantined key must be in the index"
+        );
+        let ids = |s: BranchState| -> Vec<u64> {
+            c.in_state(s).unwrap().iter().map(|r| r.branch_id.id).collect()
+        };
+        let held = ids(BranchState::Quarantined);
+        assert!(!held.contains(&lid), "E6: a stale Quarantined key listed a Live branch as held: {held:?}");
+        assert!(ids(BranchState::Live).contains(&lid), "control: in_state(Live) must still list L");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **New-wall audit round 2: the one-time build must not be wall #21 again.** It asked
+    /// `has_live_children` for every unreleased `Reaped` slot. Over a DEAD chain that is still
+    /// attached, each question walks everything below the slot, and a NO files no witness, so the
+    /// build costs D(D+1)/2 CHILD-span scans. A memoised bottom-up pass scans each span once.
+    /// PRE-REGISTERED (lane §8.12): 2087 at `7b96554`, which fails the bound; 68 after the fix.
+    #[test]
+    fn the_one_time_build_scans_each_child_span_once() {
+        const D: usize = 64;
+        const K: usize = 4;
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d200-buildcost-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (dead, pinned) = {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            let reap = |b: BranchId| {
+                c.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+                c.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+            };
+            // A DEAD chain, still attached: every link Reaped, nothing alive below any of them.
+            let mut dead = Vec::with_capacity(D);
+            let mut parent = BranchId::TRUNK;
+            for _ in 0..D {
+                parent = c.fork(parent, LeaseDeadline(100)).unwrap().branch_id;
+                dead.push(parent);
+            }
+            for b in &dead {
+                reap(*b);
+            }
+            // A PINNED chain: K reaped interiors above a live leaf. None of them may be keyed.
+            let mut pinned = Vec::with_capacity(K);
+            let mut parent = BranchId::TRUNK;
+            for _ in 0..K {
+                parent = c.fork(parent, LeaseDeadline(100)).unwrap().branch_id;
+                pinned.push(parent);
+            }
+            let _leaf = c.fork(parent, LeaseDeadline(100)).unwrap();
+            for b in &pinned {
+                reap(*b);
+            }
+            // The pre-D200 state: no UNRELEASED key and no marker, durably.
+            let _g = c.logical.lock().unwrap();
+            for b in dead.iter().chain(pinned.iter()) {
+                let _ = c.remove_if_present(&keys::unreleased(b.id));
+            }
+            assert!(c.remove_if_present(&keys::unreleased_index_built()).unwrap(), "fixture: no marker");
+            let seq = c.stage().unwrap();
+            drop(_g);
+            c.durable(seq).unwrap();
+            let ids = |v: &Vec<BranchId>| v.iter().map(|b| b.id).collect::<Vec<u64>>();
+            (ids(&dead), ids(&pinned))
+        };
+
+        // The build runs inside this open, on a fresh catalog, so the counter is its whole cost.
+        let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+        let spans = c.child_spans_scanned();
+        let mut got = c.unreleased_reaped_candidates().unwrap();
+        got.sort_unstable();
+        let mut want = dead.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "the build must key every dead link and no pinned interior {pinned:?}");
+        assert!(
+            spans <= (2 * (D + K)) as u64,
+            "the one-time build scanned {spans} CHILD spans for {D} dead and {K} pinned reaped slots; \
+             a per-slot walk costs D(D+1)/2 = {} over the dead chain alone",
+            D * (D + 1) / 2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// See [`TableBranchCatalog::child_liveness`].
 enum ChildLiveness {
-    /// A live child: its parent is pinned by it.
-    Live,
-    /// A reaped child that may still have live descendants (D16). Carries its id so the caller
-    /// can explore it without recursing.
-    ReapedWithSubtree(u64),
+    /// A live child: its parent is pinned by it. Carries the child, so a walk that stops here can
+    /// file it as a witness; `None` for an entry written before the value carried an id.
+    Live(Option<BranchAt>),
+    /// A reaped child that may still have live descendants (D16). Carries it so the caller can
+    /// check its witness or explore it without recursing.
+    ReapedWithSubtree(BranchAt),
     // There is deliberately no `Gone` variant. It existed until D124 and meant "no record at all
     // — a stale hint, pinning nothing", and `has_live_children` skipped it, so a child whose
     // record could not be read let the parent be reclaimed. A missing record is now an ERROR
@@ -3615,3 +5162,46 @@ enum EnvelopeWrite {
     Remove,
 }
 
+
+/// One incarnation of a branch: its slot id and the epoch it was forked at. A recycled slot is
+/// forked at a fresh epoch, so a witness keyed by the pair cannot come to name a different
+/// branch. ⚠ It does NOT pin the branch's PLACE: `reparent` keeps the epoch if its caller passes
+/// the old one, and the designed splice does exactly that (the blind spot on `witnesses`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BranchAt {
+    id: u64,
+    fork_epoch: Epoch,
+}
+
+/// **Wall #21.** "Below the incarnation of this slot forked at `of`, `live` was found alive." See
+/// [`TableBranchCatalog::valid_witness`] for when it may be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Witness {
+    of: Epoch,
+    live: BranchAt,
+}
+
+/// What `liveness_below` found below one slot. See its precedence note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Below {
+    Pin,
+    Unknown,
+    Clear,
+}
+
+/// A slot `liveness_below` has entered and not finished: the reaped kids it still waits on, and
+/// whether resolving one of its own entries erred.
+struct Frame {
+    err: bool,
+    kids: Vec<u64>,
+}
+
+/// A node a `has_live_children` walk has reached: `fork_epoch` is `None` only for the root, which
+/// the caller names by id alone, and `up` is the index in the walk's `visited` of the node whose
+/// span it was found in, so a live find can be filed back up the path the walk came down.
+#[derive(Debug, Clone, Copy)]
+struct Visited {
+    id: u64,
+    fork_epoch: Option<Epoch>,
+    up: Option<usize>,
+}

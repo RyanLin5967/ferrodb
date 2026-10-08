@@ -1,0 +1,33 @@
+step=i_audit2 sha=7f23ceec31086147a6dc4541d8f4998d563c6e6f
+cmd=cargo test --test d200_reap_releases_id_slots -- a_cascade_that --nocapture
+2026-09-24T23:01:34Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.07s
+     Running tests/d200_reap_releases_id_slots.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d200_reap_releases_id_slots-afa85a8f8f13df19)
+
+running 2 tests
+F1 schedule 2: reap(L) -> Ok(())
+
+thread 'a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator' (363526405) panicked at tests/d200_reap_releases_id_slots.rs:494:5:
+assertion `left == right` failed: F1: a parent read that failed mid-cascade let the reap release the originator and remove the only key, stranding every reaped ancestor above it
+  left: [3]
+ right: [1, 2, 3]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator ... FAILED
+
+thread 'a_cascade_that_fails_part_way_strands_no_ancestor' (363526406) panicked at tests/d200_reap_releases_id_slots.rs:464:5:
+assertion `left == right` failed: F1: a slot the failed cascade had released was recycled, the sweep's walk stopped there, and an ancestor above it was stranded with no key
+  left: [2, 3]
+ right: [1, 2, 3]
+test a_cascade_that_fails_part_way_strands_no_ancestor ... FAILED
+
+failures:
+
+failures:
+    a_cascade_that_cannot_read_a_parent_fails_instead_of_releasing_the_originator
+    a_cascade_that_fails_part_way_strands_no_ancestor
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.18s
+
+error: test failed, to rerun pass `--test d200_reap_releases_id_slots`
+rc=101

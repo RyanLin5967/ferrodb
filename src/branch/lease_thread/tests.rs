@@ -1178,3 +1178,29 @@ fn d127_the_trait_sweep_counts_a_refusal_it_cannot_report() {
          Live-only and resume_interrupted_reaps runs at open, not per tick."
     );
 }
+
+/// **Audit 4 A2 and A6 (wall21 review): each refusal at open is worded for its source, and none
+/// promises a retry that cannot succeed.** No test read these lines before, so swapping two arms
+/// survived every test (audit 4 Q5). Kills M55 (lane §8.16).
+#[test]
+fn each_open_refusal_is_worded_for_its_source() {
+    let slot = super::open_refusal_line("slot 7: branch error: x");
+    let unread = super::open_refusal_line("interrupted reap of slot 7: its record cannot be read: y");
+    let resumed = super::open_refusal_line("resumed reap of b7@g0: branch error: z");
+    assert!(slot.contains("did not give back an id slot"), "the swept slot's line: {slot}");
+    assert!(unread.contains("did not resume an interrupted reap"), "the unreadable record's line: {unread}");
+    assert!(resumed.contains("a resumed reap stopped part-way"), "the resumed reap's line: {resumed}");
+    assert!(
+        slot.contains("at every open") && unread.contains("at every open"),
+        "A2: a persistent fault's line must say it repeats at every open:\n{slot}\n{unread}"
+    );
+    assert!(resumed.contains("by a later drain"), "A6: the drain's retry is not named: {resumed}");
+    for (line, why) in [
+        (&slot, "slot 7: branch error: x"),
+        (&unread, "interrupted reap of slot 7: its record cannot be read: y"),
+        (&resumed, "resumed reap of b7@g0: branch error: z"),
+    ] {
+        assert!(!line.contains("the next open asks again"), "A2: a line still promises a retry: {line}");
+        assert!(line.ends_with(why), "the line lost the refusal it reports: {line}");
+    }
+}
