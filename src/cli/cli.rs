@@ -217,12 +217,48 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    txn.checkpoint()?;
-    // Persist where the arena starts and what it has allocated. Without this the next open finds
-    // no checkpoint, refuses to reattach, and the branch tree written this session is unreachable.
-    store.checkpoint(Path::new(&arena_path))?;
+    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
+}
+
+/// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
+/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs.
+///
+/// 1. **D244 review F7.** The branch catalog publishes its root and syncs. A publish that failed on
+///    a mutation's exit is otherwise retried only by the next mutation or the next sync
+///    (`durable()` publishes an owed root first, D244 review 2), and a quiet exit may have neither.
+///    If split pages have already reached the disk through an eviction, the header would still name
+///    the old root, and the next open would refuse. That eviction case is what this call still
+///    buys over `durable()`'s own publish.
+/// 2. The database's checkpoint.
+/// 3. Persist where the arena starts and what it has allocated. Without this the next open finds no
+///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable. It
+///    runs after the branch catalog's sync, so the map it writes is taken after the catalog's last
+///    durable write.
+///
+/// Every step runs whatever the ones before it returned, and the errors come back in step order,
+/// the first returned and any later one printed. A failed publish must not also cost the database
+/// and the arena their checkpoints (D244 review 3, R3-F2), which is the shape
+/// `rollback-index-orphan` already gives its two checkpoints (its review 2, C2).
+pub fn exit_sequence(
+    branches: &TableBranchCatalog,
+    txn: &TxnManager,
+    store: &ArenaPageStore,
+    arena_path: &Path,
+) -> Result<(), FerroError> {
+    let published = branches.publish_root_durably();
+    let wal_checkpoint = txn.checkpoint();
+    let arena_checkpoint = store.checkpoint(arena_path);
+    let mut errors = [published, wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
+    let first = errors.next();
+    for later in errors {
+        eprintln!("ferrodb: a later exit step failed as well ({later})");
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {

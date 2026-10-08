@@ -51,7 +51,8 @@ fn table_catalog_add_arena_survives_a_reopen() {
         "add_arena wrote {} of 64 arenas durably. The reaper frees exactly `record.arenas`, so \
          every arena missing here is an extent reserved in the free-space map that no branch \
          owns and nothing will ever free -- a permanent leak across a restart. `add_arena` is \
-         the only mutating method in TableBranchCatalog that never calls stage()/durable().",
+         the only mutating method in TableBranchCatalog that never went through \
+         mutate()/durable() (stage()/durable() before D244).",
         back.arenas.len()
     );
 }
