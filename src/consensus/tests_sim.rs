@@ -135,10 +135,19 @@ impl<const D: u32> RefNode<D> {
         self.log.get((r - 1) as usize).map(|e| e.term).unwrap_or(0)
     }
 
-    /// A rolling hash of the durable prefix, for the divergence detector `AppendResp` carries.
-    fn digest(&self) -> u64 {
+    /// A rolling hash of the prefix through `round`, for the divergence detector `AppendResp`
+    /// carries.
+    ///
+    /// **Through the round the message actually claims, not through everything this node happens to
+    /// have fsynced.** `mod.rs` specifies the leader's half — "a leader whose own digest at that
+    /// round disagrees latches the follower as diverged and stops counting it toward quorum" — so a
+    /// digest describing a longer prefix than `matched` names is a number the leader cannot compare
+    /// the way the contract says to compare it. A follower still holding a deposed leader's fsynced
+    /// suffix would be latched as diverged while being perfectly healthy, which is precisely the
+    /// case the digest exists to distinguish from real corruption.
+    fn digest_at(&self, round: Round) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for e in self.log.iter().take(self.durable as usize) {
+        for e in self.log.iter().take(round as usize) {
             for v in [e.term, e.round] {
                 h ^= v;
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -330,7 +339,18 @@ impl<const D: u32> RefNode<D> {
                 let granted = m.term > self.term
                     && no_leader_lately
                     && self.log_is_up_to_date(last_term, last_round);
-                out.push(self.send(m.from, self.term, Body::PreVoteResp { granted }));
+                // **A grant answers at the ENVELOPE's term; a refusal at this node's own.**
+                //
+                // A pre-vote travels at `term + 1` while nobody raises a term, so a voter whose own
+                // term is behind the campaigner's would answer *below* it — and `mod.rs`'s universal
+                // rule discards a message from an earlier term unread, without even a refusal,
+                // because a response is not a request. The grant is silently lost and the campaign
+                // stalls for another election window. Refusing at the responder's own term is the
+                // opposite case and is deliberate: it is the only way a node that restarted behind
+                // the cluster ever learns the real term when no leader is reachable. See the
+                // `PreVoteResp` arm below, which is where that is acted on.
+                let reply_term = if granted { m.term } else { self.term };
+                out.push(self.send(m.from, reply_term, Body::PreVoteResp { granted }));
             }
             Body::PreVoteResp { granted } => {
                 // **A refused pre-vote carries a real term, and this is the only place it can be
@@ -501,7 +521,7 @@ impl<const D: u32> RefNode<D> {
                 if fresh.is_empty() {
                     // Nothing was handed to the disk, so the durable watermark is already honest.
                     let d = self.ack_through.min(self.durable);
-                    let dig = self.digest();
+                    let dig = self.digest_at(d);
                     out.push(self.send(
                         m.from,
                         self.term,
@@ -509,7 +529,7 @@ impl<const D: u32> RefNode<D> {
                     ));
                 } else if Self::has(D_ACK_ON_RECEIPT) {
                     let claimed = self.ack_through;
-                    let dig = self.digest();
+                    let dig = self.digest_at(claimed);
                     out.push(self.send(
                         m.from,
                         self.term,
@@ -591,7 +611,7 @@ impl<const D: u32> RefNode<D> {
             if let Some(l) = self.leader {
                 self.ack_owed = false;
                 let d = self.ack_through.min(self.durable);
-                let dig = self.digest();
+                let dig = self.digest_at(d);
                 out.push(self.send(
                     l,
                     self.term,
@@ -789,16 +809,38 @@ fn a_healthy_five_node_cluster_elects_one_leader_and_commits_what_clients_propos
 
 /// **Breaking shape:** anything drawn from outside the seed — a clock, a `HashMap` iteration order —
 /// would make a failing seed unreplayable, which is the one thing this simulator has to promise.
+///
+/// Three assertions, deliberately overlapping. The digest is a fingerprint and could in principle
+/// collide; the whole `Report` is a wider one; and the committed history plus every node's durable
+/// log is the thing anybody actually cares about being the same. A review found the digest hashing
+/// only message *variant tags*, so two runs that committed different commands would have shared
+/// one — the digest was widened, and these two direct comparisons were added so the claim no longer
+/// rests on a hash at all.
 #[test]
 fn the_same_seed_replays_the_same_run() {
     for seed in [1u64, 2, 99, 0x5EED_BEEF] {
-        let a = Sim::<Correct>::new(seed, chaos_cfg()).run().expect("seed a");
-        let b = Sim::<Correct>::new(seed, chaos_cfg()).run().expect("seed b");
+        let mut a = Sim::<Correct>::new(seed, chaos_cfg());
+        let ra = a.run().expect("seed a");
+        let mut b = Sim::<Correct>::new(seed, chaos_cfg());
+        let rb = b.run().expect("seed b");
         assert_eq!(
-            a.digest, b.digest,
+            ra.digest, rb.digest,
             "seed {seed} produced two different runs, so no failure it finds can be replayed"
         );
-        assert_eq!(a, b, "seed {seed} produced different totals across two runs");
+        assert_eq!(ra, rb, "seed {seed} produced different totals across two runs");
+        assert_eq!(
+            a.committed(),
+            b.committed(),
+            "seed {seed} committed different commands on two runs of the same seed"
+        );
+        for n in a.cluster().members() {
+            assert_eq!(
+                a.durable_log(*n),
+                b.durable_log(*n),
+                "seed {seed} left {n} with a different durable log on two runs"
+            );
+            assert_eq!(a.hard_state(*n), b.hard_state(*n), "seed {seed} left {n} in a different term");
+        }
     }
 }
 

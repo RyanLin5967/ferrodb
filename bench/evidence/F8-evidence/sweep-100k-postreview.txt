@@ -1,0 +1,12 @@
+at_most_one_leader_per_term: 100000 seeds, 354906 elections, 3039981 committed rounds, max term 12
+test consensus::sim::tests_sim::at_most_one_leader_per_term_across_a_chaos_sweep ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 843 filtered out; finished in 45.08s
+
+a_committed_round_is_never_lost: 100000 seeds, 3037335 committed rounds, 410974 crashes, 337535 restarts
+test consensus::sim::tests_sim::a_committed_round_is_never_lost_across_a_chaos_sweep ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 843 filtered out; finished in 43.65s
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 843 filtered out; finished in 52.39s
+
