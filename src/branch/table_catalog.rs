@@ -23,12 +23,13 @@
 //!
 //! See `SCALE-DESIGN.md` D2b.
 
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::branch::group_commit::CommitGroup;
-use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+use crate::branch::record::{parent_entry_holders, BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
@@ -287,11 +288,19 @@ impl TableBranchCatalog {
     /// source through the **trait**, so it is not specific to `LogBranchCatalog` and the
     /// equivalence test can drive it with either.
     ///
-    /// Child entries are rebuilt from the children themselves — every non-`Reaped` record that
-    /// names a parent contributes one — which is exactly how `LogBranchCatalog::index` derives the
-    /// live set at replay. Rebuilding from the PARENT's `live_children` array instead would copy a
-    /// representation rather than re-derive the truth, and would carry across any staleness the
-    /// source happened to hold.
+    /// Child entries are rebuilt from the children themselves, by the rule `LogBranchCatalog::index`
+    /// uses at replay (one function, `record::parent_entry_holders`). Rebuilding from the PARENT's
+    /// `live_children` array instead would copy a representation rather than re-derive the truth,
+    /// and would carry across any staleness the source happened to hold.
+    ///
+    /// ⛔ **D235: the rule here used to be "every non-`Reaped` record that names a parent
+    /// contributes one", copied from `index` on purpose, so it inherited `index`'s omission.** A
+    /// `Reaped` interior branch with a live descendant is a D16 PIN: its entry under its own parent
+    /// is what keeps the grandparent's pages parked. The old rule dropped it, so a migrated
+    /// catalog, whose CHILD span is then durable and never rebuilt, answered "childless" for the
+    /// grandparent from the first open, and `release_id` below freed the slot of every reaped node
+    /// between two others. `a_migrated_catalog_answers_every_query_the_way_its_source_does` had no
+    /// such node until D235 added one.
     pub fn migrate_from(
         pool: Arc<BufferPoolManager>,
         source: &dyn BranchCatalog,
@@ -303,7 +312,11 @@ impl TableBranchCatalog {
         // cannot run before the records exist.
         let mut max_id = 0u64;
         let mut reaped: Vec<u64> = Vec::new();
-        let mut children: Vec<(u64, Epoch, u64)> = Vec::new();
+        // Every (parent, fork epoch, child) edge, and every record's parent and state. Which edges
+        // become CHILD entries is decided only after the scan (D235): whether a `Reaped` record is
+        // a pin depends on records below it, which the scan may not have reached yet.
+        let mut edges: Vec<(u64, Epoch, u64)> = Vec::new();
+        let mut nodes: HashMap<u64, (BranchId, Option<BranchId>, BranchState)> = HashMap::new();
         for rec in source.scan()? {
             let rec = rec?;
             // `scan` yields core records; the unbounded fields come from the source's own `get`,
@@ -313,16 +326,20 @@ impl TableBranchCatalog {
             if full.state == BranchState::Reaped {
                 reaped.push(full.branch_id.id);
             }
-            if full.state != BranchState::Reaped {
-                if let Some(p) = full.parent_id {
-                    children.push((p.id, full.fork_epoch, full.branch_id.id));
-                }
+            nodes.insert(full.branch_id.id, (full.branch_id, full.parent_id, full.state));
+            if let Some(p) = full.parent_id {
+                edges.push((p.id, full.fork_epoch, full.branch_id.id));
             }
             let old = cat.core(full.branch_id.id)?;
             cat.write_record(&full, old.as_ref())?;
         }
-        for (parent, epoch, child) in children {
-            cat.attach_child(parent, epoch, child)?;
+        // Every non-`Reaped` record, and every `Reaped` one with a live descendant: the same
+        // function `LogBranchCatalog::index` derives its live sets with.
+        let holders = parent_entry_holders(&nodes);
+        for (parent, epoch, child) in edges {
+            if holders.contains(&child) {
+                cat.attach_child(parent, epoch, child)?;
+            }
         }
 
         // Counters, matching what `LogBranchCatalog::open` derives: the next id is one past the
@@ -2638,8 +2655,8 @@ mod tests {
 
         let src = LogBranchCatalog::in_memory(9);
 
-        // -- a parent with several live children
-        let kids: Vec<_> =
+        // -- a parent with several live children (their epochs are probed through `all_epochs`)
+        let _kids: Vec<_> =
             (0..4).map(|_| src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap()).collect();
         // -- a parent whose only child gets reaped
         let lone_parent = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
@@ -2670,6 +2687,36 @@ mod tests {
         let recycled = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
         assert_ne!(recycled.branch_id.generation, 0, "fixture: no recycled slot was produced");
 
+        // -- D235: a reaped INTERIOR node that still has a live child. This is the state D16's
+        // reaper leaves: `detach_from_parent` never detaches a branch with live children, so the
+        // grandparent's entry for it is a PIN, and `release_id` refuses its slot. It is built the
+        // way `reap` builds it: Live -> Reaping -> Reaped, no detach, then a release attempt. At
+        // `9aa6968` this fixture had no such node, so a migration that dropped every pin passed.
+        // It sits ABOVE the `spare` block on purpose: forking after `spare` is released would
+        // recycle that slot and silently empty the free list the `spare` block exists to leave.
+        let pin_gp = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let pinned = src.fork(pin_gp.branch_id, LeaseDeadline(5_000)).unwrap();
+        let _pin_leaf = src.fork(pinned.branch_id, LeaseDeadline(5_000)).unwrap();
+        // -- and two reaped interiors in a row, so the pin has to be derived TRANSITIVELY
+        let chain_gp = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let p1 = src.fork(chain_gp.branch_id, LeaseDeadline(5_000)).unwrap();
+        let p2 = src.fork(p1.branch_id, LeaseDeadline(5_000)).unwrap();
+        let _chain_leaf = src.fork(p2.branch_id, LeaseDeadline(5_000)).unwrap();
+        // Deepest first, then newest fork first: the order `expired_candidates` reaps in.
+        for b in [p2.branch_id, p1.branch_id, pinned.branch_id] {
+            src.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
+            src.set_state(b, BranchState::Reaping, BranchState::Reaped).unwrap();
+            src.release_id(b.id);
+        }
+        // PREMISE: the source really holds both pins. Without this, the comparison below is vacuous
+        // over the very case it was extended for.
+        for gp in [pin_gp.branch_id.id, chain_gp.branch_id.id, p1.branch_id.id] {
+            assert!(
+                src.has_live_children(gp).unwrap(),
+                "fixture: {gp} does not pin in the SOURCE, so nothing below tests D235"
+            );
+        }
+
         // -- and leave a slot STILL FREE at migration time. Without this the free list is empty
         // when the migration runs, so a migration that skipped recycling entirely was
         // indistinguishable from a correct one - a mutant proved exactly that. Having a recycled
@@ -2692,6 +2739,12 @@ mod tests {
         let dids: Vec<u64> = dst.scan().unwrap().map(|r| r.unwrap().branch_id.id).collect();
         assert_eq!(sids, dids, "scan disagrees");
         assert!(sids.len() >= 8, "fixture too small to be meaningful: {}", sids.len());
+        // Every record's own fork epoch is a window below (D235 review F2). Probing only the live
+        // kids' epochs let a rebuild that dropped a QUARANTINED child's entry (`held`) pass,
+        // because the parent's other children hide one missing entry from `max_live_child` and
+        // `has_live_children`.
+        let all_epochs: Vec<Epoch> =
+            sids.iter().map(|id| src.get_raw(*id).unwrap().fork_epoch).collect();
 
         // ---- every record field EXCEPT live_children -----------------------------------------
         for id in &sids {
@@ -2715,10 +2768,10 @@ mod tests {
                        "max_live_child for {id}");
             assert_eq!(src.has_live_children(*id).unwrap(), dst.has_live_children(*id).unwrap(),
                        "has_live_children for {id}");
-            // Windows that include and exclude each child, plus the whole range.
-            for k in &kids {
-                let lo = k.fork_epoch;
-                let hi = Epoch(k.fork_epoch.0 + 1);
+            // Windows that include and exclude each record's fork, plus the whole range. The
+            // pinned interiors' own epochs are where a dropped pin shows (D235).
+            for &lo in &all_epochs {
+                let hi = Epoch(lo.0 + 1);
                 assert_eq!(
                     src.live_child_in_epoch_range(*id, lo, hi).unwrap(),
                     dst.live_child_in_epoch_range(*id, lo, hi).unwrap(),
@@ -2767,6 +2820,22 @@ mod tests {
         let dn = dst.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         assert_eq!(sn.branch_id, dn.branch_id, "the next branch minted differs after migrating");
         assert_eq!(sn.fork_epoch, dn.fork_epoch, "the next fork epoch differs after migrating");
+
+        // ---- and every window again, now that a slot has been RECYCLED (D235 review F1) --------
+        // A migration that attached EVERY record with a parent passes everything above: a stale
+        // entry for the reaped leaf `spare` resolves as "not live" while `spare`'s slot is free. The
+        // fork just made reused that slot, so such an entry now names a LIVE branch, and trunk
+        // answers "a live child forked at spare's epoch" where the source does not.
+        for id in &sids {
+            for &lo in &all_epochs {
+                let hi = Epoch(lo.0 + 1);
+                assert_eq!(
+                    src.live_child_in_epoch_range(*id, lo, hi).unwrap(),
+                    dst.live_child_in_epoch_range(*id, lo, hi).unwrap(),
+                    "after recycling a slot: live_child_in_epoch_range({id}, {lo:?}, {hi:?})"
+                );
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 
