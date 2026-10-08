@@ -765,14 +765,35 @@ impl Change {
 
 /// Live counters for one diff. Shared so a harness can read them while the diff runs.
 ///
-/// `visited` counts nodes whose **payload was decoded**. `skipped_subtrees` counts skip *events*
-/// — pairs found equal and abandoned without a decode. Node counts for the skipped subtrees are
-/// deliberately not computed here: counting them would cost exactly the walk the skip avoided.
-/// [`skipped_node_count`] does it as an audit, outside the measurement.
+/// `visited` counts nodes whose **payload was decoded**. The two skip counters are kept apart on
+/// purpose, because they are not the same claim:
+///
+/// * `skipped_page_id` — the two sides are literally the same page. Free, exact, and true in this
+///   store by construction; `btree.rs` states it directly: "there is no content addressing and
+///   there are no refcounts, so a subtree that did not change is not merely equal to its old self,
+///   it IS the same page id". This tier needs no hashing and cannot be wrong between two roots
+///   that are both still what they name — a fork's base against the branch's head, say. Its one
+///   scope limit is the store's, not this module's: `CowStore::cow_page` rewrites a page in place
+///   when it is already private to the writer (born after the fork, pinned by no live child), so
+///   a superseded root of the *same* branch can share a page id with the new root while the bytes
+///   under it moved. Every diff here reads that pair as equal, `CowTree::diff` included.
+/// * `skipped_identity` — two *different* pages that the supplied [`NodeIdentity`] says hold the
+///   same thing. This is the only tier a content digest can do and the only tier that can be
+///   wrong, so a reader can see exactly how much of the skipping rests on it.
+///
+/// Both count skip *events* — pairs found equal and abandoned without a decode. "Without a
+/// decode" is not "without a read": a memoising provider fetches each page's header to validate
+/// its row before it answers, so a tier-2 skip can cost two page fetches. A tier-1 skip asks the
+/// provider nothing and fetches nothing.
+///
+/// Node counts for the skipped subtrees are deliberately not computed here: counting them would
+/// cost exactly the walk the skip avoided. [`skipped_node_count`] does it as an audit, outside the
+/// measurement.
 #[derive(Debug, Default)]
 pub struct DiffStats {
     visited: AtomicUsize,
-    skipped_subtrees: AtomicUsize,
+    skipped_page_id: AtomicUsize,
+    skipped_identity: AtomicUsize,
 }
 
 impl DiffStats {
@@ -780,16 +801,29 @@ impl DiffStats {
         self.visited.load(AtomicOrdering::Relaxed)
     }
 
+    /// Every skip event, both tiers.
     pub fn skipped_subtrees(&self) -> usize {
-        self.skipped_subtrees.load(AtomicOrdering::Relaxed)
+        self.skipped_by_page_id() + self.skipped_by_identity()
+    }
+
+    pub fn skipped_by_page_id(&self) -> usize {
+        self.skipped_page_id.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn skipped_by_identity(&self) -> usize {
+        self.skipped_identity.load(AtomicOrdering::Relaxed)
     }
 
     fn note_visit(&self) {
         self.visited.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
-    fn note_skip(&self) {
-        self.skipped_subtrees.fetch_add(1, AtomicOrdering::Relaxed);
+    fn note_skip_page_id(&self) {
+        self.skipped_page_id.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn note_skip_identity(&self) {
+        self.skipped_identity.fetch_add(1, AtomicOrdering::Relaxed);
     }
 }
 
@@ -799,12 +833,31 @@ pub struct DiffReport {
     pub changes: Vec<Change>,
     /// Nodes whose payload was decoded.
     pub visited: usize,
-    /// Skip events: subtree pairs found equal by identity and never read.
+    /// Skip events, both tiers.
     pub skipped_subtrees: usize,
+    /// Skips won by page identity alone — free, and exact in this store.
+    pub skipped_by_page_id: usize,
+    /// Skips that needed the supplied [`NodeIdentity`], i.e. two distinct pages holding the same
+    /// thing. Zero here means the content digest contributed nothing this run.
+    pub skipped_by_identity: usize,
     /// The `root_a`-side page at the top of each skipped subtree, in descent order. Bounded by
     /// `visited * fanout`, so recording it is cheap; [`skipped_node_count`] turns it into an exact
     /// node count when a test needs one.
     pub skipped_roots: Vec<PageId>,
+}
+
+/// The first point where a cost series got **cheaper as the input grew**, as
+/// `(index_before, index_after)`.
+///
+/// A harness uses this on its control column. If the control's cost falls while the input rises,
+/// the clock measured the machine rather than the code, and the durations from that run are not a
+/// weaker result — they are not a result. This repo runs its suites under an agent fleet, so that
+/// is the normal case rather than the exotic one, and a harness that quietly banks such a row
+/// publishes noise with a commit sha on it.
+///
+/// `None` means every step was non-decreasing. Ties are fine; only a strict fall is an inversion.
+pub fn first_inversion<T: PartialOrd>(series: &[T]) -> Option<(usize, usize)> {
+    series.windows(2).position(|w| w[1] < w[0]).map(|i| (i, i + 1))
 }
 
 /// Exact node count under the skipped subtrees. **O(skipped) — an audit, not part of the diff.**
@@ -1014,6 +1067,8 @@ pub fn diff_with_stats(
         changes: d.changes,
         visited: stats.visited(),
         skipped_subtrees: stats.skipped_subtrees(),
+        skipped_by_page_id: stats.skipped_by_page_id(),
+        skipped_by_identity: stats.skipped_by_identity(),
         skipped_roots: d.skipped_roots,
     })
 }
@@ -1031,16 +1086,30 @@ impl Differ<'_> {
         if depth > MAX_DESCENT {
             return Err(FerroError::Cow("diff descent exceeded the depth guard".into()));
         }
-        // The skip. Equal identity => equal subtrees => equal on every sub-range of them, so this
-        // holds whether `span` is the children's full span or a clipped piece of it.
+        // Tier 1, free and unconditional: the same page is the same subtree. Sound here because
+        // copy-on-write never mutates a shared page in place — `btree.rs` states the invariant,
+        // and within one lineage an unchanged subtree is *literally* the same page id, so the
+        // common case costs a `u32` compare and no hashing at all.
         //
-        // `a == b` is decided ahead of the provider. `id_of` is a pure function of the page id by
-        // [`NodeIdentity`]'s contract, so the comparison cannot come out anything but equal — and
-        // for the memoising providers, finding that out costs two page fetches and two header
-        // parses. One consequence is deliberate: an identical pair no longer counts toward
+        // It is also decided ahead of the provider, which is a second, independent reason to put
+        // it first. `id_of` is a pure function of the page id by [`NodeIdentity`]'s contract, so
+        // asking about `a == b` cannot come out anything but equal — and for the memoising
+        // providers, finding that out costs two page fetches and two header parses. One
+        // consequence is deliberate: an identical pair never counts toward
         // [`MemoIdentity::misses`], because no digest was consulted to decide it.
-        if a == b || self.identity.id_of(a) == self.identity.id_of(b) {
-            self.stats.note_skip();
+        // `comparing_a_page_with_itself_never_consults_the_identity_provider` pins that.
+        if a == b {
+            self.stats.note_skip_page_id();
+            self.skipped_roots.push(a);
+            return Ok(());
+        }
+        // Tier 2: two distinct pages that may still hold the same rows — a subtree rewritten to
+        // identical content, or two branches that never shared a page. Page id cannot express
+        // that; only a content identity can, and only this tier can be wrong, which is why it is
+        // counted separately. Equal identity => equal subtrees => equal on every sub-range, so it
+        // holds whether `span` is the children's full span or a clipped piece of it.
+        if self.identity.id_of(a) == self.identity.id_of(b) {
+            self.stats.note_skip_identity();
             self.skipped_roots.push(a);
             return Ok(());
         }
@@ -1300,6 +1369,11 @@ mod tests {
             assert_eq!(r.visited, 0, "{label} read a page for two identical roots");
             assert_eq!(r.skipped_subtrees, 1, "{label} should skip at the root, once");
             assert_eq!(
+                (r.skipped_by_page_id, r.skipped_by_identity),
+                (1, 0),
+                "{label}: the same root is the same page, so tier 1 must win it for free"
+            );
+            assert_eq!(
                 skipped_node_count(&f.tree, r).unwrap(),
                 total,
                 "{label} skipped fewer than all {} nodes",
@@ -1526,6 +1600,23 @@ mod tests {
             by_hash.visited, 0,
             "the content hash should have matched at the root and read nothing"
         );
+
+        // This is the case that separates the two tiers, so pin which one fired. The roots are
+        // different pages, so tier 1 cannot win it; a skip here is the content digest earning its
+        // keep, and tier 2 reading 0 would mean the digest contributed nothing.
+        assert_eq!(
+            (by_hash.skipped_by_page_id, by_hash.skipped_by_identity),
+            (0, 1),
+            "tier 2 did not win a case only a content identity can see"
+        );
+        assert_eq!(
+            by_page.skipped_by_identity, 0,
+            "PageIdentity cannot skip two distinct pages, so tier 2 must be empty for it"
+        );
+        assert!(
+            by_page.skipped_by_page_id > 0,
+            "the untouched siblings are the same pages and should have been free"
+        );
     }
 
     /// The adapter an on-demand digest such as `cow::cid::subtree_cid` has to go through. The
@@ -1536,7 +1627,11 @@ mod tests {
         let f = Fixture::new();
         let base = f.build(2000);
         let mut head = f.fork(B1, base);
-        head = f.put(head, B1, &key(11), "changed");
+        // A no-op overwrite: new pages, identical content. Tier 1 cannot skip it, so the wrapped
+        // digest is forced to be what decides — otherwise this test would pass without the memo
+        // ever being consulted.
+        head = f.put(head, B1, &key(11), &value(11, 0));
+        assert_ne!(head, base, "the overwrite did not shadow anything");
 
         let inner = SubtreeHash::new(f.store_dyn());
         // `inner` holds the tree's own store, so ignoring the supplied `&CowTree` here does
@@ -1546,9 +1641,13 @@ mod tests {
         assert_eq!(warmed, m.warmed());
 
         let r = diff(&f.tree, base, head, &m).unwrap();
-        assert_eq!(r.changes.len(), 1);
+        assert!(r.changes.is_empty(), "a no-op overwrite is not a change");
         assert_eq!(m.misses(), 0, "a fully warmed memo still fell back to page identity");
-        assert!(r.skipped_subtrees > 0);
+        assert_eq!(
+            (r.skipped_by_page_id, r.skipped_by_identity),
+            (0, 1),
+            "the wrapped digest was not what decided the skip"
+        );
         assert_eq!(m.id_of(base)[0], TAG_CONTENT, "a warmed id must sit in the content domain");
     }
 
@@ -1640,6 +1739,121 @@ mod tests {
             counted.calls(),
             real.visited
         );
+    }
+
+    /// This module and `CowTree::diff` must agree on every changeset, because callers are moved
+    /// from one to the other. `CowTree::diff` is the validated implementation — it has its own
+    /// tests and a proptest (`tests/prop_cow_diff.rs`) — so it is the oracle here, and the
+    /// expected values come from it rather than from anything this file computes.
+    ///
+    /// The swap this was written for has since been made one level up: D103 moved
+    /// `AgentRuntime::page_changeset` from `CowTree::diff` to this module, and `CowTree::diff`
+    /// stays for `BTreeMap`-shaped callers and as the control arm of
+    /// `examples/d103_production_diff_curve.rs`. This is the module-level check that the swap did
+    /// not change an answer. It is an oracle test only while `CowTree::diff` does **not** delegate
+    /// here; if it ever does, the expected values would come from the subject, and this test needs
+    /// a different oracle.
+    #[test]
+    fn this_module_agrees_with_the_existing_cowtree_diff() {
+        // Each case is (label, how to derive head from base). Between them they cover every arm
+        // of the join: overwrite, insert, delete, no-op rewrite, and a shape change from splits.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn(&Fixture, PageId) -> PageId>)> = vec![
+            ("untouched", Box::new(|_: &Fixture, r: PageId| r)),
+            (
+                "four overwrites",
+                Box::new(|f: &Fixture, mut r: PageId| {
+                    for i in [3usize, 250, 611, 999] {
+                        r = f.put(r, B1, &key(i), &value(i, 7));
+                    }
+                    r
+                }),
+            ),
+            (
+                "no-op rewrite",
+                Box::new(|f: &Fixture, r: PageId| f.put(r, B1, &key(400), &value(400, 0))),
+            ),
+            (
+                "inserts that split",
+                Box::new(|f: &Fixture, mut r: PageId| {
+                    for i in 0..200 {
+                        r = f.put(r, B1, &format!("k{:09}-x", i * 3), "inserted");
+                    }
+                    r
+                }),
+            ),
+            (
+                "deletes",
+                Box::new(|f: &Fixture, mut r: PageId| {
+                    for i in [10usize, 500, 990] {
+                        let e = f.tick();
+                        r = f.tree.delete(r, B1, e, key(i).as_bytes()).unwrap();
+                    }
+                    r
+                }),
+            ),
+            (
+                "mixed",
+                Box::new(|f: &Fixture, mut r: PageId| {
+                    r = f.put(r, B1, &key(1), "over");
+                    r = f.put(r, B1, "zzzz-appended", "new");
+                    let e = f.tick();
+                    r = f.tree.delete(r, B1, e, key(777).as_bytes()).unwrap();
+                    r
+                }),
+            ),
+        ];
+
+        for (label, make_head) in cases {
+            let f = Fixture::new();
+            let base = f.build(1000);
+            let forked = f.fork(B1, base);
+            let head = make_head(&f, forked);
+
+            // The oracle, converted to this module's shape. `TreeDiff::deltas` is
+            // (key, before, after) with None meaning absent on that side.
+            let oracle = f.tree.diff(base, head).unwrap();
+            let mut expected: Vec<Change> = oracle
+                .deltas
+                .iter()
+                .map(|(k, before, after)| match (before, after) {
+                    (None, Some(v)) => Change::Added { key: k.clone(), value: v.clone() },
+                    (Some(v), None) => Change::Removed { key: k.clone(), value: v.clone() },
+                    (Some(x), Some(y)) => {
+                        Change::Modified { key: k.clone(), before: x.clone(), after: y.clone() }
+                    }
+                    (None, None) => panic!("{label}: oracle emitted a delta with no sides"),
+                })
+                .collect();
+            expected.sort_by(|x, y| x.key().cmp(y.key()));
+
+            let (by_page, by_hash) = both_providers(&f, base, head);
+            assert_eq!(by_page.changes, expected, "case {label}: page identity disagrees");
+            assert_eq!(by_hash.changes, expected, "case {label}: subtree hash disagrees");
+        }
+    }
+
+    /// Fired both ways, because a refusal that has never refused anything is indistinguishable
+    /// from one that cannot.
+    #[test]
+    fn the_inversion_detector_fires_on_a_fall_and_stays_quiet_otherwise() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // Quiet: rising, and flat-with-ties.
+        assert_eq!(first_inversion(&[ms(1), ms(2), ms(3), ms(90)]), None);
+        assert_eq!(first_inversion(&[ms(5), ms(5), ms(5)]), None);
+        assert_eq!(first_inversion::<Duration>(&[]), None);
+        assert_eq!(first_inversion(&[ms(7)]), None);
+
+        // Fires: the shape actually banked on 2026-09-21 — 15.2 s at N=64k, 138 ms at N=256k.
+        assert_eq!(
+            first_inversion(&[ms(0), ms(1), ms(4), ms(15_209), ms(138)]),
+            Some((3, 4))
+        );
+        // And it reports the FIRST fall, not the largest.
+        assert_eq!(first_inversion(&[ms(10), ms(9), ms(100), ms(1)]), Some((0, 1)));
+        assert_eq!(first_inversion(&[1.0f64, 2.0, 1.5]), Some((1, 2)));
     }
 
     #[test]
