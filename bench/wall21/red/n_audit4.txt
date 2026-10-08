@@ -1,0 +1,79 @@
+step=n_audit4 sha=1ab35e93abb7f06bb30154340c60bf3b30a90ffa
+cmd=cargo test --lib --test d200_reap_releases_id_slots -- a_non_branch_error_at_open_is_that_slots_refusal branch::table_catalog::tests::a_stale_reaping_key_on_a_live_record_is_refused_not_reaped branch::table_catalog::tests::the_build_keys_a_cycle_member_with_nothing_below
+2026-09-24T23:02:04Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2517:17
+     |
+2517 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2689 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2517:17
+     |
+2517 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2689 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2517:17
+     |
+2517 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2690 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2517:17
+     |
+2517 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2690 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.49s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 2 tests
+test branch::table_catalog::tests::a_stale_reaping_key_on_a_live_record_is_refused_not_reaped ... FAILED
+test branch::table_catalog::tests::the_build_keys_a_cycle_member_with_nothing_below ... ok
+
+failures:
+
+---- branch::table_catalog::tests::a_stale_reaping_key_on_a_live_record_is_refused_not_reaped stdout ----
+
+thread 'branch::table_catalog::tests::a_stale_reaping_key_on_a_live_record_is_refused_not_reaped' (363593077) panicked at src/branch/table_catalog.rs:3689:9:
+assertion `left == right` failed: A3: a stale Reaping key made the open reap a Live branch
+  left: Reaped
+ right: Live
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    branch::table_catalog::tests::a_stale_reaping_key_on_a_live_record_is_refused_not_reaped
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1676 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `--lib`
+rc=101

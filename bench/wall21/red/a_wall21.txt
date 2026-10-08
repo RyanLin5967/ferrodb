@@ -1,0 +1,25 @@
+step=a_wall21 sha=3d4d4d2bb1f6a80539fcc5691e05b9ee0f358666
+cmd=cargo test --test wall21_reaped_chain_liveness -- --nocapture
+2026-09-24T23:00:58Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.14s
+     Running tests/wall21_reaped_chain_liveness.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/wall21_reaped_chain_liveness-5cfaa19ecf6d3db9)
+
+running 1 test
+wall21 D=16 reap_interiors=360 resolve_parked=120 write_path=136 cascade=18
+wall21 D=64 reap_interiors=6048 resolve_parked=2016 write_path=2080 cascade=66
+
+thread 'a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth' (363467391) panicked at tests/wall21_reaped_chain_liveness.rs:195:5:
+REAP: 96 spans per interior reap at D=64 against 24 at D=16 — the reaper walks the reaped chain below every branch it reaps
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth ... FAILED
+
+failures:
+
+failures:
+    a_liveness_question_under_a_reaped_chain_costs_the_same_at_any_depth
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.47s
+
+error: test failed, to rerun pass `--test wall21_reaped_chain_liveness`
+rc=101

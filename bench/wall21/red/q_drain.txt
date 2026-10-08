@@ -1,0 +1,23 @@
+step=q_drain sha=89e4e82d5ca0b82234385c1ef9ffcbcc69887809
+cmd=cargo test --test d200_reap_releases_id_slots -- a_persistent_fault_in_the_drain_read_fails_no_open --nocapture
+2026-09-24T23:02:32Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.58s
+     Running tests/d200_reap_releases_id_slots.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d200_reap_releases_id_slots-afa85a8f8f13df19)
+
+running 1 test
+
+thread 'a_persistent_fault_in_the_drain_read_fails_no_open' (363636203) panicked at tests/d200_reap_releases_id_slots.rs:1020:13:
+§8.22 (window): a persistent fault in the drain's read failed the first open: io error: injected persistent I/O error: live_child_in_epoch_range of slot 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_persistent_fault_in_the_drain_read_fails_no_open ... FAILED
+
+failures:
+
+failures:
+    a_persistent_fault_in_the_drain_read_fails_no_open
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `--test d200_reap_releases_id_slots`
+rc=101
