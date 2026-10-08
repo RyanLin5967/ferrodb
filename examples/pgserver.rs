@@ -60,7 +60,16 @@ fn main() {
         .expect("open db");
     let dm = Arc::new(DiskManager::new(file).unwrap());
     let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{db}.wal").into()).unwrap());
+    // D280: the same refusal as the CLI's, through the same function. Released by hand because
+    // `process::exit` runs no destructors, and a lock left behind refuses the next open as stale.
+    let wal = match WalManager::open_for_database(Path::new(&db), &bp.disk_manager) {
+        Ok(w) => Arc::new(w),
+        Err(e) => {
+            eprintln!("pgserver: {e}");
+            drop(_lock);
+            std::process::exit(1);
+        }
+    };
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal);
     recover(&txn).unwrap();

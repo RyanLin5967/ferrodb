@@ -59,7 +59,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
     let dm = Arc::new(DiskManager::new(file)?);
     let bp = Arc::new(BufferPoolManager::new(dm));
-    let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
+    // D280: refuses a data file whose pages carry LSNs this log never issued (a restored backup, a
+    // replica's file, a lost `.wal`), before anything else is created beside it.
+    let wal = Arc::new(WalManager::open_for_database(Path::new(db_path), &bp.disk_manager)?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
     let recovered = recover(&txn)?;
