@@ -1,0 +1,4 @@
+# 2026-09-24T22:09:05Z HEAD=a3b2a08 dirty=0
+# cmd: cargo test --no-fail-fast --test d268_power_loss_redo --test integration_replica_applier --test d236_commit_after_a_drain_survives_kill9
+2026-09-24T22:09:05Z d256 acquiring (5s poll), pid 85745
+2026-09-24T23:08:39Z d256 ABORTED by signal (every descendant ran its own exit)

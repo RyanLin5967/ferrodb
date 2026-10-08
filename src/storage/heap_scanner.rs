@@ -16,7 +16,7 @@ impl HeapScanner {
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let page = {
             let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-            Page::deserialize(frame.data)?
+            Page::deserialize_at(page_id, frame.data)?
         };
         self.buffer_pool.unpin_page(page_id, false);
         Ok(page)

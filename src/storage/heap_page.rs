@@ -95,24 +95,107 @@ impl Page {
         Ok(buffer)
     }
 
+    /// [`Page::deserialize_at`], naming the page id the page's own header records. A caller that
+    /// knows which page it read calls `deserialize_at` with it instead: an all-zero page's header
+    /// records page 0.
     pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
-        let page_type = u8::from_be_bytes(bytes[0..1].try_into().unwrap());
+        let stored = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        Self::deserialize_at(stored, bytes)
+    }
+
+    /// **D256: parse page `page_id`, refusing a header that cannot describe a heap page.**
+    ///
+    /// This sliced `bytes[HEADER_SIZE..free_space_start]` and `bytes[free_space_end..]` with no
+    /// check. So a page whose bytes never reached disk, all zero, PANICKED (`bytes[23..0]`), and
+    /// did so at every open: `rebuild_indexes` scans every primary heap. Other headers parsed, and
+    /// then `read` or `restore_at` indexed past the page, `insert` underflowed, or `read` returned
+    /// another slot's bytes.
+    ///
+    /// Each check holds for every page [`Page::serialize`] writes, by construction: it writes the
+    /// slot count and `free_space_start` from one `slot_arr.len()`, `free_space_end` as
+    /// [`Page::get_free_space_end`], and every heap page starts as [`Page::empty`].
+    /// `tests::d256::every_page_the_writer_produces_is_one_the_reader_accepts` is the falsifier.
+    /// A refusal is [`FerroError::Corruption`], as `CatalogPage::deserialize` refuses a page that is
+    /// neither of its formats, and for the same reason it refuses an all-zero one: accepting it
+    /// "would let a genuinely corrupt page through".
+    ///
+    /// No caller reads a refused page as empty. `wal::recovery::redo_one` does rebuild from empty
+    /// a page whose header records ANOTHER page id, which a zero page does, before calling this:
+    /// a page allocated after the last checkpoint and never flushed is zero on disk, and the log
+    /// holds every change made to it.
+    ///
+    /// **Not checked, stated:** the `checksum` field, which nothing computes
+    /// (`tests/sim_durability.rs::a_torn_table_page_is_served_as_a_row_that_was_never_written`);
+    /// the tuple bytes; overlapping slots, on which no method with a caller indexes out of bounds
+    /// (`compact`, which could, has none); and whether the header's page id is `page_id`, which is
+    /// only named here.
+    pub fn deserialize_at(page_id: u32, bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
+        Self::parse(&bytes).map_err(|why| {
+            let stored = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+            let header = if stored == page_id { String::new() } else { format!(" (its header names page {stored})") };
+            FerroError::Corruption(format!("heap page {page_id} cannot be read{header}: {why}"))
+        })
+    }
+
+    /// The checks of [`Page::deserialize_at`], ordered so every index stays in bounds: the slot
+    /// array is sliced only once it is known to end inside the page. The error says why.
+    fn parse(bytes: &[u8; PAGE_SIZE]) -> Result<Self, String> {
+        if bytes.iter().all(|b| *b == 0) {
+            return Err("every byte is zero: nothing was written here, or the write never reached disk".into());
+        }
+        let page_type = bytes[0];
         let page_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-        let free_space_start = u16::from_be_bytes(bytes[7..9].try_into().unwrap());
-        let free_space_end = u16::from_be_bytes(bytes[9..11].try_into().unwrap());
+        let num_slots = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+        let free_space_start = u16::from_be_bytes(bytes[7..9].try_into().unwrap()) as usize;
+        let free_space_end = u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize;
         let lsn = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
         let checksum = u32::from_be_bytes(bytes[19..23].try_into().unwrap());
 
-        let raw_slot_arr = &bytes[HEADER_SIZE..free_space_start as usize];
-        let mut slot_arr = Vec::new();
-        for slice in raw_slot_arr.chunks(SLOT_ENTRY_SIZE) {
-            let offset = u16::from_be_bytes(slice[0..2].try_into().unwrap());
-            let length = u16::from_be_bytes(slice[2..4].try_into().unwrap());
-            slot_arr.push(SlotEntry::new(offset, length))
+        if page_type != HEAP_PAGE_TYPE {
+            return Err(format!("its page type is {page_type}, and a heap page's is {HEAP_PAGE_TYPE}"));
         }
-        
-        let tuples = bytes[free_space_end as usize..PAGE_SIZE].to_vec();
-        Ok (Page { page_type, page_id, lsn, checksum, slot_arr, tuples })
+        // This also puts the slot array's end at or past the header, and on a slot boundary.
+        let slots_end = HEADER_SIZE + num_slots * SLOT_ENTRY_SIZE;
+        if free_space_start != slots_end {
+            return Err(format!(
+                "its header counts {num_slots} slot(s), which end at byte {slots_end}, but says free space \
+                 starts at byte {free_space_start}"
+            ));
+        }
+        if free_space_start > free_space_end {
+            return Err(format!(
+                "its free space would run backwards, from byte {free_space_start} to byte {free_space_end}"
+            ));
+        }
+        if free_space_end > PAGE_SIZE {
+            return Err(format!("its free space ends at byte {free_space_end}, past the {PAGE_SIZE}-byte page"));
+        }
+
+        let mut slot_arr = Vec::with_capacity(num_slots);
+        let mut lowest = PAGE_SIZE;
+        for (i, raw) in bytes[HEADER_SIZE..free_space_start].chunks_exact(SLOT_ENTRY_SIZE).enumerate() {
+            let slot = SlotEntry::new(u16::from_be_bytes([raw[0], raw[1]]), u16::from_be_bytes([raw[2], raw[3]]));
+            // A live or retired slot's bytes must lie inside the page; the check below puts their
+            // start at or past the tuple region.
+            if !slot.is_free() {
+                let (start, end) = (slot.offset as usize, slot.offset as usize + slot.span());
+                if end > PAGE_SIZE {
+                    return Err(format!("slot {i} holds bytes {start}..{end}, past the {PAGE_SIZE}-byte page"));
+                }
+                lowest = lowest.min(start);
+            }
+            slot_arr.push(slot);
+        }
+        // `read` and `update` locate a tuple from the lowest occupied offset, and `insert` and
+        // `restore_at` from where `tuples` begins, which is this field. They must be one number.
+        if free_space_end != lowest {
+            return Err(format!(
+                "its free space ends at byte {free_space_end}, but its slots' tuples begin at byte {lowest}"
+            ));
+        }
+
+        let tuples = bytes[free_space_end..PAGE_SIZE].to_vec();
+        Ok(Page { page_type, page_id, lsn, checksum, slot_arr, tuples })
     }
 
     // finds space in page, writes tuple bytes, add slot entry
@@ -357,10 +440,14 @@ mod tests {
 
     use crate::storage::heap_page::Page;
     use crate::storage::heap_page::SlotEntry;
+    use crate::storage::heap_page::HEAP_PAGE_TYPE;
 
+    // The heap page type, not 1: 1 is `PAGE_TYPE_DIRECTORY`, and since D256 the reader refuses a
+    // page of any other type (`d256::a_page_of_another_type_is_refused`). The law is unchanged: a
+    // heap page round-trips.
     #[test]
     fn test_basic() {
-        let page = Page::new(1,2,3,4,Vec::new(), Vec::new());
+        let page = Page::new(HEAP_PAGE_TYPE,2,3,4,Vec::new(), Vec::new());
         let bytes = page.serialize().unwrap();
         let de_page = Page::deserialize(bytes).unwrap();
 
@@ -520,5 +607,280 @@ mod tests {
         assert!(page.retire(0).is_err(), "a free slot was retired");
         assert!(page.retire(5).is_err(), "a slot past the array was retired");
         assert!(page.release(5).is_err(), "a slot past the array was released");
+    }
+
+    // ---- D256: a page whose header cannot describe a heap page is refused, never a panic.
+    //
+    // Each page below is `serialize` output with header or slot bytes edited, which is what a
+    // page that never reached disk, a torn write, or another structure's page named as a heap page
+    // looks like to the reader. Lane report: artie-research `frontier/lane_d256_heap_page.md` §2.
+    mod d256 {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        use crate::error::FerroError;
+        use crate::storage::disk_manager::PAGE_SIZE;
+        use crate::storage::heap_page::{Page, HEADER_SIZE, RETIRED, SLOT_ENTRY_SIZE};
+        use crate::storage::sim::Rng;
+        use crate::storage::tuple::Tuple;
+
+        use super::page_with;
+
+        // Header fields, from the layout comment above `impl Page`.
+        const NUM_SLOTS: usize = 5;
+        const FREE_START: usize = 7;
+        const FREE_END: usize = 9;
+
+        /// Write a big-endian `u16` header or slot field at byte `at`.
+        fn put(bytes: &mut [u8; PAGE_SIZE], at: usize, v: u16) {
+            bytes[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        }
+
+        fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
+            match p.downcast_ref::<String>() {
+                Some(s) => s.clone(),
+                None => p.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_else(|| "no text".into()),
+            }
+        }
+
+        /// The refusal's message for `bytes`. Fails, naming what happened instead, if the reader
+        /// accepted the page, refused it as something other than corruption, or panicked.
+        fn refusal(bytes: [u8; PAGE_SIZE], what: &str) -> String {
+            match catch_unwind(|| Page::deserialize(bytes)) {
+                Ok(Err(FerroError::Corruption(msg))) => msg,
+                Ok(Err(e)) => panic!("{what}: refused, but not as corruption: {e}"),
+                Ok(Ok(_)) => panic!("{what}: ACCEPTED"),
+                Err(p) => panic!("{what}: PANICKED ({}) instead of refusing", panic_text(p)),
+            }
+        }
+
+        #[test]
+        fn an_all_zero_page_is_refused_and_says_so() {
+            let msg = refusal([0u8; PAGE_SIZE], "an all-zero page");
+            assert!(msg.contains("zero"), "an all-zero page was refused without saying it is all zero: {msg}");
+        }
+
+        #[test]
+        fn a_slot_array_starting_inside_the_header_is_refused() {
+            let mut bytes = Page::empty(7).serialize().unwrap();
+            put(&mut bytes, FREE_START, 19);
+            refusal(bytes, "a slot array starting at byte 19, inside the 23-byte header");
+        }
+
+        #[test]
+        fn a_slot_array_that_disagrees_with_the_slot_count_is_refused() {
+            // (a) Half a slot entry: 25 is not 23 plus a multiple of 4.
+            let mut bytes = Page::empty(7).serialize().unwrap();
+            put(&mut bytes, FREE_START, 25);
+            refusal(bytes, "a slot array 2 bytes long");
+            // (b) One whole slot, under a header that counts three.
+            let mut bytes = page_with(&[100]).serialize().unwrap();
+            assert_eq!(bytes[FREE_START..FREE_START + 2], 27u16.to_be_bytes(), "premise: one slot ends at byte 27");
+            put(&mut bytes, NUM_SLOTS, 3);
+            refusal(bytes, "one slot's array under a header counting 3");
+        }
+
+        #[test]
+        fn a_slot_array_running_past_the_page_is_refused() {
+            // 1019 slots end at byte 4099, three past the page. The count agrees with the array and
+            // free space ends where the array does, so only the bound on the page can refuse it.
+            assert_eq!(HEADER_SIZE + 1019 * SLOT_ENTRY_SIZE, 4099, "premise: the header and slot sizes");
+            let mut bytes = Page::empty(7).serialize().unwrap();
+            put(&mut bytes, NUM_SLOTS, 1019);
+            put(&mut bytes, FREE_START, 4099);
+            put(&mut bytes, FREE_END, 4099);
+            refusal(bytes, "a slot array ending at byte 4099 of 4096");
+        }
+
+        #[test]
+        fn free_space_that_ends_before_it_starts_is_refused() {
+            // One slot, (25, 2), and the header says free space ends at 25: the header and the slot
+            // array AGREE on where tuples begin. That is inside the slot array, which ends at 27, so
+            // `insert` would compute 25 - 27.
+            let mut bytes = Page::empty(7).serialize().unwrap();
+            put(&mut bytes, NUM_SLOTS, 1);
+            put(&mut bytes, FREE_START, 27);
+            put(&mut bytes, FREE_END, 25);
+            put(&mut bytes, HEADER_SIZE, 25);
+            put(&mut bytes, HEADER_SIZE + 2, 2);
+            refusal(bytes, "free space from byte 27 to byte 25");
+        }
+
+        #[test]
+        fn a_free_space_end_that_disagrees_with_the_slots_is_refused() {
+            let page = page_with(&[100, 50]);
+            assert_eq!(
+                (page.slot_arr[0].offset, page.slot_arr[1].offset),
+                (3996, 3946),
+                "premise: tuples begin at byte 3946"
+            );
+            // (a) Lower, at 3000: `read(1)` would return the bytes at 3000, silently.
+            let mut bytes = page.serialize().unwrap();
+            put(&mut bytes, FREE_END, 3000);
+            refusal(bytes, "free space ending at byte 3000 over tuples beginning at 3946");
+            // (b) Higher, at 3996, over slot 1: `restore_at` would compute 3946 - 3996.
+            let mut bytes = page.serialize().unwrap();
+            put(&mut bytes, FREE_END, 3996);
+            refusal(bytes, "free space ending at byte 3996 over a slot at 3946");
+        }
+
+        #[test]
+        fn a_slot_running_past_the_end_of_the_page_is_refused() {
+            let page = page_with(&[100]);
+            assert_eq!((page.slot_arr[0].offset, page.slot_arr[0].length), (3996, 100), "premise: the fixture's slot");
+            // (a) Live and one byte too long: `read(0)` would slice past the page.
+            let mut bytes = page.serialize().unwrap();
+            put(&mut bytes, HEADER_SIZE + 2, 101);
+            refusal(bytes, "a live slot holding bytes 3996..4097");
+            // (b) Retired, the same span: `restore_at(0, ..)` would zero-fill past the page.
+            let mut bytes = page.serialize().unwrap();
+            put(&mut bytes, HEADER_SIZE + 2, 101 | RETIRED);
+            refusal(bytes, "a retired slot holding bytes 3996..4097");
+        }
+
+        #[test]
+        fn a_page_of_another_type_is_refused() {
+            // Byte 0 of every other page kind in this crate: 1 a page directory, 2 and 3 B+tree nodes,
+            // 4 and 5 catalog pages. 255 is none of them.
+            for t in [1u8, 2, 3, 4, 5, 255] {
+                let mut bytes = page_with(&[100]).serialize().unwrap();
+                bytes[0] = t;
+                refusal(bytes, &format!("a page of type {t}"));
+            }
+        }
+
+        /// One change of the kinds production makes, chosen by `rng`. A refusal (no room, a slot in
+        /// the wrong state) leaves the page as it was, which is also a shape production produces.
+        fn random_change(page: &mut Page, rng: &mut Rng) {
+            let slot = rng.below(page.slot_arr.len().max(1) as u64) as usize;
+            let _ = match rng.below(7) {
+                0 | 1 => {
+                    let len = 1 + rng.below(300) as usize;
+                    page.insert(Tuple::new(vec![1 + rng.below(250) as u8; len])).map(|_| ())
+                }
+                2 => page.update(slot, Tuple::new(vec![7; 1 + rng.below(300) as usize])),
+                3 => page.retire(slot),
+                4 => page.release(slot),
+                5 => page.delete(slot),
+                _ => page.restore_at(slot, &vec![3; 1 + rng.below(120) as usize]),
+            };
+        }
+
+        /// A page any method left behind must serialise into bytes the reader accepts again.
+        fn reparse(page: &Page, what: &str) {
+            if let Err(e) = Page::deserialize(page.serialize().expect("serialize")) {
+                panic!("{what} left a page the reader refuses: {e}");
+            }
+        }
+
+        /// Every method with a caller, run on `bytes` if the reader accepts them, each mutation on a
+        /// fresh parse (`Page` is not `Clone`). `compact` is left out: it has no caller. Returns
+        /// whether the page was accepted.
+        fn exercise(bytes: [u8; PAGE_SIZE], rng: &mut Rng) -> bool {
+            let Ok(page) = Page::deserialize(bytes) else { return false };
+            let fresh = || Page::deserialize(bytes).expect("the same bytes parsed once and not twice");
+            for s in 0..page.slot_arr.len() {
+                let _ = page.read(s);
+                let span = page.slot_arr[s].span() as u64;
+                let mut p = fresh();
+                let _ = p.update(s, Tuple::new(vec![7; 1 + rng.below(200) as usize]));
+                reparse(&p, "update");
+                let mut p = fresh();
+                let _ = p.restore_at(s, &vec![3; rng.below(span + 2) as usize]);
+                reparse(&p, "restore_at");
+                let mut p = fresh();
+                let _ = p.retire(s);
+                reparse(&p, "retire");
+                let mut p = fresh();
+                let _ = p.release(s);
+                reparse(&p, "release");
+                let mut p = fresh();
+                let _ = p.delete(s);
+                reparse(&p, "delete");
+            }
+            let mut p = fresh();
+            let _ = p.insert(Tuple::new(vec![5; 1 + rng.below(200) as usize]));
+            reparse(&p, "insert");
+            reparse(&page, "nothing");
+            true
+        }
+
+        /// Damage where the layout lives: 1-4 random bytes of the header or the slot array, or one
+        /// `u16` field (the slot count, either end of free space, a slot's offset or length) set near
+        /// its own value or anywhere, which is what reaches each check's edge.
+        fn damage(bytes: &mut [u8; PAGE_SIZE], rng: &mut Rng) {
+            let slots = u16::from_be_bytes([bytes[NUM_SLOTS], bytes[NUM_SLOTS + 1]]) as usize;
+            if rng.below(2) == 0 {
+                for _ in 0..1 + rng.below(4) {
+                    let at = rng.below((HEADER_SIZE + slots * SLOT_ENTRY_SIZE + 4) as u64) as usize;
+                    bytes[at] = rng.next_u64() as u8;
+                }
+            } else {
+                let at = match rng.below(3 + 2 * slots as u64) as usize {
+                    0 => NUM_SLOTS,
+                    1 => FREE_START,
+                    2 => FREE_END,
+                    k => HEADER_SIZE + (k - 3) * 2,
+                };
+                let now = u16::from_be_bytes([bytes[at], bytes[at + 1]]);
+                let v = if rng.below(2) == 0 {
+                    now.wrapping_add(rng.below(17) as u16).wrapping_sub(8)
+                } else {
+                    rng.below(4200) as u16
+                };
+                put(bytes, at, v);
+            }
+        }
+
+        #[test]
+        fn no_bytes_panic_the_reader_or_a_page_it_accepts() {
+            let mut rng = Rng::new(0xD256_0009);
+            let (mut accepted, mut refused) = (0u32, 0u32);
+            for i in 0..1500u32 {
+                let mut bytes = Page::empty(1 + i).serialize().unwrap();
+                for _ in 0..rng.below(40) {
+                    let mut page = Page::deserialize(bytes).expect("premise: the writer's own page parses");
+                    random_change(&mut page, &mut rng);
+                    bytes = page.serialize().unwrap();
+                }
+                damage(&mut bytes, &mut rng);
+                match catch_unwind(AssertUnwindSafe(|| exercise(bytes, &mut rng))) {
+                    Ok(true) => accepted += 1,
+                    Ok(false) => refused += 1,
+                    Err(p) => panic!("iteration {i}: PANICKED ({}) on a damaged page", panic_text(p)),
+                }
+            }
+            assert!(
+                accepted >= 100 && refused >= 100,
+                "the damage never reached one side of the checks: accepted {accepted}, refused {refused}"
+            );
+        }
+
+        #[test]
+        fn every_page_the_writer_produces_is_one_the_reader_accepts() {
+            let mut rng = Rng::new(0xD256_0010);
+            // Shapes the checks could wrongly refuse, counted so the test cannot pass without them.
+            let (mut retired_lowest, mut with_free, mut nearly_full) = (0u32, 0u32, 0u32);
+            for run in 0..60u32 {
+                let mut bytes = Page::empty(1 + run).serialize().unwrap();
+                for step in 0..80 {
+                    let mut page = match catch_unwind(|| Page::deserialize(bytes)) {
+                        Ok(Ok(page)) => page,
+                        Ok(Err(e)) => panic!("run {run}, step {step}: the reader refused a page the writer wrote: {e}"),
+                        Err(p) => panic!("run {run}, step {step}: the reader PANICKED on a page the writer wrote: {}", panic_text(p)),
+                    };
+                    let lowest = page.slot_arr.iter().filter(|s| !s.is_free()).min_by_key(|s| s.offset);
+                    retired_lowest += lowest.is_some_and(|s| s.is_retired()) as u32;
+                    with_free += page.slot_arr.iter().any(|s| s.is_free()) as u32;
+                    nearly_full += (page.get_free_space_end() - page.get_free_space_start() < 64) as u32;
+                    random_change(&mut page, &mut rng);
+                    bytes = page.serialize().unwrap();
+                }
+            }
+            assert!(
+                retired_lowest > 0 && with_free > 0 && nearly_full > 0,
+                "the writer never produced a shape the checks could wrongly refuse: a retired lowest slot \
+                 {retired_lowest}, a free slot {with_free}, under 64 B free {nearly_full}"
+            );
+        }
     }
 }

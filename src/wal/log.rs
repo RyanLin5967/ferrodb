@@ -175,6 +175,47 @@ impl ColumnAlteration {
     }
 }
 
+/// **Every log record's first byte: its kind.** `#[repr(u8)]`, so a second variant with a number
+/// already taken is a compile error (E0081) instead of a decode arm silently shadowed by the one
+/// before it. `RecKind::serialize` and `RecKind::deserialize` read the constants below, never a bare
+/// number. The shape is lease-grace's for its key tags (`branch::tree_keys::tag`).
+///
+/// Numbers are never reused or renumbered: a log written before a variant existed must still decode
+/// (`tests::an_older_logs_records_still_decode_after_the_new_tag_was_added`). 12 is D212's
+/// `RevertHistory`, registered in `LANDING-QUEUE` (`9c4a559`) and not on this branch; it joins here
+/// at that merge.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalTag {
+    Begin = 0,
+    Commit = 1,
+    Abort = 2,
+    TxnEnd = 3,
+    Checkpoint = 4,
+    HeapInsert = 5,
+    HeapDelete = 6,
+    HeapUpdate = 7,
+    Clr = 8,
+    Ddl = 9,
+    RunIdentity = 10,
+    HeapRelease = 11,
+    HeapInitPage = 13,
+}
+
+const TAG_BEGIN: u8 = WalTag::Begin as u8;
+const TAG_COMMIT: u8 = WalTag::Commit as u8;
+const TAG_ABORT: u8 = WalTag::Abort as u8;
+const TAG_TXN_END: u8 = WalTag::TxnEnd as u8;
+const TAG_CHECKPOINT: u8 = WalTag::Checkpoint as u8;
+const TAG_HEAP_INSERT: u8 = WalTag::HeapInsert as u8;
+const TAG_HEAP_DELETE: u8 = WalTag::HeapDelete as u8;
+const TAG_HEAP_UPDATE: u8 = WalTag::HeapUpdate as u8;
+const TAG_CLR: u8 = WalTag::Clr as u8;
+const TAG_DDL: u8 = WalTag::Ddl as u8;
+const TAG_RUN_IDENTITY: u8 = WalTag::RunIdentity as u8;
+const TAG_HEAP_RELEASE: u8 = WalTag::HeapRelease as u8;
+const TAG_HEAP_INIT_PAGE: u8 = WalTag::HeapInitPage as u8;
+
 #[derive(Debug, PartialEq)]
 pub enum RecKind {
     Begin, Commit, Abort, TxnEnd, 
@@ -193,6 +234,21 @@ pub enum RecKind {
     /// inserts would find no room. It carries no row, so it is not a change-feed event, and nothing
     /// ever undoes it: its transaction has committed.
     HeapRelease { dir_root: u32, page_id: u32, slot: u16 },
+    /// **D268: a heap page was made, and redo must initialise it before anything names it.** Tag 13.
+    /// Redo-only: nothing undoes it, and it carries no row, so it is not a change-feed event.
+    ///
+    /// `HeapFileManager::add_empty_page` appends it BEFORE the directory lists the page: on the
+    /// inserting transaction's chain, or, for a heap with no transaction (`catalog::alter`'s unlogged
+    /// rewrite and its reservation), unchained under transaction 0 through the pool's WAL. The page's
+    /// empty image carries this record's LSN, and so does the frame of every directory page that lists
+    /// it (`Frame::gate_lsn`), so the listing cannot reach the disk before this record is durable.
+    ///
+    /// A power loss can drop every page-file write since the last checkpoint and keep the log, which a
+    /// COMMIT syncs. A page freed and reused then reverted to its old owner's image, with its own id,
+    /// and redo applied the new owner's rows onto it; a listed page whose image never reached the disk
+    /// was zeros, or another structure. Redo (`wal::recovery::redo_one`) now resets such a page to
+    /// empty at this record, unless it already holds its own image at or past it.
+    HeapInitPage { dir_root: u32, page_id: u32 },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
     Checkpoint,
     /// A schema change, logged so the change feed can carry it.
@@ -376,15 +432,46 @@ pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
 }
 
 impl RecKind {
+    /// **The heap page this record writes, as `(dir_root, page_id)`, or `None` if it writes none.**
+    ///
+    /// One exhaustive list with no `_ =>` arm, so a new record kind is a compile error (E0004) here
+    /// instead of a silent skip in each list that used to spell the heap kinds out by hand: recovery's
+    /// analysis and redo, `redo_one`'s page, and the replica applier's two loops. D268's
+    /// `HeapInitPage` had to be added to each of those by hand, and D250's `heap_root` (not on this
+    /// branch) still ends in `_ => None`, which skips it without a word until its merge calls this.
+    ///
+    /// A CLR answers for the record it carries, one level down, as redo applies it. No CLR carrying a
+    /// CLR is ever written, and redo has always skipped one, so it answers `None`.
+    pub fn heap_page(&self) -> Option<(u32, u32)> {
+        match self {
+            RecKind::HeapInsert { dir_root, page_id, .. }
+            | RecKind::HeapDelete { dir_root, page_id, .. }
+            | RecKind::HeapUpdate { dir_root, page_id, .. }
+            | RecKind::HeapRelease { dir_root, page_id, .. }
+            | RecKind::HeapInitPage { dir_root, page_id } => Some((*dir_root, *page_id)),
+            RecKind::Clr { redo, .. } => match redo.as_ref() {
+                RecKind::Clr { .. } => None,
+                carried => carried.heap_page(),
+            },
+            RecKind::Begin
+            | RecKind::Commit
+            | RecKind::Abort
+            | RecKind::TxnEnd
+            | RecKind::Checkpoint
+            | RecKind::Ddl { .. }
+            | RecKind::RunIdentity { .. } => None,
+        }
+    }
+
     pub fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), FerroError> {
         match self {
-            RecKind::Begin => buffer.push(0),
-            RecKind::Commit => buffer.push(1),
-            RecKind::Abort => buffer.push(2),
-            RecKind::TxnEnd => buffer.push(3),
-            RecKind::Checkpoint => buffer.push(4),
+            RecKind::Begin => buffer.push(TAG_BEGIN),
+            RecKind::Commit => buffer.push(TAG_COMMIT),
+            RecKind::Abort => buffer.push(TAG_ABORT),
+            RecKind::TxnEnd => buffer.push(TAG_TXN_END),
+            RecKind::Checkpoint => buffer.push(TAG_CHECKPOINT),
             RecKind::HeapInsert { dir_root, page_id, slot, tuple } => {
-                buffer.push(5);
+                buffer.push(TAG_HEAP_INSERT);
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
@@ -392,7 +479,7 @@ impl RecKind {
                 buffer.extend_from_slice(tuple);
             }
             RecKind::HeapDelete { dir_root, page_id, slot, old } => {
-                buffer.push(6);
+                buffer.push(TAG_HEAP_DELETE);
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
@@ -400,7 +487,7 @@ impl RecKind {
                 buffer.extend_from_slice(old);
             }
             RecKind::HeapUpdate { dir_root, page_id, slot, old, new } => {
-                buffer.push(7);
+                buffer.push(TAG_HEAP_UPDATE);
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
@@ -410,13 +497,18 @@ impl RecKind {
                 buffer.extend_from_slice(new);
             }
             RecKind::HeapRelease { dir_root, page_id, slot } => {
-                buffer.push(11);
+                buffer.push(TAG_HEAP_RELEASE);
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&page_id.to_be_bytes());
                 buffer.extend_from_slice(&slot.to_be_bytes());
             }
+            RecKind::HeapInitPage { dir_root, page_id } => {
+                buffer.push(TAG_HEAP_INIT_PAGE);
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&page_id.to_be_bytes());
+            }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
-                buffer.push(9);
+                buffer.push(TAG_DDL);
                 // Tags 0 and 1 keep their meaning and their position, so every DDL record already
                 // in a log still deserializes byte for byte. The alteration's payload is written
                 // immediately after the op byte and only for tag 2, so nothing that reads an older
@@ -462,7 +554,7 @@ impl RecKind {
                 }
             }
             RecKind::RunIdentity { run } => {
-                buffer.push(10);
+                buffer.push(TAG_RUN_IDENTITY);
                 buffer.extend_from_slice(&run.prov_id.0.to_be_bytes());
                 write_str(buffer, &run.agent_id, "an agent id")?;
                 write_str(buffer, &run.run_id, "a run id")?;
@@ -474,7 +566,7 @@ impl RecKind {
                 buffer.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
             }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
-                buffer.push(8);
+                buffer.push(TAG_CLR);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
                 buffer.extend_from_slice(&undo_next.to_be_bytes());
                 redo.serialize(buffer)?;
@@ -488,29 +580,33 @@ impl RecKind {
             return Err(FerroError::Wal("empty log record".into()))
         }
         match bytes[0] {
-            0 => Ok(RecKind::Begin),
-            1 => Ok(RecKind::Commit),
-            2 => Ok(RecKind::Abort),
-            3 => Ok(RecKind::TxnEnd),
-            4 => Ok(RecKind::Checkpoint),
-            5 => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let tuple = bytes[15..15+length].to_vec();
+            TAG_BEGIN => Ok(RecKind::Begin),
+            TAG_COMMIT => Ok(RecKind::Commit),
+            TAG_ABORT => Ok(RecKind::Abort),
+            TAG_TXN_END => Ok(RecKind::TxnEnd),
+            TAG_CHECKPOINT => Ok(RecKind::Checkpoint),
+            // D277: every read below goes through `need`, which refuses a record too short for it as
+            // corruption naming its kind. These arms indexed their slices unchecked, so a short record
+            // PANICKED, and the replica applier decodes whatever a peer's frame carries once its CRC
+            // matches (`replication::ReplicaApplier::apply`).
+            TAG_HEAP_INSERT => {
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_INSERT)?;
+                let tuple = need(bytes, 15, length, TAG_HEAP_INSERT)?.to_vec();
                 Ok(RecKind::HeapInsert { dir_root, page_id, slot, tuple })
             }
-            6 => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let old = bytes[15..15 + length].to_vec();
+            TAG_HEAP_DELETE => {
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_DELETE)?;
+                let old = need(bytes, 15, length, TAG_HEAP_DELETE)?.to_vec();
                 Ok(RecKind::HeapDelete { dir_root, page_id, slot, old })
             }
-            7 => {
-                let (dir_root, page_id, slot, length) = read_heap(bytes)?;
-                let old = bytes[15..15 + length].to_vec();
-                let new_len = u32::from_be_bytes(bytes[15 + length..19 + length].try_into().unwrap()) as usize;
-                let new = bytes[19 + length.. 19 + length + new_len].to_vec();
+            TAG_HEAP_UPDATE => {
+                let (dir_root, page_id, slot, length) = read_heap(bytes, TAG_HEAP_UPDATE)?;
+                let old = need(bytes, 15, length, TAG_HEAP_UPDATE)?.to_vec();
+                let new_len = u32::from_be_bytes(need(bytes, 15 + length, 4, TAG_HEAP_UPDATE)?.try_into().unwrap()) as usize;
+                let new = need(bytes, 19 + length, new_len, TAG_HEAP_UPDATE)?.to_vec();
                 Ok(RecKind::HeapUpdate { dir_root, page_id, slot, old, new })
             }
-            9 => {
+            TAG_DDL => {
                 // Every read is bounds-checked against the record's own length: these bytes came
                 // off a disk or a socket, and `deserialize` must refuse a truncated record rather
                 // than index past it and panic the process.
@@ -549,7 +645,7 @@ impl RecKind {
                 }
                 Ok(RecKind::Ddl { op, table, dir_root, time_travel_root, columns })
             }
-            10 => {
+            TAG_RUN_IDENTITY => {
                 // Bounds-checked throughout, for the same reason the DDL arm is: these bytes came
                 // off a disk, and a truncated record must be refused rather than indexed past.
                 let mut at = 1usize;
@@ -582,16 +678,23 @@ impl RecKind {
                     ),
                 })
             }
-            11 => {
+            TAG_HEAP_RELEASE => {
                 let mut at = 1usize;
                 let dir_root = take_u32(bytes, &mut at)?;
                 let page_id = take_u32(bytes, &mut at)?;
                 let slot = take_u16(bytes, &mut at)?;
                 Ok(RecKind::HeapRelease { dir_root, page_id, slot })
             }
-            8 => {
-                let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-                let undo_next = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
+            TAG_HEAP_INIT_PAGE => {
+                let dir_root = u32::from_be_bytes(need(bytes, 1, 4, TAG_HEAP_INIT_PAGE)?.try_into().unwrap());
+                let page_id = u32::from_be_bytes(need(bytes, 5, 4, TAG_HEAP_INIT_PAGE)?.try_into().unwrap());
+                Ok(RecKind::HeapInitPage { dir_root, page_id })
+            }
+            TAG_CLR => {
+                let undone_lsn = u64::from_be_bytes(need(bytes, 1, 8, TAG_CLR)?.try_into().unwrap());
+                let undo_next = u64::from_be_bytes(need(bytes, 9, 8, TAG_CLR)?.try_into().unwrap());
+                // A CLR carries a record; one with none is as truncated as one cut inside its fields.
+                need(bytes, 17, 1, TAG_CLR)?;
                 let redo = RecKind::deserialize(&bytes[17..])?;
                 Ok(RecKind::Clr { undone_lsn, undo_next, redo: Box::new(redo) })
             }
@@ -1191,12 +1294,27 @@ pub fn scan_valid_end(file: &dyn Storage, base_lsn: u64, file_len: u64) -> Resul
     Ok(base_lsn + (offset - HEADER_SIZE as u64))
 }
 
-fn read_heap(bytes: &[u8]) -> Result<(u32, u32, u16, usize), FerroError> {
-    let dir_root = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-    let page_id = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
-    let slot = u16::from_be_bytes(bytes[9..11].try_into().unwrap());
-    let length = u32::from_be_bytes(bytes[11..15].try_into().unwrap()) as usize;
+/// A heap record's `dir_root`, `page_id`, `slot` and first length, each read through [`need`] (D277).
+fn read_heap(bytes: &[u8], tag: u8) -> Result<(u32, u32, u16, usize), FerroError> {
+    let dir_root = u32::from_be_bytes(need(bytes, 1, 4, tag)?.try_into().unwrap());
+    let page_id = u32::from_be_bytes(need(bytes, 5, 4, tag)?.try_into().unwrap());
+    let slot = u16::from_be_bytes(need(bytes, 9, 2, tag)?.try_into().unwrap());
+    let length = u32::from_be_bytes(need(bytes, 11, 4, tag)?.try_into().unwrap()) as usize;
     Ok((dir_root, page_id, slot, length))
+}
+
+/// **D277: `bytes[at..at + len]` of a record of kind `tag`, or its refusal as corruption naming the
+/// kind.** A record too short for a field is damage, whether it came off a disk or a peer's frame,
+/// and a decoder that indexes past it panics the process instead of refusing. The arms that already
+/// read through `take_*` (tags 9, 10 and 11) keep their `FerroError::Wal` refusal; those helpers are
+/// shared, and changing a refusal's variant is not this row.
+fn need(bytes: &[u8], at: usize, len: usize, tag: u8) -> Result<&[u8], FerroError> {
+    at.checked_add(len).and_then(|end| bytes.get(at..end)).ok_or_else(|| {
+        FerroError::Corruption(format!(
+            "log record of kind {tag} is truncated: wanted {len} byte(s) at offset {at} but the record is {} bytes",
+            bytes.len()
+        ))
+    })
 }
 
 fn crc32_table() -> [u32; 256] {
@@ -1501,6 +1619,75 @@ mod tests {
         assert_eq!(buf.len(), 11, "a HeapRelease is its tag plus a u32, a u32 and a u16");
         assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
         assert!(RecKind::deserialize(&buf[..10]).is_err(), "a truncated HeapRelease decoded");
+    }
+
+    /// **D268: `HeapInitPage` round-trips under tag 13, and a truncated one is refused as corruption
+    /// naming its kind.** Tag 12 is D212's `RevertHistory` (`LANDING-QUEUE` @ `9c4a559`), so this takes
+    /// 13, and every older tag keeps its meaning. Lane report: artie-research
+    /// `frontier/lane_d268_power_loss_redo.md` §2.2, test 6'.
+    #[test]
+    fn a_heap_init_page_round_trips_under_tag_13() {
+        let kind = RecKind::HeapInitPage { dir_root: 7, page_id: 42 };
+        let mut buf = Vec::new();
+        kind.serialize(&mut buf).unwrap();
+        assert_eq!(buf[0], 13, "HeapInitPage is not tag 13");
+        assert_eq!(buf.len(), 9, "a HeapInitPage is its tag, a u32 and a u32");
+        assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        for n in 1..buf.len() {
+            match RecKind::deserialize(&buf[..n]) {
+                Err(FerroError::Corruption(m)) => {
+                    assert!(m.contains("kind 13"), "a HeapInitPage cut to {n} bytes was refused without naming kind 13: {m}")
+                }
+                other => panic!("a HeapInitPage cut to {n} bytes was not refused as corruption: {other:?}"),
+            }
+        }
+    }
+
+    /// **D277: a truncated heap or CLR record is refused as corruption naming its kind, never a
+    /// panic.** These arms indexed their slices unchecked, so a short record panicked, and a replica
+    /// decodes whatever a peer's frame carries once its CRC matches. Built from raw bytes, so this
+    /// does not depend on `RecKind`'s fields. Lane report: artie-research
+    /// `frontier/lane_d268_power_loss_redo.md` §2.2 E, test 9.
+    #[test]
+    fn a_truncated_heap_or_clr_record_is_refused_as_corruption_naming_its_kind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        // A heap record: its tag, dir_root, page_id and slot, then each byte string behind its u32 length.
+        let heap = |tag: u8, strings: &[&[u8]]| -> Vec<u8> {
+            let mut b = vec![tag];
+            b.extend_from_slice(&7u32.to_be_bytes());
+            b.extend_from_slice(&42u32.to_be_bytes());
+            b.extend_from_slice(&3u16.to_be_bytes());
+            for s in strings {
+                b.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                b.extend_from_slice(s);
+            }
+            b
+        };
+        let insert = heap(5, &[&[1, 2, 3]]);
+        // A CLR: its tag, undone_lsn and undo_next, then the record it carries.
+        let mut clr = vec![8u8];
+        clr.extend_from_slice(&11u64.to_be_bytes());
+        clr.extend_from_slice(&0u64.to_be_bytes());
+        clr.extend_from_slice(&insert);
+        let cases: Vec<(u8, Vec<u8>)> =
+            vec![(5, insert.clone()), (6, heap(6, &[&[4, 5]])), (7, heap(7, &[&[6], &[7, 8, 9]])), (8, clr)];
+        for (tag, full) in &cases {
+            assert!(RecKind::deserialize(full).is_ok(), "premise: the whole kind-{tag} record does not decode");
+            for n in 1..full.len() {
+                let cut = &full[..n];
+                let what = format!("a kind-{tag} record cut to {n} of {} bytes", full.len());
+                match catch_unwind(AssertUnwindSafe(|| RecKind::deserialize(cut))) {
+                    Err(_) => panic!("{what} PANICKED instead of being refused"),
+                    Ok(Ok(kind)) => panic!("{what} DECODED as {kind:?}"),
+                    Ok(Err(FerroError::Corruption(m))) => {
+                        // A CLR cut inside the record it carries is refused naming that record's kind.
+                        let named = if *tag == 8 && n > 17 { 5 } else { *tag };
+                        assert!(m.contains(&format!("kind {named}")), "{what} was refused without naming kind {named}: {m}");
+                    }
+                    Ok(Err(e)) => panic!("{what} was refused, but not as corruption: {e}"),
+                }
+            }
+        }
     }
 
     /// **The additive-tag discipline, for tag 10.**
