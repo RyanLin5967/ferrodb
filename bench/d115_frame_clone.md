@@ -9,8 +9,9 @@
 >
 > **It is also 3.2% of the statement path on the configuration ferrodb ships, and the writes phase
 > on that configuration is already LINEAR (exponent 1.01) before anything is changed.** The cost is
-> one fsync per statement in `DurableEffectLog::append`, which is 92.6% of `stage_all` and which
-> that store's own comment describes as the deliberate price of its guarantee.
+> `DurableEffectLog::append` at **4.057 ms per statement — 92.6% of `stage_all`** — of which ≥97.6%
+> is encode + `pwrite` + `sync_data` (bounded from a counter, §3) and not comparison. That store's
+> own comment calls the per-statement fsync the deliberate price of its guarantee.
 >
 > **Do not "fix" the clone.** Removing it buys ~6% at 8192 ops. On the shipped store the clone does
 > not overtake the per-statement fsync until **~122,000 ops in a single agent session**.
@@ -23,6 +24,17 @@ Measured at `8249c50` with the `tel::stage_probe` counters added and **no other 
 was written, deliberately. Raw runs, both directions, in `bench/d115_before.txt`,
 `bench/d115_real_mem.txt`, `bench/d115_real_durable.txt`, `bench/d115_crossover.txt`;
 `bench/d115_run4.sh` is the driver.
+
+⚠ **`main` moved during this run** — from `8249c50` to `dc2a2cf` (the D114 and D99 lanes landed).
+What that does and does not do to these numbers, checked by diff rather than assumed:
+
+* **`stage_all` is byte-identical** at both commits, and `src/tel/log.rs` is untouched. The only
+  `runtime.rs` change is D114's `ours_scan` counters at three merge-path sites. So the clone, drop
+  and append terms transfer unchanged.
+* ⛔ **`src/cow/{btree,node,mod,cid,diff,merge3}.rs` DID change** (the D113 compact-refusal lane).
+  The CoW mirror descends through those on every `put_row`, so **the mirror term specifically may
+  differ on current main and is not carried forward by this run.** Re-run arm 1 before quoting the
+  mirror column against `dc2a2cf` or later.
 
 **Suite:** the instrument commit is `a19e881` on `D115-frame-clone`; `cargo test --release --lib`
 there reports **`ok. 1599 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out`**, `rc=0`,
