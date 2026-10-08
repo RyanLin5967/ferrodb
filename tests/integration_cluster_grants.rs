@@ -467,6 +467,27 @@ fn is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick()
 }
 
 #[test]
+fn an_over_long_lease_cannot_forge_the_never_expires_sentinel() {
+    // `TRUNK_LEASE` is `LeaseDeadline(u64::MAX)` and means never expires — reaping skips it. A
+    // plain `saturating_add` turns a huge `lease_millis`, or a cluster tick far in the future, into
+    // a branch indistinguishable from trunk: nothing errors, the branch just stays for ever, and
+    // exit criterion 8 fails with no symptom.
+    let _scope = ClusterScope::joined(N1);
+    cluster::apply_lease_tick(1_000).unwrap();
+
+    let d = LeaseDeadline::try_from_now(u64::MAX).unwrap();
+    assert_ne!(d.0, u64::MAX, "an over-long lease forged the trunk sentinel");
+    assert_eq!(d.0, u64::MAX - 1);
+    // And it is still a real deadline: something can expire it.
+    assert!(d.is_expired_at(u64::MAX), "the clamped deadline is unreachable, so it never expires");
+
+    // The same through the whole reaper path, against an absurd tick rather than an absurd lease.
+    cluster::apply_lease_tick(u64::MAX).unwrap();
+    let d2 = LeaseDeadline::try_from_now(60_000).unwrap();
+    assert_ne!(d2.0, u64::MAX, "an absurd tick forged the trunk sentinel");
+}
+
+#[test]
 fn a_standalone_node_refuses_a_lease_tick() {
     let _scope = ClusterScope::standalone();
     let err = cluster::apply_lease_tick(1_000).unwrap_err();
