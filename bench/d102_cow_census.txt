@@ -1,5 +1,5 @@
 D102 — WHICH ARM OF cow_page DOES AN AGENT MERGE TAKE, AND WHAT WOULD IT ENCODE TO?
-Harness: examples/d102_cow_census.rs. Measured at 7361e1f (the D102 commit), on a
+Harness: examples/d102_cow_census.rs. RAW OUTPUT BELOW IS FROM THE FINAL TREE, on a
 20,000-row table, r = rows changed, swept 1 -> 512 by doubling. Each r: fork a branch,
 UPDATE exactly r scattered rows (i -> 1 + i*7919 mod N, injective, D90's scatter), MERGE.
 
@@ -66,6 +66,11 @@ built; 1 live arena pages
   bases they encode to 2412 B, with 0 refused for exceeding the budget.
   ⇒ 16.9x less, measured on pages the engine really produced.
 
+  stale delta bases: 0 — no recorded base had its page id reissued, which is
+  what the epoch interval rule predicts. The refusal is proven to fire in
+  branch::arena::tests::a_base_whose_id_was_reissued_is_refused_rather_than_encoded_against,
+  so this zero is a fact about the workload and not about a dead counter.
+
   ⚠ THAT RATIO IS OCCUPANCY, NOT BYTES STORED, AND THE TWO ARE NOT THE SAME HERE.
     Each shadow above is ONE page, and one page is the smallest thing DiskManager
     writes. D90's headline is `distinct pages x 4096 + WAL`, so a page whose useful
@@ -82,3 +87,33 @@ REFUSED: a warm-up cycle did not complete; no steady state was reached.
 exit 1. 46270 is 6610*7, the row's build-time value: the merge genuinely moved
 nothing while reporting applied_to_target. Without the flag the same binary
 completes the sweep and exits 0, so the guard does not fire spuriously.
+
+REPRODUCED THREE TIMES, from three separately built binaries, at three commits along this
+branch (before the stale-base check, after it, and at the final tree). Every DELTA B value
+is identical across all three: r=1 -> 52 B, and 2412 B over the sweep. Counters, not
+timings, so the box being at load 12-21 with a fleet running does not enter.
+
+================================================================================
+FULL-SUITE CERTIFICATION at 40d89525e23a095c1de7483fa171ac3355b0fe53
+
+CERTIFYING 40d89525e23a095c1de7483fa171ac3355b0fe53
+build rc=0
+LIB rc=0 | test result: ok. 1552 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 109.08s
+
+124 integration targets: 123 green on the first pass. The one non-zero was
+  adversarial_i20 rc=143  (143 = 128+15 = SIGTERM, killed externally mid-run;
+  the fleet does this. It is NOT a test failure and NOT a timeout, which would
+  have been rc=124 from this script's own `timeout 600`.)
+Re-run standalone: adversarial_i20  ok. 14 passed; 0 failed; 1 ignored  (195s)
+
+The tree did not move under the run, which is what makes this certify a SHA:
+TREE AT END: 40d89525e23a095c1de7483fa171ac3355b0fe53 0 dirty
+
+d59_snapshot_cache PASSED in this run (9 passed) after failing in an earlier one,
+which is the same load-flakiness bench/d102_d59_flaky.txt records with three reps.
+
+AFTER this run, one further change landed (PageDelta::decode bounds run_count by
+the format before it sizes an allocation) plus its test. Integration coverage is
+unaffected by construction: PageDelta::decode has no caller outside delta.rs's own
+test module - verified by grep over src/, examples/ and tests/. The lib suite was
+re-run at that final tree: 1553 passed; 0 failed; 3 ignored, cargo rc=0.
