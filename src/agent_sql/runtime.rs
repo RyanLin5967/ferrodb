@@ -181,6 +181,40 @@ pub fn scan_table_seq_tuples() -> u64 {
     SCAN_TABLE_SEQ_TUPLES.load(AtomicOrdering::Relaxed)
 }
 
+/// **D191 instrument — how many `State::applied` entries `AgentRuntime::diff` VISITED.**
+///
+/// `diff` answers each changed row's `concurrent` flag with `state.applied.iter().any(..)`, once
+/// PER CHANGED ROW, over a log that is global across branches and never pruned. D86's
+/// `applied_by_cell` index is keyed `(tbl, row, col)` and cannot serve this `(tbl, row)` question,
+/// so the read shape is O(delta x |applied|). This counter is what turns that reading into a
+/// measurement (`examples/d191_diff_applied_curve.rs`).
+///
+/// Taken from INSIDE the `.any` closure, for the reason `ours_ops_on_cell` gives: a count computed
+/// as `applied.len()` from outside would be an assertion about the code rather than a reading of
+/// it, and it would miss the short-circuit — `.any` stops at the first concurrent entry, so a row
+/// the target DID move visits only up to that entry. Integers, like `OURS_SCAN_*`, because a count
+/// does not move when the box is loaded.
+///
+/// ⚠ Counted per ROW, not per entry: one local increment inside the closure and one relaxed add
+/// per changed row, so the instrument cannot create the slope it measures.
+pub static DIFF_APPLIED_VISITED: AtomicU64 = AtomicU64::new(0);
+/// Changed rows `diff` examined — the delta, which a curve over `|applied|` must hold fixed.
+pub static DIFF_ROWS: AtomicU64 = AtomicU64::new(0);
+/// Frame ops plus frame guards the two sibling per-row `filter`s visited. They have no early
+/// exit, so this is `delta x (|frame.ops| + |frame.guards|)` — the per-task term `diff` pays beside
+/// the global one. Kept so a reader can see which of the two dominates, not assume it.
+pub static DIFF_FRAME_VISITED: AtomicU64 = AtomicU64::new(0);
+
+/// `(applied_visited, rows, frame_visited)` since process start. Read twice and subtract to scope
+/// it to one `DIFF`.
+pub fn diff_scan_counters() -> (u64, u64, u64) {
+    (
+        DIFF_APPLIED_VISITED.load(AtomicOrdering::Relaxed),
+        DIFF_ROWS.load(AtomicOrdering::Relaxed),
+        DIFF_FRAME_VISITED.load(AtomicOrdering::Relaxed),
+    )
+}
+
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
 /// cell, in the order it wrote them, for `compose_ops` to fold.
 ///
@@ -3275,13 +3309,20 @@ impl AgentRuntime {
                 ws.rows
                     .iter()
                     .map(|((t, r), st)| {
+                        // D191 instrument: counted inside the closures that walk, never as a
+                        // `len()` from outside. See `DIFF_APPLIED_VISITED`.
+                        let mut frame_visited = 0u64;
+                        let mut applied_visited = 0u64;
                         let table = ws.tables.get(t).cloned().unwrap_or_default();
                         let before = ws.base_rows.get(&(*t, *r)).cloned().flatten();
                         let ops: Vec<Op> = ws
                             .frame
                             .ops
                             .iter()
-                            .filter(|o| o.tbl.0 == *t && o.row.0 == *r)
+                            .filter(|o| {
+                                frame_visited += 1;
+                                o.tbl.0 == *t && o.row.0 == *r
+                            })
                             .cloned()
                             .collect();
                         let guards: Vec<Guard> = ws
@@ -3289,6 +3330,7 @@ impl AgentRuntime {
                             .guards
                             .iter()
                             .filter(|g| {
+                                frame_visited += 1;
                                 g.expr
                                     .referenced_cells()
                                     .iter()
@@ -3296,10 +3338,13 @@ impl AgentRuntime {
                             })
                             .cloned()
                             .collect();
-                        let concurrent = state
-                            .applied
-                            .iter()
-                            .any(|a| a.seq > ws.fork_seq && a.tbl.0 == *t && a.row.0 == *r);
+                        let concurrent = state.applied.iter().any(|a| {
+                            applied_visited += 1;
+                            a.seq > ws.fork_seq && a.tbl.0 == *t && a.row.0 == *r
+                        });
+                        DIFF_APPLIED_VISITED.fetch_add(applied_visited, AtomicOrdering::Relaxed);
+                        DIFF_FRAME_VISITED.fetch_add(frame_visited, AtomicOrdering::Relaxed);
+                        DIFF_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
                         (*t, *r, table, before, st.clone(), ops, guards, concurrent)
                     })
                     .collect();
