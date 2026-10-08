@@ -1,0 +1,11 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -733,7 +733,7 @@
+         // the version-2 header durable first, so no crash can leave a large frame under a header
+         // an older build accepts. It runs before the offsets below are taken, because the switch
+         // moves the live file.
+-        if self.version == LEGACY_VERSION && frames.iter().any(|f| f.len() > LEGACY_READ_BOUND) {
++        if false && self.version == LEGACY_VERSION && frames.iter().any(|f| f.len() > LEGACY_READ_BOUND) {
+             self.raise_version()?;
+         }
+ 

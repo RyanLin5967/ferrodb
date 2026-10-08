@@ -1,0 +1,11 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -125,7 +125,7 @@
+ /// The read bound of every build before D223. Their `MAX_FRAME` was `MAX_ENTRY_BYTES + 64`, with
+ /// `MAX_ENTRY_BYTES = MAX_FRAME_BYTES − 4096`, which is 8,384,576 bytes (READ at `9aa6968`). A
+ /// literal, because it is a fact about binaries already shipped, not something this build can move.
+-const LEGACY_READ_BOUND: usize = 8_384_576;
++const LEGACY_READ_BOUND: usize = 8_388_538;
+ 
+ /// `magic | version | generation | snapshot_round | snapshot_term | crc32(the previous 32 bytes)`.
+ const HEADER_SIZE: usize = 36;

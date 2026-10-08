@@ -1,0 +1,11 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -517,7 +517,7 @@
+                 // Born at the legacy version: nothing large is in it yet, and an older build can
+                 // still open it. The first large frame raises it (`RoundLog::append`).
+                 let h = Header {
+-                    version: LEGACY_VERSION,
++                    version: VERSION,
+                     generation: 1,
+                     snapshot_round: 0,
+                     snapshot_term: 0,

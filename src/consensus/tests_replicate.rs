@@ -1574,3 +1574,262 @@ fn adopting_a_new_leader_retracts_everything_established_with_the_last_one() {
     );
     assert_eq!(digest, 0, "and a claim of nothing carries no digest");
 }
+
+// -------------------------------------------------------------------------------------------
+// D220 — an Append capped by entry count and not by bytes. Found by the D207 lane, ledger row
+// D220. Written red against de1fa99, and compiling against 9aa6968.
+// -------------------------------------------------------------------------------------------
+
+/// The key every D220 frame is signed with. Signed because it is the stricter framing: the MAC
+/// spends `MAC_LEN` of the same frame limit, so an `Append` that fits signed fits unsigned too.
+fn d220_key() -> crate::consensus::signing::Key {
+    crate::consensus::signing::Key::from_bytes_for_test(vec![0x5a; 32])
+        .expect("32 bytes is the minimum")
+}
+
+/// What `node.rs` does with a send, reduced to what the peer sees. Frame it with the real codec;
+/// drop it if the codec refuses, because `node.rs` discards that error by design; otherwise hand
+/// the peer what its own codec reads back. `[5..]` skips the tag byte and the u32 length, which is
+/// `encode_signed`'s own header.
+fn over_the_wire(m: Message, key: &crate::consensus::signing::Key) -> Option<Message> {
+    let frame = crate::consensus::transport::encode_signed(&m, Some(key)).ok()?;
+    Some(
+        crate::consensus::transport::decode_verified(&frame[5..], Some(key))
+            .expect("a frame this codec produced must read back"),
+    )
+}
+
+#[test]
+fn a_follower_far_behind_on_large_entries_catches_up_over_the_real_wire() {
+    // **D220.** An `Append` is capped at `MAX_ENTRIES_PER_APPEND` entries and at nothing else, while
+    // one entry may be up to `MAX_ENTRY_BYTES`. So 64 entries of 1 MiB make a 64 MiB `Append`. The
+    // encoder refuses it, because the frame limit is 8 MiB; `node.rs` discards the refusal; and
+    // every later heartbeat rebuilds the same batch. The follower never catches up and no meter
+    // moves.
+    //
+    // `catch_up` above hands `Message`s across without encoding them, which is why nothing here saw
+    // this. This harness routes every message the way `node.rs` does.
+    const ENTRIES: u8 = 64;
+    let big = |mark: u8| Command::WalBatch { start_lsn: 100 + mark as u64, bytes: vec![mark; 1 << 20] };
+    let key = d220_key();
+
+    let mut leader = Consensus::new(N1, cfg3(), 61);
+    seed(&mut leader, &(0..ENTRIES).map(|i| (1u64, big(i))).collect::<Vec<_>>());
+    promote_bare(&mut leader, 1);
+    leader.progress.entry(N2).or_default().next = 1;
+    let mut f = Consensus::new(N2, cfg3(), 62);
+    follower_of(&mut f, 1, N1);
+
+    let mut refused = 0usize;
+    let mut delivered = 0usize;
+    // One pass per heartbeat: the leader offers N2 an `Append`, and the exchange runs until it goes
+    // quiet. N3 is down, so what is addressed to it is lost.
+    for _heartbeat in 0..20 {
+        if f.last_round == leader.last_round {
+            break;
+        }
+        let mut out = Vec::new();
+        leader.send_append_to(N2, &mut out);
+        let mut pending: VecDeque<Message> = sends(&out).into();
+        while let Some(m) = pending.pop_front() {
+            if m.to != N1 && m.to != N2 {
+                continue;
+            }
+            let Some(m) = over_the_wire(m, &key) else {
+                refused += 1;
+                continue;
+            };
+            delivered += 1;
+            let node: &mut Consensus = if m.to == N1 { &mut leader } else { &mut f };
+            let acts = node.step(Event::Recv(m));
+            pending.extend(sends(&acts));
+            for a in &acts {
+                if let Action::Persist { entries } = a {
+                    let round = entries.last().map(|e| e.round).unwrap_or(0);
+                    let term = node.term();
+                    pending.extend(sends(&node.step(Event::Persisted { term, round })));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        refused, 0,
+        "{refused} message(s) the leader built were refused by the wire codec. node.rs drops each \
+         one, so this follower is offered the same unsendable batch on every heartbeat"
+    );
+    assert_eq!(
+        f.last_round, leader.last_round,
+        "after 20 heartbeats the follower holds round {} of {} ({delivered} messages delivered)",
+        f.last_round, leader.last_round
+    );
+}
+
+#[test]
+fn an_append_is_cut_where_a_signed_frame_would_overflow_and_not_a_byte_before() {
+    // D220's bound, at its edge. The state machine cannot know whether its transport signs, so a
+    // batch must fit a SIGNED frame: the MAC's `MAC_LEN` bytes come out of the same limit. Two
+    // entries are sized, by the encoder itself, to fill a signed frame exactly, and then to overrun
+    // it by one byte. At the exact fit both must go; one byte over, only the first may.
+    let key = d220_key();
+    let first = Command::WalBatch { start_lsn: 1, bytes: vec![1; 4 << 20] };
+    // The signed body of an `Append` carrying `first` and an EMPTY second batch. Each byte of the
+    // second payload adds exactly one to it, because its length prefix is fixed-width.
+    let probe = append_msg(
+        N1,
+        N2,
+        1,
+        0,
+        0,
+        vec![
+            Entry { term: 1, round: 1, command: first.clone() },
+            Entry { term: 1, round: 2, command: Command::WalBatch { start_lsn: 2, bytes: Vec::new() } },
+        ],
+        0,
+    );
+    let probe_body = crate::consensus::transport::encode_signed(&probe, Some(&key))
+        .expect("the probe fits a frame")
+        .len()
+        - 5;
+    // Pinned as a premise, not trusted: 45 (the Append envelope) + 4,194,333 (the 4 MiB entry) + 29
+    // (the empty one) + 32 (the MAC). A change common to the encoder and to the budget, such as a
+    // wider count prefix, moves both sides of this test together; this is what notices.
+    assert_eq!(probe_body, 4_194_439, "the signed probe is not the size this test's arithmetic is about");
+    let exact = crate::replication::MAX_FRAME_BYTES - probe_body;
+
+    for (second, want) in [(exact, 2usize), (exact + 1, 1)] {
+        let mut c = Consensus::new(N1, cfg3(), 63);
+        seed(
+            &mut c,
+            &[(1, first.clone()), (1, Command::WalBatch { start_lsn: 2, bytes: vec![2; second] })],
+        );
+        promote_bare(&mut c, 1);
+        c.progress.entry(N2).or_default().next = 1;
+        let mut out = Vec::new();
+        c.send_append_to(N2, &mut out);
+        let m = only_send(&out);
+        let Body::Append { entries, .. } = &m.body else { panic!("expected an Append, got {m:?}") };
+        assert_eq!(
+            entries.len(),
+            want,
+            "with a second entry of {second} bytes ({exact} fills a signed frame exactly), the \
+             leader put {} entries in one Append",
+            entries.len()
+        );
+        assert!(
+            crate::consensus::transport::encode_signed(&m, Some(&key)).is_ok(),
+            "the Append the leader built with a {second}-byte second entry does not fit a signed frame"
+        );
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// D223 — one admission check at proposal: nothing the wire cannot carry reaches the log. From the
+// re-review of dd9d1e1..5a86ad8 (artie-research frontier/d207_rereview.md, R1 and R2). Written
+// red against 5a86ad8.
+// -------------------------------------------------------------------------------------------
+
+/// Propose `c` to a fresh leader of `cfg3`. Returns the last round it held before and after the
+/// proposal, and the actions the proposal produced.
+fn propose_to_fresh_leader(c: Command) -> (Round, Round, Vec<Action>) {
+    let mut l = Consensus::new(N1, cfg3(), 71);
+    promote_bare(&mut l, 1);
+    let before = l.last_round;
+    let out = l.step(Event::Propose(c));
+    (before, l.last_round, out)
+}
+
+fn refusals(out: &[Action]) -> Vec<String> {
+    out.iter()
+        .filter_map(|a| match a {
+            Action::Refuse { why } => Some(format!("{why}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_membership_the_wire_cannot_carry_is_refused_at_proposal_and_never_reaches_the_log() {
+    // **D223, re-review R1.** The wire refuses a configuration over `MAX_CONFIG_NODES`, but nothing
+    // in front of it did: `write_config` checks only that a count fits a u32, and `on_propose`
+    // appended any command at all. So a leader could hold a round that no frame will ever carry,
+    // and offer it, alone, to a follower on every heartbeat. `node.rs` discards the encoder's refusal,
+    // so no meter moved.
+    let cfg = Config::new([N1, N2, N3], 2, 1).with_learners((4..=1028).map(NodeId));
+    assert_eq!(
+        cfg.learners().len(),
+        crate::consensus::transport::MAX_CONFIG_NODES + 1,
+        "the fixture is not one learner over the wire's limit"
+    );
+    let (before, after, out) = propose_to_fresh_leader(Command::Membership { config: cfg });
+    assert_eq!(
+        after, before,
+        "the proposal reached the log: the leader now holds round {after}, which no frame can carry"
+    );
+    assert!(persisted_entries(&out).is_empty(), "the proposal was sent to the disk");
+    let why = refusals(&out);
+    assert_eq!(why.len(), 1, "expected exactly one refusal, got {why:?}");
+    assert!(why[0].contains("1024"), "the refusal does not name the limit it enforces: {}", why[0]);
+}
+
+#[test]
+fn a_wal_batch_one_byte_over_a_frame_is_refused_at_proposal_and_one_at_the_limit_is_admitted() {
+    // **D223, re-review R2.** Nothing checked an entry's size before the in-memory tail:
+    // `append_own_entry` pushed it and emitted `Persist`, the disk refused it later, and the tail
+    // kept the round. The limit that matters is the wire's: one entry must fit one signed `Append`
+    // frame on its own.
+    //
+    // The boundary is pinned as literals, not taken from the functions under test. The budget is
+    // 8,388,608 − 45 (the Append envelope) − 32 (the MAC) = 8,388,531, and a `WalBatch` entry spends
+    // 29 bytes around its payload: term 8, round 8, tag 1, lsn 8, length 4.
+    const AT_LIMIT: usize = 8_388_531 - 29;
+    assert_eq!(
+        crate::consensus::transport::append_entries_budget(),
+        8_388_531,
+        "the frame budget moved; re-derive AT_LIMIT"
+    );
+    for (payload, admitted) in [(AT_LIMIT, true), (AT_LIMIT + 1, false)] {
+        let (before, after, out) =
+            propose_to_fresh_leader(Command::WalBatch { start_lsn: 1, bytes: vec![7; payload] });
+        if admitted {
+            assert_eq!(
+                after,
+                before + 1,
+                "a {payload}-byte batch fits one signed frame exactly and was not admitted: {:?}",
+                refusals(&out)
+            );
+            assert!(refusals(&out).is_empty(), "an admitted batch was also refused");
+        } else {
+            assert_eq!(
+                after, before,
+                "a {payload}-byte batch, one byte over a signed frame, reached the log at round {after}"
+            );
+            assert!(persisted_entries(&out).is_empty(), "the over-size batch was sent to the disk");
+            assert_eq!(refusals(&out).len(), 1, "the over-size batch was not refused exactly once");
+        }
+    }
+}
+
+#[test]
+fn an_entry_that_fits_no_frame_is_still_offered_alone() {
+    // The at-least-one rule in `slice_from`, pinned: it is what mutant M27 removes, and before this
+    // test nothing killed that mutant. Since D223 no proposal can put an entry like this in a log.
+    // One placed around admission — a driver bug, or a log written before D223 — is still a state
+    // this code must handle. The rule stops such an entry hiding as an empty batch, which a follower
+    // would read as a heartbeat.
+    let cfg = Config::new([N1, N2, N3], 2, 1).with_learners((4..=1028).map(NodeId));
+    let mut c = Consensus::new(N1, cfg3(), 73);
+    // Around admission, on purpose: `seed` appends through `append_own_entry` directly.
+    seed(&mut c, &[(1, Command::Membership { config: cfg })]);
+    let offered = c.entries_from(1);
+    assert_eq!(
+        offered.len(),
+        1,
+        "an entry no frame can carry was hidden: the batch is empty, which a follower reads as a \
+         heartbeat, so the leader would never learn that this round cannot be sent"
+    );
+    assert_eq!(
+        crate::consensus::transport::entry_wire_len(&offered[0]),
+        usize::MAX,
+        "the fixture is an entry the wire can express, so this test exercises nothing"
+    );
+}

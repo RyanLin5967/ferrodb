@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -1266,7 +1266,7 @@
+                 || st.bytes.saturating_add(frame.len()) > self.max_bytes)
+         {
+             if let Some(old) = st.queue.pop_front() {
+-                st.bytes -= old.len();
++                let _ = old.len();
+                 self.dropped.fetch_add(1, Ordering::SeqCst);
+             }
+         }

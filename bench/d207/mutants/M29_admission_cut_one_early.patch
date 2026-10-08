@@ -1,0 +1,11 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -276,7 +276,7 @@
+     let mut b = Vec::new();
+     encode_entry(&mut b, e)?;
+     let budget = append_entries_budget();
+-    if b.len() > budget {
++    if b.len() >= budget {
+         return Err(FerroError::Wal(format!(
+             "an entry of {} bytes on the wire cannot fit one Append frame, which carries at most \
+              {budget} bytes of entries once its envelope and a signature are paid for. Refused at \

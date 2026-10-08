@@ -691,14 +691,22 @@ const HEADER_SIZE: u64 = 12;
 /// `total_len(4) | tag(1) | crc32(4)`: the smallest record that can exist.
 const MIN_RECORD: usize = 9;
 
-/// The largest record this store will **write**.
+/// The largest record this store will **write**: one replication frame less 4 KiB.
 ///
-/// **Reused rather than chosen.** It is [`crate::consensus::log::MAX_ENTRY_BYTES`], the consensus
-/// log's own limit, for the reason `DISTRIBUTED.md` §F9 gives: `BEGIN AGENT SESSION ... DURABLE` is
-/// the row that makes a session's TEL frames a replicated command, and a delta larger than one
-/// replication frame is a delta that could never be shipped. Two constants with one derivation
-/// would be two numbers to keep equal; this is the same number.
-const MAX_APPEND_BYTES: usize = crate::consensus::log::MAX_ENTRY_BYTES;
+/// The reason is `DISTRIBUTED.md` §F9's. `BEGIN AGENT SESSION ... DURABLE` is the row that makes a
+/// session's TEL frames a replicated command, and a delta larger than one consensus entry could
+/// never be shipped. So this must stay at or below what one entry inside one `Append` can carry,
+/// with room for the command and envelope that will carry it.
+///
+/// **It used to be `consensus::log::MAX_ENTRY_BYTES`, and deliberately no longer is** (D223 review
+/// F5). That constant was the same number, `MAX_FRAME_BYTES − 4096`, until D223 raised it to the
+/// whole frame, so that the consensus disk never refuses what the wire delivered. The disk's bound
+/// is now ABOVE what one `Append` carries (the signed budget is 77 bytes under the frame), so
+/// following it would let this store accept deltas that could never be replicated, the opposite of
+/// the reason it is bounded at all. The value is unchanged from before D223, and so is what this
+/// store accepts. Nothing replicates TEL yet; when something does, the exact command envelope
+/// should replace the 4 KiB of headroom with a measured bound, as D220 did for `Append`s.
+const MAX_APPEND_BYTES: usize = crate::replication::MAX_FRAME_BYTES - 4096;
 
 /// The largest record this store will **read** from a disk — a constant of the *format*, and
 /// deliberately not the same number as [`MAX_APPEND_BYTES`].

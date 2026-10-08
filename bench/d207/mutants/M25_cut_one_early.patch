@@ -1,0 +1,11 @@
+--- a/src/consensus/replicate.rs
++++ b/src/consensus/replicate.rs
+@@ -228,7 +228,7 @@
+         let mut bytes = 0usize;
+         for e in self.entries[from..].iter().take(limit) {
+             let len = super::transport::entry_wire_len(e);
+-            if !taken.is_empty() && bytes.saturating_add(len) > max_bytes {
++            if !taken.is_empty() && bytes.saturating_add(len) >= max_bytes {
+                 break;
+             }
+             bytes = bytes.saturating_add(len);

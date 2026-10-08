@@ -1,0 +1,11 @@
+--- a/src/consensus/log.rs
++++ b/src/consensus/log.rs
+@@ -987,7 +987,7 @@
+     /// accepts.
+     fn raise_version(&mut self) -> Result<(), LogError> {
+         let all = self.index.clone();
+-        self.switch(all, self.snapshot_round, self.snapshot_term, VERSION, "format upgrade")
++        self.switch(all, self.snapshot_round, self.last_term(), VERSION, "format upgrade")
+     }
+ 
+     // -- internals ----------------------------------------------------------------------------

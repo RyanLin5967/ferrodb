@@ -1,0 +1,10 @@
+--- a/src/consensus/transport.rs
++++ b/src/consensus/transport.rs
+@@ -2137,6 +2137,7 @@
+                     // with no number attached is the silent loss this module does not allow.
+                     counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                     let _ = stream.shutdown(Shutdown::Both);
++                    std::mem::forget(registration);
+                     continue;
+                 }
+                 let _ = stream.set_nodelay(true);
