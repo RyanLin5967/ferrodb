@@ -1,0 +1,26 @@
+# 2026-09-24T01:55:36Z HEAD=0074645 dirty=11
+# cmd: taskpolicy -b timeout 1800 cargo test --test zz_d194_probe -- --nocapture --test-threads=1
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.72s
+     Running tests/zz_d194_probe.rs (target/debug/deps/zz_d194_probe-d73b1856077762e1)
+
+running 3 tests
+test probe_key_reuse_after_fork_scan_vs_point ... PROBE2 main scan: [[Integer(1), Integer(20)], [Integer(3), Integer(8)]]
+PROBE2 branch scan: [[Integer(1), Integer(20)], [Integer(3), Integer(7)]]
+PROBE2 branch point id=3: []
+PROBE2 branch update id=3 -> rows affected: 0
+PROBE2 branch insert id=3: Ok("admitted")
+ok
+test probe_key_reuse_under_explicit_transaction ... PROBE3 txn first scan: [[Integer(1), Integer(20)], [Integer(3), Integer(7)]]
+PROBE3 txn scan: [[Integer(1), Integer(20)], [Integer(3), Integer(7)]]
+PROBE3 txn point id=3: []
+ok
+test probe_nested_child_point_read_reason ... PROBE1 child point read: [[Integer(20)]]
+PROBE1 merge: true
+PROBE1 quarantine reason: Some("Retry at merge admission — [Invariants sound] read-premise: 1 row(s) this branch read changed in the base before it merged: t4244489279:r1 (read version 0, base now 1)")
+PROBE1 main row 1: [[Integer(15)]]
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+# rc=0 end=2026-09-24T01:55:46Z

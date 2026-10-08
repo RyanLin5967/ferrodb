@@ -1,0 +1,44 @@
+# 2026-09-24T01:46:55Z HEAD=0074645 dirty=4
+# cmd: taskpolicy -b timeout 1800 cargo test --test agent_sql_surface
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.82s
+     Running tests/agent_sql_surface.rs (target/debug/deps/agent_sql_surface-3cafa62735b530de)
+
+running 33 tests
+test a_comparison_on_a_branch_does_not_round_the_literal ... ok
+test agent_statements_outside_a_session_name_the_missing_branch ... ok
+test a_malformed_model_is_refused_rather_than_recorded_blank ... ok
+test a_second_agent_session_on_one_connection_is_refused ... ok
+test abandon_drops_the_branch_and_leaves_main_untouched ... ok
+test begin_agent_session_forks_a_branch_and_interns_the_run ... ok
+test as_of_branch_sees_uncommitted_inserts_and_deletes_too ... ok
+test a_nested_task_forks_from_its_parents_state_and_then_diverges ... ok
+test a_multi_row_merge_publishes_every_row_in_one_transaction ... ok
+test a_whole_numbered_literal_updates_a_float_column_on_a_branch_and_on_trunk ... ok
+test branch_writes_are_invisible_to_main_and_to_siblings ... ok
+test a_conflicting_merge_attributes_nothing ... ok
+test a_guard_that_fails_against_merged_state_returns_the_predicate_itself ... ok
+test a_branch_reads_main_as_of_its_fork_not_as_of_now ... ok
+test a_solo_merge_is_clean_and_publishes_to_main ... ok
+test an_lww_column_resolves_with_loss_and_never_reports_clean ... ok
+test a_merge_with_no_downstream_reader_reverts_without_cascading ... ok
+test a_session_declaring_no_model_is_recorded_as_unspecified_not_guessed ... ok
+test captured_frames_reach_the_effect_log_as_one_frame_per_task ... ok
+test diff_of_an_untouched_branch_is_empty_but_still_a_changeset ... ok
+test concurrent_assignments_conflict_rather_than_silently_picking_one ... ok
+test inserts_and_deletes_on_a_branch_are_also_invisible_until_merge ... ok
+test diff_returns_a_structured_changeset_with_ops_and_outcomes ... ok
+test reverting_an_unknown_merge_is_an_error_not_a_no_op ... ok
+test diff_marks_a_row_the_target_moved_under ... ok
+test row_authorship_survives_the_merge_that_published_it ... ok
+test ordinary_statements_are_unaffected_by_the_agent_surface ... ok
+test select_as_of_branch_reads_another_branchs_uncommitted_state ... ok
+test two_runs_are_attributed_separately_and_interned_once_each ... ok
+test revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request ... ok
+test two_decrements_inside_one_task_are_not_collapsed ... ok
+test two_branches_decrementing_the_same_row_compose_arithmetically ... ok
+test row_authorship_survives_a_process_restart_when_provenance_is_durable ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+# rc=0 end=2026-09-24T01:47:25Z

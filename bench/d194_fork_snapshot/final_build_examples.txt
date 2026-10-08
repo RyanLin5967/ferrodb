@@ -1,0 +1,25 @@
+# 2026-09-24T03:21:39Z HEAD=696bb5c dirty=1
+# cmd: taskpolicy -b timeout 1800 cargo build --examples
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+warning: unused import: `Barrier`
+  --> examples/d68_merge_is_o_table.rs:50:22
+   |
+50 | use std::sync::{Arc, Barrier};
+   |                      ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> examples/d51_sharedword_probe.rs:77:17
+   |
+77 |             let mut one = |s: &Shared| match arm {
+   |                 ----^^^
+   |                 |
+   |                 help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 1 warning (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 26s
+# rc=0 end=2026-09-24T03:25:08Z

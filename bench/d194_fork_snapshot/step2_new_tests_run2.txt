@@ -1,0 +1,87 @@
+# 2026-09-24T01:56:25Z HEAD=0074645 dirty=12
+# cmd: taskpolicy -b timeout 1800 cargo test --no-fail-fast --test agent_sql_surface --test integration_read_premise --test integration_cherry_pick --test integration_sibling_merge
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.72s
+     Running tests/agent_sql_surface.rs (target/debug/deps/agent_sql_surface-3cafa62735b530de)
+
+running 36 tests
+test a_comparison_on_a_branch_does_not_round_the_literal ... ok
+test a_malformed_model_is_refused_rather_than_recorded_blank ... ok
+test a_conflicting_merge_attributes_nothing ... ok
+test a_branch_reads_main_as_of_its_fork_not_as_of_now ... ok
+test a_multi_row_merge_publishes_every_row_in_one_transaction ... ok
+test a_session_declaring_no_model_is_recorded_as_unspecified_not_guessed ... ok
+test abandon_drops_the_branch_and_leaves_main_untouched ... ok
+test a_nested_task_forks_from_its_parents_state_and_then_diverges ... ok
+test a_merge_with_no_downstream_reader_reverts_without_cascading ... ok
+test agent_statements_outside_a_session_name_the_missing_branch ... ok
+test a_second_agent_session_on_one_connection_is_refused ... ok
+test a_solo_merge_is_clean_and_publishes_to_main ... ok
+test a_guard_that_fails_against_merged_state_returns_the_predicate_itself ... ok
+test an_lww_column_resolves_with_loss_and_never_reports_clean ... ok
+test a_whole_numbered_literal_updates_a_float_column_on_a_branch_and_on_trunk ... ok
+test a_nested_task_reads_its_parents_fork_and_composes_with_what_main_published_since ... ok
+test a_scan_through_the_pin_is_not_a_dependent_of_a_merge_it_could_not_see ... ok
+test a_branch_is_pinned_at_its_fork_not_at_its_first_read ... ok
+test as_of_branch_sees_uncommitted_inserts_and_deletes_too ... ok
+test begin_agent_session_forks_a_branch_and_interns_the_run ... ok
+test branch_writes_are_invisible_to_main_and_to_siblings ... ok
+test captured_frames_reach_the_effect_log_as_one_frame_per_task ... ok
+test diff_returns_a_structured_changeset_with_ops_and_outcomes ... ok
+test ordinary_statements_are_unaffected_by_the_agent_surface ... ok
+test concurrent_assignments_conflict_rather_than_silently_picking_one ... ok
+test diff_of_an_untouched_branch_is_empty_but_still_a_changeset ... ok
+test reverting_an_unknown_merge_is_an_error_not_a_no_op ... ok
+test select_as_of_branch_reads_another_branchs_uncommitted_state ... ok
+test diff_marks_a_row_the_target_moved_under ... ok
+test inserts_and_deletes_on_a_branch_are_also_invisible_until_merge ... ok
+test row_authorship_survives_the_merge_that_published_it ... ok
+test two_branches_decrementing_the_same_row_compose_arithmetically ... ok
+test two_decrements_inside_one_task_are_not_collapsed ... ok
+test revert_merge_halts_on_a_downstream_dependent_then_cascades_on_request ... ok
+test two_runs_are_attributed_separately_and_interned_once_each ... ok
+test row_authorship_survives_a_process_restart_when_provenance_is_durable ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+     Running tests/integration_cherry_pick.rs (target/debug/deps/integration_cherry_pick-d4c8b390290d8ee6)
+
+running 7 tests
+test a_selector_naming_no_op_is_refused ... ok
+test a_pick_spanning_two_tables_is_refused_rather_than_half_applied ... ok
+test an_empty_selection_is_refused ... ok
+test one_op_of_several_lands_and_the_others_do_not ... ok
+test a_pick_whose_cell_the_target_already_moved_is_refused_and_writes_nothing ... ok
+test a_pick_reads_the_target_branch_as_of_its_fork ... ok
+test a_commuting_divergence_is_recovered_through_the_by_cell_index ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/integration_read_premise.rs (target/debug/deps/integration_read_premise-5c7b7e6036a74c42)
+
+running 5 tests
+test a_premise_read_through_the_fork_snapshot_after_main_moved_is_held ... ok
+test a_read_of_an_unpublished_row_is_recorded_as_version_zero ... ok
+test a_branch_that_read_a_row_another_branch_then_changed_is_held ... ok
+test a_premise_read_through_the_fork_snapshot_names_the_older_published_version ... ok
+test two_branches_reading_different_rows_both_merge ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/integration_sibling_merge.rs (target/debug/deps/integration_sibling_merge-bfeabfa1f35d46b8)
+
+running 10 tests
+test a_sibling_merge_refuses_an_ancestor_and_refuses_itself ... ok
+test the_fork_point_is_computed_not_assumed ... ok
+test the_fork_point_query_costs_fewer_hops_than_the_walk_it_replaces ... ok
+test only_one_side_moved_the_cell ... ok
+test a_row_the_target_never_touched_still_carries_its_fork_point_image ... ok
+test the_index_hydrates_from_the_catalog_rather_than_from_a_fork_hook ... ok
+test merging_two_siblings_was_impossible_before_a_fork_point_could_be_computed ... ok
+test two_siblings_merge_and_the_target_carries_both_branches_work ... ok
+test both_siblings_moved_the_same_cell_and_it_conflicts ... ok
+test a_row_only_the_source_touched_is_compared_against_the_targets_own_fork_image ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+# rc=0 end=2026-09-24T01:56:39Z
