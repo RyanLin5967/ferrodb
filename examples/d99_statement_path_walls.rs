@@ -148,10 +148,14 @@ fn pad_branches(rig: &Rig, n: usize) -> Vec<ArenaId> {
 
 /// Park `n` entries on the pending-free log. They name an arena no extent uses, so `free_arena`'s
 /// `retain` walks all of them and keeps all of them — the worst case, and the one being measured.
+///
+/// **Distinct pages, one per entry.** The log keeps one entry per `(page, arena)` since D183's
+/// de-dup at push, so the 1000 pages this used to cycle through would pad it to 1000 whatever `n` is,
+/// and the guard below would call every larger row "NOT A RESULT".
 fn pad_pending(rig: &Rig, n: usize) {
     let entries: Vec<PendingFree> = (0..n)
         .map(|i| PendingFree {
-            page_id: u32::MAX - (i as u32 % 1000),
+            page_id: u32::MAX - i as u32,
             arena_id: ArenaId(u32::MAX - 7),
             birth_epoch: Epoch(1),
             free_epoch: Epoch(2),

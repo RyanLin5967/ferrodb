@@ -37,6 +37,23 @@
 //! the sentence describing HOW was false, and a header that mis-names the mechanism is how the
 //! next reader concludes these assertions are stale when they are not.
 //!
+//! ⚠ **D183 — and until D183 the sentence above was still false for HALF the events it covers.**
+//! "the whole image is rewritten only when the tail outgrows its share" was true of the claim and
+//! the free and of nothing else: the slow-path retire and the pending-free drain both ended in
+//! `persist_full_locked`, which never consults the threshold, so they rewrote the whole image
+//! EVERY time — two per interior branch reaped and, through the empty-drain `pending_version`
+//! bump, one per leaf reap, counted through `Reaper::reap` by
+//! `branch::arena::d183_adversary::d183adv_a1_what_the_real_reaper_costs`. (An earlier version of
+//! this paragraph said "one per interior branch" and cited a test, since renamed
+//! `d183_what_the_two_reclamation_store_methods_cost_per_call`, that never called the reaper.)
+//! They append now too — `TAIL_PAGES_PARKED`, and `TAIL_PENDING_DRAINED` or its absolute fallback
+//! `TAIL_PENDING_REPLACED` — so the sentence is true of all four events, EXCEPT where a change no
+//! record kind describes forces the next persist to be whole: a pending-log push with no record
+//! (`pending_version`), a recycled page handed out again (`recycled_reissued`), or an authority
+//! change. Again the property is untouched: a record still reaches the device, fsynced, at each
+//! one. Recorded here because this header is where the next reader checks what the file's numbers
+//! rest on, and it is the THIRD time this paragraph described a mechanism it did not have.
+//!
 //! * `reserved_page_count` is exact whenever the map is read, because it only ever changes at an
 //!   extent event, which is the moment the map is made durable.
 //! * `live_page_count` counts individual pages, and those are handed out **between** extent events.

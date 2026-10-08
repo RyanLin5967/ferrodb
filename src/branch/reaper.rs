@@ -1816,8 +1816,9 @@ mod tests {
     /// scan can recover them.
     ///
     /// Forcing the error without injecting a fault: point the store's free-space-map checkpoint
-    /// at a path whose PARENT IS A FILE. `free_arena` ends in `persist_if_configured()?`, the
-    /// atomic-file write cannot create its temp beside a non-directory, and the `?` fires — the
+    /// at a path whose PARENT IS A FILE. `free_arena` ends in a durable persist whose first write
+    /// is a full image (`image_bytes == 0` until this process has written one), the atomic-file
+    /// write cannot create its temp beside a non-directory, and the `?` fires — the
     /// store's own durability path, not a mock.
     ///
     /// ⚠ Fire-checked: against the pre-fix `mem::take` this fails on the final assertion with the
