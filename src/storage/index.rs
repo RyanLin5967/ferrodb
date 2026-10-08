@@ -58,7 +58,14 @@
 //!   split must start again. Every descent loop re-reads `root_page_id` under its first latch.
 //!
 //! Acquisition order is **down** the tree and **rightward** along the leaf chain, never upward or
-//! leftward, so the wait-for graph is ordered by depth and then by key and cannot cycle.
+//! leftward, so the wait-for graph is ordered by depth and then by key and cannot cycle. **One
+//! exception, D233:** unlinking an emptied leaf write-latches its LEFT neighbour, then its RIGHT one
+//! while still holding the left, to splice the chain, all while holding the root-to-leaf path.
+//! `remove_and_unlink` argues why that cannot cycle, and states the premises the argument needs:
+//! no READER and no fast-path writer waits on another page latch while holding a leaf latch (either
+//! may wait inside the buffer pool, which takes none); the two holders that do wait, a splitter on
+//! its `old_next` and another unlinker, first need the root latch this thread holds, which requires
+//! one shared root cell (review 3 L3); and the chain names no page twice, nor a page on the path.
 //!
 //! # What this does NOT make safe, stated rather than implied
 //!
@@ -183,16 +190,48 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         }
     }
 
-    /// Remove one entry.
+    /// Remove one entry. **An entry whose removal empties a leaf takes the leaf out of the tree**
+    /// (free-at-empty, D233).
     ///
-    /// Takes the same latches as a non-splitting insert, and for the same reason: a removal never
-    /// splits, and `handle_underflow` is unreachable (see its doc comment), so no ancestor is ever
-    /// touched and the parent's read latch plus the leaf's write latch is the whole requirement.
+    /// The common case takes the same latches as a non-splitting insert: the parent's read latch
+    /// until the leaf's write latch is in hand, then the leaf alone. A removal that would leave a
+    /// leaf empty, when that leaf has a neighbour (so it is not the root), writes nothing and
+    /// restarts on [`Self::delete_unlinking`], exactly as a splitting insert restarts on
+    /// [`Self::write_splitting`].
+    ///
+    /// # Why an emptied leaf leaves the tree (Johnson & Shasha's free-at-empty)
+    ///
+    /// Before D233 an emptied leaf stayed in the chain for ever. A key space that drains from one
+    /// end — the branch catalog's DEADLINE span, whose deadlines only move forward — therefore
+    /// piled empty leaves exactly where every lease pass starts, and each pass walked all of
+    /// them: about one leaf per 81 reaps, plus ~1,000 page reads past the 64-hop bound of
+    /// [`Self::read_leaf_for`] (`frontier/deadline_leaf_adversary.md` §0). Johnson & Shasha
+    /// ("B-trees with inserts and deletes: why free-at-empty is better than merge-at-half")
+    /// remove a node only when it is empty and never rebalance at half; a queue-shaped key
+    /// space drains every leaf completely, so free-at-empty reclaims every one of them.
+    ///
+    /// The unlinked page is **not freed** ([`Self::delete_unlinking`] says why, and what that costs
+    /// in a key range that refills). It stays allocated, as a drained leaf did before D233; what
+    /// changes is that no descent and no chain reaches it.
     pub fn delete(&self, key: &K) -> Result<(), FerroError> {
-        let (page_id, _latch) = self.latch_leaf_for_write(key)?;
-        let mut leaf = self.read_leaf_raw(page_id)?;
-        leaf.remove_entry(key)?;
-        self.write_page(page_id, leaf.serialize()?)
+        {
+            let (page_id, _latch) = self.latch_leaf_for_write(key)?;
+            let mut leaf = self.read_leaf_raw(page_id)?;
+            leaf.remove_entry(key)?;
+            if !Self::would_unlink(&leaf) {
+                return self.write_page(page_id, leaf.serialize()?);
+            }
+            // Nothing written, and the leaf's latch drops here: the removal is redone under the
+            // whole path's write latches, which is where an unlink can be done.
+        }
+        self.delete_unlinking(key)
+    }
+
+    /// Whether a leaf image, after a removal, is one [`Self::delete`] takes out of the tree: empty,
+    /// and with a neighbour on the leaf chain. A leaf with no neighbour is the only leaf, which is
+    /// the root, and a tree always keeps one leaf.
+    fn would_unlink(leaf: &BPlusTreeLeafPage<K, V>) -> bool {
+        leaf.key_arr.is_empty() && (leaf.prev.is_some() || leaf.next.is_some())
     }
 
     /// Insert one entry.
@@ -314,9 +353,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// Both loops are bounded; past the bound, or on any page that is not resident under its
     /// hint, the latched path answers. It is always correct, only slow.
     ///
-    /// What makes a snapshot safe to descend: leaves never go underfull (nothing frees a tree
-    /// page except `free_all`, under the exclusive catalog lock with readers drained), so a page
-    /// this reader copied cannot have been reused as something else mid-descent.
+    /// What makes a snapshot safe to descend: **nothing frees a tree page** except `free_all`,
+    /// under the exclusive catalog lock with readers drained, so a page this reader copied cannot
+    /// have been reused as something else mid-descent. That is the load-bearing half. This used
+    /// to say "leaves never go underfull", which was never what made it safe and stopped being
+    /// true at D233: `delete` now takes an emptied leaf out of the tree, and it does so WITHOUT
+    /// freeing the page (`delete_unlinking`), precisely so that this sentence keeps holding. A
+    /// reader that lands on an unlinked leaf finds it empty and walks its intact `next`. (After
+    /// D225 merges, `release_unpublished` also frees the pages of a refused split. They were never
+    /// published, so no reader ever held their ids, and the sentence holds for every page a reader
+    /// can reach; review 3 L8.)
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         const RESTARTS: usize = 16;
         const RIGHT_WALK: usize = 64;
@@ -387,13 +433,18 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     //
                     // The empty case is not hypothetical and `is_some_and` got it wrong: it is
                     // false for an empty leaf, so the walk stopped there and returned it, and the
-                    // key read as absent. `BPlusTreeManager::delete` removes an entry and writes
-                    // the page back with no rebalance (`handle_underflow` is an honest refusal),
-                    // and `execution::insert`'s key reuse does exactly `delete(key)` then
-                    // `insert(key, rid)` — so a leaf holding one key is empty between those two
+                    // key read as absent. Before D233, `BPlusTreeManager::delete` removed an entry
+                    // and wrote the page back with no rebalance (`handle_underflow` is an honest
+                    // refusal), and `execution::insert`'s key reuse did exactly `delete(key)` then
+                    // `insert(key, rid)`, so a leaf holding one key was empty between those two
                     // writes, and a concurrent optimistic reader walking past it saw the gap.
                     // Found by a fresh-context review; `no_workload_drives_a_leaf_underfull` pins
                     // occupancy for the SQL paths and says nothing about this window.
+                    //
+                    // Still load-bearing after D233, for two reasons. `delete` publishes an emptied
+                    // leaf before it unlinks it (`remove_and_unlink`, step 1), and a reader that
+                    // descended through a parent from before the unlink can land on an unlinked
+                    // leaf, which stays empty with its `next` intact.
                     let mut hops = 0;
                     while leaf.key_arr.last().is_none_or(|max| max < key) {
                         let Some(next) = leaf.next else { break };
@@ -806,6 +857,247 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(page_id)
     }
 
+    /// The slow path of [`Self::delete`]: write latches on the whole root-to-leaf path, then the
+    /// removal and, if it empties a linked leaf, the unlink. The same latch shape as
+    /// [`Self::write_splitting`], and the same reason: the parent is about to change.
+    ///
+    /// # Nothing is freed, on purpose
+    ///
+    /// The latch-free descent is sound only because no tree page is freed while it runs
+    /// ([`Self::read_leaf_for`]): a reader holding a stale page id could otherwise read a recycled
+    /// page whose own header still names that id. So the unlinked leaf keeps its bytes, including
+    /// `next`. A reader that descended through a parent from before the unlink lands on it, finds
+    /// it empty, and walks right, which is the walk the empty case already took. A reader that
+    /// descends afterwards never reaches it.
+    ///
+    /// **Each unlink leaks the leaf page, plus each internal page the cascade empties.** Returning
+    /// them waits on D229's reclamation mechanism (a durable pending-free list, or a reachability
+    /// sweep at open when no reader exists), which this change does not pre-empt.
+    ///
+    /// **What that costs depends on whether the drained key range refills** (D233 review F4):
+    /// - A range that never refills, such as the catalog's DEADLINE span (deadlines only grow),
+    ///   uses no more disk than before D233, where the same drained pages stayed allocated in the
+    ///   chain.
+    /// - A range that refills does use more. The catalog's FREE_ID span (fork pops the highest free
+    ///   id: the key stores `u64::MAX - id`) and the STATE span of recycled ids are like this.
+    ///   Before D233 a drained leaf there took the refill in place. Now the drained leaf is leaked and the refill splits a neighbour into a new page,
+    ///   so such a span grows from O(max live) pages to O(splits), without bound, until D229 frees
+    ///   unlinked pages.
+    fn delete_unlinking(&self, key: &K) -> Result<(), FerroError> {
+        loop {
+            let root = self.root_page_id.load(Ordering::Acquire);
+            let mut guards: Vec<PageWriteGuard<'_>> = vec![self.latches().write(root)];
+            if self.root_page_id.load(Ordering::Acquire) != root {
+                continue; // `guards` is dropped here
+            }
+            let mut stack: Vec<u32> = Vec::new();
+            let mut curr = root;
+            let leaf_id = loop {
+                match self.read_node_raw(curr)? {
+                    BPlusTreePage::Leaf(_) => break curr,
+                    BPlusTreePage::Internal(n) => {
+                        stack.push(curr);
+                        let child = n.find_child(key);
+                        guards.push(self.latches().write(child));
+                        curr = child;
+                    }
+                }
+            };
+            let result = self.remove_and_unlink(leaf_id, &stack, key);
+            drop(guards);
+            return result;
+        }
+    }
+
+    /// Remove `key` from a leaf whose whole root-to-leaf path this thread holds write latches on,
+    /// and take the leaf out of the tree if that empties it.
+    ///
+    /// # Order of the writes, each one a state a latch-free reader may see
+    ///
+    /// 1. The emptied leaf, `next` intact: the state every reader already copes with (it walks
+    ///    past an empty leaf).
+    /// 2. The chain splice, `prev.next = next` then `next.prev = prev`: a scan from the left now
+    ///    skips the leaf, and a reader that still lands on it walks its intact `next`.
+    /// 3. The parent drops its pointer and one separator ([`Self::unlink_from_parent`]): from here
+    ///    no descent reaches the leaf.
+    ///
+    /// # Everything is read and checked before anything is written
+    ///
+    /// An unlink touches up to four pages, and a refusal after the first write would leave a leaf
+    /// that is out of the chain but still routed (D233 review F3). So, under latches this thread
+    /// already holds or takes here, every page is read and every link is checked first: `prev.next`
+    /// and `next.prev` must name this leaf, and [`Self::unlink_from_parent`] must find where the
+    /// cascade stops. Every new image is serialised too. Only then are the pages written, in the
+    /// order above. What is left to fail after the first write is the pool's own I/O.
+    ///
+    /// # The one LEFTWARD latch in this file, and why it cannot deadlock
+    ///
+    /// The splice write-latches `prev`, which is leftward along the chain, against this file's
+    /// acquisition order (down, then rightward). It then takes `next` while still holding `prev`,
+    /// and holds both until the splice is written. It is safe because of who can hold a leaf latch
+    /// while this thread waits for it:
+    ///
+    /// - a reader (`load_leaf`, or a latched descent's last step) copies the leaf and releases it,
+    ///   and waits on no page latch while holding it;
+    /// - a fast-path writer (`latch_leaf_for_write`) holds the leaf write latch and waits on no page
+    ///   latch while holding it: it either writes and releases, or releases and restarts;
+    /// - a pessimistic writer (a split, or another unlink) would need the ROOT's write latch first,
+    ///   and this thread holds it for the whole operation, so no such writer is running.
+    ///
+    /// "Waits on no page latch" is the whole claim: a holder may wait inside the buffer pool (its
+    /// `write_page` goes through `fetch_page`), and the pool never takes a page latch
+    /// (`page_latch.rs`, enforced by `enter_pool`). So every holder of `prev`'s or `next`'s latch
+    /// releases it without waiting on anything this thread holds, and the wait cannot close a
+    /// cycle. The branch catalog also serialises every writer under `TableBranchCatalog::logical`,
+    /// but this argument does not rely on that.
+    ///
+    /// **Its premises, stated** (review 2 Q2, G6, G7):
+    /// - **Every writer on this tree shares one root cell** (`open_shared` / the catalog's one
+    ///   manager). Two handles with private root cells (`open`) break "a pessimistic writer needs
+    ///   the root latch this thread holds": a splitter descending from a stale root can hold `prev`
+    ///   and wait on this leaf as its `old_next`, while this thread holds the leaf and waits on
+    ///   `prev`. That is a cycle. It is unreachable today, because `delete`'s only caller is the
+    ///   branch catalog, which owns one manager; see the module's "What this does NOT make safe".
+    /// - The pool never takes a page latch (enforced in debug builds only, `page_latch.rs`).
+    /// - The chain is consistent: `prev != next`, neither is the leaf, and neither is a page on the
+    ///   descent path (review 3 L2). That one is checked below, before any neighbour's latch, because
+    ///   latches are not re-entrant.
+    fn remove_and_unlink(&self, leaf_id: u32, stack: &[u32], key: &K) -> Result<(), FerroError> {
+        let mut leaf = self.read_leaf_raw(leaf_id)?;
+        leaf.remove_entry(key)?;
+        // Decided again under the path's write latches: a writer may have refilled the leaf between
+        // the fast path letting go of it and this thread taking the path.
+        let unlink = Self::would_unlink(&leaf);
+        if !unlink {
+            return self.write_page(leaf_id, leaf.serialize()?);
+        }
+        // Review 2 G6: page latches are not re-entrant, and this thread already holds the leaf's and
+        // will hold `prev`'s while it takes `next`'s. A chain that names one page twice would make it
+        // wait on itself, holding the root, which stalls the whole tree. Refused before either latch.
+        if (leaf.prev.is_some() && leaf.prev == leaf.next) || leaf.prev == Some(leaf_id) || leaf.next == Some(leaf_id) {
+            return Err(FerroError::Io(format!(
+                "page {leaf_id}'s neighbours are prev {:?} and next {:?}: a chain that names one page \
+                 twice is inconsistent, so the unlink is refused and nothing is written",
+                leaf.prev, leaf.next
+            )));
+        }
+        // Review 3 L2: nor may a neighbour be a page on the descent path. This thread holds every
+        // page in `stack` in WRITE, so a neighbour naming one of them would wait on itself exactly as
+        // above. Only arbitrary corruption produces it (no tree page is freed and reused, so a leaf's
+        // id never becomes an internal page's); the check is O(height).
+        if let Some(on_path) = [leaf.prev, leaf.next].into_iter().flatten().find(|p| stack.contains(p)) {
+            return Err(FerroError::Io(format!(
+                "page {leaf_id}'s neighbours are prev {:?} and next {:?}, and page {on_path} is on its own \
+                 descent path: the chain is inconsistent, so the unlink is refused and nothing is written",
+                leaf.prev, leaf.next
+            )));
+        }
+        // `prev`/`next` are stable here: they change only in a split or an unlink, and both hold
+        // the root's write latch, which this thread holds. Their KEYS may still change under a
+        // fast-path writer until their latches are taken, which is why each image is read under its
+        // latch and the latch is kept until that image is written.
+        let _left_latch = leaf.prev.map(|id| self.latches().write(id));
+        let left = match leaf.prev {
+            Some(prev_id) => {
+                let mut left = self.read_leaf_raw(prev_id)?;
+                if left.next != Some(leaf_id) {
+                    return Err(FerroError::Io(format!(
+                        "page {leaf_id}'s prev is page {prev_id}, whose next is {:?}; the leaf chain is \
+                         inconsistent, so the unlink is refused and nothing is written",
+                        left.next
+                    )));
+                }
+                left.next = leaf.next;
+                Some((prev_id, left.serialize()?))
+            }
+            None => None,
+        };
+        let _right_latch = leaf.next.map(|id| self.latches().write(id));
+        let right = match leaf.next {
+            Some(next_id) => {
+                let mut right = self.read_leaf_raw(next_id)?;
+                if right.prev != Some(leaf_id) {
+                    return Err(FerroError::Io(format!(
+                        "page {leaf_id}'s next is page {next_id}, whose prev is {:?}; the leaf chain is \
+                         inconsistent, so the unlink is refused and nothing is written",
+                        right.prev
+                    )));
+                }
+                right.prev = leaf.prev;
+                Some((next_id, right.serialize()?))
+            }
+            None => None,
+        };
+        let (parent_id, parent) = self.unlink_from_parent(stack, leaf_id)?;
+        let parent = parent.serialize()?;
+        let leaf = leaf.serialize()?;
+
+        // The writes, in the order a latch-free reader may see them (above).
+        self.write_page(leaf_id, leaf)?;
+        if let Some((prev_id, image)) = left {
+            self.write_page(prev_id, image)?;
+        }
+        if let Some((next_id, image)) = right {
+            self.write_page(next_id, image)?;
+        }
+        self.write_page(parent_id, parent)
+    }
+
+    /// Plan dropping `doomed` from its parent, cascading while a parent would be left with no
+    /// child. **Writes nothing**: returns the page where the cascade stops and that page's new
+    /// image, which [`Self::remove_and_unlink`] writes only once every check has passed.
+    /// **The caller must hold write latches on every page in `stack`**, which is the path from the
+    /// root down to `doomed`'s parent, so the image is still current when it is written.
+    ///
+    /// The separator rule is `cow::btree::unlink_up`'s (D104), the in-repo precedent: removing a
+    /// child that is not the leftmost removes the separator to its LEFT, so its key range joins its
+    /// left sibling's; removing the leftmost removes the separator to its RIGHT, so the next child
+    /// takes the range and becomes the leftmost. Either way the parent's own range is unchanged, so
+    /// nothing above it moves. A parent whose ONLY child goes is itself empty: it is left as it is,
+    /// unreachable and not freed, and removed from its own parent in turn.
+    ///
+    /// The cascade cannot empty the root. [`Self::remove_and_unlink`] unlinks only a leaf with a
+    /// neighbour, and the lowest common ancestor of the leaf and that neighbour has at least two
+    /// children, one of which survives. Reaching the root with nothing left is therefore refused
+    /// as a broken invariant rather than turned into an empty tree. The root is also never
+    /// collapsed onto a single child; like `unlink_up`, this keeps a level a shrunken tree no
+    /// longer needs.
+    fn unlink_from_parent(&self, stack: &[u32], doomed: u32) -> Result<(u32, BPlusTreeInternalPage<K>), FerroError> {
+        let mut doomed = doomed;
+        let mut above = stack.iter().rev();
+        loop {
+            let Some(&parent_id) = above.next() else {
+                return Err(FerroError::Io(format!(
+                    "unlinking page {doomed} would leave the B+tree with no leaf; only a leaf with a \
+                     neighbour is unlinked, so the tree's links are inconsistent"
+                )));
+            };
+            let mut parent = match self.read_node_raw(parent_id)? {
+                BPlusTreePage::Internal(n) => n,
+                BPlusTreePage::Leaf(_) => return Err(FerroError::Io(format!(
+                    "page {parent_id} was reached as an internal node but holds a leaf"
+                ))),
+            };
+            let Some(slot) = parent.child_ptrs.iter().position(|&c| c == doomed) else {
+                return Err(FerroError::Io(format!(
+                    "page {parent_id} is on the path to page {doomed} but does not point at it"
+                )));
+            };
+            if parent.child_ptrs.len() == 1 {
+                doomed = parent_id;
+                continue;
+            }
+            if slot == 0 {
+                parent.key_arr.remove(0);
+            } else {
+                parent.key_arr.remove(slot - 1);
+            }
+            parent.child_ptrs.remove(slot);
+            parent.num_keys = parent.key_arr.len() as u16;
+            return Ok((parent_id, parent));
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // RAW PAGE ACCESS — every one of these requires the caller to hold the page's latch
     // ---------------------------------------------------------------------------------------
@@ -929,8 +1221,23 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// parent, recursing up; and if the root is internal and falls to a single child, make that child
     /// the new root. None of it is written.
     ///
-    /// **Nothing can reach this, because no code path net-removes a key from a tree.** Measured
-    /// 2026-08-17 (`tests/integration_index_debt.rs`):
+    /// ⛔ **CORRECTED by D233. The sentence below used to read "no code path net-removes a key
+    /// from a tree", and at `9aa6968` that was false.** The branch catalog's tree net-removes keys:
+    /// every reap drops a DEADLINE key, every detach a CHILD key, every recycled fork a FREE_ID
+    /// key, and every state change moves a STATE key (`TableBranchCatalog::write_record`,
+    /// `table_catalog.rs`). E70 measured the SQL paths only, and the comment generalised it to
+    /// every tree. The consequence was a chain of empty leaves at the head of the DEADLINE span
+    /// that every lease pass walked (`frontier/deadline_leaf_adversary.md`).
+    ///
+    /// **What is true, and why this is still not called:** `delete` now frees at empty (Johnson &
+    /// Shasha): an emptied leaf leaves the tree, and nothing rebalances at half. That is the whole
+    /// answer for a tree that drains, and merge-at-half is not needed to bound a walk. For the SQL
+    /// trees nothing changes, because **no SQL path calls `delete` at all**: key reuse is `upsert`
+    /// (D126: `execution::insert`, `execution::update`, `catalog::alter`), and a SQL `DELETE` stamps
+    /// `end_ts` and keeps the entry. So no SQL leaf ever empties, `delete` never unlinks one, and
+    /// `no_workload_drives_a_leaf_underfull` still holds and still pins it.
+    ///
+    /// **What was measured for the SQL paths**, 2026-08-17 (`tests/integration_index_debt.rs`):
     ///
     /// - `execution::delete` holds a `primary_index` field and never calls `delete` on it. A SQL
     ///   `DELETE` stamps `end_ts` on the version in place and leaves the entry, because a reader whose
@@ -952,11 +1259,10 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// on a full index scan at 50 live rows in 400 entries, scaling with the dead-to-live ratio.
     pub fn handle_underflow(&self, _path: &mut Vec<u32>, node_id: u32) -> Result<(), FerroError> {
         Err(FerroError::Io(format!(
-            "B+tree node {node_id} is underfull and rebalancing is not implemented. This should be \
-             unreachable: no write path removes a key without re-inserting it, so occupancy never \
-             drops (see tests/integration_index_debt.rs). If you are reading this, that invariant \
-             broke - a new caller removes entries outright - and borrow-or-merge now has to be \
-             written."
+            "B+tree node {node_id} is underfull and merge-at-half is not implemented. Nothing calls \
+             this: an EMPTY leaf is taken out of the tree by delete (free-at-empty, D233), and an \
+             underfull one is left as it is by design. If you are reading this, a new caller wants \
+             rebalancing at half, which has to be written first."
         )))
     }
 }
@@ -1387,5 +1693,746 @@ mod tests {
         ids.sort_unstable();
         again.sort_unstable();
         assert_eq!(again, ids, "a page the refused split allocated was not given back");
+    }
+
+    // ---- D233: free-at-empty ----------------------------------------------------------------
+
+    /// A 1,000-byte key: a leaf holds four entries and an internal page four children, so a few
+    /// dozen keys build a tree deep enough for an unlink to cascade.
+    fn wide(i: i32) -> Value {
+        Value::Varchar(format!("{i:06}{}", "x".repeat(994)))
+    }
+
+    /// Every leaf reachable by descending from the root, left to right.
+    fn leaves_by_descent(tree: &BPlusTreeManager<Value, Value>) -> Vec<u32> {
+        fn walk(tree: &BPlusTreeManager<Value, Value>, page: u32, out: &mut Vec<u32>) {
+            match tree.read_node(page).unwrap() {
+                BPlusTreePage::Leaf(_) => out.push(page),
+                BPlusTreePage::Internal(n) => {
+                    for c in &n.child_ptrs {
+                        walk(tree, *c, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, tree.root_page_id.load(Ordering::Acquire), &mut out);
+        out
+    }
+
+    /// The leaf chain from the leftmost leaf through `next`.
+    fn leaves_by_chain(tree: &BPlusTreeManager<Value, Value>) -> Vec<BPlusTreeLeafPage<Value, Value>> {
+        let mut out = vec![tree.leftmost_leaf().unwrap()];
+        while let Some(n) = out.last().unwrap().next {
+            out.push(tree.read_leaf(n).unwrap());
+        }
+        out
+    }
+
+    fn height(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        let mut h = 1;
+        let mut page = tree.root_page_id.load(Ordering::Acquire);
+        while let BPlusTreePage::Internal(n) = tree.read_node(page).unwrap() {
+            h += 1;
+            page = n.child_ptrs[0];
+        }
+        h
+    }
+
+    /// D233: after `delete` empties leaves, the parents and the leaf chain must agree on which
+    /// leaves are in the tree, no emptied leaf may stay in the chain, `prev` must mirror `next`,
+    /// every surviving key must be found, and a key put back into an emptied range must be found
+    /// by `search` AND by a full scan.
+    ///
+    /// Two removals are forced on a tree of height at least 3: keys 0..20, which empty a whole
+    /// left subtree (the cascade, and the leftmost-child rule at every level it climbs), and keys
+    /// 35..42, which empty at least one leaf in the middle (a slotted child). This is the test
+    /// that sees an unlink that splices the chain but leaves the parent pointing at the leaf. The
+    /// catalog's lease-pass test cannot see that, because its descent never lands there. Here a
+    /// re-inserted key would land in a leaf no scan reaches.
+    #[test]
+    fn free_at_empty_keeps_the_chain_and_the_parents_in_agreement() {
+        let (tree, _dir) = setup();
+        const N: i32 = 60;
+        for i in 0..N {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert!(height(&tree) >= 3, "premise: height {} is too shallow to cascade", height(&tree));
+        let before = leaves_by_descent(&tree);
+
+        let gone: Vec<i32> = (0..20).chain(35..42).collect();
+        for &i in &gone {
+            tree.delete(&wide(i)).unwrap();
+        }
+
+        let descent = leaves_by_descent(&tree);
+        let chain = leaves_by_chain(&tree);
+        let chain_ids: Vec<u32> = chain.iter().map(|l| l.page_id).collect();
+        assert!(descent.len() < before.len(), "premise: no leaf was taken out of the tree");
+        assert_eq!(descent, chain_ids, "the parents and the leaf chain disagree about the leaves");
+        assert!(chain.iter().all(|l| !l.key_arr.is_empty()), "an emptied leaf is still in the chain");
+        assert_eq!(chain[0].prev, None, "the first leaf still has a left neighbour");
+        for w in chain.windows(2) {
+            assert_eq!(w[1].prev, Some(w[0].page_id), "prev does not mirror next");
+        }
+
+        for i in 0..N {
+            let found = tree.search(&wide(i)).unwrap().is_some();
+            assert_eq!(found, !gone.contains(&i), "key {i}: found = {found}");
+        }
+
+        for i in [3, 38] {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let scanned: Vec<Value> = tree
+            .range_scan(Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        let mut sorted = scanned.clone();
+        sorted.sort();
+        assert_eq!(scanned, sorted, "the chain is out of order");
+        assert_eq!(scanned.len(), (N as usize) - gone.len() + 2, "a full scan lost or duplicated a key");
+        for i in [3, 38] {
+            assert!(tree.search(&wide(i)).unwrap().is_some(), "re-inserted key {i} not found by search");
+            assert_eq!(
+                scanned.iter().filter(|k| **k == wide(i)).count(),
+                1,
+                "re-inserted key {i} not seen exactly once by a full scan"
+            );
+        }
+    }
+
+    // ---- D233 review: F1, F2, F3 and the two survivors it named ------------------------------
+
+    /// A key that sorts after `wide(i)` and before `wide(i + 1)`, and is neither.
+    fn between(i: i32) -> Value {
+        Value::Varchar(format!("{i:06}{}y", "x".repeat(993)))
+    }
+
+    /// The raw bytes of a page as the pool holds it.
+    fn page_bytes(tree: &BPlusTreeManager<Value, Value>, page: u32) -> [u8; PAGE_SIZE] {
+        let frame_i = tree.buffer_pool.fetch_page(page).unwrap();
+        let data = tree.buffer_pool.frames[frame_i].read().unwrap().data;
+        tree.buffer_pool.unpin_page(page, false);
+        data
+    }
+
+    /// The internal page that points at `child`, found by descent from the root.
+    fn parent_of(tree: &BPlusTreeManager<Value, Value>, child: u32) -> u32 {
+        fn walk(tree: &BPlusTreeManager<Value, Value>, page: u32, child: u32) -> Option<u32> {
+            match tree.read_node(page).unwrap() {
+                BPlusTreePage::Leaf(_) => None,
+                BPlusTreePage::Internal(n) if n.child_ptrs.contains(&child) => Some(page),
+                BPlusTreePage::Internal(n) => n.child_ptrs.iter().find_map(|&c| walk(tree, c, child)),
+            }
+        }
+        walk(tree, tree.root_page_id.load(Ordering::Acquire), child).expect("the child is reachable by descent")
+    }
+
+    /// Rewrite one leaf in place, under its write latch: how these tests plant a broken link.
+    fn rewrite_leaf(
+        tree: &BPlusTreeManager<Value, Value>,
+        page: u32,
+        edit: impl FnOnce(&mut BPlusTreeLeafPage<Value, Value>),
+    ) {
+        let _latch = tree.latches().write(page);
+        let mut leaf = tree.read_leaf_raw(page).unwrap();
+        edit(&mut leaf);
+        tree.write_page(page, leaf.serialize().unwrap()).unwrap();
+    }
+
+    /// Pages the allocator holds for this test's file: the set bits of its first bitmap page.
+    fn allocated_pages(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        let bitmap = tree.buffer_pool.disk_manager.read(0).unwrap();
+        bitmap[4..].iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    /// Every page reachable by descent from the root, internal pages included.
+    fn reachable_pages(tree: &BPlusTreeManager<Value, Value>) -> usize {
+        fn walk(tree: &BPlusTreeManager<Value, Value>, page: u32) -> usize {
+            match tree.read_node(page).unwrap() {
+                BPlusTreePage::Leaf(_) => 1,
+                BPlusTreePage::Internal(n) => 1 + n.child_ptrs.iter().map(|&c| walk(tree, c)).sum::<usize>(),
+            }
+        }
+        walk(tree, tree.root_page_id.load(Ordering::Acquire))
+    }
+
+    /// Every key still in the tree, by a full scan of the leaf chain.
+    fn scan_all(tree: &BPlusTreeManager<Value, Value>) -> Vec<Value> {
+        tree.range_scan(Bound::Unbounded, Bound::Unbounded).unwrap().map(|r| r.unwrap().0).collect()
+    }
+
+    /// **F1, the killer.** `remove_and_unlink` decides emptiness AGAIN under the path's write
+    /// latches, because a writer may refill the leaf between the fast path letting go of it and the
+    /// unlinker taking the path. That re-check is the only thing between a refill and a lost write.
+    ///
+    /// The post-refill state, without the race: the pessimistic path is called directly for a key
+    /// whose leaf still holds other keys. Nothing may be unlinked, and every other key must stay
+    /// reachable by descent and by chain. Mutant `let unlink = true;` unlinks the leaf with its keys
+    /// in it; this test is what sees that. It passes at `0eda6ca`: it guards a line that is right.
+    #[test]
+    fn the_unlink_path_keeps_a_leaf_a_writer_refilled() {
+        let (tree, _dir) = setup();
+        const N: i32 = 16;
+        for i in 0..N {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let mid = &chain[1];
+        assert!(mid.key_arr.len() >= 2, "premise: the middle leaf holds {} keys, need two", mid.key_arr.len());
+        let (mid_id, victim) = (mid.page_id, mid.key_arr[0].clone());
+
+        tree.delete_unlinking(&victim).unwrap();
+
+        let descent = leaves_by_descent(&tree);
+        let chain_ids: Vec<u32> = leaves_by_chain(&tree).iter().map(|l| l.page_id).collect();
+        assert!(descent.contains(&mid_id), "a leaf still holding keys was taken out of the parents");
+        assert_eq!(descent, chain_ids, "the parents and the leaf chain disagree about the leaves");
+        let scanned = scan_all(&tree);
+        for i in 0..N {
+            let k = wide(i);
+            let want = k != victim;
+            assert_eq!(tree.search(&k).unwrap().is_some(), want, "key {i} by descent");
+            assert_eq!(scanned.contains(&k), want, "key {i} by chain");
+        }
+    }
+
+    /// **F1, the concurrent arm. Not a killer**: it hits the refill window only when the scheduler
+    /// puts it there. Four writers own interleaved keys, so every toggling leaf is shared by all
+    /// four; each writer inserts and deletes its keys in rounds, so leaves empty (and unlink) and
+    /// refill while other writers are mid-operation. Keys in every third block of four are never
+    /// touched, and two optimistic readers assert on every pass that each of those is found: a key
+    /// present for a reader's whole operation must never be missed. After the join every key is
+    /// checked by descent and by chain, and the parents must agree with the chain.
+    ///
+    /// **Its premises (review 2 G5), so that it cannot pass without having raced anything:** the
+    /// writers start only after each reader has finished one pass, so both readers are running
+    /// while the writers work; each reader finishes at least one pass; at least one reader pass
+    /// began after all four writers had started and ended before the last one finished (review 3
+    /// L1: the pass premise alone could not fail, because the writers wait for it); and pages
+    /// allocated minus pages reachable by descent must GROW over the run. Nothing frees a tree page,
+    /// so that growth is exactly the pages the run unlinked. (After D225 merges, `release_unpublished`
+    /// frees a refused split's pages. They were never reachable, and each is allocated and freed
+    /// within the split, so they cancel out of the difference.)
+    ///
+    /// **It fails, and never hangs, when a thread errs** (review 3 H2). A writer whose `insert` or
+    /// `delete` returns `Err` panics. Its panic is collected by `join`, `done` is set by a guard on
+    /// every exit of the scope's body so the readers stop, and the panic is re-raised after the scope.
+    /// A reader that dies releases the writers' start gate through its own guard. Every wait is
+    /// bounded by one 60 s deadline, so no thread spins for ever.
+    #[test]
+    fn unlinks_racing_refills_and_readers_lose_no_key() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::time::{Duration, Instant};
+
+        /// Sets its flag when dropped, so the flag is set on every exit, a panic included.
+        struct SetOnDrop<'a>(&'a AtomicBool);
+        impl Drop for SetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        const KEYS: i32 = 240;
+        const WRITERS: i32 = 4;
+        const ROUNDS: i32 = 6;
+        let stable = |i: i32| (i / 4) % 3 == 0;
+        let (tree, _dir) = setup();
+        for i in (0..KEYS).filter(|&i| stable(i)) {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let done = AtomicBool::new(false);
+        let abort = AtomicBool::new(false);
+        let first_passes = AtomicUsize::new(0);
+        let passes = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let writers_started = AtomicUsize::new(0);
+        let writers_finished = AtomicUsize::new(0);
+        let overlapped = AtomicUsize::new(0);
+        let unreachable_before = allocated_pages(&tree) - reachable_pages(&tree);
+
+        let joined: Vec<std::thread::Result<()>> = std::thread::scope(|s| {
+            // Set on every exit of this body, so the readers stop whether the writers finished or
+            // panicked. Dropped after the joins below, not before: the readers read while any writer runs.
+            let _done = SetOnDrop(&done);
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    let (tree, first_passes, abort) = (&tree, &first_passes, &abort);
+                    let (started, finished) = (&writers_started, &writers_finished);
+                    s.spawn(move || {
+                        while first_passes.load(Ordering::Acquire) < 2 {
+                            if abort.load(Ordering::Acquire) {
+                                return; // a reader died before its first pass ended; its panic fails the test
+                            }
+                            assert!(Instant::now() < deadline, "the readers finished no first pass within 60 s");
+                            std::thread::yield_now();
+                        }
+                        started.fetch_add(1, Ordering::AcqRel);
+                        let mine: Vec<i32> = (0..KEYS).filter(|&i| !stable(i) && i % WRITERS == w).collect();
+                        for r in 0..ROUNDS {
+                            for &i in &mine {
+                                if r % 2 == 0 {
+                                    tree.insert(wide(i), Value::Integer(i)).unwrap();
+                                } else {
+                                    tree.delete(&wide(i)).unwrap();
+                                }
+                            }
+                        }
+                        // ROUNDS is even, so the last round deleted everything; put the even keys back.
+                        for &i in mine.iter().filter(|&&i| i % 2 == 0) {
+                            tree.insert(wide(i), Value::Integer(i)).unwrap();
+                        }
+                        finished.fetch_add(1, Ordering::AcqRel);
+                    })
+                })
+                .collect();
+            for r in 0..2 {
+                let (tree, done, abort, first_passes, passes) = (&tree, &done, &abort, &first_passes, &passes);
+                let (started, finished, overlapped) = (&writers_started, &writers_finished, &overlapped);
+                s.spawn(move || {
+                    // Set on every exit, so a reader that dies in its first pass releases the start gate.
+                    let _abort = SetOnDrop(abort);
+                    loop {
+                        let all_started = started.load(Ordering::Acquire) == WRITERS as usize;
+                        for i in 0..KEYS {
+                            let got = tree.search(&wide(i)).unwrap();
+                            if stable(i) {
+                                assert_eq!(got, Some(Value::Integer(i)), "untouched key {i} missed by a concurrent reader");
+                            } else if let Some(v) = got {
+                                assert_eq!(v, Value::Integer(i), "key {i} read the wrong value");
+                            }
+                        }
+                        if all_started && finished.load(Ordering::Acquire) < WRITERS as usize {
+                            overlapped.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if passes[r].fetch_add(1, Ordering::AcqRel) == 0 {
+                            first_passes.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "reader {r}: the writers had not finished within 60 s");
+                    }
+                });
+            }
+            writers.into_iter().map(|w| w.join()).collect()
+        });
+        // Every thread has stopped. A writer's `Err` now fails the test with its own message.
+        for result in joined {
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        for (r, n) in passes.iter().enumerate() {
+            assert!(n.load(Ordering::Acquire) >= 1, "premise: reader {r} finished no pass");
+        }
+        assert!(
+            overlapped.load(Ordering::Acquire) >= 1,
+            "premise: no reader pass began after all {WRITERS} writers had started and ended before the last \
+             one finished, so the readers raced no write"
+        );
+        let unreachable_after = allocated_pages(&tree) - reachable_pages(&tree);
+        assert!(
+            unreachable_after > unreachable_before,
+            "premise: no page was unlinked ({unreachable_before} unreachable pages before, {unreachable_after} \
+             after), so the run raced nothing"
+        );
+
+        let expected: Vec<i32> = (0..KEYS).filter(|&i| stable(i) || i % 2 == 0).collect();
+        for i in 0..KEYS {
+            assert_eq!(tree.search(&wide(i)).unwrap().is_some(), expected.contains(&i), "key {i} by descent after the join");
+        }
+        let want: Vec<Value> = expected.iter().map(|&i| wide(i)).collect();
+        assert_eq!(scan_all(&tree), want, "a full scan after the join disagrees with the expected keys");
+        let chain_ids: Vec<u32> = leaves_by_chain(&tree).iter().map(|l| l.page_id).collect();
+        assert_eq!(leaves_by_descent(&tree), chain_ids, "the parents and the leaf chain disagree after the join");
+    }
+
+    /// **F2.** `d58_latch_free_descent::the_right_walk_crosses_an_empty_leaf` no longer crosses one:
+    /// since D233 the emptied leaf is spliced out of the chain before its walk starts. That test is
+    /// Ryan's to judge (⚖11) and is not edited. This is its replacement for the walk.
+    ///
+    /// A reader that read the root BEFORE an unlink descends through it onto the unlinked leaf,
+    /// which is empty with its `next` intact. The unlinked leaf is the root's leftmost child, so its
+    /// key range joins its right neighbour, and a key inserted into that range afterwards lives
+    /// there. The reader must walk right off the empty leaf and find it. Mutant `is_some_and` (the
+    /// original D58 bug) stops the walk on the empty leaf, and this test sees it.
+    #[test]
+    fn a_reader_from_before_an_unlink_walks_off_the_unlinked_leaf() {
+        let (tree, _dir) = setup();
+        for i in 0..8 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert_eq!(height(&tree), 2, "premise: the root's children must be leaves");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let (doomed, right) = match tree.read_node(root).unwrap() {
+            BPlusTreePage::Internal(n) => {
+                assert!(n.child_ptrs.len() >= 3, "premise: the root has {} children, need 3", n.child_ptrs.len());
+                (n.child_ptrs[0], n.child_ptrs[1])
+            }
+            BPlusTreePage::Leaf(_) => unreachable!("height 2"),
+        };
+        let gone = tree.read_leaf(doomed).unwrap().key_arr;
+        let right_keys = tree.read_leaf(right).unwrap().key_arr;
+        assert_eq!(gone.first(), Some(&wide(0)), "premise: the leftmost leaf holds the smallest key");
+        let refill = between(0);
+
+        // Snapshots of the root taken before the unlink, one per descent (a page image is consumed).
+        let snap_refill = tree.read_node(root).unwrap();
+        match &snap_refill {
+            BPlusTreePage::Internal(n) => assert_eq!(
+                n.find_child(&refill),
+                doomed,
+                "premise: the pre-unlink root routes the refill key to the leaf being unlinked"
+            ),
+            BPlusTreePage::Leaf(_) => unreachable!("height 2"),
+        }
+        let snaps_gone: Vec<_> = gone.iter().map(|_| tree.read_node(root).unwrap()).collect();
+        let snaps_right: Vec<_> = right_keys.iter().map(|_| tree.read_node(root).unwrap()).collect();
+
+        for k in &gone {
+            tree.delete(k).unwrap();
+        }
+        assert!(!leaves_by_descent(&tree).contains(&doomed), "premise: the emptied leaf was not unlinked");
+        let frozen = tree.read_leaf(doomed).unwrap();
+        assert!(frozen.key_arr.is_empty(), "premise: the unlinked leaf is not empty");
+        assert_eq!(frozen.next, Some(right), "premise: the unlinked leaf's next is not its old neighbour");
+        tree.insert(refill.clone(), Value::Integer(-1)).unwrap();
+        assert!(
+            tree.read_leaf(right).unwrap().key_arr.contains(&refill),
+            "premise: the refill key did not land in the leaf that absorbed the unlinked range"
+        );
+
+        let (page, leaf) = tree
+            .descend_optimistic(snap_refill, root, &refill, 64)
+            .unwrap()
+            .expect("premise: the optimistic descent gave up (a page not resident, or torn)");
+        assert!(
+            leaf.key_arr.contains(&refill),
+            "a reader holding the pre-unlink root stopped on page {page} (the unlinked leaf is {doomed}) \
+             and missed a key that lives in {right}"
+        );
+        for (k, snap) in gone.iter().zip(snaps_gone) {
+            let (_, leaf) = tree.descend_optimistic(snap, root, k, 64).unwrap().expect("premise: descent gave up");
+            assert!(!leaf.key_arr.contains(k), "a deleted key was found through the pre-unlink root");
+        }
+        for (k, snap) in right_keys.iter().zip(snaps_right) {
+            let (_, leaf) = tree.descend_optimistic(snap, root, k, 64).unwrap().expect("premise: descent gave up");
+            assert!(leaf.key_arr.contains(k), "a key to the right of the unlinked leaf was missed");
+        }
+    }
+
+    /// **The neighbour clause of `would_unlink`.** A leaf with no neighbour is the only leaf, the
+    /// root, and deleting its last key must leave an empty, usable tree. Without the clause the
+    /// delete takes the unlink path, finds no parent, and refuses. Nothing else empties a root leaf
+    /// through `delete`, so without this test that mutant survives.
+    #[test]
+    fn deleting_the_last_key_of_the_only_leaf_keeps_a_usable_tree() {
+        let (tree, _dir) = setup();
+        tree.insert(Value::Integer(1), Value::Integer(10)).unwrap();
+        tree.delete(&Value::Integer(1)).unwrap();
+        assert_eq!(tree.search(&Value::Integer(1)).unwrap(), None);
+        assert_eq!(leaves_by_descent(&tree), vec![tree.root_page_id.load(Ordering::Acquire)]);
+        tree.insert(Value::Integer(2), Value::Integer(20)).unwrap();
+        assert_eq!(tree.search(&Value::Integer(2)).unwrap(), Some(Value::Integer(20)));
+    }
+
+    /// A middle leaf emptied down to one key, with one of its neighbour links broken as `broken`
+    /// says, then its last key deleted. The delete must be refused, and the leaf, its neighbours and
+    /// its parent must be byte-identical to before it. Shared by the (a) and (b) tests below.
+    fn a_broken_neighbour_link_refuses_the_unlink(broken: &str) {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let (prev, mid, next) = (chain[0].page_id, chain[1].page_id, chain[2].page_id);
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        match broken {
+            "prev.next" => rewrite_leaf(&tree, prev, |l| l.next = Some(next)),
+            _ => rewrite_leaf(&tree, next, |l| l.prev = Some(prev)),
+        }
+        let parent = parent_of(&tree, mid);
+        let pages = [mid, prev, next, parent];
+        let before: Vec<_> = pages.iter().map(|&p| page_bytes(&tree, p)).collect();
+
+        let last = keys.last().unwrap();
+        assert!(tree.delete(last).is_err(), "{broken} broken: the unlink was not refused");
+        for (&p, b) in pages.iter().zip(&before) {
+            assert!(page_bytes(&tree, p) == *b, "{broken} broken: the refused unlink rewrote page {p}");
+        }
+    }
+
+    /// **F3 (a), red first against `0eda6ca`** (review 2 G4 split the one F3 test into three, so a
+    /// red run shows each case). The left neighbour's `next` skips the leaf. `0eda6ca` checked no
+    /// link: it spliced over the broken one and returned `Ok`.
+    #[test]
+    fn a_refused_unlink_with_a_broken_prev_link_writes_nothing() {
+        a_broken_neighbour_link_refuses_the_unlink("prev.next");
+    }
+
+    /// **F3 (b), red first against `0eda6ca`.** The right neighbour's `prev` skips the leaf.
+    #[test]
+    fn a_refused_unlink_with_a_broken_next_link_writes_nothing() {
+        a_broken_neighbour_link_refuses_the_unlink("next.prev");
+    }
+
+    /// **F3 (c), red first against `0eda6ca`: the cascade would empty the root.** Two leaves. The
+    /// right one is unlinked, which leaves the root one child. Then a stale `next` is planted on the
+    /// left one and it is emptied. Its neighbour still points back at it, so only the parents show
+    /// the break, and only past the root. `0eda6ca` wrote the leaf and the splice, THEN planned the
+    /// parents and refused. This is the one case that sees that order (mutant V6).
+    #[test]
+    fn a_refused_cascade_that_would_empty_the_root_writes_nothing() {
+        let (tree, _dir) = setup();
+        let mut i = 0;
+        while height(&tree) < 2 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+            i += 1;
+        }
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let (l1, l2) = match tree.read_node(root).unwrap() {
+            BPlusTreePage::Internal(n) => {
+                assert_eq!(n.child_ptrs.len(), 2, "premise: the first root split makes two leaves");
+                (n.child_ptrs[0], n.child_ptrs[1])
+            }
+            BPlusTreePage::Leaf(_) => unreachable!("height 2"),
+        };
+        for k in tree.read_leaf(l2).unwrap().key_arr {
+            tree.delete(&k).unwrap();
+        }
+        assert_eq!(leaves_by_descent(&tree), vec![l1], "premise: the right leaf was unlinked");
+        assert_eq!(tree.read_leaf(l2).unwrap().prev, Some(l1), "premise: the unlinked leaf still points back");
+        rewrite_leaf(&tree, l1, |l| l.next = Some(l2));
+        let keys = tree.read_leaf(l1).unwrap().key_arr;
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        let pages = [l1, l2, root];
+        let before: Vec<_> = pages.iter().map(|&p| page_bytes(&tree, p)).collect();
+        assert!(tree.delete(keys.last().unwrap()).is_err(), "an unlink that empties the root was not refused");
+        for (&p, b) in pages.iter().zip(&before) {
+            assert!(page_bytes(&tree, p) == *b, "the refused cascade rewrote page {p}");
+        }
+    }
+
+    /// **Review 2 G6, red first against `f03e25d`.** A chain whose `prev` and `next` name the same
+    /// page must be refused, not waited on. Page latches are not re-entrant, and `f03e25d` held
+    /// `prev`'s write latch while it took `next`'s, so when the two are one page the unlinker waited
+    /// on its own latch for ever, holding the root and stalling the whole tree.
+    ///
+    /// The broken leaf's `next` is set to its `prev`, which does point back at it, so the prev check
+    /// passes and only the latch order can go wrong. The delete runs on its own thread; a delete
+    /// that has not returned after 10 s is taken to be waiting on itself. On a red run that thread
+    /// stays blocked on a latch of this test's own tree.
+    #[test]
+    fn a_chain_whose_prev_is_its_next_is_refused_not_waited_on() {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let (prev, mid) = (chain[0].page_id, chain[1].page_id);
+        assert_eq!(chain[0].next, Some(mid), "premise: the left neighbour points at the leaf");
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        rewrite_leaf(&tree, mid, |l| l.next = Some(prev));
+        let last = keys.last().unwrap().clone();
+
+        let tree = Arc::new(tree);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.delete(&last).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(refused) => assert!(refused, "an unlink whose prev is its next was not refused"),
+            // Review 3 L7: a panicked worker is not a self-wait, and the message says which it was.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on its own latch")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the unlink of page {mid} panicked before returning")
+            }
+        }
+    }
+
+    /// **Review 3 L2, red first against `f6909db`.** The unlinker holds every page on its descent path
+    /// in WRITE, so a `prev` or `next` naming one of them makes it wait on its own latch while holding
+    /// the root, exactly as G6's shape does. Only arbitrary corruption produces it (no tree page is
+    /// freed and reused, so a leaf's id never becomes an internal page's), and the check is
+    /// O(height), so it is checked rather than documented. Here a middle leaf's `prev` is rewritten
+    /// to the ROOT's id. The delete runs on its own thread; one that has not returned after 10 s is
+    /// taken to be waiting on itself, and on a red run that thread stays blocked on a latch of this
+    /// test's own tree.
+    #[test]
+    fn a_neighbour_on_the_descent_path_is_refused_not_waited_on() {
+        let (tree, _dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert_eq!(height(&tree), 2, "premise: the root is the one internal page on every path");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let chain = leaves_by_chain(&tree);
+        assert!(chain.len() >= 3, "premise: {} leaves, need a middle one", chain.len());
+        let mid = chain[1].page_id;
+        let keys = chain[1].key_arr.clone();
+        for k in &keys[..keys.len() - 1] {
+            tree.delete(k).unwrap();
+        }
+        rewrite_leaf(&tree, mid, |l| l.prev = Some(root));
+        let last = keys.last().unwrap().clone();
+
+        let tree = Arc::new(tree);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.delete(&last).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(refused) => assert!(refused, "an unlink whose prev is the root was not refused"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the unlink of page {mid} has not returned after 10 s: it is waiting on the root's latch, which it holds")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the unlink of page {mid} panicked before returning")
+            }
+        }
+    }
+
+    // ---- D233 review 4 A4: every latched descent refuses a cycle ---------------------------------
+
+    /// Point internal page `page`'s child for `key` at `target`, under `page`'s write latch: how these
+    /// tests plant a cycle. Returns the image it replaced.
+    fn redirect_child(tree: &BPlusTreeManager<Value, Value>, page: u32, key: &Value, target: u32) -> [u8; PAGE_SIZE] {
+        let _latch = tree.latches().write(page);
+        let before = page_bytes(tree, page);
+        let BPlusTreePage::Internal(mut n) = tree.read_node_raw(page).unwrap() else {
+            panic!("premise: page {page} is an internal page")
+        };
+        let slot = n.child_ptrs.iter().position(|&c| c == n.find_child(key)).unwrap();
+        n.child_ptrs[slot] = target;
+        tree.write_page(page, n.serialize().unwrap()).unwrap();
+        before
+    }
+
+    /// Run `op` on its own thread and wait up to 10 s for its answer. On a timeout `page` gets its
+    /// `before` image back through `write_page`, WITHOUT a page latch (the stuck thread may hold that
+    /// page's read latch, and a latched write would queue behind it for ever), so a thread looping on
+    /// the planted cycle reads the repaired page and leaves, instead of spinning until the binary ends.
+    /// A thread blocked on its own write latch stays blocked, using no CPU, as in the L2 test.
+    fn within_10s<T: Send + 'static>(
+        tree: &Arc<BPlusTreeManager<Value, Value>>,
+        page: u32,
+        before: [u8; PAGE_SIZE],
+        what: &str,
+        op: impl FnOnce(&BPlusTreeManager<Value, Value>) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(tree);
+        std::thread::spawn(move || {
+            let _ = tx.send(op(&worker));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tree.write_page(page, before).unwrap();
+                panic!("{what} has not returned after 10 s: it is following the planted cycle, or waiting on a latch it holds")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what} panicked before returning"),
+        }
+    }
+
+    /// A height-2 tree whose root routes `wide(15)` back to the root: a cycle through a page that
+    /// every latched descent still holds when it reads the pointer.
+    fn a_root_that_names_itself() -> (Arc<BPlusTreeManager<Value, Value>>, tempfile::TempDir, u32, [u8; PAGE_SIZE]) {
+        let (tree, dir) = setup();
+        for i in 0..16 {
+            tree.insert(wide(i), Value::Integer(i)).unwrap();
+        }
+        assert_eq!(height(&tree), 2, "premise: the root is the one internal page on every path");
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let before = redirect_child(&tree, root, &wide(15), root);
+        (Arc::new(tree), dir, root, before)
+    }
+
+    fn refused_as_held(what: &str, got: Result<(), FerroError>) {
+        let err = got.expect_err(&format!("{what} through a child pointer to a page it holds was not refused"));
+        assert!(err.to_string().contains("already holds"), "{what} was refused, but not by the held-page check: {err}");
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** A latched read (`search` falls back to
+    /// `read_leaf_for_latched` after its optimistic restarts) read-crabs from the root with no bound, so
+    /// a child pointer naming the page it holds made it latch that page again and loop for ever.
+    #[test]
+    fn a_latched_read_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "search", |t| t.search(&wide(15)).map(|_| ()));
+        refused_as_held("search", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** Every `insert`, `upsert` and `delete` first runs
+    /// `latch_leaf_for_write`'s read-crabbing descent, along the same pointers the pessimistic descents
+    /// follow, so a check in the pessimistic ones alone is never reached: this one loops first.
+    #[test]
+    fn a_write_fast_path_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "delete", |t| t.delete(&wide(15)));
+        refused_as_held("delete", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** The unlink descent holds every page on its path in
+    /// WRITE, so a child pointer to one of them made it wait on its own latch while holding the root.
+    #[test]
+    fn an_unlink_descent_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "delete_unlinking", |t| t.delete_unlinking(&wide(15)));
+        refused_as_held("delete_unlinking", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** The split descent: the same hold, the same self-wait.
+    #[test]
+    fn a_split_descent_refuses_a_child_pointer_to_a_page_it_holds() {
+        let (tree, _dir, root, before) = a_root_that_names_itself();
+        let got = within_10s(&tree, root, before, "write_splitting", |t| {
+            t.write_splitting(wide(15), Value::Integer(99), LeafWrite::Insert)
+        });
+        refused_as_held("write_splitting", got);
+    }
+
+    /// **Review 4 A4, red first against `79eec23`.** A read-crabbing descent lets go of each page as it
+    /// takes the next, so a cycle through a page it has let go of is not a self-wait: it is a loop. In
+    /// a height-3 tree a level-2 page routes the key back to the root, which the latched read no longer
+    /// holds there, so only the level bound can refuse it.
+    #[test]
+    fn a_latched_read_refuses_a_cycle_through_a_page_it_let_go_of() {
+        let (tree, _dir) = setup();
+        let mut n = 0;
+        while height(&tree) < 3 {
+            tree.insert(wide(n), Value::Integer(n)).unwrap();
+            n += 1;
+            assert!(n < 400, "premise: 400 keys did not build a height-3 tree");
+        }
+        let key = wide(n - 1);
+        let root = tree.root_page_id.load(Ordering::Acquire);
+        let BPlusTreePage::Internal(r) = tree.read_node(root).unwrap() else { panic!("premise: the root is internal") };
+        let mid = r.find_child(&key);
+        assert!(matches!(tree.read_node(mid).unwrap(), BPlusTreePage::Internal(_)), "premise: page {mid} is on level 2");
+        let before = redirect_child(&tree, mid, &key, root);
+        let tree = Arc::new(tree);
+        let got = within_10s(&tree, mid, before, "search", move |t| t.search(&key).map(|_| ()));
+        let err = got.expect_err("a search whose descent cycles through a page it let go of was not refused");
+        assert!(err.to_string().contains("levels"), "the search was refused, but not by the level bound: {err}");
     }
 }
