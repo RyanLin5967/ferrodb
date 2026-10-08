@@ -936,6 +936,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// count and the minimum keys-per-leaf all unchanged. `no_workload_drives_a_leaf_underfull` pins
     /// that, and it is the test that fails if this ever becomes reachable.
     ///
+    /// ⚠ **D202 made the first sentence above false, and this function is still unreachable.** A
+    /// ROLLBACK now removes the primary entry of every key its transaction added
+    /// (`TxnManager::abort` → `delete`), so a rolled-back bulk INSERT can leave leaves underfull or
+    /// empty. Nothing calls this function, `delete` included, so an underfull leaf is left sparse.
+    /// The descent already walks past an empty leaf (`descend_optimistic`'s B-link repair), and so
+    /// does a scan: `RangeScanner::next` follows `next` whenever `idx >= key_arr.len()`, which an
+    /// empty leaf satisfies at `idx = 0`.
+    /// Sparse is correct. What changed is that `no_workload_drives_a_leaf_underfull` covers
+    /// DELETE-and-reinsert workloads only: it no longer bounds occupancy for every workload.
+    ///
     /// **An error rather than `todo!()`.** This function returns `Result` so a caller can handle
     /// failure; `todo!()` aborts the process instead, and it was reachable-in-principle from `delete`,
     /// which is on a live path. Same argument as E62's seven binder panics. Implementing a real

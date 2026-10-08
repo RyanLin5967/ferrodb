@@ -164,6 +164,14 @@ impl Modify for Update {
                 // updated: `delete` returns `KeyNotFound` for a missing entry, and propagating
                 // that here aborted the statement with the index left disagreeing with the heap.
                 // `upsert` repairs the entry instead, which is the outcome that was wanted.
+                //
+                // **D202 — and a rollback must put it back.** The rollback frees `new_rid`
+                // (`undo_insert`) and restores the row at `rid` (`undo_delete`). Without this record
+                // the key was left on the freed slot while the row lived at `rid`: every lookup
+                // of it and every INSERT of it then failed with `SlotDeleted`.
+                if let Some(txn) = &self.heap.txn {
+                    txn.record_primary_write(self.heap.txn_id, self.primary_index.root_cell(), pk.clone(), Some(rid));
+                }
                 self.primary_index.upsert(pk.clone(), new_rid)?;
             }
 
