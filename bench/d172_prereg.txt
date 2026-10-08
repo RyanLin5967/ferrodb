@@ -1,0 +1,195 @@
+D172 PRE-REGISTRATION — WHICH S-KEYED STRUCTURE CARRIES D171's ~70 ns PER STATEMENT?
+Cut 2026-09-23, BEFORE any measurement. Amendments append-only below the line.
+
+⚠ THIS ROW IS REGISTERED BUT NOT RUN. It needs the fleet measure lock, which is committed to
+`d170-land` for its landing. Written now so the next reader starts from a design rather than a
+blank page. Whoever runs it: re-read the falsifiers before the first number, and append an
+amendment if the design changes.
+
+## WHAT IS ALREADY ESTABLISHED, so this row does not re-measure it
+
+`frontier/d171_session_length_wall.md` (artifacts `bench/d171_stage_cost*.txt`, commit `6970be9`):
+an agent session's per-statement cost grows linearly in the number of statements it has already
+executed, ~46-107 ns per prior statement (~70 ns in the shipped configuration), **flat in the
+overlay size across 128x**, present in stub and arena and with and without the D71 pushdown.
+
+Two exclusions already hold, each behind a fire-checked measurement — DO NOT SPEND AN ARM ON EITHER:
+
+  * **W-keyed structures are out.** D171 arm C holds S fixed, sweeps W 128x, and is flat. That
+    excludes `ws.rows` and `ws.base_rows`, including the `PersistentMap` path-copying insert that
+    D170 led with.
+  * **SEARCH over the effect log's frames is out.** `bench/d138_index_slope/` measures scan = 0
+    across a log growing to 1750+ frames, and licenses that zero with its own fire-check
+    (`d138_ship_raw.txt:16-17`). Its arm (2), "1 session x 200 writes", is this regime.
+    ⛔ But D138 measured COUNTS, not durations ("⛔ COUNTS ONLY. No timing is reported and none was
+    taken"), so it excludes SEARCHING and not GROWING — and its axis is the effect LOG's frame
+    count, NOT the `ops` Vec inside one open `TxnFrame`, which is a different structure its sweep
+    never reaches.
+
+## THE SURVIVING CANDIDATES — all keyed by S, none checked
+
+  C1. `TxnFrame::push_op` (`src/tel/frame.rs:49`) appending to `ops` on the ONE open frame held in
+      the live workspace (`runtime.rs:360`). Append-only, never trimmed within a session.
+  C2. The effect-log `frames` Vec's own ALLOCATION growth — distinct from the search D138 zeroed.
+  C3. `record_write_scan`'s per-statement read-set retention.
+
+## THE INSTRUMENT — COUNTS FIRST, and a REMOVAL arm, because a shape cannot name a structure
+
+This row is licensed to name a structure ONLY via (b) or (c). (a) alone narrows, it does not name.
+
+  (a) **ALLOCATION COUNTS, not durations.** A counting global allocator, sampled around each
+      statement: allocations and bytes per statement, swept over S. Follow D129/D138's discipline
+      — report integers, and FIRE-CHECK the counter by forcing a known allocation before trusting
+      any zero. A candidate whose allocation count is FLAT in S cannot be carrying a term linear
+      in S.
+  (b) **REMOVAL.** Behind an env flag, make each candidate's growth not happen — e.g. `push_op`
+      returns without pushing — and re-run D171 arm B. ⛔ THIS BREAKS CORRECTNESS BY CONSTRUCTION;
+      it is an instrument that must never land, and the run must assert it is measuring a
+      deliberately broken binary so a later reader cannot mistake it for a result about ferrodb.
+  (c) **READING the structure**, which is free and should come first.
+
+## THE PREDICTION, FIXED BEFORE THE RUN
+
+  1. Allocations per statement RISE with S and removing C1 flattens D171 arm B -> C1 named.
+  2. Allocations FLAT in S while the duration still rises -> it is not allocation at all; memcpy
+     on `Vec` regrowth, cache behaviour, or something not yet listed. Report that the candidate
+     list was WRONG rather than forcing a fit.
+  3. Removing C1 leaves the slope intact -> C1 is dead whatever the counts say. The removal arm
+     OUTRANKS the counting arm.
+
+## FALSIFIERS — each says the INSTRUMENT failed, not that the cost is zero
+
+  1. The allocation counter not fire-checked, or reading 0 where an allocation is known to occur
+     -> VOID.
+  2. The removal arm changing `Affected`, the read-back, or the negative control -> it changed
+     more than the one structure; VOID.
+  3. D171 arm B not reproducing on the same tree before any of this -> stop; the baseline moved.
+
+## WHAT A CONFIRMED RESULT WOULD AND WOULD NOT LICENSE
+
+  OK   "The per-statement term is <structure>, shown by removing it and by its allocation count."
+  NOT  a fix. Naming the structure and deciding whether an append-only per-session frame SHOULD be
+       trimmed are different questions, and the second one has correctness consequences —
+       `tel/log.rs` states that stored index positions are valid ONLY because nothing prunes,
+       compacts or reorders `frames`. **Anything that trims must reckon with that invariant, and
+       it is not a tuning knob.**
+
+-------------------------------------------------------------------------------------------
+AMENDMENTS (append-only)
+
+B1. 2026-09-23, BEFORE any D172 measurement. THE SITE IS LOCATED BY READING, which this prereg's
+    step (c) said should come first and which cost ten minutes.
+
+    `src/agent_sql/runtime.rs:3069`, the last statement inside `stage_all`'s state-lock block:
+
+        ws.frame.clone()
+
+    `stage_all` runs ONCE PER STATEMENT (`branch_update:2670`, `branch_delete:2840`,
+    `stage:2861`). `ws.frame` is a `TxnFrame` whose `ops: Vec<Op>` is append-only and never
+    trimmed within a session, so at statement S it holds ~S ops. **Cloning it is Theta(S), once
+    per statement.**
+
+    ⭐ AND THE CONSUMER NO LONGER NEEDS IT. `MemEffectLog::append` (`src/tel/log.rs:389`) takes
+    `&TxnFrame`, and on the `Reappend::Grew` path — the path every statement after the first takes
+    — it reads ONLY THE NEW TAIL:
+
+        stored.ops.extend_from_slice(&frame.ops[ops..]);
+
+    Its own comment names the very cost this row is chasing, as something it FIXED:
+      "The open frame grew. **Extended rather than replaced**, and the difference is not
+       performance (though it is also that: replacing cloned the whole frame on every statement of
+       a task, which is quadratic in the ops it ran)."
+    ⇒ The STORAGE half of that fix landed. The CALLER still materialises the full O(S) clone to
+    hand to it. This is one fix with two halves and one of them landed.
+
+    FITS EVERY D171 CONSTRAINT WITHOUT ADJUSTMENT: linear in S (clone of an S-length Vec); flat in
+    W (arm C — the Vec is keyed by ops, not by distinct rows); present in stub AND arena (the
+    clone is above the storage layer); present with and without pushdown; and it is a `Vec`
+    reallocation-and-copy, which is what `d71_point_update_curve.txt`'s discarded profile saw as
+    `RawVecInner::finish_grow` / `do_reserve_and_handle`.
+
+    ⛔ THIS IS NOT YET CONFIRMED. A site that COULD produce the shape is not the site that DOES.
+
+B2. THE CONFIRMATION ARM, registered before running it. **A PHASE TIMER, NOT A REMOVAL.**
+    Removing the clone cannot be done without breaking `append`'s `Grew` path, which indexes
+    `frame.ops[ops..]` by ABSOLUTE position and so requires the full frame; a truncated frame
+    would silently mis-index rather than fail. So the non-destructive instrument is used instead:
+
+      time `ws.frame.clone()` alone, and pair it with the INTEGER `ws.frame.ops.len()` at the same
+      moment — a timer paired with a counter, per this project's rule.
+
+    PREDICTIONS:
+      B2a. clone_ns rises LINEARLY with ops.len(), and clone_ns at S accounts for most of D171's
+           measured per-statement excess at S -> the site is CONFIRMED as the dominant term.
+      B2b. clone_ns rises linearly but is a SMALL fraction of the excess -> it is A term, not THE
+           term; report the fraction and keep looking. This is a live outcome.
+      B2c. clone_ns FLAT in ops.len() -> the reading is wrong somewhere; report and stop.
+
+    FALSIFIER: if `ops.len()` does not itself grow ~1 per statement in this workload, the axis is
+    not what I think and the fit is meaningless — so `ops.len()` is REPORTED, never assumed.
+
+B3. 2026-09-23. OUTCOME B2b FIRED: the clone is A term, not THE term. Measured, arm B, arena,
+    pushdown, W=100 fixed, ops.len() REPORTED not assumed (it reads S+200 throughout, i.e. exactly
+    1 op per statement, so the falsifier in B2 passes):
+
+        S      us/stmt   clone us   ops.len   clone%
+      100        67.00       7.39       300     11.0
+      400        88.33      16.35       600     18.5
+     1600       176.17      51.20      1800     29.1
+     6400       541.37     202.83      6600     37.5
+    12800       914.92     370.76     13000     40.5
+
+    The clone is LINEAR in ops.len() at a very stable ~28 ns per op copied (24.6 / 27.3 / 28.4 /
+    30.7 / 28.5), and contributes 28.6 of the 66.8 ns/statement total slope = **43%**.
+    ⇒ B1's site is CONFIRMED as a real Theta(S) per-statement term. It is NOT the whole term.
+
+    ⛔ 57% IS UNATTRIBUTED, AND AN UNATTRIBUTED MAJORITY IS NOT A RESULT -- a phase table must
+    close. Registering the next site BEFORE measuring it.
+
+    THE SECOND SITE, again located by READING: `self.log.append(&frame)` immediately after the
+    clone. `MemEffectLog::append` -> `classify(&frames.frames[i], frame)` (`src/tel/log.rs:368`),
+    which runs `frame_eq(old, new)` and then `extends(old, new)` -- BOTH op-by-op over the stored
+    frame via `op_eq` (`log.rs:300`, comparing tbl/row/col/witness/kind). **That is a second
+    Theta(S) pass per statement**, on top of the Theta(S) copy.
+    `log.rs:284-286` states the cause in its own words: *"because `stage_all` re-appends the open
+    frame once per statement"*. One design decision, two Theta(S) costs.
+
+    ⚠ D138 DOES NOT COVER THIS AND MUST NOT BE READ AS COVERING IT. Its arms report
+    `classify_append calls 0` -- classify was never exercised in that measurement -- and its scan
+    counter is on the INDEX lookup (`frames_for`), not on classify's prefix comparison.
+
+    PREDICTIONS:
+      B3a. append_ns rises linearly with ops.len() and clone% + append% accounts for ~all of the
+           slope -> the phase table CLOSES and the term is fully attributed to the re-append design.
+      B3b. clone% + append% still leaves a large gap -> a third site exists; report the gap as a
+           gap and do NOT distribute it across the two known ones.
+      B3c. append_ns flat -> classify is not the second term; the reading is wrong.
+
+B4. 2026-09-23. OUTCOME B3b FIRED: the table does NOT close. Measured (arm B, arena, pushdown,
+    W=100, load 3):
+
+        S      us/stmt   clone us  append us   clone%  append%   SUM%
+      100        64.75       7.11       2.67     11.0      4.1    15.1
+      400        89.58      16.51       6.47     18.4      7.2    25.7
+     1600       165.04      48.90      20.44     29.6     12.4    42.0
+     6400       539.75     202.54      84.33     37.5     15.6    53.1
+    12800       947.04     383.22     162.28     40.5     17.1    57.6
+
+    As SLOPES over S=100..12800: total 69.5 ns/stmt; clone 29.6 (43%); append 12.6 (18%).
+    ⇒ BOTH sites CONFIRMED Theta(S) and linear. Together they are 61% of the slope.
+    ⇒ **~27 ns/stmt (39%) IS UNATTRIBUTED. Reported as a gap, and NOT distributed across the two
+    known sites**, per B3b.
+
+    THE THIRD SITE, registered before measuring: **the cloned frame's DROP.** `stage_all` clones
+    an O(S) `TxnFrame`, passes `&frame` to `append`, and the clone then falls out of scope.
+    Dropping a `Vec<Op>` of length S deallocates S `Op`s, each carrying an `Option<Value>`
+    witness -- Theta(S), and it sits OUTSIDE both existing timers.
+    ⚠ This is a KNOWN pattern in this project's own notes ("a phase table must close -- an
+    unattributed 40% was the clone's DROP"), which is a reason to TEST it, not to assume it.
+
+    PREDICTIONS:
+      B4a. drop_ns is Theta(S) and clone+append+drop accounts for ~the whole slope -> the table
+           CLOSES; the whole per-statement term is the cost of materialising, comparing and
+           discarding a cumulative frame once per statement.
+      B4b. drop_ns small, gap persists -> a fourth site; report the gap again and STOP rather than
+           keep guessing. Two registered misses is the limit for this row.

@@ -1,0 +1,170 @@
+ACQUIRED d170-adversary  load_at_acquire=26
+CAVEAT: load 26 >= 8. You hold exclusivity against other MEASURERS, but the
+box is NOT quiet. Prefer COUNTERS (integers) over durations; if you must report
+a duration, stamp load_at_acquire=26 beside it and say it is an upper bound.
+host: Darwin arm64  started: 2026-09-23T06:33:31Z
+load: 26.99 23.08 22.10
+tree: 7f4f8464f06b15af6b9695d76fe5e234c16be3f0  (worktree d170-adversary, branch_update instrumented)
+df:  /dev/disk3s5   926Gi   839Gi    61Gi    94%    8.6M  642M    1%   /System/Volumes/Data
+=== BUILD ===
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d170-adversary)
+    Finished `release` profile [optimized] target(s) in 9.78s
+BUILD OK
+
+=== PAIR 1 — STAGED — HEAD (pushdown ON) — load 25.19 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      0.0703        0.0703         0.00             60           YES         0
+        2000      0.0638        0.0319         0.00             60           YES         0
+             ^ 2.0x the rows, 0.91x the time
+        4000      0.0485        0.0121         0.00             60           YES         0
+             ^ 4.0x the rows, 0.69x the time
+        8000      0.0495        0.0062         0.00             60           YES         0
+             ^ 8.0x the rows, 0.70x the time
+       16000      0.0897        0.0056         0.00             60           YES         0
+             ^ 16.0x the rows, 1.27x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== PAIR 1 — STAGED — NOPUSHDOWN (pre-e6958d6) — load 23.83 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      0.1894        0.1894         0.00             60           YES         0
+        2000      0.3045        0.1522         0.00             60           YES         0
+             ^ 2.0x the rows, 1.61x the time
+        4000      0.5650        0.1412         0.00             60           YES         0
+             ^ 4.0x the rows, 2.98x the time
+        8000      1.1010        0.1376         0.00             60           YES         0
+             ^ 8.0x the rows, 5.81x the time
+       16000      2.2312        0.1394         0.00             60           YES         0
+             ^ 16.0x the rows, 11.78x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== PAIR 2 — STAGED — NOPUSHDOWN (pre-e6958d6) — load 28.37 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      0.1844        0.1844         0.00             60           YES         0
+        2000      0.2882        0.1441         0.00             60           YES         0
+             ^ 2.0x the rows, 1.56x the time
+        4000      0.6397        0.1599         0.00             60           YES         0
+             ^ 4.0x the rows, 3.47x the time
+        8000      1.0709        0.1339         0.00             60           YES         0
+             ^ 8.0x the rows, 5.81x the time
+       16000      2.6823        0.1676         0.00             60           YES         0
+             ^ 16.0x the rows, 14.55x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== PAIR 2 — STAGED — HEAD (pushdown ON) — load 27.77 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      0.0652        0.0652         0.00             60           YES         0
+        2000      0.0585        0.0292         0.00             60           YES         0
+             ^ 2.0x the rows, 0.90x the time
+        4000      0.0505        0.0126         0.00             60           YES         0
+             ^ 4.0x the rows, 0.77x the time
+        8000      0.0490        0.0061         0.00             60           YES         0
+             ^ 8.0x the rows, 0.75x the time
+       16000      0.0497        0.0031         0.00             60           YES         0
+             ^ 16.0x the rows, 0.76x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== Q3 N-SWEEP — STAGED — D170_NOPUSHDOWN=0 — load 26.64 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = STAGED
+
+Q3 — N-SWEEP at a FIXED 4000-row table. Axis = rows staged in the session.
+  staged N     median ms   us/update   affected!=1
+        50        0.0503       50.25             0
+       100        0.0939       93.88             0
+       200        0.0581       58.08             0
+       400        0.0618       61.83             0
+       800        0.0793       79.25             0
+      1600        0.1050      105.04             0
+      3200        0.1618      161.75             0
+rc=0
+
+=== Q3 N-SWEEP — STAGED — D170_NOPUSHDOWN=1 — load 22.35 ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = STAGED
+
+Q3 — N-SWEEP at a FIXED 4000-row table. Axis = rows staged in the session.
+  staged N     median ms   us/update   affected!=1
+        50        0.6006      600.63             0
+       100        0.5687      568.71             0
+       200        0.5673      567.29             0
+       400        0.5796      579.62             0
+       800        0.6278      627.79             0
+      1600        0.6567      656.71             0
+      3200        0.7852      785.21             0
+rc=0
+
+=== PLAIN CONTROL — D170_NOPUSHDOWN=0 (must be unaffected) ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = false  (HEAD, predicate pushed)
+arm = PLAIN
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      4.0884        4.0884         1.03             60           YES         0
+        2000      3.0263        1.5132         1.03             60           YES         0
+             ^ 2.0x the rows, 0.74x the time
+        4000      3.9729        0.9932         1.00             60           YES         0
+             ^ 4.0x the rows, 0.97x the time
+        8000      4.0007        0.5001         1.00             60           YES         0
+             ^ 8.0x the rows, 0.98x the time
+       16000      5.0374        0.3148         1.00             60           YES         0
+             ^ 16.0x the rows, 1.23x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+=== PLAIN CONTROL — D170_NOPUSHDOWN=1 (must be unaffected) ===
+D170 ADVERSARY PROBE
+at 7f4f8464f06b +DIRTY (uncommitted changes — this commit does NOT describe the code that ran)
+D170_NOPUSHDOWN = true  (PRE-e6958d6 unpredicated scan in branch_update)
+arm = PLAIN
+
+  table rows   median ms   ms per 1000   fsyncs/upd   affected_sum   readback_ok   neg_ctl
+        1000      3.7400        3.7400         1.03             60           YES         0
+        2000      3.0306        1.5153         1.03             60           YES         0
+             ^ 2.0x the rows, 0.81x the time
+        4000      3.8836        0.9709         1.00             60           YES         0
+             ^ 4.0x the rows, 1.04x the time
+        8000      4.0091        0.5011         1.00             60           YES         0
+             ^ 8.0x the rows, 1.07x the time
+       16000      4.9878        0.3117         1.00             60           YES         0
+             ^ 16.0x the rows, 1.33x the time
+
+Every row above asserted: affected==1 per statement, read-back equal, negative control==0.
+rc=0
+
+finished: 2026-09-23T06:47:19Z  load: 17.38 20.06 21.62
+RELEASED d170-adversary
+D170_ADV_COMPLETE

@@ -321,6 +321,55 @@ pub fn row_id_of(row: &[Value]) -> RowId {
 /// key would probe a key no staged row was ever stored under and MISS a staged version — the one
 /// wrong answer. On any mismatch this returns `None` and the caller walks the table prefix, which
 /// is always correct.
+/// D170 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Which arm of the overlay each staged statement
+/// took. `d170_overlay_counters()` reads them; `d170_reset_overlay_counters()` zeroes them.
+pub static D170_PROBE_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_WALK_UNPROBEABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_WALK_NO_PK_CONJUNCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_MAX_UNPROBEABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D170_MAX_OVERLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (probe_fired, walk_unprobeable, walk_no_pk_conjunct, max_unprobeable_rows, max_overlay_len)
+pub fn d170_overlay_counters() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        D170_PROBE_FIRED.load(Relaxed),
+        D170_WALK_UNPROBEABLE.load(Relaxed),
+        D170_WALK_NO_PK_CONJUNCT.load(Relaxed),
+        D170_MAX_UNPROBEABLE.load(Relaxed),
+        D170_MAX_OVERLAY.load(Relaxed),
+    )
+}
+
+pub fn d170_reset_overlay_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [&D170_PROBE_FIRED, &D170_WALK_UNPROBEABLE, &D170_WALK_NO_PK_CONJUNCT,
+              &D170_MAX_UNPROBEABLE, &D170_MAX_OVERLAY] {
+        c.store(0, Relaxed);
+    }
+}
+
+/// D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Cost of `stage_all`'s per-statement
+/// `ws.frame.clone()` (`runtime.rs`), paired with the `ops.len()` it copied.
+pub static D172_DROP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_APPEND_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_CLONE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_CLONE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_OPS_LEN_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D172_OPS_LEN_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (total clone ns, clone calls, total append ns, max ops.len())
+pub fn d172_clone_counters() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (D172_CLONE_NS.load(Relaxed), D172_CLONE_CALLS.load(Relaxed),
+     D172_APPEND_NS.load(Relaxed), D172_OPS_LEN_MAX.load(Relaxed), D172_DROP_NS.load(Relaxed))
+}
+
+pub fn d172_reset_clone_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [&D172_CLONE_NS, &D172_CLONE_CALLS, &D172_APPEND_NS, &D172_DROP_NS, &D172_OPS_LEN_SUM, &D172_OPS_LEN_MAX] { c.store(0, Relaxed); }
+}
+
 fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u64> {
     let pk_type = pk_type?;
     let mut conjuncts = Vec::new();
@@ -2236,6 +2285,18 @@ impl AgentRuntime {
                 // key AND holds column 0 in the declared variant; `unprobeable_rows` says whether
                 // either has ever stopped being true here (see `Workspace`).
                 let probe = if unprobeable_rows == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
+                // D170 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Counts which arm each statement
+                // took, and WHY the walk was taken when it was, so "the probe fired" is a
+                // measurement rather than a reading of the source.
+                if unprobeable_rows != 0 {
+                    D170_WALK_UNPROBEABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if probe.is_none() {
+                    D170_WALK_NO_PK_CONJUNCT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    D170_PROBE_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                D170_MAX_UNPROBEABLE.fetch_max(unprobeable_rows, std::sync::atomic::Ordering::Relaxed);
+                D170_MAX_OVERLAY.fetch_max(staged.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 match probe {
                     Some(row) => {
                         if let Some(st) = staged.get(&(tbl.0, row)) {
@@ -2678,13 +2739,21 @@ impl AgentRuntime {
         // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
         // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
         // between the two paths. What changes is how many rows reach it, never which ones pass.
+        // ⚠⚠ D170 ADVERSARY INSTRUMENT — NOT FOR LANDING. `D170_NOPUSHDOWN=1` restores the
+        // PRE-`e6958d6` call EXACTLY: that commit states `visible_rows(..)` was
+        // `visible_rows_where(.., None, None, None)`, so passing `None, None` here IS the old
+        // path. ONE binary, TWO runtime states, so this A/B cannot be a build difference.
+        let nopush = {
+            static NP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NP.get_or_init(|| std::env::var("D170_NOPUSHDOWN").map(|v| v == "1").unwrap_or(false))
+        };
         let rows = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
             None,
-            where_clause.as_ref(),
-            bound_where.as_ref(),
+            if nopush { None } else { where_clause.as_ref() },
+            if nopush { None } else { bound_where.as_ref() },
         )?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
@@ -3132,12 +3201,38 @@ impl AgentRuntime {
                 }
                 mirrored.push((item.row, item.after));
             }
-            ws.frame.clone()
+            // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Times THIS clone alone and pairs it
+            // with the integer `ops.len()` at the same moment, so the timer never travels without
+            // its counter.
+            {
+                let n = ws.frame.ops.len() as u64;
+                let t0 = std::time::Instant::now();
+                let f = ws.frame.clone();
+                D172_CLONE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                D172_CLONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                D172_OPS_LEN_SUM.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                D172_OPS_LEN_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                f
+            }
         };
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
         // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
         // statement, which is also why the frame is cloned after every row is folded in.
-        self.log.append(&frame)?;
+        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The second Theta(S) site: classify's
+        // frame_eq + extends compare op-by-op over the stored frame.
+        {
+            let t0 = std::time::Instant::now();
+            let r = self.log.append(&frame);
+            D172_APPEND_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            r?
+        };
+        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The third Theta(S) site: dropping the
+        // clone deallocates S `Op`s and their witnesses, outside both timers above.
+        {
+            let t0 = std::time::Instant::now();
+            drop(frame);
+            D172_DROP_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
         // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
