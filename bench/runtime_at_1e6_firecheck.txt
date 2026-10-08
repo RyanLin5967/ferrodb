@@ -1,0 +1,12 @@
+S15 phase 4 — FIRE-CHECK. The branch count is FIXED at 10000; the TABLE grows.
+These are the same three timers phase 1 reports as flat against branch count. If they
+do not move here, phase 1's flat rows are a broken instrument and mean nothing.
+
+     rows    INSERT ms    SELECT ms      ASOF ms   sel rows
+       20       0.0346       0.0179       0.0185          1
+      200       0.0559       0.0424       0.0425          1
+     2000       0.3381       0.2826       0.2846          1
+    20000       3.4017       3.7349       3.4622          1
+
+Rising here + flat in phase 1 = the SQL data path is sensitive to TABLE size and not to
+BRANCH count, which is the claim. Flat here would mean the timers see nothing at all.
