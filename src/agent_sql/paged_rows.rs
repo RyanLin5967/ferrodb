@@ -216,6 +216,19 @@ impl PagedRows {
         self.tree.insert(root, branch, epoch, &key, &val)
     }
 
+    /// Would [`PagedRows::put`] refuse this row for its **shape**? The same two calls `put` makes —
+    /// the encoding and the tree's own size check — minus the write.
+    ///
+    /// `Ok` here leaves only the store's own failures for `put` to report: a page it cannot
+    /// allocate, an I/O error. D258: `AgentRuntime::stage_all` asks this for every row of a
+    /// statement before it changes anything, because the tree refused an over-long row only after
+    /// the statement had been staged, and `MERGE` published the row the client was told had failed.
+    pub fn check_put(table_id: u32, row_id: u64, vals: &[Value]) -> Result<(), FerroError> {
+        let key = row_key(table_id, row_id);
+        let val = encode_row(vals)?;
+        CowTree::check_entry(&key, &val)
+    }
+
     /// Read one row. `None` means absent, which is distinct from a row whose cells are all `Null`.
     pub fn get(
         &self,

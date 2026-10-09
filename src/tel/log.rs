@@ -620,8 +620,9 @@ impl MemEffectLog {
     /// The frame for one transaction on one branch, if it was ever appended.
     ///
     /// ⚠ **No production caller, checked at HEAD rather than assumed.** `frame` is not on the
-    /// [`crate::tel::EffectLog`] trait — that declares `append` and `frames_for` and nothing else
-    /// — so it can only be called on a concrete store, and nothing outside this file does:
+    /// [`crate::tel::EffectLog`] trait — that declares `append`, `check_append` (D258) and
+    /// `frames_for` and nothing else — so it can only be called on a concrete store, and nothing
+    /// outside this file does:
     /// `git grep '\.frame('` over `src`, `tests`, `examples`, `bench` and `tools` returns this
     /// file, its test children, and `consensus/log.rs`, whose `frame(Round)` belongs to an
     /// unrelated type. It goes through D138's index anyway — one index serves every keyed lookup,
@@ -854,6 +855,12 @@ impl EffectLog for MemEffectLog {
         }
         frames.push(frame.clone());
         Ok(())
+    }
+
+    /// The one refusal `append` above can make — a frame that does not extend what is stored under
+    /// its key — decided by the same [`classify`], without storing anything.
+    fn check_append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
+        self.classify_append(frame).map(|_| ())
     }
 
     /// Every frame on one branch from `from_seq`, in `(seq, txn_id)` order.
@@ -2028,6 +2035,41 @@ impl DurableEffectLog {
         Ok((RecoveryReport { frames, extensions, discarded_tail_bytes }, good_end))
     }
 
+    /// The record `append` would write for `frame`, or `None` for a retry, which writes nothing.
+    ///
+    /// `classify_append` is a read, so every refusal this store owes the caller — a contradiction
+    /// under an id already used, a string too long for its length prefix, a guard nested past what
+    /// the decoder can survive, a delta too large to replicate — happens with the index and the file
+    /// both untouched. `provenance::durable` had to mutate first because its guards live inside the
+    /// mutation; this store's do not, and the difference is what lets `append`'s order be the safe
+    /// one.
+    ///
+    /// **Shared by `append` and `check_append`, and that sharing is the whole of `check_append`'s
+    /// correctness.** A second copy of this match would be a second definition of what this store
+    /// refuses, free to drift from the first — and a check that admits what `append` refuses is the
+    /// D258 defect one layer down.
+    fn encode_append(&self, frame: &TxnFrame) -> Result<Option<Vec<u8>>, FerroError> {
+        let classified = self.mem.classify_append(frame)?;
+        Self::encode_classified(frame, classified)
+    }
+
+    /// `encode_append`'s second half: the record for an already-classified `frame`. Split out only
+    /// so `append` can time the lookup and the encode apart (D148); `append` and `check_append`
+    /// still reach the same match, so there is still one definition of what this store refuses.
+    fn encode_classified(
+        frame: &TxnFrame,
+        classified: Option<Reappend>,
+    ) -> Result<Option<Vec<u8>>, FerroError> {
+        let body = match classified {
+            None => encode_open(frame)?,
+            Some(Reappend::Retry) => return Ok(None),
+            Some(Reappend::Grew { ops, guards, claims }) => {
+                encode_extend(frame, ops, guards, claims)?
+            }
+        };
+        frame_record(&body).map(Some)
+    }
+
     fn write_record(file: &dyn Storage, rec: &[u8], at: u64) -> Result<(), FerroError> {
         let tw = std::time::Instant::now();
         pwrite_all(file, rec, at)?;
@@ -2088,14 +2130,11 @@ impl EffectLog for DurableEffectLog {
     fn append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
         let mut inner = self.inner.lock().expect("durable effect log mutex poisoned");
 
-        // Classified, and encoded, BEFORE anything is mutated and before a byte is written.
+        // Classified, and encoded, BEFORE anything is mutated and before a byte is written — by
+        // `encode_append`'s two halves, which `check_append` runs too, so the two cannot disagree.
+        // The halves are called separately here only so D148 can time the lookup and the encode
+        // apart; `encode_classified` is still the one definition of what this store refuses.
         //
-        // `classify_append` is a read, so every refusal this store owes the caller — a
-        // contradiction under an id already used, a string too long for its length prefix, a guard
-        // nested past what the decoder can survive, a delta too large to replicate — happens with
-        // the index and the file both untouched. `provenance::durable` had to mutate first because
-        // its guards live inside the mutation; this store's do not, and the difference is what lets
-        // the order below be the safe one.
         // D148 instrumentation. `t_total` brackets the whole append so the parts must add up to
         // something independently measured, rather than to their own sum.
         let t_total = std::time::Instant::now();
@@ -2109,16 +2148,11 @@ impl EffectLog for DurableEffectLog {
         phase::record(phase::LOOKUP_CLASSIFY, dt_classify, log_len);
 
         let t1 = std::time::Instant::now();
-        let body = match classified {
-            None => encode_open(frame)?,
+        let Some(rec) = Self::encode_classified(frame, classified)? else {
             // A retry. There is no new tail, so there is nothing to write — which is stronger than
             // writing a second copy and collapsing it on read: the file simply never holds one.
-            Some(Reappend::Retry) => return Ok(()),
-            Some(Reappend::Grew { ops, guards, claims }) => {
-                encode_extend(frame, ops, guards, claims)?
-            }
+            return Ok(());
         };
-        let rec = frame_record(&body)?;
         phase::record(phase::ENCODE, t1.elapsed().as_nanos() as u64, rec.len() as u64);
 
         // **The record lands first, and only then does the index accept it.**
@@ -2143,6 +2177,13 @@ impl EffectLog for DurableEffectLog {
         inner.end = at + rec.len() as u64;
         phase::record(phase::TOTAL, t_total.elapsed().as_nanos() as u64, 1);
         Ok(())
+    }
+
+    /// `append` up to the write and no further: the same `encode_append`, under the same lock, so
+    /// a check never reads the index half way through someone else's append.
+    fn check_append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
+        let _inner = self.inner.lock().expect("durable effect log mutex poisoned");
+        self.encode_append(frame).map(|_| ())
     }
 
     fn frames_for(&self, branch: BranchId, from_seq: u64) -> Result<Vec<TxnFrame>, FerroError> {
@@ -2276,6 +2317,28 @@ mod tests {
         let f = decrement(7, 1, 0, 5);
         log.append(&f).unwrap();
         log.append(&f).unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    /// **D258. `check_append` refuses what `append` refuses, with the same words, and stores
+    /// nothing either way.** The durable store's half is in `tests_durable_log.rs`.
+    #[test]
+    fn mem_check_append_refuses_a_contradiction_and_stores_nothing() {
+        let log = MemEffectLog::new();
+        let first = decrement(7, 1, 0, 5);
+        log.check_append(&first).expect("a fresh frame was refused");
+        assert_eq!(log.len(), 0, "check_append stored the frame");
+        log.append(&first).unwrap();
+
+        let rewrite = decrement(7, 1, 0, 9);
+        let checked = log.check_append(&rewrite).expect_err("a rewrite of a stored op was admitted");
+        let appended = log.append(&rewrite).expect_err("append accepted what the check refused");
+        assert_eq!(checked.to_string(), appended.to_string());
+        let stored = log.frame(BranchId::new(1, 0), TxnId(7)).expect("the first frame is gone");
+        assert_eq!(stored.ops.len(), 1);
+        assert!(op_eq(&stored.ops[0], &first.ops[0]), "the refused frame reached the store");
+
+        log.check_append(&first).expect("a retry of the stored frame was refused");
         assert_eq!(log.len(), 1);
     }
 

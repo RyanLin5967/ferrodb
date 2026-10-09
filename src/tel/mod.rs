@@ -44,6 +44,20 @@ use crate::error::FerroError;
 pub trait EffectLog: Send + Sync {
     fn append(&self, frame: &TxnFrame) -> Result<(), FerroError>;
 
+    /// Would [`EffectLog::append`] accept `frame`? Everything `append` decides except the write:
+    /// the same classification against what is already stored and, for a store with a format, the
+    /// same encoding and the same size bound. **Mutates nothing.**
+    ///
+    /// D258: `AgentRuntime::stage_all` asks this before it changes anything, so every refusal the
+    /// log owes a statement arrives while there is still nothing to undo. After `Ok` here, `append`
+    /// of the same frame may still fail, but only on I/O.
+    ///
+    /// **No default body, deliberately.** `Ok(())` is the fail-open answer: a store that forgot to
+    /// override it would admit a statement its own `append` then refuses, after the caller had
+    /// already charged the budget and written the page tree. An implementor has to decide what it
+    /// refuses, and implementing it by sharing `append`'s own code is how the two stay equal.
+    fn check_append(&self, frame: &TxnFrame) -> Result<(), FerroError>;
+
     /// Frames written on `branch` at or after `from_seq`, in sequence order.
     fn frames_for(
         &self,

@@ -43,17 +43,21 @@ pub static STAGE_NS: AtomicU64 = AtomicU64::new(0);
 /// Calls to `stage_all`. One per statement that stages at least one row.
 pub static STAGE_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// The decide half: envelope `admit`, the escrow batch check, and `charge_row_writes`.
+/// The decide half: envelope `admit`, the escrow batch check, and `charge_row_writes`. Since D258
+/// it also holds the log's `check_append` and the tree's `check_put`, and still excludes the clone.
 pub static DECIDE_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The apply half, EXCLUDING the frame clone: workspace map inserts and op/guard pushes.
+/// The apply half, EXCLUDING the frame clone: workspace map inserts and op/guard pushes. Since
+/// D258 also the escrow `spend_all` and the install, less the replaced frame's drop (`DROP_NS`).
 pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
 
 /// `ws.frame.clone()` alone. The term the row names.
 pub static CLONE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Ops copied by those clones, summed. The integer form of the same term: with `delta` fixed
-/// and one op per statement this is `W(W+1)/2` and nothing else.
+/// and one op per statement this was `W(W+1)/2` and nothing else. ⚠ Since D258 the clone is taken
+/// BEFORE the statement's own ops are pushed onto it, so the same workload reads `W(W-1)/2`: the
+/// same quadratic, one statement's ops smaller. Quote the commit with any reading.
 pub static CLONE_OPS: AtomicU64 = AtomicU64::new(0);
 
 /// Guards copied by those clones, summed.
