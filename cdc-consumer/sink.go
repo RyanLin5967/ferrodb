@@ -383,6 +383,8 @@ func (s *Sink) tableDDL(table string, cols []map[string]any) (names []string, de
 	// without the source having chosen a leading underscore deliberately.
 	out = append(out, `"_commit_lsn" INTEGER NOT NULL`, `"_lsn" INTEGER NOT NULL DEFAULT 0`,
 		`"_deleted" INTEGER NOT NULL DEFAULT 0`)
+	// The attribution columns, rendered by the same renderer so a retype rebuild carries them
+	// across instead of silently dropping the writer of every row it moves.
 	for _, w := range writerColumns {
 		out = append(out, quoteIdent(w.name)+" "+w.decl)
 	}
@@ -526,6 +528,13 @@ func (s *Sink) applySchemaChange(e *Event) error {
 // dropped rather than mis-assigned — but this source has no DROP COLUMN, so the name sets are equal
 // in practice and a difference would be a bug worth failing on rather than absorbing.
 func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
+	// The rebuild below carries the attribution columns across, so the destination must have them
+	// first. `applySchemaChange` reaches here for a table that already exists WITHOUT going through
+	// `ensureTable`, and a destination older than attribution would otherwise fail the copy on
+	// "no such column". Idempotent: a duplicate column is the expected, swallowed outcome.
+	if err := s.ensureWriterColumns(table); err != nil {
+		return err
+	}
 	existing, err := s.tableColumns(table)
 	if err != nil {
 		return err
@@ -544,6 +553,12 @@ func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
 		carried = append(carried, quoteIdent(n))
 	}
 	carried = append(carried, `"_commit_lsn"`, `"_lsn"`, `"_deleted"`)
+	// I15's resolution of B11: the attribution columns travel with the row. Without this the
+	// rebuilt table re-declares them (tableDDL) and the copy leaves them at their defaults, so a
+	// retype resets every row's writer to `_prov_id = 0` and un-retracts every retracted row.
+	for _, w := range writerColumns {
+		carried = append(carried, quoteIdent(w.name))
+	}
 	tmp := table + "_cdc_rebuild"
 
 	tx, err := s.db.Begin()
