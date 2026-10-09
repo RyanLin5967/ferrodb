@@ -1,1 +1,0 @@
-the log was poisoned: transaction 1's Commit record could not be made durable (wal error: simulated fault: FailSync at operation 42)
