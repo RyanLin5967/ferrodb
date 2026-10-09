@@ -1,0 +1,135 @@
+D129 — SCANNED ELEMENTS PER EFFECT-LOG APPEND, BUCKETED HIT / MISS
+=================================================================
+
+Row: SCALE-DESIGN.md `## ⭐ D129 — THE EFFECT LOG IS O(FRAMES EVER APPENDED) PER WRITE, AND
+NOTHING PRUNES IT`.
+
+Instrument: `src/tel/log.rs::scan_count` (this branch) + `examples/d129_effect_log_scan_count.rs`.
+Workload: a fork-heavy agent fleet driven **over a real TCP socket** against `pgwire::serve`
+running in the harness process.
+
+⛔ COUNTS ONLY. No timing is reported here and none was taken. The row says so in its own words and
+the reason is on this project's record: the box is shared and three D-row results have already died
+of a duration measured beside other work. A scan length is a property of the structure and the
+workload and does not move when somebody else's `cargo` starts.
+
+
+PRE-REGISTRATION — written and committed BEFORE the harness was built or run
+----------------------------------------------------------------------------
+(Recorded at commit time; the first number did not exist yet. Amendments append-only, below.)
+
+What is counted: for each of the three front-to-back searches over `MemEffectLog::frames`, the
+number of elements the predicate actually walked, and whether the key was found. `position` and
+`find` short-circuit, so a HIT costs `index + 1` and a MISS costs the whole `Vec`. The two are
+counted apart because a mean over both hides which one the workload has.
+
+The three sites (D77 said "two"; the row corrects that to three, and this confirms it by
+instrumenting each separately):
+  SITE_APPEND    `MemEffectLog::append`        — the write path
+  SITE_CLASSIFY  `MemEffectLog::classify_append` — reached on every `DurableEffectLog::append`
+  SITE_FRAME     `MemEffectLog::frame`         — the point read
+
+Axis: number of agent sessions already run, in blocks. Each row is a DELTA over its own block, not
+a running total — a running total rises whatever the per-append cost does.
+
+OUTCOME A — MISS-SCANS DOMINATE AND GROW WITH SESSION COUNT.
+  `scan/miss` rises with the number of prior sessions, and misses are a large share of appends.
+  ⇒ Licenses option (2) PRUNE. The row's own reasoning applies: the growth axis is
+    frames-ever-appended, pruning removes the axis rather than indexing around it, and the repo's
+    "do not index it" warning at `src/agent_sql/runtime.rs` (the `ours_ops_on_cell` doc comment)
+    does NOT transfer, because that site was measured flat in the thing it scans and this one is
+    not.
+
+OUTCOME B — THEY DO NOT.
+  `scan/miss` is flat in session count, or misses are a negligible share of appends.
+  ⇒ D129 is a SMALLER ROW THAN IT LOOKS and this artifact says so plainly. The "do not index it"
+    warning transfers, and the correct action is to write the measurement into the row and close it.
+
+OUTCOME C — REGISTERED IN ADVANCE, AND THE ROW DOES NOT ANTICIPATE IT.
+  BOTH buckets grow with session count, because `append` PUSHES a new frame to the BACK of the Vec
+  while every search starts at the FRONT. The frame an agent re-appends on its second and later
+  statements is therefore the one furthest from the start of the scan, so a HIT costs
+  approximately `len` too and the short-circuit buys nothing at all for this workload.
+  ⇒ If C fires, the row's "⭐ THE SHARPENING THAT DECIDES IT: the O(N) case is the MISS, not the
+    hit" is TOO NARROW rather than wrong: the hit is also the O(N) case here, the hit/miss split is
+    not the discriminator, and the licence for (2) is STRONGER than the row argues, not weaker —
+    every append pays, not only the first of each session.
+  ⚠ C is derived by READING (`frames.push` at the tail; `iter().position` from the head), not from
+    any number. It is registered so that, if it fires, it cannot be presented as a prediction made
+    after the fact.
+
+FALSIFIER FOR THE ARMS — the CHURN arm is the decisive one for PRUNE vs INDEX.
+  PARK  sessions begin, write, and never end: the frames are for LIVE work, and an index over them
+        would be defensible.
+  CHURN every session MERGEs, so every branch is FINISHED and every transaction committed. If
+        CHURN's counts track PARK's, the frames being walked are DEAD, and option (2) fixes memory
+        and time where option (1) fixes only time. If CHURN's counts stay flat while PARK's grow,
+        something already removes finished frames and the row's "It is NEVER pruned" is wrong.
+
+REFUSALS PRE-REGISTERED IN THE INSTRUMENT (not in prose — the harness exits non-zero):
+  - Three fire-checks run BEFORE the axis, and the axis is not printed if any fails:
+      (1) MISS-ONLY  — N sessions x 1 write. Every append is a first append. Misses must dominate.
+      (2) HIT-HEAVY  — 1 session x N writes. `stage_all` re-appends per statement. Hits must
+                       dominate. Together with (1) this is the proof that the BUCKETS are real and
+                       separate, not that a single total moved.
+      (3) ANTI-VACUITY — N plain UPDATEs on trunk with no agent session anywhere. `append` calls
+                       must be EXACTLY 0. Without this, a counter wired to some unrelated hot path
+                       would pass (1) and (2) on volume alone.
+  - Zero appends across an axis is refused by name, not printed as a result.
+  - An empty bucket prints `-`, never `0.0`: "no calls landed here" is not "calls here were free".
+
+
+AMENDMENT 1 — appended before the first number, while the fleet suite lock was still held
+------------------------------------------------------------------------------------------
+A FOURTH scan site was added to the instrument: `MemEffectLog::frames_for`'s `filter`.
+
+Found by enumerating the scans from the `EffectLog` trait (which declares exactly two methods)
+rather than by eye, which is how D77 came to say "two" and D129 to correct it to "three". It does
+NOT short-circuit — `filter` visits every element — so it walks the whole `Vec` on every call.
+
+⚠ `grep -rn 'frames_for' src/` finds no production caller: the only callers are
+`src/tel/tests_durable_log.rs` and the trait declaration in `src/tel/mod.rs`. The expected reading
+on the axis is therefore ZERO, and it is counted rather than asserted for exactly that reason — a
+site left out of an instrument is a site the instrument reports as absent, and a grep that missed a
+caller and a site that has none look identical.
+
+No numbers had been taken when this was written; the harness had not been compiled.
+
+ALSO RECORDED BEFORE THE RUN, from reading rather than measuring:
+  - `MemEffectLog::frames` is mutated in exactly two ways: `frames.push(frame.clone())` at the
+    TAIL, and `extend_from_slice` in place on an existing frame. There is no `clear`, `truncate`,
+    `retain`, `drain`, `remove` or `pop` anywhere in `src/tel/log.rs`. The row's "It is NEVER
+    pruned" holds at this branch's base (ferrodb 2bc80fd).
+  - `DurableEffectLog::append` calls `self.mem.classify_append(frame)` and then
+    `self.mem.append(frame)` — TWO of the counted sites per logical append.
+  - `DurableEffectLog::open` replays the file with one `mem.append` per record, so opening a
+    K-frame file pays K scans of a Vec that grows by one each time.
+  - `examples/pgserver.rs` — the pgwire server — constructs `MemEffectLog::new()`.
+    `src/cli/cli.rs` constructs `DurableEffectLog::default_for_database`. So the
+    measurement-through-pgwire the row asks for can only exercise the Mem store, and the durable
+    store has no wire path at all. The addendum arm drives it directly and is labelled as such.
+
+
+AMENDMENT 2 — the unit, recorded before the first number (run still queued behind the fleet lock)
+-------------------------------------------------------------------------------------------------
+Prompted by a sibling lane's retraction of "3-4 acquisitions per fork": the figure died because
+per-fork was never a unit — the two arms being compared sent different statement counts, so a
+per-fork total measured the workload's shape rather than the mechanism's cost.
+
+⚠ THE SAME TRAP IS AVAILABLE HERE AND IS REFUSED IN ADVANCE. The PARK and CHURN arms do NOT send
+the same statements: CHURN adds a `MERGE;` per session and PARK does not. So:
+
+  - **PER-APPEND is the unit** — `scanned / calls` within a bucket, which is a property of the
+    structure at the moment of the call.
+  - **PER-SESSION totals are NOT comparable across the two arms** and no cross-arm claim is made
+    from them. Where a session count appears it is the AXIS (how much history exists), never the
+    denominator of a cross-arm ratio.
+  - Within one arm, block-over-block growth in `scanned/call` is comparable, because the statements
+    per session are identical from block to block by construction.
+
+No per-fork, per-session or per-statement cost figure is quoted anywhere in the RESULT below.
+
+
+RESULT
+------
+(appended below, after the run)
