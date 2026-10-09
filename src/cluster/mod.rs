@@ -279,7 +279,11 @@ pub fn apply_lease_tick(unix_millis: u64) -> Result<u64, GrantError> {
 /// Where a lease decision is entitled to read time from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseSource {
-    /// This node is its own leader, so its wall clock *is* the cluster's time.
+    /// This node is its own leader, so its own clock *is* the cluster's time.
+    ///
+    /// Named for the wall clock it read until F2, and kept under that name because
+    /// `cluster::tests` pins the rule by it. What it reads now is [`local_lease_millis`]: the
+    /// wall clock ONCE per process, then a monotonic clock.
     LocalWall,
     /// The cluster's time as of the last applied tick.
     Cluster(u64),
@@ -322,21 +326,183 @@ pub fn lease_now_millis() -> Result<u64, GrantError> {
         (p.authority, p.cluster_millis)
     };
     match lease_source(auth, ms)? {
-        LeaseSource::LocalWall => Ok(local_wall_millis()),
+        LeaseSource::LocalWall => Ok(local_lease_millis()),
         LeaseSource::Cluster(ms) => Ok(ms),
     }
+}
+
+/// A standalone node's lease clock, in milliseconds on the unix-epoch scale.
+///
+/// # F2 — monotonic within a process, anchored to the wall clock once
+///
+/// This returned `SystemTime::now()` on every call, so a forward step of the wall clock — an NTP
+/// step, a VM resuming, an operator setting the date — expired every lease whose deadline it
+/// crossed, in one scan, with no client having been idle at all. Reaping is destructive and a
+/// `BranchId` generation makes it unrecoverable, so a clock that can jump is the wrong input.
+///
+/// So the wall clock is read **once per process**, at the first lease reading, and every reading
+/// after that is that anchor plus [`std::time::Instant`]'s elapsed time. `Instant` is monotonic:
+/// within one process the lease clock never moves backwards and no step of the wall clock moves it
+/// at all. Deadlines stay on the unix-epoch millisecond scale they have always had, so every
+/// durable deadline already written keeps its meaning.
+///
+/// **Across processes the anchor is taken again**, and whatever the wall clock did between the two
+/// — a step, a slew, the machine being off — lands in the gap between one process's last reading
+/// and the next one's first. That gap is exactly what F1's restart grace measures as downtime and
+/// adds to every live lease (`BranchCatalog::resume_leases`), so a step between processes is
+/// credited rather than charged. Together the two rules are Chubby's (§2.8–2.9): the lease timer
+/// runs only while the authority does, and deadlines only ever move forward.
+///
+/// ⚠ **A suspended machine stops this clock.** `Instant` does not advance while the host sleeps
+/// (`CLOCK_UPTIME_RAW` on macOS; `CLOCK_MONOTONIC` on Linux does not count suspend either), so a
+/// lease does not run down while the process is frozen. That is the stopped timer again — a
+/// suspended process is an authority that is down — and it is the direction that keeps a lease
+/// rather than reaps one. Anything else that reads the lease clock as a wall-clock timestamp
+/// inherits the same lag after a sleep; `AgentRuntime::begin_session_as_staged` stamps a run's
+/// `started_at` from it.
+///
+/// Private on purpose, for the reason [`local_wall_millis`] gives.
+fn local_lease_millis() -> u64 {
+    static ANCHOR: OnceLock<(u64, std::time::Instant)> = OnceLock::new();
+    let (wall, at) = *ANCHOR.get_or_init(|| (local_wall_millis(), std::time::Instant::now()));
+    anchored_millis(wall, at.elapsed())
+}
+
+/// The lease reading `since_anchor` after a wall-clock anchor of `anchor_wall_millis`.
+///
+/// Pure, and its signature is the F2 property: the wall clock is not an argument, so no reading of
+/// it after the anchor can reach a lease decision. Saturates rather than wrapping — a wrapped
+/// reading is a time in 1970, which reaps everything.
+fn anchored_millis(anchor_wall_millis: u64, since_anchor: std::time::Duration) -> u64 {
+    anchor_wall_millis.saturating_add(u64::try_from(since_anchor.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The local wall clock in unix milliseconds.
 ///
 /// **The only `SystemTime::now()` a lease decision may reach**, and only via
-/// [`lease_now_millis`] on a standalone node. Private on purpose: a caller that can name this
-/// function can reintroduce the divergence the module exists to remove.
+/// [`local_lease_millis`]'s anchor on a standalone node — once per process since F2. Private on
+/// purpose: a caller that can name this function can reintroduce the divergence the module exists
+/// to remove.
 fn local_wall_millis() -> u64 {
-    std::time::SystemTime::now()
+    let real = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    #[cfg(test)]
+    let real = wall_step::apply(real);
+    real
+}
+
+/// **A file's modification time, as the OS stamped it — on the WALL clock** — and the only thing in
+/// this crate that measures an age against the wall clock (D198 reviews 3 and 4, C1 and C3).
+///
+/// The FirstStart policy needs the wall-clock age of a catalog's (or a legacy log's) last write. A
+/// function from an integer stamp to its age would hand out a wall READING to any caller that
+/// passes 0 — the door [`local_wall_millis`]'s privacy closes, reopened by a comment. So the stamp is
+/// a type whose one constructor reads a FILE, and **no single call returns a wall reading**.
+///
+/// **That is all the type buys** (D198 review 5, C3). Any two independent functions of the stamp
+/// and the wall clock let the wall clock be solved for: `s.millis() + s.wall_age_millis()` IS the
+/// wall reading, for any stamp, and an inline `SystemTime::now()` is always available anyway. So
+/// `millis()` has exactly two named consumers (its doc), the arithmetic goes through
+/// [`Self::lease_scale_age_millis`] and [`Self::wall_age_millis`], and the mutant that rebuilds a
+/// reading from a stamp (M58b) is killed by a TEST, not by this type.
+///
+/// Why a stamp and not `fn(&Path) -> age`: the evidence is the file's time when the catalog was
+/// OPENED, and its age is needed at the resume, after this process may have written the file
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileWallStamp(u64);
+
+impl FileWallStamp {
+    /// `path`'s last modification, in unix milliseconds, or `None` if it cannot be read — including
+    /// a time before 1970, which is no evidence of anything.
+    pub(crate) fn of(path: &std::path::Path) -> Option<FileWallStamp> {
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        u64::try_from(since.as_millis()).ok().map(FileWallStamp)
+    }
+
+    /// The stamp, in unix milliseconds on the wall clock. **Exactly two consumers, named here**
+    /// (review 5, C3): `TableBranchCatalog::first_start_credit`, which prints it in the startup
+    /// report (`LeaseResume::FirstStartFromFileTime::file_mtime`), and the `#[cfg(test)]`
+    /// `table_catalog::file_mtime_millis`. Arithmetic uses [`Self::lease_scale_age_millis`] or
+    /// [`Self::wall_age_millis`]; a third consumer can rebuild a wall reading with the latter.
+    pub(crate) fn millis(self) -> u64 {
+        self.0
+    }
+
+    /// `lease_now − stamp`, saturating at 0: the file's age on the LEASE scale. **Correct only under
+    /// R2** (`table_catalog::FirstStartEvidence`): it reads the stamp as the lease reading of a
+    /// writer whose lease clock was the wall clock — every pre-D198 build. For a file last written
+    /// by a D198 process whose lease clock lagged, it is short by that lag (review 5, C1b/C1d; a
+    /// stated residual, never below the pre-policy 0).
+    pub(crate) fn lease_scale_age_millis(self, lease_now: u64) -> u64 {
+        lease_now.saturating_sub(self.0)
+    }
+
+    /// How long ago, on the wall clock, the file was written: `W(now) − stamp`, saturating at 0 for
+    /// a stamp in the future. Through `local_wall_millis`, the one `SystemTime::now()` reader, so a
+    /// test's `wall_step` moves it as it moves everything else.
+    pub(crate) fn wall_age_millis(self) -> u64 {
+        local_wall_millis().saturating_sub(self.0)
+    }
+}
+
+/// **This node's lease clock if it is standalone, else `None` — one acquisition of the process
+/// lock** (D198 review 4, C6). The soft mark's reading: a cluster member's lease time is the
+/// replicated tick, and it writes no mark of either kind. One acquisition, not `is_clustered()`
+/// then `try_now_millis()`: those are two, on a path that runs inside `logical` on every commit of
+/// an unmarked catalog, and between them a `join` plus an applied tick could stamp a tick as a
+/// standalone reading.
+pub(crate) fn standalone_lease_millis() -> Option<u64> {
+    let authority = lock().authority;
+    match authority {
+        Authority::Standalone => Some(local_lease_millis()),
+        Authority::Member(_) => None,
+    }
+}
+
+/// **A test's hand on the wall clock — THIS THREAD's view of it only, and only in `cfg(test)`.**
+///
+/// F2's claim is that no step of the wall clock inside a process moves a lease decision, and a
+/// claim about a clock step cannot be tested without a clock that steps. The real one cannot be
+/// stepped from a test, so this adds a signed offset to what [`local_wall_millis`] — the process's
+/// one `SystemTime::now()` reader — returns on the calling thread. With F2 in place the step is
+/// invisible to every lease decision, because the lease clock read the wall once, at its anchor;
+/// with F2 reverted (the decision site reading `local_wall_millis` directly, as it did at `9aa6968`)
+/// the step lands in the decision, and `cluster::tests::f2_a_wall_clock_step_…` fails.
+///
+/// Thread-local so that stepping cannot touch a sibling test in the same binary, even under that
+/// mutant. Stated blind spot: a mutant that calls `SystemTime::now()` inline at the decision site,
+/// bypassing `local_wall_millis`, is not steppable by this and would pass the test; the one-reader
+/// rule in `local_wall_millis`'s doc is what stands against that.
+#[cfg(test)]
+pub(crate) mod wall_step {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEP_MILLIS: Cell<i64> = const { Cell::new(0) };
+    }
+
+    /// Step this thread's wall clock by `millis` (negative is backwards) until the guard drops.
+    pub(crate) fn by(millis: i64) -> Guard {
+        STEP_MILLIS.with(|c| c.set(millis));
+        Guard
+    }
+
+    pub(super) fn apply(real: u64) -> u64 {
+        real.saturating_add_signed(STEP_MILLIS.with(|c| c.get()))
+    }
+
+    /// Restores the real clock, including when the test that stepped it panics.
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STEP_MILLIS.with(|c| c.set(0));
+        }
+    }
 }
 
 // ---- the granted counter -----------------------------------------------------------------------

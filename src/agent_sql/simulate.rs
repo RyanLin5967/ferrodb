@@ -425,10 +425,10 @@ impl AgentRuntime {
                 None => format!("<unnamed>/{}", c.name),
             };
             let model = plan.model.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
+            // The candidate runs its body under the ordinary fork lease. `plan.lease_millis` is
+            // applied once the bodies have run, below — see there.
             let session =
                 self.begin_session_with_model(&plan.agent_id, Some(&run), model, base)?;
-            self.branches()
-                .renew_lease(session.branch, LeaseDeadline::from_now(plan.lease_millis))?;
             forked.push((i, session));
         }
         let pages_after_fork = self.live_page_count()?;
@@ -497,6 +497,20 @@ impl AgentRuntime {
                 admitted: false,
                 merge_id: None,
             });
+        }
+        // **The candidates' own lease starts when their bodies have finished, not at fork.**
+        //
+        // `lease_millis` is how long a loser lives for the reaper to find (the field's doc), so it
+        // is a lease on the simulation's OUTPUT. Set at fork, as it was, a candidate's body ran
+        // inside it — harmless while nothing refused an expired lease, because this statement
+        // holds the runtime lock and the scan cannot reap mid-simulation. Since F1's adjacent point
+        // `stage_all` refuses a write to an expired lease, so a body slower than `lease_millis`
+        // would have its later statements refused and score as an error: a candidate lost to the
+        // host's load, not to its own content. Applied here, every body runs under the ordinary
+        // fork lease and every candidate still leaves with exactly `lease_millis` from now.
+        for (_, session) in &forked {
+            self.branches()
+                .renew_lease(session.branch, LeaseDeadline::from_now(plan.lease_millis))?;
         }
         let pages_after_bodies = self.live_page_count()?;
 

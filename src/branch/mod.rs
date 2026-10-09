@@ -40,8 +40,8 @@ pub use record::{CoreRecord,
     CapabilityRefusal, ColumnCapability, PendingFree, RowEffect, RowImage, TableCapability, Verb,
 };
 pub use types::{
-    ArenaId, BranchError, BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId,
-    ARENA_EXTENT_PAGES,
+    ArenaId, BranchError, BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, LeaseResume,
+    PageId, ARENA_EXTENT_PAGES,
 };
 
 use crate::error::FerroError;
@@ -429,6 +429,74 @@ pub trait BranchCatalog: Send + Sync {
 
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;
+
+    /// The deadline the reaper will **enforce** on `branch`, or `None` if it enforces none.
+    ///
+    /// `Some` exactly for a `Live`, non-trunk branch — the set `expired_before` answers from and
+    /// the only branches a lease scan ever reaps. A quarantined branch keeps a deadline in its
+    /// record that "expired long ago" (`tree_keys::tag::DEADLINE`) and is never reaped for it, so
+    /// it answers `None`: a refusal keyed on that deadline would refuse on a lease nobody enforces.
+    ///
+    /// **Read on every agent write and on every fork from a non-trunk parent** — F1's adjacent
+    /// point, `AgentRuntime::refuse_if_lease_expired` — so, exactly as for [`Self::envelope_of`],
+    /// the default's hydration is worth overriding. Checked like `get`: a stale generation answers
+    /// `Reaped` and a branch mid-reap answers `Reaping`, never a deadline.
+    ///
+    /// A default body is admissible here and would not be on the mutators above: this is a READ,
+    /// and the default is the same read `get` performs, only wider.
+    fn enforced_lease(&self, branch: BranchId) -> Result<Option<LeaseDeadline>, FerroError> {
+        let rec = self.get(branch)?;
+        Ok((rec.state == BranchState::Live && !rec.branch_id.is_trunk())
+            .then_some(rec.lease_deadline))
+    }
+
+    /// **F1 — resume the lease clock at startup, after a downtime this catalog measures itself.**
+    ///
+    /// Reads the durable last-alive mark ([`Self::record_lease_alive`]), extends every lease by
+    /// `now_millis - mark`, and records `now_millis` as the new mark — **all in one durable
+    /// write**, so a crash leaves either the old extension with the old mark or the new with the
+    /// new, and never credits the same outage twice. See [`LeaseResume`] for the rule (Chubby
+    /// §2.8–2.9) and each outcome.
+    ///
+    /// **The write must not grow with the number of branches (D198).** An implementation that
+    /// rewrites each deadline has put an O(live branches) write wall into every restart;
+    /// `TableBranchCatalog` keeps a virtual lease clock instead, so the extension is one addition
+    /// to a stored offset and every deadline it hands out is read through it.
+    ///
+    /// Call it once, at startup, before anything reaps and before anything is served — that is
+    /// `LeaseThread::start`, under the runtime lock, beside `resume_interrupted_reaps`.
+    ///
+    /// **Why this, and [`Self::record_lease_alive`], have default bodies when the mutators above
+    /// refuse to.** The rule on those is that the obvious default IS the race — a `get`/mutate/`put`
+    /// that looks correct. There is no such default here to fall into: the mark is a key only a
+    /// catalog with durable keys can hold, so the honest default is "this catalog keeps no mark",
+    /// which is exactly the behaviour every catalog had before F1. It is REPORTED, not silent —
+    /// `LeaseThread::start` prints [`LeaseResume::NoMark`] — and the catalog both binaries open
+    /// overrides it. The log catalog and the in-memory one keep the default: a mark in a file that
+    /// is migrated away at the next open (`TableBranchCatalog::default_for_database`), or in memory
+    /// that does not survive the restart it would measure, would be a mark that means nothing.
+    fn resume_leases(&self, now_millis: u64) -> Result<LeaseResume, FerroError> {
+        let _ = now_millis;
+        Ok(LeaseResume::NoMark)
+    }
+
+    /// Record, durably, that leases were being enforced at lease-clock time `now_millis`.
+    ///
+    /// The lease scan calls it on every pass and once more when it stops; the latest value is the
+    /// `last_alive` the next [`Self::resume_leases`] measures downtime from. It is a plain
+    /// overwrite, not a maximum: the mark must be THIS process's latest reading, because a mark
+    /// left higher than the clock by a wall-clock step between processes would under-measure the
+    /// next outage and charge the difference to every lease.
+    ///
+    /// The default refuses. `TwoTierReaper` only calls this after `resume_leases` reported a mark it
+    /// keeps, so the refusal is reachable only by a catalog that overrides one of the pair and not
+    /// the other — and that should be loud.
+    fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
+        Err(FerroError::Branch(format!(
+            "this branch catalog keeps no last-alive mark, so the lease clock reading {now_millis} \
+             cannot be recorded. A catalog that overrides resume_leases must override this too"
+        )))
+    }
 
     /// What this branch is permitted to write, without cloning the rest of the record.
     ///

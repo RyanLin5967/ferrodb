@@ -387,3 +387,85 @@ fn a_standalone_node_at_the_end_of_the_value_space_refuses_distinguishably() {
         GrantError::SpaceExhausted { counter: "txn-id", issued_through: u64::MAX }
     );
 }
+
+// ---- F2: the standalone lease clock is monotonic within a process ------------------------------
+
+#[test]
+fn f2_the_standalone_lease_clock_is_its_anchor_plus_monotonic_elapsed_time() {
+    use std::time::Duration;
+    // The whole reading is anchor + elapsed. The wall clock is not an argument, which is the F2
+    // property by construction: nothing read from it after the anchor can move a lease.
+    assert_eq!(anchored_millis(1_700_000_000_000, Duration::ZERO), 1_700_000_000_000);
+    assert_eq!(anchored_millis(1_700_000_000_000, Duration::from_millis(1_500)), 1_700_000_001_500);
+    // Sub-millisecond elapsed time does not round up: a lease is not expired a millisecond early.
+    assert_eq!(anchored_millis(10, Duration::from_micros(999)), 10);
+    // Saturates. A wrapped reading would be a time near 1970 and would reap every lease there is.
+    assert_eq!(anchored_millis(u64::MAX - 1, Duration::from_millis(5)), u64::MAX);
+    assert_eq!(anchored_millis(5, Duration::MAX), u64::MAX);
+}
+
+#[test]
+fn f2_the_process_lease_clock_never_reads_backwards() {
+    // A weak witness, stated as one: the wall clock can go backwards and this cannot, but no test
+    // in-process can step the wall clock to show the difference — `anchored_millis`'s signature,
+    // pinned above, is what carries that half. This pins the other half: successive readings of
+    // the real clock, through the path every lease decision takes, are non-decreasing.
+    let mut last = local_lease_millis();
+    for _ in 0..10_000 {
+        let now = local_lease_millis();
+        assert!(now >= last, "the lease clock went backwards: {last} -> {now}");
+        last = now;
+    }
+}
+
+/// **F2, through the decision path itself — the guard `447269e` shipped without.** A lease is
+/// decided by `LeaseDeadline::is_expired_now`, which reads `lease_now_millis`, which on a
+/// standalone node reads [`local_lease_millis`]. This steps the wall clock an hour each way, on
+/// this thread only (`wall_step`), and requires that neither step expires a live lease nor revives
+/// an expired one.
+///
+/// Its red is mutant M15 in `bench/lease_grace/PREREG.md`: put `local_wall_millis()` back at the
+/// `LeaseSource::LocalWall` arm, which is exactly the line `447269e` replaced. Both assertions
+/// below then fail — the forward step expires the ten-minute lease and the backward one revives
+/// the lapsed one. It cannot see a mutant that calls `SystemTime::now()` inline at that arm; see
+/// `wall_step`.
+#[test]
+fn f2_a_wall_clock_step_mid_process_neither_expires_nor_revives_a_lease() {
+    use crate::branch::types::LeaseDeadline;
+
+    // A running process has anchored its lease clock long before any step it lives through, so the
+    // anchor is taken here, unstepped. (It is process-wide and may already exist; either way it is
+    // not a stepped reading, because the step below is this thread's alone.)
+    let before = lease_now_millis().expect("a standalone node always knows its lease time");
+    let live = LeaseDeadline::from_now(600_000);
+    let lapsed = LeaseDeadline(before.saturating_sub(1));
+    assert!(!live.is_expired_now().unwrap(), "premise: a ten-minute lease is live");
+    assert!(lapsed.is_expired_now().unwrap(), "premise: a deadline in the past is expired");
+
+    {
+        let _step = wall_step::by(3_600_000);
+        assert!(
+            !live.is_expired_now().unwrap(),
+            "a FORWARD wall-clock step of one hour expired a ten-minute lease: lease decisions are \
+             reading the wall clock, which is F2 reverted. An NTP step or a resumed VM would reap \
+             every live branch whose deadline it crossed"
+        );
+        let during = lease_now_millis().unwrap();
+        assert!(
+            during - before < 600_000,
+            "the lease clock jumped with the wall clock ({before} -> {during})"
+        );
+    }
+    {
+        let _step = wall_step::by(-3_600_000);
+        assert!(
+            lapsed.is_expired_now().unwrap(),
+            "a BACKWARD wall-clock step of one hour revived an expired lease: lease decisions are \
+             reading the wall clock, which is F2 reverted"
+        );
+        assert!(
+            lease_now_millis().unwrap() >= before,
+            "the lease clock went backwards with the wall clock"
+        );
+    }
+}
