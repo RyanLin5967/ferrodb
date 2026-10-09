@@ -64,7 +64,7 @@
 //!   values that are silently different from what was stored.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
@@ -370,7 +370,22 @@ pub struct AlterPlan {
     carried: Option<Vec<ColumnStats>>,
     prov: Option<Arc<dyn ProvenanceStore>>,
     dir_root: u32,
-    primary_root: u32,
+    /// The primary index's SHARED root cell (D53), not a root page id: the rewrite opens the tree
+    /// through it and `finish` records the root from it (D214, the D208 review's F1). So a root
+    /// move lands in the cell as it happens, and the record follows the tree as it IS.
+    ///
+    /// ⚠ **`apply_plan` does not check that the table still has the identity it was planned against**
+    /// (this same `Arc` in `root_cell(table, None)`, and this `dir_root`). A plan held across
+    /// `DROP TABLE t; CREATE TABLE t` would rewrite the dead table's freed heap through the dead
+    /// cell and write the dead root into the new table's record. **Unreachable today** (D208 review
+    /// 2, Q3): `alter_table` plans and applies back to back, and `AgentRuntime::merge` only reads
+    /// the catalog between its plans and their applies. `dir_root` and the old `u32` root were held
+    /// the same way before D214. A caller that holds a plan across a statement must add the check
+    /// (`Arc::ptr_eq` against the live cell, `dir_root == first_directory_page_id`) first.
+    /// D249's staleness check on `read` (below) refuses a plan whose entry changed, and so a moved
+    /// `dir_root`, but not a DROP + CREATE that produced an equal entry, which is its own stated
+    /// blind spot; the cell's identity is still not compared.
+    primary_cell: Arc<AtomicU32>,
     /// The table's catalog entry exactly as the plan read it, before any change. Everything the plan
     /// decided, the encoder's answer included, was decided against this entry, so
     /// [`Catalog::apply_plan`] refuses the plan unless the live entry is still this one (D249 reviews,
@@ -585,7 +600,20 @@ impl Catalog {
         let entry = self.require_table(table)?;
         let old_schema = entry.schema.clone();
         let dir_root = entry.first_directory_page_id;
-        let primary_root = entry.primary_index_root;
+        // D214 — plan from the primary index's SHARED cell, never from the record (the D208
+        // review's F1, principled form). The record can LAG the cell. An INSERT whose primary
+        // upsert split the root has already stored the new root into the cell, and it reaches
+        // `sync_roots` only after its index maintenance; if that fails, the record stays behind.
+        // A plan taken from the record would have the rewrite, and then the record, follow a root
+        // the tree has moved past. The cell is the one copy every statement already descends from,
+        // so planning from it leaves nothing to reconcile afterwards.
+        //
+        // A table the catalog never gave a cell gets a private one seeded from the record, which
+        // is correct for the same reason as `plan::open_table`'s fallback: nothing else can hold a
+        // handle on it.
+        let primary_cell = self
+            .root_cell(table, None)
+            .unwrap_or_else(|| Arc::new(AtomicU32::new(entry.primary_index_root)));
         let row_count = self.stats.get(table).map(|s| s.row_count).unwrap_or(0);
 
         // Every refusal about the SHAPE lives in `resulting_schema`, shared with the branch path, so
@@ -658,7 +686,7 @@ impl Catalog {
             carried,
             prov: prov.cloned(),
             dir_root,
-            primary_root,
+            primary_cell,
             read: entry.clone(),
         })
     }
@@ -712,7 +740,7 @@ impl Catalog {
             carried,
             prov,
             dir_root,
-            primary_root,
+            primary_cell,
             read,
         } = plan;
 
@@ -778,8 +806,7 @@ impl Catalog {
             HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
         }
 
-        let primary_root_now =
-            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
+        commit_rewrite(&self.buffer_pool, dir_root, &primary_cell, prepared, prov.as_ref())?;
 
         // An index records the column it covers by NAME (`IndexInfo.column_name`) and the planner
         // re-resolves it to an ordinal with `position()` on every statement. Miss this and the
@@ -792,13 +819,22 @@ impl Catalog {
         if actions.iter().any(|a| matches!(a, AlterAction::RenameColumn { .. })) {
             let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
             rename_indexed_columns(entry, &actions);
+            // **And the shared root cells, which are keyed by the same name (D208).** Left behind,
+            // the renamed index opens a private root until something re-seeds it, and an index
+            // later built on a new column that takes the old name inherits this tree through the
+            // old cell. See `Catalog::rename_root_cells`. Same chain order as the records above.
+            for action in &actions {
+                if let AlterAction::RenameColumn { from, to } = action {
+                    self.rename_root_cells(&table, from, to);
+                }
+            }
         }
 
         let new_schema = shapes
             .last()
             .cloned()
             .ok_or_else(|| FerroError::Internal(format!("a plan for '{table}' held no shape")))?;
-        self.finish(&table, new_schema, primary_root_now, carried)?;
+        self.finish(&table, new_schema, &primary_cell, carried)?;
         // ALTER changed the schema, so every cached reader snapshot is stale. Root moves do NOT
         // bump this (D53 made the root cell shared); a column change must.
         self.epoch_bump();
@@ -808,10 +844,15 @@ impl Catalog {
     /// Install the new schema and the statistics [`carried_stats`] computed for it, persist, and
     /// hand back the shape.
     ///
-    /// `primary_root_now` is the primary index's root as [`rewrite_heap`] left it. It is written
-    /// back here, in the same `persist` as the schema, rather than through
-    /// [`Catalog::update_primary_root`] — two persists would be two chances to store one half of an
-    /// alteration.
+    /// `primary_cell` is the primary index's SHARED cell, which the plan was taken from and the
+    /// rewrite opened the tree through. The RECORD is written from it here, in the same `persist`
+    /// as the schema, rather than through [`Catalog::update_primary_root`]: two persists would be
+    /// two chances to store one half of an alteration.
+    ///
+    /// **It never stores into the cell** (D214, the D208 review's F1, principled form). The cell is
+    /// the source and the record follows it. Whatever moved the cell — a split during the rewrite,
+    /// or an earlier INSERT whose `sync_roots` never ran — the record ends equal to it, and the cell
+    /// cannot be regressed, because nothing here writes it.
     ///
     /// **Nothing in here may be fallible except the `persist` itself**, and that is a property to
     /// preserve rather than a coincidence. This function runs after `rewrite_heap` has converted
@@ -823,7 +864,7 @@ impl Catalog {
         &mut self,
         table: &str,
         new_schema: Schema,
-        primary_root_now: u32,
+        primary_cell: &Arc<AtomicU32>,
         carried: Option<Vec<ColumnStats>>,
     ) -> Result<Vec<ColumnShape>, FerroError> {
         if let (Some(columns), Some(stats)) = (carried, self.stats.get_mut(table)) {
@@ -831,8 +872,17 @@ impl Catalog {
         }
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.schema = new_schema;
-        entry.primary_index_root = primary_root_now;
+        // D214 — the record FOLLOWS the cell. Read after the rewrite, so a root the rewrite moved is
+        // already in it (the tree was opened through the cell), and a root an earlier INSERT moved
+        // is too. The first D214 stored the plan's record INTO the cell instead, and regressed a cell
+        // that was ahead of a lagging record; the compare-exchange that fixed that reconciled two
+        // copies, and there is now one.
+        entry.primary_index_root = primary_cell.load(Ordering::Acquire);
         let shape = shape_of(&entry.schema);
+        // And every INDEX record from its cell, by the same rule (D208 review 2, C4). The rewrite
+        // never touches an index tree, but an earlier failed INSERT can have left an index record
+        // behind its cell, and this persist writes every record of the table.
+        self.catch_up_index_records(table);
         self.persist()?;
         Ok(shape)
     }
@@ -1232,19 +1282,24 @@ fn prepare_rewrite(
     Ok(prepared)
 }
 
-/// Lay down the tuples [`prepare_rewrite`] produced, and return the primary index's root **as it
-/// stands afterwards**.
+/// Lay down the tuples [`prepare_rewrite`] produced, repointing the primary index **through its
+/// shared cell**, so that where its root is afterwards is simply what the cell says.
 ///
 /// Every remaining failure is environmental; see [`prepare_rewrite`]'s note on that boundary.
 fn commit_rewrite(
     bp: &Arc<BufferPoolManager>,
     dir_root: u32,
-    primary_root: u32,
+    primary_cell: &Arc<AtomicU32>,
     prepared: Vec<Prepared>,
     prov: Option<&Arc<dyn ProvenanceStore>>,
-) -> Result<u32, FerroError> {
+) -> Result<(), FerroError> {
     let heap = HeapFileManager::open(dir_root, bp.clone());
-    let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
+    // SHARED, not private (D214). A root split here stores into the cell as it happens, exactly as
+    // a statement's split does, and there is no second copy for `finish` to reconcile. Safe under
+    // ALTER's exclusive catalog lock: readers are drained, and `quiesce_guard` refused any open
+    // transaction, so nothing else is descending this tree while it moves; a reader after the
+    // ALTER takes the same `Arc`.
+    let primary = BPlusTreeManager::<Value, RecordId>::open_shared(primary_cell.clone(), bp.clone());
     for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
@@ -1279,7 +1334,8 @@ fn commit_rewrite(
         }
     }
 
-    // A split during the repointing above can move the tree's root, and the caller records it.
+    // A split during the repointing above can move the tree's root. It lands in the shared cell as
+    // it happens, and `finish` records it from there (D214).
     //
     // **This used to be a refusal, and a refusal was the wrong answer.** The observation behind it
     // is right — the catalog holds the root page id, and a root that is not written back leaves the
@@ -1294,6 +1350,109 @@ fn commit_rewrite(
     // stayed put at 300 rows x 1300 bytes, 600 x 600 and 1200 x 60 — every row relocating, every
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
-    // inventing a rule for it.
-    Ok(primary.root_page_id.load(Ordering::Relaxed))
+    // inventing a rule for it. D214 adds the reason it never moved: the `upsert` above only ever
+    // REPLACES a key the tree holds, with a fixed-size `RecordId`, and
+    // `BPlusTreeManager::try_write_without_split` documents that a same-size replacement cannot
+    // reach a split. `finish` recording from the cell is therefore tested as a unit, and through an
+    // ALTER only for the case a real split can produce: a record that lags a cell an INSERT moved
+    // (`tests/root_cell_is_per_index.rs`, T10).
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::column::Column;
+    use crate::storage::disk_manager::DiskManager;
+
+    /// **D214 — after `finish`, the record names the root the primary index's SHARED cell names,
+    /// and the cell is the same `Arc`.**
+    ///
+    /// ⚠ **A UNIT test**, driving the private `finish` with a cell whose root has moved, as the
+    /// rewrite's shared handle would move it. No `ALTER` fixture is known to move the primary root,
+    /// and none is expected to. `commit_rewrite` only `upsert`s a key the tree already holds (its
+    /// `search` guard), with a fixed-size `RecordId`, and
+    /// `BPlusTreeManager::try_write_without_split` documents that a same-size replacement cannot
+    /// reach a split (READ).
+    ///
+    /// In the principled form (the D208 review's F1) this holds **by construction**: `finish`
+    /// reads the root from the cell and never writes the cell. The test pins that contract: record
+    /// == cell == moved, and the same `Arc`. It was re-cut with the signature, as `finish` no longer
+    /// takes a root. The first version, which passed a root in, failed before D214 (INFERRED).
+    #[test]
+    fn finish_points_the_primary_cell_at_the_root_it_records() {
+        let file = tempfile::tempfile().unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let schema = Schema::new(vec![Column { name: "id".into(), data_type: DataType::Integer, nullable: false }]);
+        catalog.create_table("t".into(), schema.clone()).unwrap();
+        let cell = catalog.root_cell("t", None).expect("CREATE TABLE seeds the primary cell");
+        let before = catalog.get_table("t").unwrap().primary_index_root;
+        assert_eq!(cell.load(Ordering::SeqCst), before, "premise failed: the cell and the record disagree before the ALTER");
+        // A real second tree, so the moved root is a page that holds a tree root.
+        let moved = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap().root_page_id.load(Ordering::SeqCst);
+        assert_ne!(moved, before, "premise failed: the moved root is the old one, so nothing here can fail");
+        // The rewrite's shared handle split the root: the split stores into the cell.
+        cell.store(moved, Ordering::SeqCst);
+
+        catalog.finish("t", schema, &cell, None).unwrap();
+
+        assert_eq!(
+            catalog.get_table("t").unwrap().primary_index_root,
+            moved,
+            "finish did not record the root the shared cell names"
+        );
+        assert_eq!(cell.load(Ordering::SeqCst), moved, "finish moved the shared cell, which it must never write");
+        assert!(
+            Arc::ptr_eq(&cell, &catalog.root_cell("t", None).unwrap()),
+            "finish REPLACED the primary cell, so a statement holding the old one keeps a private root (D53)"
+        );
+    }
+
+    /// **F1 of the D208 review — `finish` leaves a primary cell that is already AHEAD of the record.**
+    ///
+    /// The record can lag the cell, as `Catalog::sync_root_cells`'s own doc says. An INSERT whose
+    /// primary upsert splits the root stores the new root into the cell at once (the root split in
+    /// `index.rs`). The record catches up only at `sync_roots`, which runs after the secondary and
+    /// full-text maintenance. If that maintenance fails, the statement returns before `sync_roots`
+    /// and the record stays behind. `plan_alters` plans from the record, the rewrite cannot move the
+    /// root (see U1 above), and so `finish` is handed that stale root back. An unconditional store
+    /// regressed every handle onto it, and a latched write from a stale root lands keys in the
+    /// wrong leaf.
+    ///
+    /// ⚠ **A UNIT test**, like U1. The lagging record is set up directly: no test can fail an INSERT
+    /// between its primary upsert and its `sync_roots` on demand. The same case through the real
+    /// ALTER path, with a real split, is T10 in `tests/root_cell_is_per_index.rs`.
+    ///
+    /// In the principled form this is U1 again by construction: `finish` copies the cell into the
+    /// record, whatever moved the cell. It stays as the pin for the first D214's regression, which
+    /// mutant K18c restores. The first version, which passed a root in, failed at `f612ba8`
+    /// (INFERRED).
+    #[test]
+    fn finish_leaves_a_primary_cell_that_is_already_ahead_of_the_record() {
+        let file = tempfile::tempfile().unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let schema = Schema::new(vec![Column { name: "id".into(), data_type: DataType::Integer, nullable: false }]);
+        catalog.create_table("t".into(), schema.clone()).unwrap();
+        let cell = catalog.root_cell("t", None).expect("CREATE TABLE seeds the primary cell");
+        let recorded = catalog.get_table("t").unwrap().primary_index_root;
+        // A split the record has not caught up with: the cell names a real second tree's root.
+        let ahead = BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap().root_page_id.load(Ordering::SeqCst);
+        assert_ne!(ahead, recorded, "premise failed: the cell cannot be ahead of the record at the same page");
+        cell.store(ahead, Ordering::SeqCst);
+
+        catalog.finish("t", schema, &cell, None).unwrap();
+
+        assert_eq!(
+            cell.load(Ordering::SeqCst),
+            ahead,
+            "finish regressed the shared primary cell to a stale record, so every handle now descends from a root a split has moved past"
+        );
+        assert_eq!(
+            catalog.get_table("t").unwrap().primary_index_root,
+            ahead,
+            "finish left the record behind the cell"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundColumn, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, index_handle::{FullTextHandle, IndexHandle}, insert::Insert, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, planner::logical_plan::LogicalPlan, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
+use crate::{binder::binder::{Binder, BoundColumn, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, index_handle::{FullTextHandle, IndexHandle}, insert::Insert, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, planner::logical_plan::LogicalPlan, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -118,18 +118,19 @@ fn open_table(entry: &TableEntry, catalog: &Catalog, bp: Arc<BufferPoolManager>,
     let mut handles = Vec::with_capacity(entry.indexes.len());
     for info in &entry.indexes {
         let col_index = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-        let tree = match catalog.root_cell(&entry.name, Some(&info.column_name)) {
+        let tree = match catalog.root_cell(&entry.name, Some(IndexTree::Secondary(&info.column_name))) {
             Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
             None => BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone()),
         };
         handles.push(IndexHandle{col_index, tree})
     }
     // B8 — the full-text indexes, opened the same way and kept apart for the reason
-    // `FullTextHandle` gives.
+    // `FullTextHandle` gives. Through the FULL-TEXT cell (D208): a B-tree index on the same column
+    // is another tree, and sharing its cell posted tokens into it and orphaned this one.
     let mut fulltext = Vec::with_capacity(entry.fulltext_indexes.len());
     for info in &entry.fulltext_indexes {
         let col_index = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-        let tree = match catalog.root_cell(&entry.name, Some(&info.column_name)) {
+        let tree = match catalog.root_cell(&entry.name, Some(IndexTree::FullText(&info.column_name))) {
             Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
             None => BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone()),
         };

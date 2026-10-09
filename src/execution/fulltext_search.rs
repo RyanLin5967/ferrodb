@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::buffer::buffer_pool::BufferPoolManager;
-use crate::catalog::catalog::Catalog;
+use crate::catalog::catalog::{Catalog, IndexTree};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
@@ -246,8 +246,22 @@ impl FullTextSearch {
             )));
         }
 
-        let tree = open_posting_tree(ft_root, bp.clone());
-        // SHARED root cell (D53); see optimizer.rs for why a private one here is a hazard.
+        // SHARED root cells (D53), the posting tree's included (D215). It used to be opened from the
+        // RECORD with a private cell, and the record is the copy a reader's cached snapshot lets go
+        // stale: a root move does not move the schema epoch, so the snapshot is kept. After a
+        // split the recorded page is the new root's left child (a leaf, or an internal node when the
+        // recorded root was deeper), so a descent from it ends on a leaf in the tree's left part.
+        // D58's right walk repairs a descent that
+        // lands up to 64 leaves short (`read_leaf_for`'s `RIGHT_WALK`), so a small drift is
+        // harmless. Past that, the descent falls back to the latched path, which does not walk
+        // right, and the scan for a later token meets a smaller one on the next leaf and stops. The
+        // same happens at ANY drift when the optimistic read cannot be used (a page not resident, a
+        // torn snapshot). Unreachable only while `executor::try_run_read` does not serve SEARCH. The
+        // record stays as the fallback, for a tree this catalog never registered.
+        let tree = match catalog.root_cell(table, Some(IndexTree::FullText(column))) {
+            Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
+            None => open_posting_tree(ft_root, bp.clone()),
+        };
         let primary_index = match catalog.root_cell(table, None) {
             Some(cell) => BPlusTreeManager::<Value, RecordId>::open_shared(cell, bp.clone()),
             None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),

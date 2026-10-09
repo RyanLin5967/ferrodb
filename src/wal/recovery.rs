@@ -1,7 +1,7 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::Path, sync::{Arc, atomic::Ordering}};
 
 use crate::branch::arena::ArenaPageStore;
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{RetiredSlot, TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -339,9 +339,24 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     names.sort_unstable();
     refuse_rows_no_rebuilt_tree_admits(catalog, bp, &names)?;
     // Every tree this rebuilds, with its fresh root: the shared cells are repointed from this at
-    // the end (D205), once the `&mut` borrow of each entry has ended.
-    let mut rebuilt: Vec<(String, Option<String>, u32)> = Vec::new();
+    // the end (D205), once the `&mut` borrow of each entry has ended. Each index carries its KIND
+    // (D208): a B-tree and a full-text index on one column are two trees, and by column alone both
+    // fresh roots were stored into one cell, the posting tree's last.
+    let mut rebuilt: Vec<(String, Option<IndexTree<String>>, u32)> = Vec::new();
     for name in names {
+        // Every old tree is freed from its LIVE root, its shared cell (D208 review 2, C4), as
+        // `drop_table` frees. A record that lags its cell names the pre-split page, now the new
+        // root's left child (a leaf or an internal node, by the tree's depth), and freeing from it
+        // leaks the rest of the tree. At `open_recovered`, the one production
+        // caller, `Catalog::open` has just seeded every cell from these records, so the two agree.
+        // A live caller (the tests) can hold a lagging record. So the index records are caught up
+        // from their cells and the primary's live root is read before the entry is borrowed
+        // mutably, and the frees below use them (`tests/root_cell_is_per_index.rs`, T13).
+        catalog.catch_up_index_records(&name);
+        let live_primary = {
+            let entry = catalog.tables.get(&name).expect("name came from this map");
+            catalog.live_root(&name, None, entry.primary_index_root)
+        };
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
         let mut rows = Vec::new();
@@ -352,7 +367,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             let deleted = tuple.version_header()?.end_ts != 0;
             rows.push((rid, tuple.deserialize(&entry.schema)?, deleted));
         }
-        let old = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+        let old = BPlusTreeManager::<Value, RecordId>::open(live_primary, bp.clone());
         old.free_tree()?;
         let fresh = BPlusTreeManager::<Value, RecordId>::create(bp.clone())?;
 
@@ -409,7 +424,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
-            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
+            rebuilt.push((name.clone(), Some(IndexTree::Secondary(info.column_name.clone())), info.root_page_id));
         }
 
         // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
@@ -436,7 +451,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
-            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
+            rebuilt.push((name.clone(), Some(IndexTree::FullText(info.column_name.clone())), info.root_page_id));
         }
     }
     // **D205: the records above are the only copy that moved.** Every loop in this function
@@ -455,15 +470,16 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     // (`a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them`). `sync_root_cells` then
     // creates a cell for any tree that has none, and it never overwrites the ones just repointed.
     //
-    // ⚠ Pre-existing, and not changed here: a cell is keyed by `(table, column)` with no index kind,
-    // so a secondary index and a full-text index on ONE column share a cell, and the full-text root
-    // is stored last. See `frontier/lane_rollback_index_orphan.md` §14.
+    // Each store lands in its own index's cell because the key carries the index KIND (D208). It
+    // did not always: keyed `(table, column)`, a B-tree and a full-text index on one column shared a
+    // cell, the full-text root was stored last, and every B-tree lookup after a rebuild descended
+    // the posting tree (`tests/root_cell_is_per_index.rs`).
     //
     // Here, and not only in `open_recovered`, because this is the function that makes the cells
     // wrong. A caller that rebuilds and then queries, as the full-text and recovery tests do, gets
     // cells that match what it built.
-    for (table, column, root) in &rebuilt {
-        if let Some(cell) = catalog.root_cell(table, column.as_deref()) {
+    for (table, index, root) in &rebuilt {
+        if let Some(cell) = catalog.root_cell(table, index.as_ref().map(|i| i.borrowed())) {
             cell.store(*root, Ordering::SeqCst);
         }
     }
@@ -887,14 +903,16 @@ use super::*;
         );
         for name in &tables {
             let entry = o.catalog.get_table(name).unwrap();
-            let mut trees: Vec<(Option<String>, u32)> = vec![(None, entry.primary_index_root)];
-            trees.extend(entry.indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
-            trees.extend(entry.fulltext_indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
+            // Each index by KIND as well as column (D208): a B-tree and a full-text index on one
+            // column are two trees with two cells.
+            let mut trees: Vec<(Option<IndexTree<String>>, u32)> = vec![(None, entry.primary_index_root)];
+            trees.extend(entry.indexes.iter().map(|i| (Some(IndexTree::Secondary(i.column_name.clone())), i.root_page_id)));
+            trees.extend(entry.fulltext_indexes.iter().map(|i| (Some(IndexTree::FullText(i.column_name.clone())), i.root_page_id)));
             assert!(trees.len() >= 2 || name != "t", "premise failed: t lost its secondary index");
             for (column, record) in trees {
                 let cell = o
                     .catalog
-                    .root_cell(name, column.as_deref())
+                    .root_cell(name, column.as_ref().map(|i| i.borrowed()))
                     .expect("Catalog::open seeds a cell for every tree it loads")
                     .load(Ordering::SeqCst);
                 assert_eq!(
