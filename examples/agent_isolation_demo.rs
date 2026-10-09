@@ -514,22 +514,14 @@ impl Db {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.db");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("open db");
-        let bp = Arc::new(BufferPoolManager::new(Arc::new(
-            DiskManager::new(file).expect("disk manager"),
-        )));
-        let catalog = Catalog::create(bp.clone()).expect("catalog");
-        let wal = Arc::new(
-            ferrodb::wal::log::WalManager::new(dir.path().join("agent.wal")).expect("wal"),
-        );
-        let txn = Arc::new(ferrodb::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
-        bp.attach_wal(wal);
+        // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+        // carries REVERT's history store and pays for it as production does; a runtime on
+        // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+        // (forgotten below), and its file goes with this scratch directory.
+        let db_path = (&path).to_path_buf();
+        let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+        let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+        let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
 
         // **Storage-backed, exactly as `src/cli/cli.rs` builds it.** Until the CLI was wired to the
         // branch engine this could not be done here either, and Act II ran on `AgentRuntime::new()`
@@ -550,14 +542,20 @@ impl Db {
             ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base)
                 .expect("arena"),
         );
-        let runtime = Arc::new(
+        let runtime = opened.attach_runtime(
             AgentRuntime::with_storage(
                 branches as Arc<dyn ferrodb::branch::BranchCatalog>,
                 Arc::new(ferrodb::tel::MemEffectLog::new()),
                 store as Arc<dyn ferrodb::cow::PageStore>,
             )
             .expect("storage-backed runtime"),
-        );
+            // D250's door takes the runtime's provenance backing; these harnesses kept the
+            // in-memory store (merge resolve-recovery-16).
+            ferrodb::wal::recovery::ProvenanceBacking::InMemory,
+        )
+        .expect("attach the runtime through the opened database");
+        let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+        std::mem::forget(lock);
         Db { catalog, bp, txn, runtime, _dir: dir }
     }
 
@@ -1172,7 +1170,9 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
     let mut a = db.session();
     db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
     db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut a);
-    report_of(db.ok("MERGE;", &mut a));
+    // D212 addendum: merge ids name the run that minted them (`m_<nonce>_<n>`), so the id to
+    // revert is the one this merge was given, not a literal.
+    let first = report_of(db.ok("MERGE;", &mut a)).merge_id;
     println!("      qty(1) = {}", db.qty(1));
 
     println!("\n  (b) agent-b READS row 1, then writes row 2 on the strength of what it read");
@@ -1188,7 +1188,7 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
 
     println!("\n  (c) now revert agent-a's merge. HALT is the default.");
     let mut main = db.session();
-    let plan = match agent_out(db.ok("REVERT MERGE m_1;", &mut main)) {
+    let plan = match agent_out(db.ok(&format!("REVERT MERGE {first};"), &mut main)) {
         AgentOutput::Revert(p) => p,
         other => panic!("expected a revert plan, got {}", other),
     };
@@ -1200,7 +1200,7 @@ fn criterion_10_revert_cascade(led: &mut Ledger) {
     let halted = plan.is_blocked() && plan.blocked_by.len() == 1 && db.qty(1) == 15;
 
     println!("\n  (d) CASCADE, on explicit request only. Dependents are undone first.");
-    let plan = match agent_out(db.ok("REVERT MERGE m_1 CASCADE;", &mut main)) {
+    let plan = match agent_out(db.ok(&format!("REVERT MERGE {first} CASCADE;"), &mut main)) {
         AgentOutput::Revert(p) => p,
         other => panic!("expected a revert plan, got {}", other),
     };

@@ -262,6 +262,10 @@ pub struct PayloadHeader {
     /// Without it a follower installs a database torn in time, `finish_install` reports the round
     /// durable, and nothing ever repairs it.
     pub wal_len: u32,
+    /// **D212 (a') AMENDED 3, item 2 — the sender's REVERT history**, `wal::history::HistoryStore::capture`:
+    /// one image of its durable window, taken after its queue was drained. The install keeps only the
+    /// records whose `Commit` is below `end_lsn`. 0 when the sender keeps no history.
+    pub history_len: u32,
     /// A resumable digest over everything after this header.
     pub body_digest: u64,
 }
@@ -269,13 +273,15 @@ pub struct PayloadHeader {
 /// `b"FDBSNAP"` plus a format generation. A payload that does not begin with these bytes is not
 /// refused for a *field* being wrong; it is refused for not being one of ours at all.
 const MAGIC: [u8; 8] = *b"FDBSNAP\x01";
-const FORMAT_VERSION: u32 = 1;
+/// 3 since D212 (a') AMENDED 3 added the history section. Not 2: `tests_snapshot.rs` writes 2 into
+/// a payload as its example of a version this build does not read.
+const FORMAT_VERSION: u32 = 3;
 
 impl PayloadHeader {
     /// magic 8 | version 4 | base_digest 8 | last_round 8 | last_term 8 | root 4 | catalog 4 |
     /// start_lsn 8 | end_lsn 8 | page_count 4 | arena_len 4 | branches_len 4 | image_len 8 |
-    /// wal_len 4 | body_digest 8 | header_digest 8
-    pub const BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 4 + 8 + 8;
+    /// wal_len 4 | history_len 4 | body_digest 8 | header_digest 8
+    pub const BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 4 + 4 + 8 + 8;
 
     /// The largest a sidecar section may claim.
     ///
@@ -308,9 +314,10 @@ impl PayloadHeader {
         b[68..72].copy_from_slice(&self.branches_len.to_be_bytes());
         b[72..80].copy_from_slice(&self.image_len.to_be_bytes());
         b[80..84].copy_from_slice(&self.wal_len.to_be_bytes());
-        b[84..92].copy_from_slice(&self.body_digest.to_be_bytes());
-        let d = digest(&b[..92]);
-        b[92..100].copy_from_slice(&d.to_be_bytes());
+        b[84..88].copy_from_slice(&self.history_len.to_be_bytes());
+        b[88..96].copy_from_slice(&self.body_digest.to_be_bytes());
+        let d = digest(&b[..96]);
+        b[96..104].copy_from_slice(&d.to_be_bytes());
         b
     }
 
@@ -341,8 +348,8 @@ impl PayloadHeader {
                  fields would parse and mean something else."
             )));
         }
-        let claimed = u64::from_be_bytes(bytes[92..100].try_into().unwrap());
-        let actual = digest(&bytes[..92]);
+        let claimed = u64::from_be_bytes(bytes[96..104].try_into().unwrap());
+        let actual = digest(&bytes[..96]);
         if claimed != actual {
             return Err(SnapshotError::Refused(format!(
                 "the snapshot payload header does not match its own digest ({claimed:#018x} \
@@ -364,7 +371,8 @@ impl PayloadHeader {
             branches_len: u32::from_be_bytes(bytes[68..72].try_into().unwrap()),
             image_len: u64::from_be_bytes(bytes[72..80].try_into().unwrap()),
             wal_len: u32::from_be_bytes(bytes[80..84].try_into().unwrap()),
-            body_digest: u64::from_be_bytes(bytes[84..92].try_into().unwrap()),
+            history_len: u32::from_be_bytes(bytes[84..88].try_into().unwrap()),
+            body_digest: u64::from_be_bytes(bytes[88..96].try_into().unwrap()),
         };
         h.check_internally_consistent()?;
         Ok(h)
@@ -396,11 +404,12 @@ impl PayloadHeader {
             ("the arena image", self.arena_len as u64),
             ("the branch catalog image", self.branches_len as u64),
             ("the redo window", self.wal_len as u64),
+            ("the REVERT history", self.history_len as u64),
         ] {
             if len > Self::MAX_SIDECAR_BYTES {
                 return Err(SnapshotError::Refused(format!(
                     "the snapshot header claims {len} bytes for {what}, above the \
-                     {}-byte ceiling. These three sections are the only ones read into memory \
+                     {}-byte ceiling. These sections are the only ones read into memory \
                      whole, so they are the only place a peer could choose this process's \
                      footprint. Refused before anything was allocated for it.",
                     Self::MAX_SIDECAR_BYTES
@@ -426,6 +435,7 @@ impl PayloadHeader {
             + self.arena_len as u64
             + self.branches_len as u64
             + self.wal_len as u64
+            + self.history_len as u64
             + self.image_len
     }
 }
@@ -519,15 +529,45 @@ impl Snapshot {
         redo: &[u8],
         image: Vec<u8>,
     ) -> Result<Snapshot, SnapshotError> {
+        Snapshot::build_with_history(
+            at,
+            root_page_id,
+            catalog_page_id,
+            label,
+            arena,
+            branches,
+            redo,
+            &[],
+            image,
+        )
+    }
+
+    /// [`Snapshot::build`] with the sender's REVERT history (D212 (a') AMENDED 3, item 2), which
+    /// travels between the redo window and the image. An empty `history` is the layout `build` makes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_history(
+        at: &SnapshotPoint,
+        root_page_id: u32,
+        catalog_page_id: u32,
+        label: crate::replication::backup::BackupLabel,
+        arena: &[u8],
+        branches: &[u8],
+        redo: &[u8],
+        history: &[u8],
+        image: Vec<u8>,
+    ) -> Result<Snapshot, SnapshotError> {
         let arena_len = fits_u32(arena.len(), "the arena image")?;
         let branches_len = fits_u32(branches.len(), "the branch catalog image")?;
         let wal_len = fits_u32(redo.len(), "the redo window")?;
+        let history_len = fits_u32(history.len(), "the REVERT history")?;
 
-        let mut body =
-            Vec::with_capacity(arena.len() + branches.len() + redo.len() + image.len());
+        let mut body = Vec::with_capacity(
+            arena.len() + branches.len() + redo.len() + history.len() + image.len(),
+        );
         body.extend_from_slice(arena);
         body.extend_from_slice(branches);
         body.extend_from_slice(redo);
+        body.extend_from_slice(history);
         body.extend_from_slice(&image);
 
         let header = PayloadHeader {
@@ -543,6 +583,7 @@ impl Snapshot {
             branches_len,
             image_len: image.len() as u64,
             wal_len,
+            history_len,
             body_digest: digest(&body),
         };
         header.check_internally_consistent()?;
@@ -1305,6 +1346,9 @@ pub struct PageStoreSnapshots {
     /// forgets its release state together with the quarantine (`TxnManager::start_new_incarnation`).
     /// None in production today.
     txn: Option<Arc<crate::wal::txn::TxnManager>>,
+    /// **D212 (a') AMENDED 3, item 2 — this node's REVERT history store**, when it keeps one
+    /// ([`PageStoreSnapshots::with_history`]). A capture ships it; an install replaces it.
+    history: Option<Arc<crate::wal::history::HistoryStore>>,
 }
 
 /// The three files a snapshot install replaces, plus the page file it restores into.
@@ -1334,6 +1378,7 @@ impl PageStoreSnapshots {
             paths,
             scratch: scratch.into(),
             txn: None,
+            history: None,
         }
     }
 
@@ -1348,6 +1393,15 @@ impl PageStoreSnapshots {
         }
         self.txn = Some(txn);
         Ok(self)
+    }
+
+    /// **D212 (a') AMENDED 3, item 2:** this node's REVERT history store — the one its log's manager
+    /// has attached. A capture then ships the history, and an install replaces it with the sender's,
+    /// cut at the image's `end_lsn`, plus the committed history the shipped redo window carries.
+    /// Without it, a capture ships an empty history and an install leaves no store behind.
+    pub fn with_history(mut self, store: Arc<crate::wal::history::HistoryStore>) -> Self {
+        self.history = Some(store);
+        self
     }
 
     /// The branch catalog as its own file format: `u32 length | BranchRecord::serialize()`.
@@ -1412,8 +1466,15 @@ impl SnapshotStore for PageStoreSnapshots {
         // is the whole reason `BackupHandle` owns a `WalPin` rather than dropping it at the end of
         // `take`.
         let redo = read_redo_window(&self.wal, label.start_lsn, label.end_lsn)?;
+        // D212 (a') AMENDED 3, item 2: after `end_lsn` was read, so every record committed below it
+        // that has been pushed is in the drained copy (see `HistoryStore::capture` for the one that
+        // may not be). A record committed later rides along and is cut at the install.
+        let history = match &self.history {
+            Some(store) => store.capture()?,
+            None => Vec::new(),
+        };
 
-        let snap = Snapshot::build(
+        let snap = Snapshot::build_with_history(
             at,
             root,
             self.catalog_page_id,
@@ -1421,6 +1482,7 @@ impl SnapshotStore for PageStoreSnapshots {
             &arena,
             &branches,
             &redo,
+            &history,
             image,
         )
         .map_err(SnapshotError::into_ferro)?;
@@ -1444,6 +1506,23 @@ impl SnapshotStore for PageStoreSnapshots {
             )));
         }
 
+        // **D212 (a') AMENDED 3, item 2 (review of `a71d3ed`, F3): a node with a REVERT history must
+        // hand its store to the install** (`with_history`), which replaces it with the sender's.
+        // Installed without it, the replaced database's history would stay beside the new rows, and
+        // the next checkpoint would declare it as theirs. Refused before anything is touched.
+        // ⚠ Stated: a store that has never written its file cannot be seen from here.
+        if self.history.is_none() {
+            let history = crate::wal::history::HistoryStore::path_for_database(&self.paths.page_file);
+            if history.exists() {
+                return Err(FerroError::Internal(format!(
+                    "{} is this node's REVERT history, and the install was not given its store \
+                     (`PageStoreSnapshots::with_history`); installing would leave the replaced \
+                     database's history beside the installed rows",
+                    history.display()
+                )));
+            }
+        }
+
         let dir = self.scratch.join(format!("install-{}", meta.last_round));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)
@@ -1455,6 +1534,7 @@ impl SnapshotStore for PageStoreSnapshots {
         let arena = read_section(&mut f, header.arena_len as u64)?;
         let branches = read_section(&mut f, header.branches_len as u64)?;
         let redo = read_section(&mut f, header.wal_len as u64)?;
+        let history = read_section(&mut f, header.history_len as u64)?;
         stream_section(
             &mut f,
             header.image_len,
@@ -1571,6 +1651,24 @@ impl SnapshotStore for PageStoreSnapshots {
                  database this install replaced and recovery would replay them over the installed \
                  pages."
             )));
+        }
+
+        // **D212 (a') AMENDED 3, item 2: the REVERT history of exactly the rows just installed.** The
+        // sender's copy cut at `end_lsn` (a record committed later is history of rows this node never
+        // received), plus every committed record the redo window carries, by membership: one committed
+        // between the sender's drain and `end_lsn` is in the window and not in the copy. One full
+        // rewrite, which also empties this node's queue: it held the replaced database's history, as
+        // the log truncated above did. Inside the marker's window, like every file above.
+        if let Some(store) = &self.history {
+            let (incarnation, floor, mut records) =
+                crate::wal::history::HistoryStore::records_through(&history, header.end_lsn)?;
+            let (window, _) = crate::replication::decode_frames(header.start_lsn, &redo)?;
+            let window: Vec<crate::wal::log::LogRecord> = window.into_iter().map(|(_, r)| r).collect();
+            // A transaction that began before the window cannot be reassembled from it and is dropped
+            // (`committed_in`): its record is in the shipped copy if it was pushed before the capture.
+            let (from_window, _began_before) = crate::wal::history::committed_in(&window)?;
+            records.extend(from_window.into_iter().filter(|r| r.commit_lsn < header.end_lsn));
+            store.install(incarnation, floor, records)?;
         }
 
         // The live objects, not only the files. A node that replaced its durable state and went on

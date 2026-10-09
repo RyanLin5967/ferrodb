@@ -863,8 +863,8 @@ fn no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap() {
 /// for either verb here, because neither one is publishing this branch's own staged rows:
 ///
 /// - `REVERT MERGE` replays a *previous* merge's writes backwards through
-///   `PendingWrite::apply` (`AgentRuntime::revert_merge` → `undo_txn`), so the rows it writes were
-///   never staged by this branch at all.
+///   `PendingWrite::apply_in` (`AgentRuntime::revert_merge` → `undo_txns_in`, one transaction since
+///   D218), so the rows it writes were never staged by this branch at all.
 /// - `MERGE BRANCH <name>` takes the branch from the statement, not from the session
 ///   (`src/agent_sql/dispatch.rs:118`, `BoundAgentStmt::Merge { branch }`), so a governed session
 ///   can publish a *different* agent's private workspace. The other branch's writes were checked

@@ -45,7 +45,6 @@
 //! merges/sec is a FLOOR on a shared machine, exactly as in D61 and D65 — a loaded box makes it
 //! smaller, never larger. The number this row turns on is the SHAPE of the column against thread
 //! count, which load does not invert.
-use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -64,8 +63,6 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
 const ROWS: i64 = 2000;
@@ -106,18 +103,14 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     let d = dir.join(tag);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(d.join("main.db"))
-        .unwrap();
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-    let catalog = Catalog::create(bp.clone()).unwrap();
-    let wal = Arc::new(WalManager::new(d.join("main.wal")).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
+    // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+    // carries REVERT's history store and pays for it as production does; a runtime on
+    // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+    // (forgotten below), and its file goes with this scratch directory.
+    let db_path = (d.join("main.db")).to_path_buf();
+    let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+    let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+    let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
     // ⚠ `with_storage`, NOT `with_catalog` — D67's first configuration was WRONG and the numbers
     // it produced are withdrawn. `with_catalog` delegates to `with_parts`, which sets
     // `storage: None, reaper: None` (src/agent_sql/runtime.rs:628-629), so the whole branch
@@ -139,14 +132,20 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     // both set one, so a run without it measures a configuration nobody ships — and it measures
     // it in the flattering direction, since the persistence work is simply skipped.
     store.checkpoint_to(d.join("main.arena"));
-    let runtime = Arc::new(
+    let runtime = opened.attach_runtime(
         AgentRuntime::with_storage(
             branches,
             Arc::new(MemEffectLog::new()),
             Arc::clone(&store) as Arc<dyn PageStore>,
         )
         .expect("attach arena storage"),
-    );
+        // D250's door takes the runtime's provenance backing; these harnesses kept the
+        // in-memory store (merge resolve-recovery-16).
+        ferrodb::wal::recovery::ProvenanceBacking::InMemory,
+    )
+    .expect("attach the runtime through the opened database");
+    let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+    std::mem::forget(lock);
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
 

@@ -65,7 +65,6 @@
 //! The axis here is the **DELTA side**, not the table. This says nothing about D110's retirement:
 //! the merge stays O(delta · log N) in table size and `MERGE;` still reads zero branch-engine
 //! pages. **Nothing here revives `merge3`.**
-use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -75,16 +74,13 @@ use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::cow::PageStore;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::pgwire::ServerContext;
-use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
 /// Rows in the table. NOT the axis — held small and fixed on purpose, because the table-size
@@ -136,32 +132,34 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     let d = dir.join(tag);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(d.join("main.db"))
-        .unwrap();
-    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
-    let catalog = Catalog::create(bp.clone()).unwrap();
-    let wal = Arc::new(WalManager::new(d.join("main.wal")).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
+    // D212 (a') AMENDED 3, item 4: through the one open path, as the CLI opens, so this harness
+    // carries REVERT's history store and pays for it as production does; a runtime on
+    // `TxnManager::new` keeps no durable history. The lock is held for the process's life
+    // (forgotten below), and its file goes with this scratch directory.
+    let db_path = (d.join("main.db")).to_path_buf();
+    let lock = ferrodb::storage::db_lock::DbLock::acquire(&db_path).unwrap();
+    let opened = ferrodb::wal::recovery::open_recovered(&db_path, &lock).unwrap();
+    let (bp, txn) = (Arc::clone(&opened.bp), Arc::clone(&opened.txn));
     let cat = Arc::new(TableBranchCatalog::open_sidecar(&d.join("b.branchcat"), 1).unwrap());
     let branches: Arc<dyn BranchCatalog> = cat.clone();
     // Reserve a table region BELOW the arena, same fixed floor and same reason as D68: taking
     // high_water() here puts the arena at page 2 and leaves the ordinary table nowhere to grow.
     const ARENA_BASE: u32 = 1024;
     let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), ARENA_BASE).unwrap());
-    let runtime = Arc::new(
+    let runtime = opened.attach_runtime(
         AgentRuntime::with_storage(
             branches,
             Arc::new(MemEffectLog::new()),
             Arc::clone(&store) as Arc<dyn PageStore>,
         )
         .expect("attach arena storage"),
-    );
+        // D250's door takes the runtime's provenance backing; these harnesses kept the
+        // in-memory store (merge resolve-recovery-16).
+        ferrodb::wal::recovery::ProvenanceBacking::InMemory,
+    )
+    .expect("attach the runtime through the opened database");
+    let ferrodb::wal::recovery::OpenedDatabase { catalog, .. } = opened;
+    std::mem::forget(lock);
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
 

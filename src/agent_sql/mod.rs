@@ -36,6 +36,8 @@ pub mod mem_catalog;
 pub mod merge_engine;
 pub mod paged_rows;
 pub mod persistent_map;
+/// D212 (a') — what a REVERT history record means: the bodies `wal::history` stores opaquely.
+pub(crate) mod revert_store;
 pub mod runtime;
 pub mod session;
 pub mod simulate;

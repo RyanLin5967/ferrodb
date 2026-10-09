@@ -348,6 +348,58 @@ impl<'a> ReplicationSource<'a> {
     }
 }
 
+/// **Parse a batch of raw log frames that begin at `start_lsn`, validating every one**: its length,
+/// its CRC against the bytes that arrived, and its embedded LSN against where the walk places it.
+/// Returns the records with their LSNs and the LSN just past the last frame. Refused whole on the
+/// first bad frame. Extracted from [`ReplicaApplier::apply`] so the snapshot install reads a shipped
+/// redo window with the same checks (D212 (a') AMENDED 3, item 2).
+pub(crate) fn decode_frames(
+    start_lsn: u64,
+    bytes: &[u8],
+) -> Result<(Vec<(u64, crate::wal::log::LogRecord)>, u64), FerroError> {
+    use crate::wal::log::{crc32, LogRecord};
+    let mut checked: Vec<(u64, LogRecord)> = Vec::new();
+    let mut at = 0usize;
+    let mut lsn = start_lsn;
+    while at < bytes.len() {
+        if at + 4 > bytes.len() {
+            return Err(FerroError::Wal("batch ends mid-length-prefix".into()));
+        }
+        let total = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        if total < 33 || at + total > bytes.len() {
+            return Err(FerroError::Wal(format!(
+                "frame at offset {at} claims {total} bytes, which runs past the batch"
+            )));
+        }
+        let frame = &bytes[at..at + total];
+
+        let stored = u32::from_be_bytes(frame[total - 4..total].try_into().unwrap());
+        if crc32(&frame[..total - 4]) != stored {
+            return Err(FerroError::Wal(format!(
+                "frame at lsn {lsn} failed its CRC; the bytes on the wire are not the bytes \
+                 the primary wrote"
+            )));
+        }
+
+        let embedded = u64::from_be_bytes(frame[4..12].try_into().unwrap());
+        if embedded != lsn {
+            return Err(FerroError::Wal(format!(
+                "frame says it is lsn {embedded} but the stream places it at {lsn}; the \
+                 replica would silently apply the log out of order"
+            )));
+        }
+
+        let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
+        let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
+        let kind = crate::wal::log::RecKind::deserialize(&frame[28..total - 4])?;
+        checked.push((lsn, LogRecord { lsn, prev_lsn, txn_id, kind }));
+
+        at += total;
+        lsn += total as u64;
+    }
+    Ok((checked, lsn))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,7 +657,6 @@ impl ReplicaApplier {
     /// whole: applying a prefix and then erroring would leave the replica at an LSN it cannot
     /// justify, which is worse than refusing to advance at all.
     pub fn apply(&self, start_lsn: u64, bytes: &[u8]) -> Result<u64, FerroError> {
-        use crate::wal::log::{crc32, LogRecord};
 
         // **A batch that begins ABOVE where this replica has applied is a GAP, and a gap is not
         // catching up — B6.** Nothing here used to check: `apply` validated each frame's own LSN
@@ -636,45 +687,7 @@ impl ReplicaApplier {
         }
 
         // Validate the whole batch before touching a page.
-        let mut checked: Vec<(u64, LogRecord)> = Vec::new();
-        let mut at = 0usize;
-        let mut lsn = start_lsn;
-        while at < bytes.len() {
-            if at + 4 > bytes.len() {
-                return Err(FerroError::Wal("batch ends mid-length-prefix".into()));
-            }
-            let total = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            if total < 33 || at + total > bytes.len() {
-                return Err(FerroError::Wal(format!(
-                    "frame at offset {at} claims {total} bytes, which runs past the batch"
-                )));
-            }
-            let frame = &bytes[at..at + total];
-
-            let stored = u32::from_be_bytes(frame[total - 4..total].try_into().unwrap());
-            if crc32(&frame[..total - 4]) != stored {
-                return Err(FerroError::Wal(format!(
-                    "frame at lsn {lsn} failed its CRC; the bytes on the wire are not the bytes \
-                     the primary wrote"
-                )));
-            }
-
-            let embedded = u64::from_be_bytes(frame[4..12].try_into().unwrap());
-            if embedded != lsn {
-                return Err(FerroError::Wal(format!(
-                    "frame says it is lsn {embedded} but the stream places it at {lsn}; the \
-                     replica would silently apply the log out of order"
-                )));
-            }
-
-            let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
-            let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
-            let kind = crate::wal::log::RecKind::deserialize(&frame[28..total - 4])?;
-            checked.push((lsn, LogRecord { lsn, prev_lsn, txn_id, kind }));
-
-            at += total;
-            lsn += total as u64;
-        }
+        let (checked, lsn) = decode_frames(start_lsn, bytes)?;
 
         // **An ALTER cannot be replayed here, so the replica stops rather than diverging — I20,
         // review finding 11.**

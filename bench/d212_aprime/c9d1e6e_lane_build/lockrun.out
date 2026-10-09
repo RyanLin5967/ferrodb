@@ -1,0 +1,10 @@
+2026-09-24T21:47:45Z d212 acquiring (5s poll), pid 33920
+2026-09-24T21:54:30Z d212 ACQUIRED: 33920 d212 2026-09-24T21:54:30Z
+CHECK.txt rc=0
+TEST_integration.txt rc=101
+TEST_lib.txt rc=0
+TEST_snapshot_ignored.txt rc=101
+tree still clean at c9d1e6e
+done
+2026-09-24T21:56:14Z d212 rc=0
+2026-09-24T21:56:14Z d212 released (owner matched)
