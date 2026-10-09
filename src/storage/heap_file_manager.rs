@@ -240,11 +240,7 @@ impl HeapFileManager {
                 let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
                 let mut frame = self.buffer_pool_manager.frame_write(frame_i);
                 let mut page = Page::deserialize(frame.data)?;
-                page.delete(record_id.slot_num as usize)?;
-                if let Some(txn) = &self.txn {
-                    let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
-                    page.lsn = lsn;
-                }
+                self.take_off_page(&mut page, record_id, &old_bytes)?;
                 frame.data = page.serialize()?;
                 drop(frame);
                 self.buffer_pool_manager.unpin_page(record_id.page_id, true);
@@ -283,15 +279,37 @@ impl HeapFileManager {
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let mut page = Page::deserialize(frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
-        page.delete(record_id.slot_num as usize)?;
-        if let Some(txn) = &self.txn {
-            let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
-            page.lsn = lsn;
-        }
+        self.take_off_page(&mut page, record_id, &old_bytes)?;
         frame.data = page.serialize()?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(record_id.page_id, true);
         self.update_directory_entry(record_id.page_id, page.get_free_space_end() - page.get_free_space_start())?;
+        Ok(())
+    }
+
+    /// Delete `record_id`'s tuple from `page`, logged when this heap has a transaction. The one
+    /// place both deletes ([`Self::delete`] and the relocation arm of [`Self::update`]) do it. D213.
+    ///
+    /// A LOGGED delete RETIRES the slot (`Page::retire`): the transaction can still roll back, and
+    /// its undo puts the tuple back in place, so the bytes must stay counted as occupied until it
+    /// commits. This freed the slot at once, and when it was the page's lowest tuple its bytes were
+    /// free space at the next serialise. Other transactions could commit rows into them, and the
+    /// rollback, or recovery's undo at the next open, could then never finish (ledger D213). The
+    /// slot is recorded with the transaction, whose commit frees it (`TxnManager::commit`, logged as
+    /// `RecKind::HeapRelease`).
+    ///
+    /// An UNLOGGED delete has no undo (`catalog::alter::rewrite_heap` relocates through a heap with
+    /// no transaction), so it frees the slot at once, as every delete did before.
+    fn take_off_page(&self, page: &mut Page, record_id: RecordId, old: &[u8]) -> Result<(), FerroError> {
+        let slot = record_id.slot_num as usize;
+        match &self.txn {
+            Some(txn) => {
+                page.retire(slot)?;
+                page.lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, old)?;
+                txn.record_retired(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num);
+            }
+            None => page.delete(slot)?,
+        }
         Ok(())
     }
 

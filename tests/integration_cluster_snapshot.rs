@@ -757,6 +757,53 @@ fn an_install_discards_the_receivers_own_wal() {
     );
 }
 
+/// An install moves the replaced database's release quarantine aside (rollback lane §21.14 test 3,
+/// review 6's F6 gap).
+///
+/// The quarantine's dedupe key (`txn=`, `dir_root=`, `page=`, `slot=`) has no incarnation, and an install
+/// replaces the database at this path, so a line the replaced database wrote would make a colliding
+/// mismatch of the installed one look already recorded. Moved aside, not deleted: it is evidence.
+#[test]
+fn an_install_moves_the_replaced_databases_release_quarantine_aside() {
+    use ferrodb::consensus::snapshot::{SnapshotPoint, SnapshotStore};
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    seed_pages(&from_engine, 3, 0x2A);
+
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 2, 0x5B);
+    let quarantine = ferrodb::wal::txn::release_quarantine(&to_engine.wal.path);
+    let old = "txn=5 dir_root=3 page=7 slot=1 found=live error=the replaced database's mismatch\n";
+    std::fs::write(&quarantine, old).unwrap();
+
+    let at = SnapshotPoint {
+        last_round: 3,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    to.install(&snap.meta, &spool).expect("install failed");
+
+    assert!(
+        !quarantine.exists(),
+        "the install kept the replaced database's quarantine at its path, so a colliding mismatch of the \
+         installed database would be taken as already recorded"
+    );
+    let prefix = format!("{}.before-", quarantine.file_name().unwrap().to_string_lossy());
+    let aside: Vec<PathBuf> = std::fs::read_dir(dst.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+        .collect();
+    assert_eq!(aside.len(), 1, "the replaced database's quarantine was not moved aside once: {aside:?}");
+    assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), old, "the replaced database's evidence was not kept");
+}
+
 /// A node whose storage was left part-way through an install refuses to start.
 ///
 /// Three files are replaced and no rename sequence makes them land together, so the dangerous state

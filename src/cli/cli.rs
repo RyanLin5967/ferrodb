@@ -235,6 +235,12 @@ pub fn exit_sequence(
     let published = branches.publish_root_durably();
     let wal_checkpoint = txn.checkpoint();
     let arena_checkpoint = store.checkpoint(arena_path);
+    // `rollback-index-orphan`'s review 2 and review 3 caveat 4: the transaction manager's failure
+    // counters are printed at exit, after both checkpoints and whatever they returned, so a failed
+    // checkpoint does not also cost the counters their only reader outside tests.
+    if let Some(line) = crate::wal::txn::failure_counters_line() {
+        eprintln!("{line}");
+    }
     let mut errors = [published, wal_checkpoint, arena_checkpoint].into_iter().filter_map(Result::err);
     let first = errors.next();
     for later in errors {

@@ -1169,8 +1169,11 @@ impl LogicalDecoder {
                 }
                 // `Clr` records are undo work, and undo only happens on the way to an `Abort`,
                 // whose buffer is discarded whole. `Begin`, `TxnEnd` and `Checkpoint` carry no row
-                // data. None of them produce events.
-                RecKind::Begin | RecKind::TxnEnd | RecKind::Checkpoint | RecKind::Clr { .. } => {}
+                // data, and neither does `HeapRelease`: it is a committed transaction freeing bytes
+                // its delete kept for a rollback that did not happen (D213), and the delete itself
+                // was already decoded. None of them produce events.
+                RecKind::Begin | RecKind::TxnEnd | RecKind::Checkpoint | RecKind::Clr { .. }
+                | RecKind::HeapRelease { .. } => {}
             }
 
             if next <= lsn {
