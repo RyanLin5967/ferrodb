@@ -1743,6 +1743,15 @@ impl TxnManager {
     /// never succeeds blocked all DDL for ever (review 2's Q3). A DROP frees pages, and goes through
     /// [`TxnManager::drop_checkpointed`].
     ///
+    /// **D271: CREATE [FULLTEXT] INDEX runs only its ATTACH here.** Its O(rows) backfill runs first,
+    /// outside, into a tree no record names (`Catalog::build_index`), so the hold covers the O(1)
+    /// attach and the checkpoint and never the backfill. The checkpoint still flushes and syncs the
+    /// pages the backfill dirtied, so a `begin` can wait on that write: at most the pool's frames,
+    /// however many rows the table has. A refusal here frees that tree
+    /// (`execution::executor::attach_built_index`). Until D271 those statements attached first and
+    /// then called a checkpoint that refused while another session's transaction was open: A8's
+    /// shape, for indexes.
+    ///
     /// Nothing reachable from `f` or from the checkpoint takes `att` or `release_retry`, so this
     /// cannot deadlock on itself. The lock order is `att`, then `release_retry`, then the buffer pool,
     /// and no path takes `att` while it holds `release_retry`. The retry's releases are appended
@@ -1898,19 +1907,20 @@ impl TxnManager {
         }
     }
 
-    /// The checkpoint after a DDL that frees no page and mutates first: CREATE INDEX and CREATE
-    /// FULLTEXT INDEX (review 3's caveat 1 and decision 1).
+    /// The checkpoint after a DDL that frees no page and mutates first. CREATE INDEX and CREATE
+    /// FULLTEXT INDEX called it (review 3's caveat 1 and decision 1) until D271, which runs their
+    /// O(1) attach and the checkpoint as ONE unit under [`TxnManager::ddl_checkpointed`]
+    /// (`execution::executor::attach_built_index`), with the O(rows) backfill outside the hold.
+    /// **Since D271 it has no production caller.** It is kept because it is one of the path-A
+    /// entries D253 fences (`checkpoint_or_keep_locked`), and D253's per-entry tests in
+    /// `wal::recovery` drive it (`via_ddl_checkpoint`); d271 deleted it while d253 tested it, and
+    /// the merge keeps both.
     ///
     /// While a release is owed it flushes every page and syncs, keeps the log, counts the deferral,
     /// and answers `Ok`. At `7cede54` those statements called `checkpoint`, which then refused after
     /// the index was built and flushed. The client was told the DDL failed over an index that existed
-    /// and was used, which is A8's shape.
-    ///
-    /// Refuses while a transaction is open, as `checkpoint` does. They are not moved under
-    /// [`TxnManager::ddl_checkpointed`]: that would hold `att` shut across the index's backfill, so
-    /// every `begin`, and every reader whose cached snapshot missed, would wait O(rows). An open
-    /// transaction elsewhere therefore still refuses them after the index is built. That is A8's
-    /// shape for indexes, it predates this lane, and it is unchanged here.
+    /// and was used, which is A8's shape. Refuses while a transaction is open, as `checkpoint` does
+    /// (the check is in `checkpoint_or_keep_locked`, D253).
     pub fn ddl_checkpoint(&self) -> Result<(), FerroError> {
         self.checkpoint_or_keep_locked(true).map(|_| ())
     }
