@@ -75,9 +75,10 @@ use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, predicate_to_bounds, Plan};
 use crate::optimizer::optimizer::split_and;
 use crate::catalog::column::DataType;
-use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
+use crate::provenance::capture::{TxnCapture, WriteRecord};
+use crate::provenance::capture_set::CaptureSet;
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
-use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
+use crate::provenance::revert::{RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceFlush, ProvenanceStore, RunEntity};
@@ -231,6 +232,59 @@ pub fn diff_scan_counters() -> (u64, u64, u64) {
         DIFF_ROWS.load(AtomicOrdering::Relaxed),
         DIFF_FRAME_VISITED.load(AtomicOrdering::Relaxed),
     )
+}
+
+/// **Wall #18 instrument — how many `applied` entries `REVERT` TOUCHED to find one transaction's
+/// ops, and how many it KEPT.** The `OURS_SCAN_*` pair's shape, aimed at `undo_txn`.
+///
+/// `undo_txn` asks a KEYED question — `a.txn == txn` — of `State::applied`, a Vec that is never
+/// pruned and gains one entry per cell that any `MERGE` ever published. `EXAMINED` counts what the
+/// lookup walked; `MATCHED` counts what it returned, which the undo loop must then apply and which
+/// no index can remove. `EXAMINED` growing with merge history while `MATCHED` stays put is the
+/// rescan; both growing together would be a bigger revert, not a defect.
+///
+/// ⚠ Counted per reverted TRANSACTION, not per op: one relaxed add of a local count per call, so
+/// the instrument cannot create the slope it measures.
+pub static REVERT_APPLIED_EXAMINED: AtomicU64 = AtomicU64::new(0);
+pub static REVERT_APPLIED_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `(examined, matched)` since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_applied_counters() -> (u64, u64) {
+    (
+        REVERT_APPLIED_EXAMINED.load(AtomicOrdering::Relaxed),
+        REVERT_APPLIED_MATCHED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// **Wall #18 instrument — how many retained captures one `REVERT`'s planner consulted.**
+///
+/// `captures` keeps every PUBLISHED transaction for the life of the process
+/// (`forget_captures_unless_published` is the only remover, and it drops only the unpublished).
+/// The full-graph planner folded ALL of them into one graph on every call, so this counted
+/// merged-branch history. Since wall #18's walk (`CaptureSet::plan_revert`) it counts the captures
+/// the walk VISITED: the target and each dependent reached, which is the size of the answer. The
+/// debug-build oracle that re-runs the full graph beside it is not counted.
+pub static REVERT_GRAPH_CAPTURES: AtomicU64 = AtomicU64::new(0);
+
+/// Captures consulted since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_captures() -> u64 {
+    REVERT_GRAPH_CAPTURES.load(AtomicOrdering::Relaxed)
+}
+
+/// **Wall #18 instrument — how many retained reads a demand-driven `REVERT` planner examined as
+/// candidates**, one per (write, candidate read) pair it looked at. That is the walk's analogue of
+/// `GRAPH_BUILD_PAIRS`.
+///
+/// It exists so that a planner which walks out from the target cannot hide a linear scan: counting
+/// only the captures it visits would read 1 for a walk that then compares the target's writes
+/// against every read in the table. Counted by `revert_merge` from `CaptureSet::plan_revert`'s
+/// `WalkCost`. (The full-graph planner that came before examined no candidates; it compared pairs,
+/// counted by `GRAPH_BUILD_PAIRS`.)
+pub static REVERT_GRAPH_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+/// Candidates examined since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_candidates() -> u64 {
+    REVERT_GRAPH_CANDIDATES.load(AtomicOrdering::Relaxed)
 }
 
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
@@ -1240,11 +1294,13 @@ struct State {
     /// ⚠ The Vec STAYS. This is an index beside the log, not a replacement for it, so the two must
     /// be pushed together, and `push_applied` is the only place that does either. Its readers that
     /// this key does not serve, enumerated by symbol:
-    /// * `undo_txn`'s `txn` filter (REVERT): one full pass per reverted txn.
     /// * `highest_applied_seq`: one full pass per merge, kept on purpose as an ordering guard
     ///   (D182; do not replace it with `last()`).
     /// * `RuntimeCherryLog::project`'s `at_seq` map: one full pass per cherry-pick.
     /// * `pickable_ops`: returns the whole log, so it is output-sized.
+    ///
+    /// `undo_txn`'s `txn` filter (REVERT), one full pass per reverted txn, was on this list; since
+    /// wall #18 it has its own index, [`State::applied_by_txn`], pushed by the same door.
     ///
     /// ⚠ That list used to say "two" and name only the first two. `AgentRuntime::diff` was a third,
     /// scanning the whole log once per changed row, and nothing listed it (D191, branch-count wall
@@ -1309,6 +1365,20 @@ struct State {
     /// Precision locking (Jordan et al., SIGMOD 1981) is the predicate generalisation. It is not
     /// needed here, because `diff` asks about a row KEY, not a predicate.
     applied_row_high: std::collections::HashMap<(u32, u64), u64>,
+    /// **Wall #18.** `txn` -> positions in `applied`, so `REVERT` stops rescanning the whole log
+    /// for every transaction it undoes.
+    ///
+    /// `undo_txn` asked a KEYED question — `a.txn == txn` — of a Vec that is never pruned, once per
+    /// reverted transaction, under the lock every statement takes: O(every op any merge ever
+    /// published) to find the handful one merge did. It is D86's defect on one of the two readers
+    /// D86's index said it did not serve, and it gets D86's answer: an index beside the log,
+    /// pushed by the same door. This is the materialised form of ARIES's per-transaction
+    /// `PrevLSN` chain — a rollback walks its own transaction's records, never the log.
+    ///
+    /// Each list is increasing, because `push_applied` appends, so a transaction's positions come
+    /// back in log order — the order the scan it replaces produced — and `undo_txn`'s stable sort
+    /// sees the same input it always did.
+    applied_by_txn: std::collections::HashMap<u64, Vec<u32>>,
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id SLOT.
     ///
@@ -1377,7 +1447,24 @@ struct State {
     /// Keyed by txn, and never dropped by `seal`: the dependency graph has to outlive the workspace
     /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
     /// become visible to everyone else, which is the moment they can start being read.
-    captures: BTreeMap<u64, TxnCapture>,
+    ///
+    /// **Wall #18: a `CaptureSet`, not a bare map, so REVERT can walk instead of join.** The set
+    /// indexes every READ as it is retained, and `revert_merge` walks out from the reverted merge
+    /// through that index instead of folding every capture into one graph per call — Θ(N²)
+    /// comparisons under this lock after N merged tasks. It owns the captures privately, so the two
+    /// retention sites below go through `CaptureSet::entry` and cannot retain without indexing.
+    /// The sites and the invariant each keeps:
+    ///
+    /// * fork (`insert`): a new, empty capture, keyed by its own txn — `insert` refuses otherwise;
+    /// * `record_read` (`entry` → `on_read` / `on_write_targeting_read`): what the capture now
+    ///   holds exactly, and every predicate read it appended, is indexed;
+    /// * `record_applied` (`entry` → `on_write`): nothing to index — the walk reads a txn's writes
+    ///   from its own capture;
+    /// * `forget_captures_unless_published` (`remove`), the only remover: every index entry of the
+    ///   capture goes with it;
+    /// * `revert_merge`: reads only — the walk, and in debug builds the full-graph oracle and an
+    ///   index audit beside it.
+    captures: CaptureSet,
     /// Txns whose staged writes reached the shared tables -- by their own `MERGE`, or by a
     /// DESCENDANT's merge publishing writes the descendant inherited at fork time.
     ///
@@ -1409,14 +1496,16 @@ struct State {
 }
 
 impl State {
-    /// **D86.** The one place that appends to `applied`, so the log and its index cannot drift.
+    /// **D86.** The one place that appends to `applied`, so the log and its indexes cannot drift.
     ///
     /// A second source of truth rots when someone adds a write and does not know about the index.
     /// Making the append the only operation removes the ordering to get wrong — the same reason
-    /// `CatalogState::install` exists for the live-branch counter.
+    /// `CatalogState::install` exists for the live-branch counter. Wall #18's `applied_by_txn` is
+    /// pushed here for the same reason, and for EVERY op: a whole-row create or delete has no
+    /// cell, but it is still one of its transaction's ops and `REVERT` still has to undo it.
     fn push_applied(&mut self, op: AppliedOp) {
+        let at = self.applied.len() as u32;
         if let Some(col) = op.col {
-            let at = self.applied.len() as u32;
             self.applied_by_cell
                 .entry((op.tbl.0, op.row.0, col.0))
                 .or_default()
@@ -1426,7 +1515,14 @@ impl State {
         // `State::applied_row_high` for why each of those is load-bearing.
         let high = self.applied_row_high.entry((op.tbl.0, op.row.0)).or_insert(op.seq);
         *high = (*high).max(op.seq);
+        self.applied_by_txn.entry(op.txn.0).or_default().push(at);
         self.applied.push(op);
+    }
+
+    /// Positions in `applied` of one transaction's published ops, in log order. Empty for a
+    /// transaction that published nothing — a cascade can name a live task that never merged.
+    fn applied_of_txn(&self, txn: TxnId) -> &[u32] {
+        self.applied_by_txn.get(&txn.0).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Positions in `applied` for one cell, newest last. Empty when the cell has never been
@@ -3487,10 +3583,7 @@ impl AgentRuntime {
         // no error anywhere. There is one workspace-creation site and it opens a capture, so this
         // arm should be unreachable; it is written this way so that a second site cannot make
         // retention optional by forgetting.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, prov, reader));
+        let mut capture = state.captures.entry(txn, prov, reader);
         match purpose {
             ReadPurpose::Inspection => capture.on_read(shape, versions, Some(summary), observed_at),
             ReadPurpose::RowTargeting => capture.on_write_targeting_read(summary, observed_at),
@@ -7344,10 +7437,7 @@ impl AgentRuntime {
         // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
         // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
         // a merge that published nothing.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        let mut capture = state.captures.entry(txn, snapshot.prov, branch);
         for w in written {
             capture.on_write(w);
         }
@@ -7716,23 +7806,42 @@ impl AgentRuntime {
         merge_id: &str,
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
-        let (targets, rec_branch, graph) = {
+        let (target, plan) = {
             let state = self.state.lock().unwrap();
             let rec = state
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
-        };
-        let target = *targets
-            .first()
-            .ok_or_else(|| {
+            let target = *rec.txns.first().ok_or_else(|| {
                 FerroError::Merge(format!(
                     "merge {} of branch {} recorded no transaction",
-                    merge_id, rec_branch
+                    merge_id, rec.branch
                 ))
             })?;
-        let plan = graph.plan_revert(target, mode);
+            // **Wall #18: walk out from the target; do not join everything ever retained.** This
+            // was `dependency_graph_of(&state.captures)` — every capture cloned into one
+            // `ProvenanceLog` and joined pairwise, Θ(N²) after N merged tasks, under this lock —
+            // for the one target's transitive dependents. The walk finds the same set; see
+            // `provenance::capture_set` for the argument and for what it still costs.
+            let (plan, cost) = state.captures.plan_revert(target, mode);
+            REVERT_GRAPH_CAPTURES.fetch_add(cost.captures, AtomicOrdering::Relaxed);
+            REVERT_GRAPH_CANDIDATES.fetch_add(cost.candidates, AtomicOrdering::Relaxed);
+            // The differential, debug builds only: the full-graph plan the walk replaced, and an
+            // audit that the read index is exactly what rebuilding it from the captures gives. Both
+            // are OBSERVING checks, and neither is the only guard: the REVERT tests assert the
+            // answers themselves, and a release build — where these compile out — must still fail
+            // them for every broken walk (lane_wall18_revert.md Amendment 1, mutants W1-W5).
+            debug_assert!(
+                state.captures.index_is_consistent(),
+                "the REVERT read index disagrees with a rebuild from the captures it indexes"
+            );
+            debug_assert_eq!(
+                plan,
+                state.captures.plan_revert_by_full_graph(target, mode),
+                "the REVERT walk disagrees with the full-graph plan for {target:?} under {mode:?}"
+            );
+            (target, plan)
+        };
         if plan.is_blocked() {
             return Ok(plan);
         }
@@ -7753,8 +7862,23 @@ impl AgentRuntime {
     fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
         let ops: Vec<AppliedOp> = {
             let state = self.state.lock().unwrap();
-            let mut v: Vec<AppliedOp> =
-                state.applied.iter().filter(|a| a.txn == txn).cloned().collect();
+            // **Wall #18: ask the index, do not rescan the log.** This was
+            // `state.applied.iter().filter(|a| a.txn == txn)`: every op any merge ever published,
+            // once per reverted transaction, under the lock every statement takes. The positions
+            // come back in log order, which is the order that filter produced, so the stable sort
+            // below hands back the same undo order it always did, ties included.
+            let mut examined = 0u64;
+            let mut v: Vec<AppliedOp> = state
+                .applied_of_txn(txn)
+                .iter()
+                .filter_map(|&i| {
+                    examined += 1;
+                    state.applied.get(i as usize)
+                })
+                .cloned()
+                .collect();
+            REVERT_APPLIED_EXAMINED.fetch_add(examined, AtomicOrdering::Relaxed);
+            REVERT_APPLIED_MATCHED.fetch_add(v.len() as u64, AtomicOrdering::Relaxed);
             v.sort_by(|a, b| b.seq.cmp(&a.seq));
             v
         };
@@ -8216,8 +8340,11 @@ fn blind_writes_of(
 /// could falsify it.
 ///
 /// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
-/// final element is not necessarily the largest. One pass per merge, the same order of cost
-/// `undo_txn` already pays per revert over the same vector.
+/// final element is not necessarily the largest. That makes it one pass over the whole vector per
+/// merge, so each merge pays for every op published before it. (This used to add "the same order
+/// of cost `undo_txn` already pays per revert over the same vector"; wall #18 indexed `undo_txn`'s
+/// lookup by txn, so that comparison no longer holds and this is the merge path's own whole-log
+/// walk.)
 fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
     applied.iter().map(|a| a.seq).max()
 }
@@ -8368,12 +8495,6 @@ struct PublishedImages {
     post: BTreeMap<(u32, u64), Vec<Value>>,
 }
 
-/// The dependency graph over everything every task retained — exact and predicate-derived alike.
-///
-/// **One derivation, and it lives in `ProvenanceLog::dependency_graph`.** That function is the only
-/// code in the tree that composes read-after-write edges over exact versions with the edges derived
-/// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
-/// does not keep a second copy of it, which is the reconciliation this lane exists to make.
 /// Drop the captures of a workspace that is going away WITHOUT having published anything -- and of
 /// any ancestor whose protection lapsed at the same moment.
 ///
@@ -8467,14 +8588,6 @@ fn capture_is_protected(state: &State, txn: TxnId) -> bool {
         "txn_refs disagrees with a scan of workspaces about txn {txn:?}"
     );
     state.published_txns.contains(&txn.0) || indexed
-}
-
-fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
-    let mut log = ProvenanceLog::new();
-    for c in captures.values() {
-        log.record(c.clone().finish());
-    }
-    log.dependency_graph()
 }
 
 /// The region a range or full scan looked at, retained so that a write landing inside it later is a

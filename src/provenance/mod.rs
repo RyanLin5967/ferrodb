@@ -15,6 +15,7 @@
 
 pub mod capture;
 pub mod deferred;
+pub mod capture_set;
 pub mod durable;
 pub mod readset;
 pub mod revert;
@@ -33,6 +34,7 @@ pub use revert::{
     DependencyEdge, DependencyGraph, DependencyGraphBuilder, RevertMode, RevertPlan,
 };
 pub use deferred::ProvenanceFlush;
+pub use capture_set::{CaptureEntry, CaptureSet, WalkCost};
 pub use durable::DurableProvenanceStore;
 pub use sha256::{prompt_digest, sha256 as sha256_of, to_hex, Sha256};
 pub use store::{MemProvenanceStore, PageProvDict, MAX_PAGE_DICT_ENTRIES, PROV_SLOT_BYTES};
