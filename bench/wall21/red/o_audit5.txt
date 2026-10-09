@@ -1,0 +1,77 @@
+step=o_audit5 sha=60249282efc4198124ed0ae859f149d90901e0b9
+cmd=cargo test --lib --test d200_reap_releases_id_slots -- a_write_error_inside_a_unit_at_open_fails_the_open a_non_branch_read_inside_a_cascade_is_the_slots_refusal branch::table_catalog::tests::a_failed_record_write_leaves_the_slot_in_a_state_span branch::table_catalog::tests::a_question_from_above_a_cycle_ends
+2026-09-24T23:02:13Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2589:17
+     |
+2589 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2761 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2589:17
+     |
+2589 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2761 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2589:17
+     |
+2589 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2762 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2589:17
+     |
+2589 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2762 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.78s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 2 tests
+test branch::table_catalog::tests::a_failed_record_write_leaves_the_slot_in_a_state_span ... FAILED
+test branch::table_catalog::tests::a_question_from_above_a_cycle_ends ... ok
+
+failures:
+
+---- branch::table_catalog::tests::a_failed_record_write_leaves_the_slot_in_a_state_span stdout ----
+
+thread 'branch::table_catalog::tests::a_failed_record_write_leaves_the_slot_in_a_state_span' (363607412) panicked at src/branch/table_catalog.rs:3942:13:
+D264: the failed flip removed R's STATE key before rewriting its record, so no STATE key names it: nothing will ever resume it
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    branch::table_catalog::tests::a_failed_record_write_leaves_the_slot_in_a_state_span
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1681 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `--lib`
+rc=101

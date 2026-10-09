@@ -1,0 +1,318 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2686:17
+     |
+2686 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2858 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2686:17
+     |
+2686 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2858 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2686:17
+     |
+2686 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2859 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2686:17
+     |
+2686 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2859 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.85s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 359 tests
+test branch::arena::tests::a_torn_page_is_refused_rather_than_returned ... ok
+test branch::arena::tests::a_released_page_forgets_the_base_it_was_a_shadow_of ... ok
+test branch::arena::tests::a_corrupt_free_space_map_is_refused_not_partially_loaded ... ok
+test branch::arena::tests::a_v2_checkpoint_image_still_loads_after_the_v3_bump ... ok
+test branch::arena::tests::a_base_whose_id_was_reissued_is_refused_rather_than_encoded_against ... ok
+test branch::arena::tests::a_shadow_nobody_touched_encodes_to_no_runs_although_its_header_differs ... ok
+test branch::arena::tests::a_private_page_is_mutated_in_place_not_shadowed ... ok
+test branch::arena::tests::a_shadow_that_rewrote_the_page_is_refused_a_delta ... ok
+test branch::arena::tests::a_checkpoint_describing_another_region_is_refused ... ok
+test branch::arena::tests::a_shadow_that_changed_a_little_encodes_to_a_delta_far_under_a_page ... ok
+test branch::arena::tests::a_chain_stops_growing_at_the_bound_rather_than_being_caught_on_read ... ok
+test branch::arena::tests::an_unarmed_store_appends_nothing ... ok
+test branch::arena::tests::an_arena_region_is_still_off_limits_after_reopening_the_file ... ok
+test branch::arena::tests::arena_rolls_over_when_an_extent_fills ... ok
+test branch::arena::tests::an_inherited_page_is_shadowed_and_the_original_is_left_alone ... ok
+test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+test branch::arena::tests::fork_allocates_no_page_at_all ... ok
+test branch::arena::tests::freed_extents_are_recycled_rather_than_leaked ... ok
+test branch::arena::tests::freeing_a_superseded_extent_leaves_the_owner_on_its_current_one ... ok
+test branch::arena::tests::free_space_map_survives_a_restart ... ok
+test branch::arena::tests::freeing_an_extent_forgets_its_owner_and_no_other_branch ... ok
+test branch::arena::tests::freeing_an_extent_gives_back_its_fill_suspicion_too ... ok
+test branch::arena::tests::privacy_barrier_is_the_later_of_own_fork_and_latest_child_fork ... ok
+test branch::arena::tests::freeing_an_extent_forgets_only_its_own_shadow_bases ... ok
+test branch::arena::tests::live_arenas_comes_back_in_arena_id_order ... ok
+test branch::arena::tests::checkpoint_round_trips_through_a_file ... ok
+test branch::arena::tests::shadowing_a_page_you_own_records_no_delta_base ... ok
+test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... ok
+test branch::arena::tests::shadowing_your_own_page_across_a_child_fork_parks_the_original ... ok
+test branch::arena::tests::store_refuses_to_share_the_bitmap_allocators_region ... ok
+test branch::arena::tests::the_checkpoint_image_lists_extents_and_current_arenas_in_key_order ... ok
+test branch::arena::tests::the_image_walker_agrees_with_state_bytes_on_a_fully_populated_store ... ok
+test branch::arena::tests::the_image_walker_refuses_a_corrupt_image_instead_of_trusting_its_counts ... ok
+test branch::arena::tests::reopen_from_checkpoint_takes_the_base_from_the_image_not_the_caller ... ok
+test branch::arena::tests::a_zero_filled_extension_is_read_as_the_end_of_the_tail ... ok
+test branch::arena::tests::a_bad_record_with_records_behind_it_is_refused_rather_than_silently_truncating_the_map ... ok
+test branch::arena::tests::an_unknown_tail_record_kind_is_refused_rather_than_skipped ... ok
+test branch::attest::tests::a_branch_with_no_fork_entry_is_reported ... ok
+test branch::attest::tests::a_fork_from_an_unknown_parent_is_reported ... ok
+test branch::arena::tests::the_checkpoint_syncs_the_image_before_the_rename_and_the_directory_after_it ... ok
+test branch::attest::tests::a_recycled_id_slot_does_not_inherit_the_reaped_branchs_chain ... ok
+test branch::attest::tests::a_rewritten_past_cannot_be_made_consistent_with_a_published_root ... ok
+test branch::arena::tests::two_stores_in_the_same_state_checkpoint_byte_identical_images ... ok
+test branch::attest::tests::an_empty_head_must_still_carry_the_empty_root ... ok
+test branch::attest::tests::an_honest_history_verifies ... ok
+test branch::attest::tests::consistency_verification_refuses_malformed_proofs ... ok
+test branch::attest::tests::a_third_party_holding_no_database_can_check_a_proof ... ok
+test branch::attest::tests::every_field_of_an_entry_is_covered_by_the_chain ... ok
+test branch::attest::tests::genesis_is_not_zero ... ok
+test branch::attest::tests::inclusion_verification_refuses_every_way_a_proof_can_be_wrong ... ok
+test branch::attest::tests::largest_power_of_two_below_is_strict ... ok
+test branch::attest::tests::leaf_and_node_hashing_are_domain_separated ... ok
+test branch::attest::tests::mutating_a_historical_record_breaks_the_chain_and_names_it ... ok
+test branch::attest::tests::mutating_the_last_entry_of_a_slot_is_caught_by_the_published_head ... ok
+test branch::attest::tests::relabelling_an_entry_as_a_fork_cannot_excise_its_predecessors ... ok
+test branch::attest::tests::reordering_entries_breaks_consistency ... ok
+test branch::attest::tests::replaying_a_fork_entry_cannot_truncate_a_branchs_ancestry ... ok
+test branch::attest::tests::the_canonical_encoding_round_trips ... ok
+test branch::attest::tests::the_empty_tree_head_is_the_published_sha256_of_the_empty_string ... ok
+test branch::attest::tests::the_entry_encoding_is_fixed_width_and_injective ... ok
+test branch::arena::tests::a_free_and_an_immediate_reclaim_of_one_range_survive_a_restart_in_that_order ... ok
+test branch::attest::tests::the_generation_changes_the_attestation ... ok
+test branch::attest::tests::the_op_codes_are_a_wire_format ... ok
+test branch::attest::tests::truncation_is_invisible_to_a_chain_walk_and_visible_to_a_witnessed_root ... ok
+test branch::attest::tests::verification_does_not_fire_on_legitimate_histories ... ok
+test branch::attest::tests::verify_against_a_published_head_catches_a_mutation_at_every_index ... ok
+test branch::attest::tests::verify_branch_findings_do_not_name_a_digest_nothing_produced ... ok
+test branch::attest::tests::verifying_a_branch_that_is_not_in_the_log_is_a_finding_not_a_pass ... ok
+test branch::catalog::tests::a_chain_far_past_the_old_cap_forks_and_reports_its_depth ... ok
+test branch::arena::tests::a_torn_final_record_is_dropped_and_the_records_in_front_of_it_survive ... ok
+test branch::catalog::tests::a_recycled_id_slot_never_answers_to_the_old_handle ... ok
+test branch::catalog::tests::a_parent_listing_only_reaped_children_comes_back_with_an_empty_array ... ok
+test branch::catalog::tests::a_slot_still_pinning_children_is_not_recycled ... ok
+test branch::arena::tests::freeing_an_extent_checkpoints_the_map_so_a_restart_gets_the_space_back ... ok
+test branch::catalog::tests::a_torn_tail_keeps_every_intact_record ... ok
+test branch::catalog::tests::epochs_are_strictly_monotonic_across_forks ... ok
+test branch::catalog::tests::every_record_sweep_comes_back_in_branch_id_order ... ok
+test branch::catalog::tests::expired_before_excludes_trunk_the_unexpired_and_the_not_live ... ok
+test branch::arena::tests::loading_a_map_from_outside_makes_the_next_persist_a_full_rewrite ... ok
+test branch::catalog::tests::fork_records_the_child_in_the_parent_atomically ... ok
+test branch::catalog::tests::reading_a_reaped_branch_is_a_hard_error ... ok
+test branch::catalog::tests::a_runtime_release_and_a_reload_agree_on_which_slot_is_next ... ok
+test branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else ... ok
+test branch::catalog::tests::reparent_refuses_a_branch_that_is_no_longer_readable ... ok
+test branch::catalog::tests::the_live_child_queries_answer_the_rule_the_array_used_to ... ok
+test branch::attest::tests::the_incremental_tree_matches_the_rfc_recursion ... ok
+test branch::cherry::tests::a_failed_commit_that_touched_one_row_twice_restores_the_original_image ... ok
+test branch::cherry::tests::a_landed_pick_is_undone_by_the_inverse_plan_through_the_same_door ... ok
+test branch::cherry::tests::a_multi_row_pick_lands_every_row_in_one_commit ... ok
+test branch::cherry::tests::an_uninvertible_write_refuses_rather_than_guessing ... ok
+test branch::cherry::tests::a_selected_op_is_not_counted_as_its_own_divergence ... ok
+test branch::cherry::tests::row01_unchanged_target_cell_applies_clean ... ok
+test branch::cherry::tests::regression_an_unselected_source_op_must_not_excuse_a_target_move ... ok
+test branch::catalog::tests::durable_catalog_survives_a_reopen ... ok
+test branch::cherry::tests::row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq ... ok
+test branch::cherry::tests::row02_max_and_min_divergences_commute_as_well_as_add ... ok
+test branch::cherry::tests::row02_target_moved_but_ops_commute_applies_composed_onto_target ... ok
+test branch::cherry::tests::row03_target_moved_and_ops_contradict_refuses_whole ... ok
+test branch::arena::tests::the_public_checkpoint_stages_through_the_durable_helper ... ok
+test branch::cherry::tests::row04_target_moved_to_the_same_value_is_not_a_conflict ... ok
+test branch::cherry::tests::row05_lww_policy_applies_and_reports_the_discarded_write ... ok
+test branch::cherry::tests::row06_no_recorded_witness_refuses_rather_than_assuming_unchanged ... ok
+test branch::cherry::tests::row07_cell_op_on_a_row_the_target_does_not_have_refuses ... ok
+test branch::cherry::tests::row08_a_column_past_the_end_of_a_created_row_image_also_refuses ... ok
+test branch::cherry::tests::row08_column_past_the_end_of_the_target_row_refuses ... ok
+test branch::cherry::tests::row09_rowcreate_onto_an_absent_row_materialises_it ... ok
+test branch::cherry::tests::row10_rowcreate_onto_a_row_that_already_exists_refuses ... ok
+test branch::cherry::tests::row11_rowdelete_of_a_present_row_removes_it ... ok
+test branch::cherry::tests::row12_rowdelete_of_an_absent_row_refuses ... ok
+test branch::cherry::tests::row13_note_a_straddled_selection_is_reported_not_refused ... ok
+test branch::cherry::tests::row13_two_selected_ops_on_one_cell_compose_into_one_write ... ok
+test branch::cherry::tests::row14_ops_with_no_composition_in_the_algebra_refuse_whole ... ok
+test branch::cherry::tests::row15_the_same_op_selected_twice_refuses_because_add_is_not_idempotent ... ok
+test branch::cherry::tests::row16_a_cell_op_on_a_row_this_pick_creates_folds_into_the_insert ... ok
+test branch::cherry::tests::row17_a_cell_op_after_a_delete_in_the_same_pick_refuses ... ok
+test branch::cherry::tests::row18_a_selector_naming_no_recorded_op_refuses ... ok
+test branch::cherry::tests::row19_a_selector_naming_another_branchs_op_refuses ... ok
+test branch::cherry::tests::row20_an_empty_selection_is_refused_not_treated_as_satisfied ... ok
+test branch::cherry::tests::row21_a_commit_that_fails_partway_leaves_the_target_unchanged ... ok
+test branch::cherry::tests::row21_a_refusal_leaves_no_partial_write_even_when_earlier_ops_were_clean ... ok
+test branch::cherry::tests::row21_control_the_same_selection_applies_whole_when_nothing_moved ... ok
+test branch::cherry::tests::row22_a_set_op_on_a_cell_refuses_rather_than_erroring ... ok
+test branch::cherry::tests::row23_a_whole_row_op_with_a_cell_kind_refuses_rather_than_erroring ... ok
+test branch::cherry::tests::row24_a_delete_then_create_selection_replaces_the_row ... ok
+test branch::cherry::tests::row25_a_create_then_delete_selection_still_checks_the_create ... ok
+test branch::cherry::tests::row26_a_cell_op_before_a_delete_in_the_same_pick_is_subsumed ... ok
+test branch::cherry::tests::row27_divergence_that_does_not_explain_the_targets_value_is_not_trusted ... ok
+test branch::cherry::tests::the_inverse_of_a_create_is_a_delete_and_of_a_delete_a_create ... ok
+test branch::cherry::tests::the_inverse_of_a_replacing_create_restores_the_prior_image ... ok
+test branch::cherry::tests::the_straddle_reporter_is_silent_on_a_contiguous_selection ... ok
+test branch::delta::delta_tests::a_compacting_update_blows_the_budget_and_is_stored_whole ... ok
+test branch::delta::delta_tests::a_delta_chain_never_makes_a_read_deeper_than_the_bound ... ok
+test branch::delta::delta_tests::a_delta_refuses_a_payload_that_is_not_a_page ... ok
+test branch::delta::delta_tests::a_delta_round_trips_through_the_real_node_encoder ... ok
+test branch::attest::tests::every_entry_has_a_log_sized_inclusion_proof_that_verifies ... ok
+test branch::arena::tests::parking_pages_by_the_interval_rule_reaches_the_durable_map ... ok
+test branch::delta::delta_tests::a_record_claiming_a_run_past_the_payload_is_refused ... ok
+test branch::delta::delta_tests::a_record_round_trips_through_bytes_and_rebuilds_the_page ... ok
+test branch::delta::delta_tests::a_refused_apply_writes_no_bytes_at_all ... ok
+test branch::delta::delta_tests::a_width_change_makes_compaction_strictly_worse ... ok
+test branch::delta::delta_tests::an_unchanged_page_encodes_to_no_runs_at_all ... ok
+test branch::delta::delta_tests::apply_refuses_runs_that_overlap_or_run_backwards ... ok
+test branch::delta::delta_tests::d93_sweep ... ignored, measurement, not a guard; run explicitly to regenerate the banked table
+test branch::delta::delta_tests::decode_refuses_a_delta_that_is_truncated_or_has_trailing_bytes ... ok
+test branch::delta::delta_tests::encoded_len_is_exactly_the_length_of_the_real_encoding ... ok
+test branch::delta::delta_tests::every_truncation_of_a_record_is_refused_rather_than_read_short ... ok
+test branch::catalog::tests::live_children_is_derived_at_replay_and_excludes_reaped_children ... ok
+test branch::delta::delta_tests::materialise_accepts_a_chain_at_the_bound_and_refuses_one_past_it ... ok
+test branch::delta::delta_tests::four_changed_rows_cost_at_least_ten_times_less_than_four_whole_pages ... ok
+test branch::delta::delta_tests::runs_coalesce_exactly_when_the_gap_is_not_worth_its_framing ... ok
+test branch::delta::delta_tests::the_read_amplification_bound_is_arithmetic_not_hope ... ok
+test branch::delta::delta_tests::the_writer_occupies_exactly_what_the_cost_model_charges ... ok
+test branch::group_commit::tests::a_failed_sync_leaves_the_group_usable ... ok
+test branch::group_commit::tests::a_ticket_taken_during_a_sync_is_not_claimed_by_that_sync ... ok
+test branch::lease_thread::tests::a_gate_that_skips_the_scan_is_refused_rather_than_ignored - should panic ... ok
+test branch::lease_thread::tests::an_unset_knob_is_the_default_and_not_a_refusal ... ok
+test branch::lease_thread::tests::d127_a_capped_refusal_report_still_states_the_true_count ... ok
+test branch::lease_thread::tests::a_database_with_no_interrupted_reap_resumes_nothing ... ok
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 1 workspace(s) forgotten
+test branch::lease_thread::tests::a_reaped_branchs_workspace_is_forgotten_without_the_client_saying_anything ... ok
+test branch::arena::tests::reusing_a_recycled_page_reaches_the_durable_map ... ok
+test branch::delta::delta_tests::stored_bytes_track_rows_changed_rather_than_pages_touched ... ok
+test branch::lease_thread::tests::d127_a_clean_sweep_reports_no_refusal_at_all ... ok
+test branch::lease_thread::tests::an_unexpired_branch_survives_every_scan ... ok
+test branch::lease_thread::tests::d88_the_orphan_sweep_does_not_run_inside_the_statement_lock ... ok
+test branch::lease_thread::tests::each_open_refusal_is_worded_for_its_source ... ok
+test branch::lease_thread::tests::d127_a_refused_reap_is_counted_and_printed_and_does_not_stop_the_sweep ... ok
+test branch::catalog::tests::two_opens_of_one_log_recycle_branch_ids_in_the_same_order ... ok
+test branch::lease_thread::tests::the_scan_interval_knob_refuses_every_value_it_cannot_use ... ok
+test branch::lease_thread::tests::d127_the_trait_sweep_counts_a_refusal_it_cannot_report ... ok
+test branch::arena::tests::putting_the_pending_log_back_reaches_the_durable_map ... ok
+lease: reaped 1 expired branch(es) with no client cooperation (b8@g0); 0 workspace(s) forgotten
+test branch::lease_thread::tests::d98_a_branch_renewed_after_the_query_is_not_reaped ... ok
+test branch::reaper::tests::log_catalog::a_branch_that_dies_before_flushing_allocates_zero_pages ... ok
+lease: finished 1 reap(s) a crash interrupted (b1@g0); 0 workspace(s) forgotten
+lease: gave back 1 id slot(s) that earlier reaps left reaped and never released (D200)
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+lease: reaped 12 expired branch(es) with no client cooperation (b12@g0, b11@g0, b10@g0, b9@g0, b8@g0, b7@g0, b6@g0, b5@g0, b4@g0, b3@g0, b2@g0, b1@g0); 0 workspace(s) forgotten
+test branch::lease_thread::tests::start_finishes_a_reap_a_crash_interrupted_before_any_scan_runs ... ok
+test branch::lease_thread::tests::d98_one_acquisition_never_reaps_more_than_a_chunk ... ok
+test branch::lease_thread::tests::the_thread_reaps_an_expired_branch_with_nobody_asking_it_to ... ok
+test branch::reaper::tests::log_catalog::a_drain_whose_sweep_never_runs_records_its_touched_arenas ... ok
+test branch::reaper::tests::log_catalog::a_drain_that_fails_partway_records_the_arenas_it_already_touched ... ok
+test branch::reaper::tests::log_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... ok
+test branch::reaper::tests::log_catalog::a_pinned_page_is_not_released_while_the_child_lives ... ok
+test branch::reaper::tests::log_catalog::a_reap_interrupted_by_a_crash_is_resumed_not_leaked ... ok
+test branch::arena::tests::a_page_allocated_after_the_last_checkpoint_is_not_reissued_over_a_live_root ... ok
+test branch::reaper::tests::log_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved ... ok
+test branch::attest::tests::a_legitimate_append_stays_consistent_at_every_pair_of_sizes ... ok
+test branch::reaper::tests::log_catalog::a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back ... ok
+test branch::reaper::tests::log_catalog::an_interrupted_reap_resumes_deepest_first_so_no_id_slot_is_stranded ... ok
+test branch::reaper::tests::log_catalog::a_failing_residue_sweep_puts_the_deferred_arenas_back ... ok
+test branch::arena::tests::parking_a_page_forces_the_next_claim_to_rewrite_instead_of_appending ... ok
+test branch::reaper::tests::log_catalog::a_freed_extent_is_reused_so_a_second_wave_costs_no_new_space ... ok
+test branch::reaper::tests::log_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+test branch::reaper::tests::log_catalog::reap_is_idempotent_and_a_stale_handle_is_refused ... ok
+test branch::reaper::tests::log_catalog::fast_path_frees_extents_wholesale_without_touching_a_page_header ... ok
+test branch::reaper::tests::log_catalog::reap_marks_a_branch_reaped_before_detaching_it_from_its_parent ... ok
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test branch::reaper::tests::log_catalog::expired_scan_reaps_deepest_first_so_a_whole_chain_goes_back ... ok
+test branch::lease_thread::tests::a_scan_does_not_reap_while_a_merge_holds_the_runtime_lock ... ok
+test branch::lease_thread::tests::a_signalled_halt_returns_at_once_instead_of_sleeping_the_interval ... ok
+test branch::reaper::tests::log_catalog::renewing_a_lease_keeps_a_branch_out_of_the_scan ... ok
+test branch::arena::tests::a_reopened_store_rewrites_the_image_before_it_appends_again ... ok
+test branch::reaper::tests::log_catalog::slow_path_pins_pages_a_live_child_can_still_see_then_releases_them ... ok
+test branch::reaper::tests::log_catalog::the_crash_orphan_collector_fires_on_state_the_narrowed_sweep_cannot_see ... ok
+test branch::reaper::tests::log_catalog::the_orphan_collector_refuses_a_live_owner_and_refuses_a_non_empty_extent ... ok
+test branch::reaper::tests::log_catalog::the_narrowed_sweep_leaves_the_global_scan_nothing_to_find ... ok
+test branch::reaper::tests::log_catalog::the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence ... ok
+test branch::reaper::tests::log_catalog::trunk_is_never_reaped ... ok
+test branch::reaper::tests::log_catalog::branches_abandoned_before_a_restart_are_still_reaped_after_it ... ok
+test branch::lease_thread::tests::dropping_the_lease_thread_stops_it ... ok
+test branch::lease_thread::tests::stop_does_not_wait_out_the_scan_interval ... ok
+test branch::reaper::tests::table_catalog::a_branch_that_dies_before_flushing_allocates_zero_pages ... ok
+test branch::reaper::tests::table_catalog::a_crash_orphaned_extent_is_collected_when_the_store_is_reopened ... ok
+test branch::reaper::tests::log_catalog::reaping_n_branches_costs_no_catalog_descent_per_branch ... ok
+test branch::reaper::tests::log_catalog::the_reaper_does_not_fire_before_the_lease_expires ... ok
+test branch::reaper::tests::table_catalog::a_drain_whose_sweep_never_runs_records_its_touched_arenas ... ok
+test branch::reaper::tests::table_catalog::a_drain_that_fails_partway_records_the_arenas_it_already_touched ... ok
+test branch::reaper::tests::log_catalog::reclaimed_space_is_reclaimed_on_disk_not_merely_in_a_counter ... ok
+test branch::reaper::tests::table_catalog::a_pinned_page_is_not_released_while_the_child_lives ... ok
+test branch::reaper::tests::table_catalog::a_failing_residue_sweep_puts_the_deferred_arenas_back ... ok
+test branch::reaper::tests::table_catalog::a_reap_interrupted_by_a_crash_is_resumed_not_leaked ... ok
+test branch::arena::tests::the_next_claim_after_a_tail_restore_does_not_overlap_an_extent_the_tail_named ... ok
+test branch::reaper::tests::table_catalog::a_refused_reap_is_not_the_same_answer_as_a_lease_that_moved ... ok
+test branch::reaper::tests::table_catalog::a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back ... ok
+test branch::reaper::tests::table_catalog::an_interrupted_reap_resumes_deepest_first_so_no_id_slot_is_stranded ... ok
+test branch::arena::tests::a_restart_recovers_the_claims_that_live_only_in_the_tail ... ok
+test branch::reaper::tests::table_catalog::d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free ... ok
+test branch::reaper::tests::table_catalog::reap_is_idempotent_and_a_stale_handle_is_refused ... ok
+test branch::reaper::tests::table_catalog::reap_marks_a_branch_reaped_before_detaching_it_from_its_parent ... ok
+test branch::reaper::tests::table_catalog::fast_path_frees_extents_wholesale_without_touching_a_page_header ... ok
+test branch::reaper::tests::log_catalog::abandoned_branches_are_reaped_with_no_client_cooperation_and_pages_return_to_baseline ... ok
+test branch::reaper::tests::log_catalog::a_fast_path_reap_reaches_the_durable_map_not_just_memory ... ok
+test branch::reaper::tests::table_catalog::the_crash_orphan_collector_fires_on_state_the_narrowed_sweep_cannot_see ... ok
+test branch::reaper::tests::table_catalog::renewing_a_lease_keeps_a_branch_out_of_the_scan ... ok
+test branch::reaper::tests::log_catalog::a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map ... ok
+test branch::reaper::tests::table_catalog::slow_path_pins_pages_a_live_child_can_still_see_then_releases_them ... ok
+test branch::record::core_record_tests::a_wrong_length_core_record_is_refused ... ok
+test branch::record::core_record_tests::an_absent_parent_is_distinguishable_from_parent_zero ... ok
+test branch::record::core_record_tests::d5_into_hydrated_is_the_only_exit_and_it_carries_both_fields ... ok
+test branch::record::core_record_tests::the_core_record_round_trips_every_field_it_carries ... ok
+test branch::record::tests::a_column_off_the_allowlist_is_refused_and_one_on_it_writes ... ok
+test branch::record::tests::a_corrupt_envelope_is_rejected_not_defaulted ... ok
+test branch::reaper::tests::table_catalog::trunk_is_never_reaped ... ok
+test branch::reaper::tests::table_catalog::expired_scan_reaps_deepest_first_so_a_whole_chain_goes_back ... ok
+test branch::record::tests::a_delete_needs_authority_over_every_column_it_destroys ... ok
+test branch::record::tests::a_duplicate_column_keeps_the_tighter_floor ... ok
+test branch::record::tests::a_granted_table_resolves_however_the_envelope_was_assembled ... ok
+test branch::record::tests::a_record_written_before_envelopes_existed_still_loads ... ok
+test branch::record::tests::a_record_with_an_envelope_roundtrips_through_bytes ... ok
+test branch::reaper::tests::table_catalog::the_orphan_collector_refuses_a_live_owner_and_refuses_a_non_empty_extent ... ok
+test branch::record::tests::a_representation_change_counts_as_writing_the_cell ... ok
+test branch::reaper::tests::table_catalog::the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence ... ok
+test branch::record::tests::a_row_whose_image_did_not_change_costs_nothing ... ok
+test branch::record::tests::a_statement_that_overruns_the_budget_is_refused_as_a_whole ... ok
+test branch::record::tests::a_table_off_the_allowlist_is_refused_and_one_on_it_writes ... ok
+test branch::arena::tests::a_claim_appends_one_record_where_it_used_to_rewrite_the_whole_image ... ok
+test branch::record::tests::a_verb_off_the_allowlist_is_refused_and_one_on_it_writes ... ok
+test branch::record::tests::an_envelope_can_be_narrowed_but_never_widened ... ok
+test branch::record::tests::an_insert_cannot_launder_a_column_or_a_floor_through_a_null ... ok
+test branch::record::tests::an_insert_cannot_write_a_column_it_was_not_granted ... rc=143

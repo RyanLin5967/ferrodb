@@ -1,0 +1,4 @@
+2026-09-24T21:48:16Z wall21 acquiring (5s poll), pid 48762
+2026-09-24T22:11:22Z wall21 ACQUIRED: 48762 wall21 2026-09-24T22:11:22Z
+2026-09-24T22:19:26Z wall21 rc=0
+2026-09-24T22:19:26Z wall21 released (owner matched)

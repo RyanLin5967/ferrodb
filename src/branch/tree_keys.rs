@@ -70,6 +70,33 @@ pub mod tag {
     /// branches would need every released id in the header, and the header must stay O(1) or
     /// `open` is O(N) again by another route. "Lowest free id" is the first key in this span.
     pub const FREE_ID: u8 = 0x04;
+    /// `[0x08][branch id]` → empty. **D200.** Every slot that may be RELEASABLE and is not yet
+    /// released:
+    /// - put here by `set_state` on the way into `Reaping`;
+    /// - kept by the `Reaped` flip only if nothing is alive below it, and taken off by the flip
+    ///   if something is (a PINNED interior is not releasable);
+    /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
+    ///   frees it runs for an originator whose own key covers it until that originator's release);
+    /// - taken off by `release_id`, and only once the slot IS on the free list;
+    /// - put here by `release_id` on each error it swallows, whatever the slot held before (C1,
+    ///   W1 and W2 of the wall21 review audits): a record read that fails (any slot); a liveness
+    ///   read that fails, on a `Reaped` slot only; a FREE_ID write that fails, on a releasable
+    ///   one. (Audit 4 A6: this said "every error", which overstated the liveness arm.) A key
+    ///   frees nothing: the sweep and `release_id` re-read before acting, and since audit 4 A1 an
+    ///   error on that re-read is the slot's refusal, not a failed open;
+    /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read,
+    ///   whatever the error (W3, A1).
+    ///
+    /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
+    /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
+    /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
+    /// interiors number up to live branches × chain depth under MCTS pruning; neither is here,
+    /// except a pinned slot a failed liveness read keyed (W7). On a catalog only ever reaped by a
+    /// reaper, with no failed read or write, the span is empty; after reaper-less use it holds
+    /// every branch sealed without one until the first open with a reaper releases them (F6 of the
+    /// wall21 review audit). The one-byte key `[0x08]` alone is not a slot: it
+    /// marks the span as complete for this catalog (see `unreleased_index_built`).
+    pub const UNRELEASED: u8 = 0x08;
 }
 
 /// `[0x00][id]`
@@ -148,6 +175,30 @@ pub fn free_id(id: u64) -> Vec<u8> {
     k.push(tag::FREE_ID);
     k.extend_from_slice(&(u64::MAX - id).to_be_bytes());
     k
+}
+
+/// `[0x08][id]` — **D200.** See [`tag::UNRELEASED`].
+pub fn unreleased(id: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9);
+    k.push(tag::UNRELEASED);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `[0x08]` alone — **D200.** Present once the UNRELEASED span names every unreleased slot in
+/// this catalog: written by `create`, or by the one-time build a catalog from before the span
+/// gets at its first open. One byte, so it sorts before every id key in the span and
+/// [`unreleased_id_from_key`] skips it.
+pub fn unreleased_index_built() -> Vec<u8> {
+    vec![tag::UNRELEASED]
+}
+
+/// Recover the id from an UNRELEASED key; `None` for the marker and anything else.
+pub fn unreleased_id_from_key(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key[0] != tag::UNRELEASED {
+        return None;
+    }
+    Some(u64::from_be_bytes(key[1..9].try_into().ok()?))
 }
 
 /// Recover the id from a `FREE_ID` key.
