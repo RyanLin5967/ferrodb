@@ -678,11 +678,18 @@ impl ProvenanceStore for DurableProvenanceStore {
         Ok(())
     }
 
+    // **A poisoned store answers no authorship question (D194 Amendment 13, D).** The append that
+    // poisoned it may have been exactly the stamp that moved a row to its new author, and every
+    // stamp after it was refused. So what memory holds for those rows is their PREVIOUS author, a
+    // confident wrong answer. The physical `attribute` / `who_wrote(rid)` reads keep answering:
+    // they are keyed by the version slot, which a refused stamp never moved.
     fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+        self.refuse_if_poisoned()?;
         self.mem.row_author(table, row)
     }
 
     fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        self.refuse_if_poisoned()?;
         self.mem.attributed_rows(table)
     }
 
@@ -1091,6 +1098,32 @@ mod tests {
         // Anti-vacuity: the reopened store is NOT poisoned, so the refusals above were about the
         // failure and not about this store never having accepted anything.
         s.stamp(rid(1, 1), id).expect("a freshly opened store refused a stamp");
+    }
+
+    /// **A poisoned store refuses to say who last wrote a row** (D194 Amendment 13, review 6 D).
+    ///
+    /// The append that failed may have been exactly the stamp that moved the row to a new author,
+    /// and a merge's later stamps are refused once the store is poisoned. So the author memory still
+    /// holds is the PREVIOUS one for every row the failed merge published after that point. An
+    /// answer of "unknown" is true, and naming that previous author is not.
+    ///
+    /// At `0fdcd81` `row_author` read memory without checking the poison, and named the old author.
+    #[test]
+    fn a_poisoned_store_refuses_to_say_who_wrote_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DurableProvenanceStore::open(dir.path().join("prov.log")).unwrap();
+        let old = s.intern(&run("restock-agent", "run-1")).unwrap();
+        s.stamp_row(7, 1, old).unwrap();
+        s.stamp_row(7, 2, old).unwrap();
+        let new = s.intern(&run("auditor", "run-2")).unwrap();
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(s.stamp_row(7, 1, new).is_err(), "fixture: the injected append failure was swallowed");
+        let answer = s.row_author(7, 2);
+        assert!(
+            answer.is_err(),
+            "a poisoned store named {answer:?} as the author of a row the failed write may have moved"
+        );
+        assert!(s.attributed_rows(7).is_err(), "a poisoned store listed authors it cannot vouch for");
     }
 
     /// **File order is not id order, and replaying in file order would renumber every run.**

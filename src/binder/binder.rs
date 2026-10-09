@@ -33,6 +33,10 @@ pub enum BoundAgentStmt {
     Abandon {
         branch: BranchId,
     },
+    /// `REBASE` — D194 step 4. Re-pin `branch`'s view of main to now; see `AgentRuntime::rebase`.
+    Rebase {
+        branch: BranchId,
+    },
     RevertMerge {
         merge_id: String,
         mode: RevertMode,
@@ -230,6 +234,7 @@ impl<'a> Binder<'a> {
             | Stmt::Diff { .. }
             | Stmt::Merge { .. }
             | Stmt::Abandon { .. }
+            | Stmt::Rebase { .. }
             | Stmt::RevertMerge { .. }
             | Stmt::Simulate { .. } => Err(FerroError::Bind(
                 "agent-session statements are bound by Binder::bind_agent, not into a plan".into(),
@@ -287,6 +292,7 @@ impl<'a> Binder<'a> {
             Stmt::Diff { branch } => Ok(BoundAgentStmt::Diff { branch: target(branch)? }),
             Stmt::Merge { branch } => Ok(BoundAgentStmt::Merge { branch: target(branch)? }),
             Stmt::Abandon { branch } => Ok(BoundAgentStmt::Abandon { branch: target(branch)? }),
+            Stmt::Rebase { branch } => Ok(BoundAgentStmt::Rebase { branch: target(branch)? }),
             Stmt::RevertMerge { merge_id, cascade } => {
                 if merge_id.trim().is_empty() {
                     return Err(FerroError::Bind("merge id must not be empty".into()));
@@ -1152,6 +1158,21 @@ mod tests {
             bind_agent("DIFF BRANCH b_1;", current).unwrap(),
             BoundAgentStmt::Diff { branch } if branch == BranchId::new(1, 0)
         ));
+    }
+
+    #[test]
+    fn test_bind_rebase_defaults_to_the_session_branch_and_refuses_without_one() {
+        let current = Some(BranchId::new(2, 0));
+        assert!(matches!(
+            bind_agent("REBASE;", current).unwrap(),
+            BoundAgentStmt::Rebase { branch } if branch == BranchId::new(2, 0)
+        ));
+        assert!(matches!(
+            bind_agent("REBASE BRANCH b_1;", current).unwrap(),
+            BoundAgentStmt::Rebase { branch } if branch == BranchId::new(1, 0)
+        ));
+        let err = bind_agent("REBASE;", None).unwrap_err();
+        assert!(err.to_string().contains("no agent session"), "REBASE; gave {}", err);
     }
 
     #[test]

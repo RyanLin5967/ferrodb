@@ -261,3 +261,89 @@ fn a_read_of_an_unpublished_row_is_recorded_as_version_zero() {
     // comparison it fully performed.
     assert!(reason.contains("sound"), "the gate should claim exactness here: {reason}");
 }
+
+/// **D194: a read through a branch's pinned snapshot records the version it SAW.**
+///
+/// B forks before A publishes row 1 and reads row 1 only after. B reads main as of its fork, so the
+/// premise it reasons from is the row as it was BEFORE A — and that premise has moved. Recording
+/// the version main holds at the moment of the read (A's) would compare A's version against
+/// itself at merge and publish B.
+#[test]
+fn a_premise_read_through_the_fork_snapshot_after_main_moved_is_held() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    let b_branch = b.agent.as_ref().unwrap().branch;
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty(1), Some(111), "fixture: A's merge did not publish");
+
+    // B's first read of row 1, after A published it: B sees the fork-time row.
+    match db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut b) {
+        Outcome::Rows(r) => assert_eq!(r[0][0], Value::Integer(100), "B did not read as of its fork"),
+        _ => panic!("expected rows"),
+    }
+    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut b);
+    db.ok("MERGE;", &mut b);
+
+    assert_eq!(
+        db.qty(2),
+        Some(200),
+        "B published a write reasoned from a row main had replaced before B ever read it"
+    );
+    let rec = db.runtime.branches().get(b_branch).expect("branch record");
+    assert_eq!(rec.state, BranchState::Quarantined, "B was not held");
+    let reason = db.runtime.quarantine_reason(b_branch).unwrap_or_default();
+    // Row 1 had no published version when B forked, so B saw none: premise 0, now A's seq 1.
+    assert!(
+        reason.contains("read version 0, base now 1"),
+        "B's retained premise is not the version B saw: {reason}"
+    );
+}
+
+/// **The same, where the row B saw WAS a published version — so the history is what answers.**
+///
+/// Z publishes row 1 (seq 1) before B forks; A publishes it again (seq 2) after. B saw Z's version,
+/// which is neither "none" nor what main holds now, so only the version history can name it.
+#[test]
+fn a_premise_read_through_the_fork_snapshot_names_the_older_published_version() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut z = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'z' RUN 'r_z';", &mut z);
+    db.ok("UPDATE oncall SET qty = 105 WHERE id = 1;", &mut z);
+    db.ok("MERGE;", &mut z);
+    assert_eq!(db.qty(1), Some(105), "fixture: Z's merge did not publish");
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    let b_branch = b.agent.as_ref().unwrap().branch;
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty(1), Some(111), "fixture: A's merge did not publish");
+
+    match db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut b) {
+        Outcome::Rows(r) => assert_eq!(r[0][0], Value::Integer(105), "B did not read as of its fork"),
+        _ => panic!("expected rows"),
+    }
+    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut b);
+    db.ok("MERGE;", &mut b);
+
+    assert_eq!(db.qty(2), Some(200), "B published a write reasoned from a replaced row");
+    let rec = db.runtime.branches().get(b_branch).expect("branch record");
+    assert_eq!(rec.state, BranchState::Quarantined, "B was not held");
+    let reason = db.runtime.quarantine_reason(b_branch).unwrap_or_default();
+    assert!(
+        reason.contains("read version 1, base now 2"),
+        "B saw Z's version (seq 1), not none and not A's (seq 2): {reason}"
+    );
+}

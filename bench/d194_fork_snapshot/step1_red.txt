@@ -1,0 +1,27 @@
+# 2026-09-24T01:41:12Z HEAD=fb3ead6 dirty=2
+# cmd: taskpolicy -b timeout 1800 cargo test --test agent_sql_surface a_branch_reads_main_as_of_its_fork_not_as_of_now
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d194-fork-snapshot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 00s
+     Running tests/agent_sql_surface.rs (target/debug/deps/agent_sql_surface-3cafa62735b530de)
+
+running 1 test
+test a_branch_reads_main_as_of_its_fork_not_as_of_now ... FAILED
+
+failures:
+
+---- a_branch_reads_main_as_of_its_fork_not_as_of_now stdout ----
+
+thread 'a_branch_reads_main_as_of_its_fork_not_as_of_now' (324623045) panicked at tests/agent_sql_surface.rs:384:5:
+assertion `left == right` failed: the branch read main as of NOW: it must see row 1's fork-time version, not row 4 (inserted on main after the fork), and row 3 (deleted on main after the fork)
+  left: [(1, 99), (2, 6), (4, 40)]
+ right: [(1, 20), (2, 6), (3, 7)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_branch_reads_main_as_of_its_fork_not_as_of_now
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `--test agent_sql_surface`
+# rc=101 end=2026-09-24T01:42:14Z

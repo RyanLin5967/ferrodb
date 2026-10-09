@@ -92,7 +92,7 @@ use crate::tel::ids::{ColId, RowId, TableId, TxnId};
 use crate::tel::merge::{ConflictKind, ConflictReport, MergeOutcome, MergePolicy};
 use crate::tel::op::{Delta, Op, OpKind};
 use crate::tel::EffectLog;
-use crate::wal::txn::{ReadView, TxnManager};
+use crate::wal::txn::{ReadView, Snapshot, TxnManager};
 
 /// Default lease on an agent branch. Leases are non-cooperative: expiry does not require the
 /// client to call anything (DESIGN.md exit criterion 8).
@@ -471,7 +471,36 @@ struct Workspace {
     txn: TxnId,
     /// Apply-sequence of the target at fork time. Anything applied after this is concurrent with
     /// us, which is what makes the three-way comparison well defined.
+    ///
+    /// **D194: it names the same instant as `fork_snapshot`, and the two move together.** An op at
+    /// or below this seq is treated by the merge as already in this branch's base, so it must be
+    /// in the snapshot the branch reads; one above it is "theirs", so it must not. A child forked
+    /// from a live branch inherits BOTH from its parent, and a lazy pin (see `fork_snapshot`)
+    /// re-reads this one at the moment it pins. Inheriting the snapshot but taking a fresh seq
+    /// would put every op published between the parent's fork and the child's outside the child's
+    /// view AND outside "theirs": `concurrent_op` would never see them, and a cell the child moved
+    /// with an `Add` would compose against a partial record of what the target did.
     fork_seq: u64,
+    /// **D194 — the shared tables as this branch sees them: main AS OF the fork.**
+    ///
+    /// Every read of the base on this branch's behalf goes through this snapshot rather than
+    /// main's current one, so main's commits after the fork never show through and two reads on
+    /// one branch agree. It is plain snapshot isolation over the MVCC the tables already have:
+    /// an UPDATE left the old version on the row's `prev` chain in the time-travel heap, and a
+    /// DELETE stamped `end_ts` in place, so an old snapshot resolves both (`resolve_visibility`).
+    /// Nothing reclaims either today, which is what makes an arbitrarily old pin readable.
+    ///
+    /// Shared, not copied: forks with no transaction begun or ended between them get the same
+    /// `Arc` from `read_snapshot_cached`, and a child forked from a live branch holds its parent's.
+    ///
+    /// **`None` is a branch forked with no transaction manager in hand** — `begin_session`,
+    /// `begin_session_as` and the cluster `fork` take none, and several callers have no database
+    /// at all. Such a branch is pinned by [`Workspace::pin`] at its FIRST read, by whoever reads
+    /// it, and from then on exactly as if it had been pinned at fork. ⚠ The blind spot, stated
+    /// here rather than discovered: main's commits between that fork and that first read ARE
+    /// visible to it. Every production door — `BEGIN AGENT SESSION` (SQL and pgwire) and
+    /// `SIMULATE` — forks through `begin_session_pinned*` and never leaves this `None`.
+    fork_snapshot: Option<Arc<Snapshot>>,
     /// The branch's root page at fork time.
     ///
     /// `set_root` moves the branch's live root on every copy-on-write write, so the fork point is
@@ -500,6 +529,12 @@ struct Workspace {
     /// the probe first shipped, and the first fix (a counter for (a) alone) missed (b).
     unprobeable_rows: u64,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
+    ///
+    /// **True by construction since D194**, and only since: every image that reaches this map
+    /// (`stage_all`'s `insert_if_absent` of `Staged::before`) was read through `fork_snapshot`,
+    /// which does not move, so "at first touch" and "at the fork" are the same image. Before it,
+    /// first touch read main's CURRENT state, and a row main changed between the fork and the
+    /// first touch recorded the later image as the fork-point one.
     base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
     ///
@@ -538,6 +573,22 @@ struct Workspace {
 impl Workspace {
     fn key(tbl: TableId, row: RowId) -> (u32, u64) {
         (tbl.0, row.0)
+    }
+
+    /// **D194.** The snapshot this branch reads the shared tables through, pinning it now if the
+    /// branch was forked without one. Idempotent: once pinned, `fresh` is not called.
+    ///
+    /// Reached only through [`State::pin`]. `fresh` builds the pair under that lock with
+    /// [`pin_seq`], so the seq and the snapshot a lazy pin records describe one instant — the same
+    /// pairing the fork itself makes. See `fork_seq` for why they must never be taken apart.
+    fn pin(&mut self, fresh: impl FnOnce() -> (Arc<Snapshot>, u64)) -> Arc<Snapshot> {
+        if let Some(s) = &self.fork_snapshot {
+            return Arc::clone(s);
+        }
+        let (s, seq) = fresh();
+        self.fork_seq = seq;
+        self.fork_snapshot = Some(Arc::clone(&s));
+        s
     }
 }
 
@@ -810,6 +861,121 @@ struct SiblingSide {
     base_shapes: PersistentMap<String, Schema>,
 }
 
+/// What `REBASE` did (D194 step 4), or exactly why it did nothing.
+///
+/// A refusal changes nothing at all — pin, `fork_seq`, staged rows and premises are as they were —
+/// and every list below names one thing that moved on main since the branch's pin and that the
+/// branch depends on. A client that ignores `rebased` and reads the lists still cannot mistake a
+/// refusal for a success: a success has all three lists empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RebaseReport {
+    pub branch: BranchId,
+    /// True when the branch now reads main as of `fork_seq_after`.
+    pub rebased: bool,
+    pub fork_seq_before: u64,
+    /// Equal to `fork_seq_before` on a refusal. Equal to it on a success too when main published
+    /// nothing through a merge in between: `fork_seq` is the merge clock, and plain SQL writes to
+    /// main move the snapshot without moving it.
+    pub fork_seq_after: u64,
+    /// Staged rows whose base image differs at the new instant, by table name and row id. A staged
+    /// row whose table is gone is listed here too: its base cannot be shown to hold. A row whose key
+    /// no image names is looked up by row id in a scan of its table instead (see `rebase_validate`).
+    pub moved_rows: Vec<(String, RowId)>,
+    /// Exact read premises that moved: `(table, row, version read, version now)`.
+    pub moved_premises: Vec<(TableId, RowId, u64, u64)>,
+    /// Tables whose shape is not the one the branch forked from.
+    pub moved_shapes: Vec<String>,
+}
+
+impl RebaseReport {
+    /// Why nothing changed, as one sentence a person reads; `None` when the branch was rebased.
+    pub fn detail(&self) -> Option<String> {
+        if self.rebased {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !self.moved_rows.is_empty() {
+            let rows: Vec<String> =
+                self.moved_rows.iter().map(|(t, r)| format!("{t}:{r}")).collect();
+            parts.push(format!(
+                "{} staged row(s) whose base changed on main since the pin: {} (REBASE never \
+                 rewrites a staged row; MERGE composes it three-way against main)",
+                self.moved_rows.len(),
+                rows.join(", ")
+            ));
+        }
+        if !self.moved_premises.is_empty() {
+            let reads: Vec<String> = self
+                .moved_premises
+                .iter()
+                .map(|(t, r, was, now)| format!("t{}:r{} (read version {was}, now {now})", t.0, r.0))
+                .collect();
+            parts.push(format!(
+                "{} read premise(s) that moved: {} (what this branch concluded from them cannot be \
+                 carried into a view where they are false; ABANDON it and fork anew)",
+                self.moved_premises.len(),
+                reads.join(", ")
+            ));
+        }
+        if !self.moved_shapes.is_empty() {
+            parts.push(format!(
+                "table shape(s) changed since the pin: {}",
+                self.moved_shapes.join(", ")
+            ));
+        }
+        Some(format!("REBASE of {} refused, nothing changed: {}", self.branch, parts.join("; ")))
+    }
+}
+
+/// What `REBASE`'s first phase established, carried to its second (`AgentRuntime::rebase_commit`).
+///
+/// The lengths are the re-check's fingerprint of the workspace: a write, a pick or a sibling merge
+/// onto the branch appends ops and usually rows, and a schema edit grows `schema_edits`, so if any of
+/// them landed between the phases the commit sees a different number and refuses.
+struct RebaseValidation {
+    branch: BranchId,
+    old_at: Option<Arc<Snapshot>>,
+    old_seq: u64,
+    new_at: Arc<Snapshot>,
+    new_seq: u64,
+    rows_len: usize,
+    ops_len: usize,
+    edits_len: usize,
+    moved_rows: Vec<(String, RowId)>,
+    moved_shapes: Vec<String>,
+}
+
+/// **D194 step 4.** The primary-key value to look a staged row up by at a new instant.
+///
+/// The row id is a one-way hash of the key, so the key has to come from an image: the base image
+/// first (what the row held at the pin), then this branch's own `RowCreate` for a row it inserted,
+/// then the staged image itself — but only when that image still hashes to the row's id, because an
+/// UPDATE on a branch may assign column 0 (`Workspace::unprobeable_rows`). `None` when no image
+/// names the key, e.g. an insert-then-delete this branch inherited from its parent; the caller then
+/// finds the row by id in one scan of its table, since the id cannot be turned back into a key.
+fn rebase_key(
+    base: Option<&Vec<Value>>,
+    staged: &RowState,
+    ops: &[Op],
+    tbl: TableId,
+    row: RowId,
+) -> Option<Value> {
+    if let Some(b) = base {
+        return b.first().cloned();
+    }
+    let created = ops.iter().rev().find_map(|o| match &o.kind {
+        OpKind::RowCreate(img) if o.tbl == tbl && o.row == row => img.first().cloned(),
+        _ => None,
+    });
+    if created.is_some() {
+        return created;
+    }
+    match staged {
+        RowState::Present(v) if row_id_of(v) == row => v.first().cloned(),
+        _ => None,
+    }
+}
+
 /// The fork point of two branches, and what finding it cost.
 ///
 /// **`hops` and `walk_hops` are the instrument the complexity claim is stated in**, and they are
@@ -877,6 +1043,97 @@ pub struct DiffCost {
     pub skipped_subtrees: usize,
 }
 
+/// **D194 new-wall audit, term 1 — what `State::version_history` may forget** (as revised by the
+/// cost review, Amendment 10).
+///
+/// A read through a pin at `F` names the newest version at or below `F` ([`State::version_seen`]).
+/// So a row's non-newest entry `h`, superseded by `s`, is read by exactly the live pins in `[h, s)`.
+/// The rule is that `h` is retained only while one exists:
+///
+/// * **At supersession** (`publish_version`), `h` goes into `readers` if a live pin lies in
+///   `[h, s)`, and is popped otherwise. A pin taken later is at or above every `begin_ts` already
+///   published, so if nobody reads `h` now, nobody ever will. The one pin that does not start
+///   there is a child's, and the child inherits a value that is already live.
+/// * **Each kept entry is filed under its HIGHEST live reader**, the largest pin in `[h, s)`
+///   (`by_reader`, Amendment 14). When that pin value leaves (`drop_pin` takes its count to 0),
+///   its bucket is swept. With `a` the next lower live pin, an entry with `a ≥ h` is still read by
+///   `a` and is handed down to `a`'s bucket in O(log n). Any other entry has no reader left and is
+///   freed. That frees exactly the rectangle `(a, p] × (p, b]`, where `b` is the next higher live
+///   pin.
+///
+///   A departure never touches an entry whose highest reader is another pin, so it never re-tests
+///   what a higher pin reads. Review 6 found that the strip queue this replaced did exactly that:
+///   `(a, p]` restarted at 0 under oldest-first turnover and starved.
+///
+/// Arrivals touch no bucket. A new pin is at or above every recorded `s`, so it lies in no kept
+/// entry's `[h, s)`. An inherited pin copies a value that is already live.
+///
+/// The bound is independent of merges: per row, the newest entry, plus one entry per distinct live
+/// pin value that reads an older version, plus garbage kept below half the row (see `garbage`).
+/// Entries in the buckets of departed pins still in `pending` are over that. Each unit of sweep
+/// work processes one such entry, so the queue drains at the budgets' rate and never restarts.
+///
+/// All six fields are derived from `workspaces` and `version_history`, and they change only
+/// through `State`'s own methods. None holds per-branch state that a statement can write.
+#[derive(Default)]
+struct HistoryRetention {
+    /// `fork_seq` -> the number of LIVE workspaces pinned there (`fork_snapshot` is `Some`).
+    ///
+    /// "Does any live pin lie in `[h, s)`" is one range probe, and "the next lower live pin" is
+    /// one reverse step: O(log n) each. A scan of `workspaces` would answer both at O(open
+    /// sessions), under the lock every statement takes. The keys are also the ONLY `seen_through`
+    /// values the history answers exactly. `record_read` checks membership here before it asks.
+    ///
+    /// Maintained at every place a pin enters or leaves: `insert_workspace` (including its eviction
+    /// of a recycled slot), `remove_workspace`, [`State::pin`] (a lazy pin) and [`State::repin`].
+    /// Debug builds re-derive it by brute force at each of those places ([`State::audit_pins`]), as
+    /// they do `txn_refs`.
+    pins: BTreeMap<u64, u32>,
+    /// Every retained non-newest entry, keyed by its value `h`: `h -> (tbl, row, s)`, where `s` is
+    /// the version that superseded it. The key is unique: every applied op gets its own seq.
+    ///
+    /// Invariant: each entry sits in exactly one bucket of `by_reader`. That bucket is its highest
+    /// live reader's, or a departed pin's still queued in `pending`.
+    readers: BTreeMap<u64, (u32, u64, u64)>,
+    /// `(pin, h)`: entry `h` filed under its highest live reader `pin` (Amendment 14). A departure
+    /// of `pin` finds its own entries by a range probe on this key, and nothing else.
+    by_reader: BTreeSet<(u64, u64)>,
+    /// Per row, how many entries still sit in its `Vec` although they have left `readers`.
+    ///
+    /// Taking an entry out of the middle of a row one at a time would cost O(len) per removal,
+    /// and a hot row read by many live pins would pay O(live pins) each time. So the row is
+    /// compacted only once its garbage reaches half its length, and the capacity is returned then.
+    /// That is O(1) moves per entry freed, amortised.
+    ///
+    /// A garbage entry never changes a live pin's answer. The newest version at or below a live pin
+    /// is always retained, and nothing retained lies between it and the pin.
+    garbage: std::collections::HashMap<(u32, u64), u32>,
+    /// Departed pins whose buckets still hold entries. A pin enters when it departs with a
+    /// non-empty bucket, and leaves in the same step that empties that bucket.
+    ///
+    /// A departure sweeps at most `DEPARTURE_SWEEP_BUDGET` entries, and every publish sweeps
+    /// `PUBLISH_SWEEP_BUDGET` more. So the work under the state lock is bounded per operation, however
+    /// many entries the departing pin read. With no publish and no departure, what is queued waits.
+    pending: BTreeSet<u64>,
+    /// Bucket entries a sweep has processed, freed or handed down, since the state was built. It
+    /// is the instrument that shows each departure touching only the entries it read highest.
+    visits: u64,
+}
+
+/// Entries one pin departure may re-test while it holds the state lock (Amendment 10, decision 3).
+/// The rest of its range waits in `HistoryRetention::pending`.
+const DEPARTURE_SWEEP_BUDGET: usize = 4096;
+
+/// Entries every publish re-tests from `pending`, so the queue drains under ordinary merge traffic.
+const PUBLISH_SWEEP_BUDGET: usize = 2;
+
+/// Give back a row's spare capacity once it is more than twice what the row holds, plus a small
+/// constant so a short row does not reallocate on every change (Amendment 10, decision 2).
+fn release_spare(history: &mut Vec<u64>) {
+    if history.capacity() > 2 * history.len() + 4 {
+        history.shrink_to_fit();
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -1022,6 +1279,42 @@ struct State {
     /// Reservations over bounded cells, so an overdraw fails when it is written.
     escrow: EscrowLedger,
     versions: BTreeMap<(u32, u64), VersionRef>,
+    /// **D194.** Every `begin_ts` a row's entry in `versions` has held, ascending.
+    ///
+    /// `versions` answers "which version does main hold NOW", which was also "which version did a
+    /// branch read" for as long as a branch read main as of now. Since a branch reads as of its
+    /// fork, the version it saw is the newest one at or below its `fork_seq`, and that needs the
+    /// history. Recording `versions`' latest instead would name a version the reader never saw —
+    /// and the premise check at merge would then compare that version against itself and pass a
+    /// branch whose read main had moved past. Written only by [`State::publish_version`].
+    ///
+    /// **Bounded by the live pins** (the D194 new-wall audit; [`HistoryRetention`] says how). It used
+    /// to hold every `begin_ts` ever published, one `u64` per applied op, never freed. Yet the only
+    /// entries a read can ask for are, for each live pin, the newest at or below it. A row now keeps
+    /// those plus its newest entry; with no live pin, its newest entry alone.
+    version_history: std::collections::HashMap<(u32, u64), Vec<u64>>,
+    /// What `version_history` may forget, found without scanning. See [`HistoryRetention`].
+    retention: HistoryRetention,
+    /// **D194: every merge that has reserved sequence numbers and not yet recorded them.** Keyed by
+    /// `reserved.start`, with the merge's publish transaction, which is begun before the
+    /// reservation so that the two are registered in one step.
+    ///
+    /// A pin pairs a snapshot with a seq, and the two must describe one instant. `apply_seq` moves
+    /// at a merge's RESERVATION, before its publish commits, so during that window it is ahead of
+    /// every snapshot. A pin that took it then would claim versions its snapshot lacks: the merge
+    /// would treat them as already in the branch's base, and could overwrite them. [`pin_seq`]
+    /// reads this map to stay below them.
+    ///
+    /// Writers:
+    /// - `PublishingEntry::register` inserts the entry under the reservation's lock and returns
+    ///   the guard that removes it, all in one call.
+    /// - `record_applied` removes it in the same lock acquisition that records the versions.
+    /// - The guard removes it on every other way out of `merge`.
+    ///
+    /// `record_read` also reads it: a pin above an entry's start claims versions that the history
+    /// cannot name yet. Only reservations are recorded here. The map holds no per-branch state and
+    /// admits no write.
+    publishing: BTreeMap<u64, u64>,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.
     ///
@@ -1104,6 +1397,272 @@ impl State {
         self.applied_row_high.get(&(tbl.0, row.0)).copied()
     }
 
+    /// **D194 — the one door that pins a branch's view of the shared tables.** Returns the snapshot
+    /// the branch reads through and the `fork_seq` it pairs with, pinning both now if the branch
+    /// was forked with no transaction manager; `None` when `branch` has no live workspace.
+    ///
+    /// It mutates a workspace, so it counts as one of the ways into branch state that
+    /// `integration_capability_envelope` pins the number of. What it writes is the two fork
+    /// fields and nothing else — no row, no schema edit, nothing the envelope governs — and every
+    /// reader of a branch's view comes through here rather than each taking its own `get_mut`.
+    ///
+    /// A LAZY pin (the branch had none) enters `retention.pins` here. A branch that already had one
+    /// was indexed when its workspace was inserted.
+    fn pin(&mut self, branch: BranchId, txn: &TxnManager) -> Option<(Arc<Snapshot>, u64)> {
+        let (publishing, apply_seq) = (&self.publishing, self.apply_seq);
+        let recorded = self.applied.last().map(|a| a.seq);
+        let ws = self.workspaces.get_mut(&branch)?;
+        let lazy = ws.fork_snapshot.is_none();
+        let at = ws.pin(|| {
+            let s = txn.read_snapshot_cached();
+            let seq = pin_seq(publishing, apply_seq, recorded, &s);
+            (s, seq)
+        });
+        let seq = ws.fork_seq;
+        if lazy {
+            self.add_pin(seq);
+            self.audit_pins();
+        }
+        Some((at, seq))
+    }
+
+    /// **D194, Amendment 11 — a read of main as it stands, paired like a pin.** Returns the snapshot
+    /// and the merge clock that snapshot pairs with (`pin_seq`), taken under one acquisition of the
+    /// lock, as `State::pin` takes a pin's. An unpinned read carries that seq as its
+    /// `seen_through`, so `record_read` names the versions its scan saw, and dates its
+    /// `observed_at`, as of the scan rather than as of the record. It pins nothing, so the history
+    /// keeps nothing for it: a row that moves before the record makes the read refuse.
+    fn read_now(&self, txn: &TxnManager) -> (Arc<Snapshot>, u64) {
+        let at = txn.read_snapshot_cached();
+        let recorded = self.applied.last().map(|a| a.seq);
+        let seq = pin_seq(&self.publishing, self.apply_seq, recorded, &at);
+        (at, seq)
+    }
+
+    /// **D194 step 4 — the one door that MOVES a pin (`REBASE`).** Sets `fork_snapshot` and
+    /// `fork_seq` to a later instant, together, and writes nothing else: no row, no base image, no
+    /// schema edit, nothing the envelope governs. `false` when the branch has no live workspace.
+    ///
+    /// Only [`AgentRuntime::rebase`] calls it, and only after showing that every staged row's base
+    /// image, every exact read premise and every base shape is the same at `(at, seq)` as it was at
+    /// the pin being replaced — which is what keeps `base_rows` the fork-point image by construction
+    /// across the move. It is the second workspace mutator D194 adds beside [`State::pin`], and
+    /// `integration_capability_envelope` counts it.
+    ///
+    /// Moving the pin moves it in `retention.pins` too. If no other branch holds the old value,
+    /// what only it read is swept (`drop_pin`).
+    fn repin(&mut self, branch: BranchId, at: Arc<Snapshot>, seq: u64) -> bool {
+        let Some(ws) = self.workspaces.get_mut(&branch) else { return false };
+        let replaced = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
+        ws.fork_snapshot = Some(at);
+        ws.fork_seq = seq;
+        // Add before drop, so a re-pin to the same seq never passes through "no pin at all", and
+        // the departure's sweep already sees the new pin.
+        self.add_pin(seq);
+        if let Some(old) = replaced {
+            self.drop_pin(old);
+        }
+        self.audit_pins();
+        true
+    }
+
+    /// Record a published row version: in `versions`, which the premise check reads as "now", and
+    /// in `version_history`, which a pinned read looks its version up in. The only writer of
+    /// either, so the two cannot disagree — the same reason `push_applied` is the only writer of
+    /// `applied` and its index.
+    ///
+    /// The superseded newest entry is kept only if a live pin reads it (see [`HistoryRetention`]),
+    /// so a merge loop with no live pin holds one entry per row. The work is O(log n) in the pins
+    /// and the index, plus `PUBLISH_SWEEP_BUDGET` entries of queued sweep. An out-of-order publish
+    /// costs O(len) more, to insert in the middle. That cannot happen with one catalog, because a
+    /// merge holds `&mut Catalog` from its reservation to its record.
+    fn publish_version(&mut self, v: VersionRef) {
+        let key = (v.tbl.0, v.row.0);
+        let mut out_of_order_garbage = false;
+        let pins = &self.retention.pins;
+        let history = self.version_history.entry(key).or_default();
+        match history.last().copied() {
+            Some(newest) if newest < v.begin_ts => {
+                // `v` supersedes `newest`. The live pins in `[newest, v)` read it; any other pin,
+                // and every pin taken from now on, reads something else.
+                match pins.range(newest..v.begin_ts).next_back() {
+                    Some((&top, _)) => {
+                        self.retention.readers.insert(newest, (key.0, key.1, v.begin_ts));
+                        self.retention.by_reader.insert((top, newest));
+                    }
+                    None => {
+                        history.pop();
+                    }
+                }
+                history.push(v.begin_ts);
+                release_spare(history);
+            }
+            _ => {
+                // Out of order (two catalogs only). Its interval is taken as `[v, next retained)`,
+                // which can only be longer than the true one, so the error is over-retention.
+                let at = history.partition_point(|&s| s < v.begin_ts);
+                if history.get(at) != Some(&v.begin_ts) {
+                    history.insert(at, v.begin_ts);
+                    if let Some(&next) = history.get(at + 1) {
+                        match pins.range(v.begin_ts..next).next_back() {
+                            Some((&top, _)) => {
+                                self.retention.readers.insert(v.begin_ts, (key.0, key.1, next));
+                                self.retention.by_reader.insert((top, v.begin_ts));
+                            }
+                            None => out_of_order_garbage = true,
+                        }
+                    }
+                }
+            }
+        }
+        self.versions.insert(key, v);
+        if out_of_order_garbage {
+            self.count_garbage(key);
+        }
+        self.sweep_pending(PUBLISH_SWEEP_BUDGET);
+    }
+
+    /// **A pin value has left** (its count reached 0; Amendment 14). Only the entries it read
+    /// highest can change: they are in its bucket. Queue it if that bucket holds anything, and
+    /// sweep a bounded amount of the queue now (Amendment 10, decision 3). What exceeds
+    /// `DEPARTURE_SWEEP_BUDGET` waits for later sweeps.
+    fn on_pin_departed(&mut self, p: u64) {
+        if self.bucket_first(p).is_some() {
+            self.retention.pending.insert(p);
+        }
+        self.sweep_pending(DEPARTURE_SWEEP_BUDGET);
+    }
+
+    /// The first entry filed under `pin`, if any.
+    fn bucket_first(&self, pin: u64) -> Option<u64> {
+        self.retention.by_reader.range((pin, 0)..=(pin, u64::MAX)).next().map(|&(_, h)| h)
+    }
+
+    /// Process up to `budget` entries from the buckets of departed pins, the oldest departed value
+    /// first. Each entry costs one unit:
+    /// - it is handed down to `a`, the next lower LIVE pin, if `a` still reads it (`a ≥ h`);
+    /// - otherwise it is freed.
+    ///
+    /// A pin leaves `pending` in the step that empties its bucket, so the queue never holds an
+    /// empty bucket and no unit is spent finding nothing.
+    fn sweep_pending(&mut self, mut budget: usize) {
+        while budget > 0 {
+            let Some(&d) = self.retention.pending.first() else { return };
+            debug_assert!(
+                !self.retention.pins.contains_key(&d),
+                "a live pin's bucket was queued as departed ({d})"
+            );
+            let Some(h) = self.bucket_first(d) else {
+                // Unreachable while the invariant holds; costs nothing, and keeps the loop finite.
+                self.retention.pending.remove(&d);
+                continue;
+            };
+            budget -= 1;
+            self.retention.visits += 1;
+            self.retention.by_reader.remove(&(d, h));
+            let below = self.retention.pins.range(..d).next_back().map(|(&a, _)| a);
+            match below {
+                Some(a) if a >= h => {
+                    self.retention.by_reader.insert((a, h));
+                }
+                _ => {
+                    let (tbl, row, _) = self.retention.readers[&h];
+                    self.free_entry(h, (tbl, row));
+                }
+            }
+            if self.bucket_first(d).is_none() {
+                self.retention.pending.remove(&d);
+            }
+        }
+    }
+
+    /// `h` has no reader left. Take it out of `readers` and count it as its row's garbage. Once
+    /// that garbage is half the row, compact the row to its newest entry plus what `readers` still
+    /// holds, and give back the capacity. Amortised, that is O(1) moves per entry freed.
+    fn free_entry(&mut self, h: u64, key: (u32, u64)) {
+        self.retention.readers.remove(&h);
+        self.count_garbage(key);
+    }
+
+    /// One more of `key`'s entries is garbage: in its `Vec`, but neither its newest nor in
+    /// `readers`. Compact the row once that is half of it.
+    fn count_garbage(&mut self, key: (u32, u64)) {
+        let Some(history) = self.version_history.get_mut(&key) else { return };
+        let garbage = self.retention.garbage.entry(key).or_insert(0);
+        *garbage += 1;
+        if 2 * (*garbage as usize) >= history.len() {
+            let newest = history.last().copied();
+            let readers = &self.retention.readers;
+            history.retain(|e| Some(*e) == newest || readers.contains_key(e));
+            release_spare(history);
+            self.retention.garbage.remove(&key);
+        }
+    }
+
+    /// A live workspace became pinned at `seq`.
+    fn add_pin(&mut self, seq: u64) {
+        *self.retention.pins.entry(seq).or_insert(0) += 1;
+    }
+
+    /// A live workspace stopped being pinned at `seq`.
+    fn drop_pin(&mut self, seq: u64) {
+        match self.retention.pins.get_mut(&seq) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.retention.pins.remove(&seq);
+                self.on_pin_departed(seq);
+            }
+            // Loud in debug, and a no-op in release. An over-count keeps history longer than it
+            // is needed. An under-count removes a live pin's value from the index: the history can
+            // then drop what that pin reads, and `record_read` refuses every read through it.
+            // That is loud rather than wrong, but it is still a refusal nobody asked for.
+            None => debug_assert!(false, "pin underflow at fork_seq {seq}"),
+        }
+    }
+
+    /// Re-derive `retention.pins` by brute force and compare. Debug builds only. It is capped like
+    /// [`State::audit_txn_refs`], for the same reason and with the same blind spot.
+    #[cfg(debug_assertions)]
+    fn audit_pins(&self) {
+        if self.workspaces.len() > AUDIT_FULL_MAX {
+            return;
+        }
+        let mut want: BTreeMap<u64, u32> = BTreeMap::new();
+        for ws in self.workspaces.values().filter(|w| w.fork_snapshot.is_some()) {
+            *want.entry(ws.fork_seq).or_insert(0) += 1;
+        }
+        assert_eq!(self.retention.pins, want, "pins disagree with a scan of workspaces");
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn audit_pins(&self) {}
+
+    /// **D194.** The published version of a row that a read SAW, or `None` if it saw none.
+    ///
+    /// `seen_through` is what [`AgentRuntime::visible_rows_where`] reports: `Some(fork_seq)` for a
+    /// read through a branch's pinned snapshot, which saw exactly the versions published at or
+    /// below that seq — so the newest of those. Since Amendment 11 an unpinned read carries the
+    /// `pin_seq` its snapshot was paired with (`State::read_now`), for the same reason. `None`
+    /// still means "the latest", and no read path passes it any more.
+    ///
+    /// ⚠ For a row whose latest version is above `seen_through`, the history answers exactly only
+    /// when `seen_through` is a LIVE pin, a key of `retention.pins`. For any other value the version
+    /// may have been dropped, and the answer would be wrong. That is why
+    /// [`AgentRuntime::record_read`] refuses such a read before it calls this: a pin released while
+    /// the read ran, or a read that was never pinned, whose row moved in the meantime.
+    /// `rebase_commit` passes `apply_seq`, which is at or above every latest version, so it never
+    /// reaches the history.
+    fn version_seen(&self, tbl: TableId, row: RowId, seen_through: Option<u64>) -> Option<VersionRef> {
+        let latest = self.versions.get(&(tbl.0, row.0)).copied()?;
+        let Some(through) = seen_through else { return Some(latest) };
+        if latest.begin_ts <= through {
+            return Some(latest);
+        }
+        let history = self.version_history.get(&(tbl.0, row.0))?;
+        let at = history.partition_point(|&s| s <= through);
+        (at > 0).then(|| VersionRef { begin_ts: history[at - 1], ..latest })
+    }
+
     /// Insert a workspace, taking the txn references it holds. One of the two doors into
     /// `workspaces`; see [`State::txn_refs`] for why there are only two.
     fn insert_workspace(&mut self, branch: BranchId, ws: Workspace) {
@@ -1144,12 +1703,22 @@ impl State {
             .collect();
         let olds: Vec<Workspace> =
             displaced.into_iter().filter_map(|dead| self.workspaces.remove(&dead)).collect();
+        // A pinned workspace enters `retention.pins` with the workspace. The pins of displaced
+        // workspaces leave in the same call, and `drop_pin` sweeps what only they could read.
+        let pinned_at = ws.fork_snapshot.is_some().then_some(ws.fork_seq);
         self.workspaces.insert(branch, ws);
+        if let Some(seq) = pinned_at {
+            self.add_pin(seq);
+        }
         for old in olds {
             self.drop_txn_refs(&old);
+            if old.fork_snapshot.is_some() {
+                self.drop_pin(old.fork_seq);
+            }
             forget_captures_unless_published(self, &old);
         }
         self.audit_txn_refs();
+        self.audit_pins();
     }
 
     /// Re-derive `txn_refs` by brute force and compare. Debug builds only.
@@ -1228,10 +1797,18 @@ impl State {
     /// The references are released **before** the caller inspects the result, which is what makes
     /// `capture_is_protected` a question about the workspaces that REMAIN — the same thing the
     /// scan meant when it ran after `BTreeMap::remove` had already taken this one out.
+    ///
+    /// A pinned workspace takes its pin out of `retention.pins`. If no other branch holds that
+    /// value, `drop_pin` sweeps what only it read, whatever its age: freeing does not wait for the
+    /// oldest pin, nor for each row's next publish.
     fn remove_workspace(&mut self, branch: &BranchId) -> Option<Workspace> {
         let ws = self.workspaces.remove(branch)?;
         self.drop_txn_refs(&ws);
+        if ws.fork_snapshot.is_some() {
+            self.drop_pin(ws.fork_seq);
+        }
         self.audit_txn_refs();
+        self.audit_pins();
         Some(ws)
     }
 
@@ -1773,9 +2350,14 @@ impl AgentRuntime {
     /// The full form: fork a branch and intern the run under everything the caller declared
     /// about it, the prompt included.
     ///
-    /// This is the only one of the three with a body; the other two are the shapes that predate
-    /// [`RunIdentity`] and delegate here. One body is the point — a second copy of the interning
-    /// sequence is how the `[0u8; 32]` this row exists to remove survived being fixed once.
+    /// The other two are the shapes that predate [`RunIdentity`] and delegate here, and every
+    /// fork door ends in the one body, `fork_session_staged`. One body is the point — a second
+    /// copy of the interning sequence is how the `[0u8; 32]` this row exists to remove survived
+    /// being fixed once.
+    ///
+    /// **D194: this takes no transaction manager, so the branch is pinned at its first read, not
+    /// here** — see `Workspace::fork_snapshot`. A caller that has one uses
+    /// [`AgentRuntime::begin_session_pinned`].
     pub fn begin_session_as(
         &self,
         id: RunIdentity<'_>,
@@ -1784,6 +2366,36 @@ impl AgentRuntime {
         let (session, durability) = self.begin_session_as_staged(id, parent)?;
         durability.complete()?;
         Ok(session)
+    }
+
+    /// **D194 — fork a branch that reads main AS OF THIS INSTANT, plus its own edits.**
+    ///
+    /// `base` is the database's transaction manager; the branch's snapshot is taken from it under
+    /// the same lock that records `fork_seq`, so the two describe one instant. Forking from a live
+    /// branch inherits that branch's snapshot and seq instead — the child sees exactly its
+    /// parent's view — and pins the parent first if it had not been read yet. Durable on return,
+    /// as [`AgentRuntime::begin_session_as`] is.
+    pub fn begin_session_pinned(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: &TxnManager,
+    ) -> Result<AgentSession, FerroError> {
+        let (session, durability) = self.begin_session_pinned_staged(id, parent, base)?;
+        durability.complete()?;
+        Ok(session)
+    }
+
+    /// [`AgentRuntime::begin_session_pinned`], stopping one step short of durable, exactly as
+    /// [`AgentRuntime::begin_session_as_staged`] does and under the same rule: only while holding
+    /// a lock wider than the runtime's own. This is the door `BEGIN AGENT SESSION` uses.
+    pub fn begin_session_pinned_staged(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: &TxnManager,
+    ) -> Result<(AgentSession, ForkDurability), FerroError> {
+        self.fork_session_staged(id, parent, Some(base))
     }
 
     /// `begin_session_as`, **stopping one step short of durable.**
@@ -1808,6 +2420,17 @@ impl AgentRuntime {
         &self,
         id: RunIdentity<'_>,
         parent: BranchId,
+    ) -> Result<(AgentSession, ForkDurability), FerroError> {
+        self.fork_session_staged(id, parent, None)
+    }
+
+    /// The one fork body. `base` is `None` only for the doors that take no transaction manager;
+    /// see `Workspace::fork_snapshot` for what that leaves unpinned and when it is pinned.
+    fn fork_session_staged(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+        base: Option<&TxnManager>,
     ) -> Result<(AgentSession, ForkDurability), FerroError> {
         let RunIdentity { agent_id, run_id, model, prompt } = id;
         if agent_id.trim().is_empty() {
@@ -1897,7 +2520,30 @@ impl AgentRuntime {
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
-        let fork_seq = state.apply_seq;
+        // **D194 — the instant this branch reads main at.** Taken here, under the lock that also
+        // reads `apply_seq`, so the snapshot and `fork_seq` are one instant (see `fork_seq` for
+        // why they may never come from two). A fork from a live branch takes its parent's pair
+        // rather than a fresh one: the child's view IS the parent's view, and a fresh seq beside
+        // an inherited snapshot would hide from the merge every op published in between. If that
+        // parent was itself forked with no manager and has not been read, forking a child is the
+        // moment it is pinned — otherwise the two would pin separately, at different instants.
+        if let Some(txn) = base {
+            state.pin(parent, txn);
+        }
+        let (fork_seq, fork_snapshot) = match state.workspaces.get(&parent) {
+            Some(p) => (p.fork_seq, p.fork_snapshot.clone()),
+            // The seq comes from the snapshot, not from `apply_seq` alone: a merge that has
+            // reserved but not committed is not in the snapshot, so it must not be in the seq
+            // either (`State::publishing`).
+            None => match base {
+                Some(txn) => {
+                    let s = txn.read_snapshot_cached();
+                    let recorded = state.applied.last().map(|a| a.seq);
+                    (pin_seq(&state.publishing, state.apply_seq, recorded, &s), Some(s))
+                }
+                None => (state.apply_seq, None),
+            },
+        };
         // Forking from a branch that is itself an open agent task: the child's visible state *is*
         // the parent's state at fork time, uncommitted rows included, exactly as the child's root
         // page is the parent's root page. Taking a snapshot rather than a link is what keeps the
@@ -1944,6 +2590,7 @@ impl AgentRuntime {
                 prov,
                 txn,
                 fork_seq,
+                fork_snapshot,
                 fork_root: record.root_page_id,
                 rows,
                 unprobeable_rows,
@@ -2021,6 +2668,64 @@ impl AgentRuntime {
             .into_iter()
             .filter_map(|(id, p)| self.prov_store.lookup(p).ok().map(|e| (id, e)))
             .collect()
+    }
+
+    /// **D194 new-wall audit, term 3: what the live branches' pinned snapshots retain.** Returns
+    /// `(pinned live branches, distinct snapshots among them, active txn ids those snapshots hold)`.
+    ///
+    /// "Distinct" means distinct `Arc`s, because that is what memory is. Two things already share
+    /// one: a child holds its parent's `Arc`, and forks on one thread with no `TxnManager`
+    /// transaction begun or ended between them share `read_snapshot_cached`'s. Each distinct
+    /// snapshot holds the active set as it was when the snapshot was taken. That set counts SQL
+    /// transactions in flight, not branches, because an agent's txn ids never enter the manager's
+    /// table.
+    ///
+    /// This is an instrument. It costs O(live branches) under the state lock, so no statement path
+    /// calls it.
+    pub fn fork_snapshot_census(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let mut distinct: std::collections::HashSet<*const Snapshot> =
+            std::collections::HashSet::new();
+        let (mut pinned, mut ids) = (0, 0);
+        for s in state.workspaces.values().filter_map(|ws| ws.fork_snapshot.as_ref()) {
+            pinned += 1;
+            if distinct.insert(Arc::as_ptr(s)) {
+                ids += s.active.len();
+            }
+        }
+        (pinned, distinct.len(), ids)
+    }
+
+    /// Whether this runtime still holds a live workspace for `branch`: it has been forked and not
+    /// yet merged, abandoned or reaped. A SQL session unbinds its branch on exactly this answer
+    /// after a MERGE or an ABANDON, whatever that statement returned (Amendment 13, A).
+    pub fn has_live_workspace(&self, branch: BranchId) -> bool {
+        self.state.lock().unwrap().workspaces.contains_key(&branch)
+    }
+
+    /// The merge id this runtime recorded for a merge FROM `branch`, if any. A record exists
+    /// exactly when that merge's publish committed and its versions were recorded, whatever
+    /// failed after that.
+    ///
+    /// It scans every merge ever recorded (`merges` is not pruned). It is for an error path, the
+    /// cluster's publish-failure message (Amendment 13, C), and no statement path calls it.
+    pub fn published_merge_of(&self, branch: BranchId) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state.merges.iter().find(|(_, m)| m.branch == branch).map(|(id, _)| id.clone())
+    }
+
+    /// **D194 cost review (Amendment 10): what `version_history` holds.** Returns
+    /// `(rows with a history, entries, capacity)`, summed over every row, so a harness can show the
+    /// history flat against merges and the capacity returned.
+    ///
+    /// This is an instrument. It costs O(rows ever published) under the state lock, so no
+    /// statement path calls it.
+    pub fn version_history_census(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let rows = state.version_history.len();
+        let entries = state.version_history.values().map(Vec::len).sum();
+        let capacity = state.version_history.values().map(Vec::capacity).sum();
+        (rows, entries, capacity)
     }
 
     /// Exit criterion 9: which agent + run + model wrote a given row.
@@ -2346,20 +3051,55 @@ impl AgentRuntime {
         alias: Option<&str>,
         raw: Option<&Expr>,
         bound: Option<&BoundExpr>,
-    ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
+    ) -> Result<(Vec<(RowId, Vec<Value>)>, Option<u64>), FerroError> {
         debug_assert_eq!(
             raw.is_some(),
             bound.is_some(),
             "raw and bound must be the same predicate in two forms, or the two sides of the \
              overlay are filtered differently"
         );
-        let base = scan_table_where(table, alias, raw, ctx)?;
+        // **D194 — the base is read AS OF THE BRANCH'S FORK, not as of now.** This read main's
+        // CURRENT snapshot (`read_snapshot_cached`) on every statement, so every commit to main
+        // after the fork showed through the branch and two SELECTs on one branch could disagree.
+        // It now reads through the workspace's `fork_snapshot`; the overlay below is untouched, so
+        // the D55 commutation argument above is too — only WHICH base it overlays has changed.
+        //
+        // Taken under the same lock acquisition as the staged map, so a branch pinned lazily here
+        // (`Workspace::pin`) pairs its snapshot with `apply_seq` read under that lock. A branch
+        // with no live workspace — `AS OF BRANCH` on a merged or abandoned one — has no fork to
+        // be as of, and reads main as it stands, as it always did.
+        //
+        // The second value returned is always `Some`. For a read through a pin it is the pin's
+        // `fork_seq`. For an unpinned read it is the seq its snapshot pairs with, from
+        // `State::read_now` (Amendment 11). Either way the read-set can record what this read saw
+        // (`record_read`, `State::version_seen`), and `record_read` refuses `None`.
+        let (at, seen_through, staged) = match branch {
+            Some(b) => {
+                let mut state = self.state.lock().unwrap();
+                match state.pin(b, &ctx.txn) {
+                    // D57 item 1 below: the clone is taken under the lock.
+                    Some((at, fork_seq)) => {
+                        let ws = &state.workspaces[&b];
+                        (at, Some(fork_seq), Some((ws.rows.clone(), ws.unprobeable_rows)))
+                    }
+                    None => {
+                        let (at, seq) = state.read_now(&ctx.txn);
+                        (at, Some(seq), None)
+                    }
+                }
+            }
+            None => {
+                let (at, seq) = self.state.lock().unwrap().read_now(&ctx.txn);
+                (at, Some(seq), None)
+            }
+        };
+        let base = scan_table_where(table, alias, raw, ctx, at)?;
         let tbl = table_id(table);
         let mut rows: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         for r in base {
             rows.insert(row_id_of(&r).0, r);
         }
-        if let Some(b) = branch {
+        {
             // **D57.** This used to hold the State mutex and iterate EVERY staged row on the
             // branch — all tables — per statement: ~11.5 ns per staged row per read, ×8 at D27's
             // measured 4,000 staged rows (`bench/d57_staged_curve_before.txt`), and the whole
@@ -2383,10 +3123,6 @@ impl AgentRuntime {
             // 3. Every other predicate walks only THIS table's prefix of the key space, which is
             //    the honest floor for a non-key predicate — the same reason the base table needs
             //    an index for one.
-            let staged = {
-                let state = self.state.lock().unwrap();
-                state.workspaces.get(&b).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
-            };
             if let Some((staged, unprobeable_rows)) = staged {
                 let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
@@ -2440,7 +3176,7 @@ impl AgentRuntime {
                 }
             }
         }
-        Ok(rows.into_iter().map(|(k, v)| (RowId(k), v)).collect())
+        Ok((rows.into_iter().map(|(k, v)| (RowId(k), v)).collect(), seen_through))
     }
 
     /// Execute a single-table SELECT against a branch's visible state, recording the read-set.
@@ -2480,7 +3216,7 @@ impl AgentRuntime {
         };
         let (proj, _out) = binder.bind_projection(columns.clone(), &scope)?;
 
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             ctx,
             Some(branch),
             &from.name,
@@ -2506,6 +3242,7 @@ impl AgentRuntime {
                 where_clause.as_ref(),
                 bound_where.as_ref(),
                 ReadPurpose::Inspection,
+                seen_through,
             )?;
         }
 
@@ -2529,6 +3266,7 @@ impl AgentRuntime {
     /// inspection or a write statement addressing its own rows ([`ReadPurpose`]).
     ///
     /// Refuses when the reading session is gone, rather than retaining nothing and reporting success.
+    #[allow(clippy::too_many_arguments)]
     fn record_read(
         &self,
         reader: BranchId,
@@ -2538,6 +3276,7 @@ impl AgentRuntime {
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
         purpose: ReadPurpose,
+        seen_through: Option<u64>,
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
         // **A read whose session is gone REFUSES; it does not report success while retaining
@@ -2567,6 +3306,87 @@ impl AgentRuntime {
                 )))
             }
         };
+        // **A read must carry the seq its snapshot was paired with** (Amendment 12, F6). Every read
+        // path pairs one: a pin's `fork_seq`, or `State::read_now`'s for an unpinned read. Without
+        // it this would name each row's LATEST version and date the read at record time, which is
+        // the cost review's Q7. So a caller that passes `None` is refused, not served.
+        if seen_through.is_none() {
+            return Err(FerroError::Internal(format!(
+                "a read on behalf of {reader} carries no seq its snapshot pairs with, so the \
+                 versions it saw cannot be named"
+            )));
+        }
+        // **A read that the history can no longer answer REFUSES. It does not record a version it
+        // may not have seen.** (D194 new-wall audit; Amendment 11.)
+        //
+        // `seen_through` was taken with the snapshot, under an earlier acquisition of this lock:
+        // a pin for a pinned read, and `pin_seq` for an unpinned one (`State::read_now`). The scan
+        // ran between the two acquisitions with the lock released, and a merge can record, or a
+        // pin can be sealed or re-pinned, in that gap. For each matched row:
+        // * If its latest version is at or below `seen_through`, the scan saw exactly that latest
+        //   version, and that is what gets named. No history is involved.
+        // * If a newer version landed, the version the scan saw is the newest at or below
+        //   `seen_through`. The history answers that exactly only for a LIVE pin value, a key of
+        //   `retention.pins`. Otherwise it may already be gone: the pin was released mid-read, or
+        //   the read was never pinned. Then `version_seen` would answer "none" or an older version,
+        //   the premise check would compare the wrong thing, and REVERT would draw its edge from
+        //   the wrong merge. So the read refuses.
+        //
+        // A read whose own pin moved is still answered exactly if another live branch pins the same
+        // value, for example a child that inherited it, or if none of its rows moved.
+        //
+        // Where the gap can be reached, stated rather than assumed:
+        // * NOT over pgwire. A connection's shared-path `SELECT` holds its registered read pass
+        //   across all of `try_run_read`, and every exclusive statement's `ServerContext::catalog()`
+        //   drains registered readers before it runs (`drain_readers`).
+        // * In-process, yes. `abandon` and `forget_reaped_branches` take no `ExecCtx`, so a library
+        //   caller can seal the branch while another thread reads it through a catalog handle.
+        //
+        // Only an INSPECTION whose shape records exact versions can record one. A row-targeting
+        // read, and a range or full-scan inspection, record a region and its `observed_at`, which
+        // is exact at `seen_through + 1`. Neither needs the history, and neither is refused
+        // (Amendment 8).
+        //
+        // The gate is by shape. The per-row refusal below looks only at matched rows, so a read that
+        // matched none is never refused by it. The unrecorded-merge refusal does not look at rows,
+        // so an exact-shape read that matched nothing is still refused by that one, although it
+        // records a predicate. That errs toward refusing, and a refusal is safe.
+        let names_versions = purpose == ReadPurpose::Inspection
+            && shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions;
+        let released = seen_through.filter(|f| {
+            names_versions
+                && !state.retention.pins.contains_key(f)
+                && matched.iter().any(|(rid, _)| {
+                    state.versions.get(&(tbl.0, rid.0)).is_some_and(|v| v.begin_ts > *f)
+                })
+        });
+        if let Some(f) = released {
+            return Err(FerroError::Branch(format!(
+                "the snapshot this read went through (main as of apply-seq {f}) was released while \
+                 this read ran, or was never a pin, and main has published a newer version of a row \
+                 it read since: {reader}, or the branch it read AS OF, was re-pinned by REBASE or \
+                 sealed while the read was in flight, or the read was of a branch no workspace \
+                 pins. The versions it saw can no longer be named, and a read that retained the \
+                 wrong ones would be worse than none. Nothing was retained. Retry."
+            )));
+        }
+        // **And one whose pin claims a merge that has not recorded yet** (D194, Amendment 7). A pin
+        // taken between a merge's commit and its `record_applied` contains the merge, so
+        // `pin_seq` rightly gives it the merge's end. But `versions` and `version_history` do not
+        // have those versions until the record, and a read recorded in that gap would name the
+        // superseded one. A pin above some publishing entry's start is exactly that pin: one taken
+        // before the reservation sits at or below the start, and one taken inside the window sits
+        // at it. In-process only, like the case above.
+        let unrecorded = seen_through.filter(|&f| {
+            names_versions && state.publishing.keys().next().is_some_and(|&start| start < f)
+        });
+        if let Some(f) = unrecorded {
+            return Err(FerroError::Branch(format!(
+                "the snapshot this read went through (main as of apply-seq {f}) contains a merge \
+                 that has not recorded its versions yet, so the versions this read saw cannot be \
+                 named. Nothing was retained. Retry."
+            )));
+        }
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
         // real observation rather than a null: `state.versions` is written only when a merge
         // PUBLISHES, so a row nobody has merged yet genuinely has no version to name.
@@ -2575,10 +3395,15 @@ impl AgentRuntime {
         // and the first `seq` is 1, so a sentinel of 1 collided with the very first publish and the
         // premise check silently compared equal. Absence is already the signal; it does not need a
         // number, and any number picked here is one a real stamp can eventually reach.
+        //
+        // **D194: the version the read SAW, not the one main holds now.** A read through a branch's
+        // pinned snapshot saw main as of the fork, so a row published since shows its OLDER
+        // version to that read — and recording the newer one would make the premise check at
+        // merge compare it against itself and pass. `State::version_seen` names the older one.
         let versions: Vec<VersionRef> = matched
             .iter()
             .map(|(rid, _)| {
-                state.versions.get(&(tbl.0, rid.0)).copied().unwrap_or(VersionRef {
+                state.version_seen(tbl, *rid, seen_through).unwrap_or(VersionRef {
                     tbl,
                     row: *rid,
                     rid: RecordId { page_id: 0, slot_num: 0 },
@@ -2596,7 +3421,11 @@ impl AgentRuntime {
         // itself, a scan would come out depending on the write that landed AT that seq — a write it
         // could not have seen — and every scan would then be a dependent of the merge immediately
         // preceding it, which is the same under-reporting failure with the sign flipped.
-        let observed_at = state.apply_seq + 1;
+        //
+        // **D194: a read through a pinned snapshot saw the clock as of the pin**, so its high water
+        // mark is `fork_seq + 1`, not `apply_seq + 1`. The latter would name as a dependency every
+        // merge published between the fork and this read — writes the read could not see.
+        let observed_at = seen_through.unwrap_or(state.apply_seq) + 1;
         let summary = predicate_summary(tbl, where_clause, bound_where, matched.len() as u64);
         // `or_insert_with`, never `if let Some`. A read that finds no capture and retains nothing
         // silently is indistinguishable from a read that had nothing to retain, and that is the
@@ -2635,6 +3464,7 @@ impl AgentRuntime {
     /// already validates the cells a branch wrote against the target's current image with a witness
     /// per cell, and adding a second staleness mechanism on top of it would promote a resolvable
     /// cell merge into a hard `Retry`. What varies is the [`ReadPurpose`].
+    #[allow(clippy::too_many_arguments)]
     fn record_write_scan(
         &self,
         branch: BranchId,
@@ -2643,6 +3473,7 @@ impl AgentRuntime {
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
+        seen_through: Option<u64>,
     ) -> Result<(), FerroError> {
         let purpose = match access_shape(where_clause, schema) {
             // `WHERE <pk> = <literal>`: the statement named the row, it did not look at anything.
@@ -2658,6 +3489,7 @@ impl AgentRuntime {
             where_clause,
             bound_where,
             purpose,
+            seen_through,
         )
     }
 
@@ -2881,7 +3713,7 @@ impl AgentRuntime {
             static NP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *NP.get_or_init(|| std::env::var("D170_NOPUSHDOWN").map(|v| v == "1").unwrap_or(false))
         };
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
@@ -2934,6 +3766,7 @@ impl AgentRuntime {
             &matched,
             where_clause.as_ref(),
             bound_where.as_ref(),
+            seen_through,
         )?;
         let touched = staged.len();
         self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
@@ -3012,6 +3845,7 @@ impl AgentRuntime {
                 Some(&pk_pred),
                 Some(&bound_pk),
             )?
+            .0
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
@@ -3065,7 +3899,7 @@ impl AgentRuntime {
         // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
         // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
         // between the two paths. What changes is how many rows reach it, never which ones pass.
-        let rows = self.visible_rows_where(
+        let (rows, seen_through) = self.visible_rows_where(
             &ctx.read(),
             Some(branch),
             table,
@@ -3104,6 +3938,7 @@ impl AgentRuntime {
             &matched,
             where_clause.as_ref(),
             bound_where.as_ref(),
+            seen_through,
         )?;
         let n = staged.len();
         self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
@@ -3665,6 +4500,259 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// **D194 step 4 — `REBASE`: move a branch's view of main to NOW, or say exactly why not.**
+    ///
+    /// A branch reads main as of its pin. This re-pins it — `fork_snapshot` and `fork_seq`, together,
+    /// through `State::repin` — to main as it stands, **only if nothing the branch depends on moved
+    /// between the old pin and now**:
+    ///
+    /// 1. every staged row's base image equals the row's image at the new instant (a point lookup
+    ///    through the new snapshot, as `evaluate_merge` does it, so the cost is O(staged · log N);
+    ///    a row whose key no image names — an inherited insert-then-delete — is found by row id in
+    ///    one scan of its table, so that rare case costs O(table) once per table);
+    /// 2. every exact read premise names the version visible at the new instant — the comparison
+    ///    the read-premise gate makes at MERGE, over the same `captures` read-sets. Scan premises are
+    ///    approximate there and are not checked here either;
+    /// 3. every shape in `base_shapes` is the catalog's current shape.
+    ///
+    /// Otherwise it changes nothing and the [`RebaseReport`] names what moved.
+    ///
+    /// # A staged row whose base moved is REFUSED, not rebased three-way — and why
+    ///
+    /// * **A staged image lives in more than `ws.rows`.** `stage_all` also writes it into the
+    ///   branch's copy-on-write page tree (which `page_changeset` and the production DIFF read),
+    ///   appends its ops and guards to the frame, and takes escrow reservations. Rewriting it here
+    ///   would need a second staging door that keeps all four in step, and `stage_all` cannot be
+    ///   that door: it appends ops (a rebase would double them) and records `base_rows` with
+    ///   `insert_if_absent` (it cannot move a base). A second door into branch write state is also
+    ///   exactly what `integration_capability_envelope` exists to catch.
+    /// * **Nothing is lost by refusing.** `MERGE` already composes a moved row three-way —
+    ///   `resolve_cell` over base, target, ours and theirs — against main at publication, which is
+    ///   later and therefore fresher than any rebase could be.
+    /// * **Kept this way, `base_rows` stays true by construction**: the re-pin happens only when
+    ///   every base image already equals its image at the new pin.
+    ///
+    /// # A read premise that moved is REFUSED too
+    ///
+    /// The gate cannot tell which staged write was derived from which read, so re-pinning past a
+    /// moved premise would put writes computed from a view that no longer exists under a view that
+    /// says otherwise — and the premise would keep failing at MERGE anyway, because read-sets are
+    /// append-only. For a branch with no staged writes, ABANDON and a fresh fork lose nothing; for
+    /// one with writes, those writes have to be redone against fresh data whatever REBASE does.
+    ///
+    /// # Refused outright
+    ///
+    /// A quarantined branch: the hold keeps the branch's view as the gate judged it so an operator
+    /// can inspect it, and REBASE would move that view. And a branch with no live workspace.
+    ///
+    /// # Atomicity
+    ///
+    /// Two phases, `rebase_validate` then `rebase_commit`. The new
+    /// instant is taken under the state lock with `apply_seq`, like a fork. Validation reads the
+    /// tables outside that lock; the commit re-takes it and refuses (an `Err`, retryable) if the
+    /// workspace's pin, staged set, ops or schema edits changed, or main's merge clock moved, in
+    /// between. Over pgwire every statement that can change one of those — a write, a MERGE, a fork,
+    /// ABANDON, an ALTER — holds the exclusive catalog for its whole run, as REBASE does, so the
+    /// server cannot interleave them.
+    ///
+    /// A shared-path SELECT cannot run beside a REBASE there either. This sentence used to say it
+    /// could; the D194 audit review corrected it. `ServerContext::catalog()` drains every
+    /// registered reader before the exclusive statement starts, and a reader that finds a writer
+    /// announced stands down to the exclusive path.
+    ///
+    /// The interleavings the re-check exists for are in-process. The library API has doors that
+    /// take no `ExecCtx`: `abandon`, `forget_reaped_branches` and `begin_session_pinned`. The split
+    /// is also the seam the race test drives (`tests::rebase_is_refused_retryably_...`): it calls
+    /// the two phases itself and lands the change in between, with no timing involved.
+    pub fn rebase(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<RebaseReport, FerroError> {
+        let validated = self.rebase_validate(ctx, branch)?;
+        self.rebase_commit(validated)
+    }
+
+    /// `REBASE`, phase 1: the new instant, and every staged base and shape checked against it. Reads
+    /// and records; changes nothing. See [`AgentRuntime::rebase`].
+    fn rebase_validate(
+        &self,
+        ctx: &ExecCtx,
+        branch: BranchId,
+    ) -> Result<RebaseValidation, FerroError> {
+        if self.branches.get(branch)?.state == BranchState::Quarantined {
+            return Err(FerroError::Branch(format!(
+                "{branch} is quarantined and cannot be rebased: {}. A hold keeps the branch's view as \
+                 the gate judged it and REBASE would move that view; release the branch first.",
+                self.quarantine_reason(branch).unwrap_or_else(|| "no reason recorded".into())
+            )));
+        }
+
+        // ---- the new instant, and everything the branch depends on, in one lock section -------
+        let (old_at, old_seq, new_at, new_seq, rows, base_rows, tables, base_shapes, ops, edits) = {
+            let state = self.state.lock().unwrap();
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {branch}"))
+            })?;
+            // D194: while a merge is between its reservation and its record, `apply_seq` runs ahead
+            // of every snapshot (`State::publishing`), so there is no consistent instant to re-pin
+            // to. Refused rather than computed around it. With one catalog this cannot fire:
+            // REBASE and MERGE both hold `&mut Catalog`. A merge that reserves AFTER this point
+            // moves `apply_seq`, and `rebase_commit` refuses on that.
+            if !state.publishing.is_empty() {
+                return Err(FerroError::Branch(format!(
+                    "a merge is publishing to main, so REBASE of {branch} has no consistent \
+                     instant to move to until it records; nothing was changed. Retry."
+                )));
+            }
+            (
+                ws.fork_snapshot.clone(),
+                ws.fork_seq,
+                ctx.txn.read_snapshot_cached(),
+                state.apply_seq,
+                ws.rows.clone(),
+                ws.base_rows.clone(),
+                ws.tables.clone(),
+                ws.base_shapes.clone(),
+                ws.frame.ops.clone(),
+                ws.schema_edits.len(),
+            )
+        };
+
+        // ---- 3. shapes ---------------------------------------------------------------------------
+        let mut moved_shapes: Vec<String> = Vec::new();
+        for (name, shape) in base_shapes.iter() {
+            match ctx.catalog.get_table(name) {
+                Some(entry) if &entry.schema == shape => {}
+                _ => moved_shapes.push(name.clone()),
+            }
+        }
+
+        // ---- 1. staged rows' base images, at the new instant ------------------------------------
+        let mut moved_rows: Vec<(String, RowId)> = Vec::new();
+        {
+            let read = ctx.read();
+            // Tables read whole at the new instant, keyed by row id — once per table per REBASE, and
+            // only for a staged row no image names the key of (`rebase_key` returned `None`: an
+            // insert-then-delete inherited from a parent, or a row whose column 0 an UPDATE moved).
+            // The row id is a one-way hash, so a row with no key can only be found by id, and only
+            // a scan can do that. It used to be counted as moved instead, which left a child holding
+            // an inherited insert-then-delete unable to rebase for ever: the staged entry never goes.
+            let mut by_id: BTreeMap<String, BTreeMap<u64, Vec<Value>>> = BTreeMap::new();
+            for ((t, r), staged) in rows.iter() {
+                let (tbl, row) = (TableId(*t), RowId(*r));
+                let name = tables.get(t).cloned().unwrap_or_default();
+                let base: Option<Vec<Value>> = base_rows.get(&(*t, *r)).cloned().flatten();
+                let holds = if read.catalog.get_table(&name).is_none() {
+                    // Its table is gone: the base cannot be shown to hold, and refusing is the
+                    // direction that cannot lie.
+                    false
+                } else {
+                    let now = match rebase_key(base.as_ref(), staged, &ops, tbl, row) {
+                        Some(k) => self.row_at(&read, &name, (*t, *r), &k, Arc::clone(&new_at))?,
+                        None => {
+                            if !by_id.contains_key(&name) {
+                                let all = scan_table_where(&name, None, None, &read, Arc::clone(&new_at))?;
+                                by_id.insert(
+                                    name.clone(),
+                                    all.into_iter().map(|img| (row_id_of(&img).0, img)).collect(),
+                                );
+                            }
+                            by_id.get(&name).and_then(|rows_now| rows_now.get(r)).cloned()
+                        }
+                    };
+                    now == base
+                };
+                if !holds {
+                    moved_rows.push((name, row));
+                }
+            }
+        }
+
+        Ok(RebaseValidation {
+            branch,
+            old_at,
+            old_seq,
+            new_at,
+            new_seq,
+            rows_len: rows.len(),
+            ops_len: ops.len(),
+            edits_len: edits,
+            moved_rows,
+            moved_shapes,
+        })
+    }
+
+    /// `REBASE`, phase 2: re-check that nothing moved since phase 1, check the premises, and re-pin —
+    /// all under one lock. The re-check is what makes the two phases one decision.
+    fn rebase_commit(&self, v: RebaseValidation) -> Result<RebaseReport, FerroError> {
+        let RebaseValidation {
+            branch,
+            old_at,
+            old_seq,
+            new_at,
+            new_seq,
+            rows_len,
+            ops_len,
+            edits_len,
+            moved_rows,
+            moved_shapes,
+        } = v;
+        let mut state = self.state.lock().unwrap();
+        let (txn, unchanged) = {
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
+                FerroError::Branch(format!(
+                    "{branch} was sealed while REBASE was validating it; nothing was changed"
+                ))
+            })?;
+            let same_pin = match (&ws.fork_snapshot, &old_at) {
+                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            };
+            (
+                ws.txn,
+                same_pin
+                    && ws.fork_seq == old_seq
+                    && ws.rows.len() == rows_len
+                    && ws.frame.ops.len() == ops_len
+                    && ws.schema_edits.len() == edits_len,
+            )
+        };
+        if !unchanged || state.apply_seq != new_seq {
+            return Err(FerroError::Branch(format!(
+                "{branch} or main moved while REBASE was validating it; nothing was changed. Retry."
+            )));
+        }
+        let mut moved_premises: Vec<(TableId, RowId, u64, u64)> = Vec::new();
+        let reads = state.captures.get(&txn.0).map(|c| c.read_sets()).unwrap_or_default();
+        for rs in &reads {
+            if let crate::provenance::readset::ReadSet::ExactVersions(versions) = rs {
+                for v in versions {
+                    let now = state
+                        .version_seen(v.tbl, v.row, Some(new_seq))
+                        .map(|s| s.begin_ts)
+                        .unwrap_or(0);
+                    if now != v.begin_ts {
+                        moved_premises.push((v.tbl, v.row, v.begin_ts, now));
+                    }
+                }
+            }
+        }
+
+        let rebased = moved_rows.is_empty() && moved_premises.is_empty() && moved_shapes.is_empty();
+        if rebased {
+            let repinned = state.repin(branch, new_at, new_seq);
+            debug_assert!(repinned, "the workspace was present under this same lock a moment ago");
+        }
+        drop(state);
+        Ok(RebaseReport {
+            branch,
+            rebased,
+            fork_seq_before: old_seq,
+            fork_seq_after: if rebased { new_seq } else { old_seq },
+            moved_rows,
+            moved_premises,
+            moved_shapes,
+        })
+    }
+
     /// Three-way merge of a branch into its parent, published if the gate admits it. Exit
     /// criteria 5, 6 and 7.
     ///
@@ -3836,12 +4924,30 @@ impl AgentRuntime {
         // Resolved up front, because `CherryTarget::row_image` takes no context and must not do
         // I/O per call. The set is bounded by the selection, so this stays O(picked).
         let mut images: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
-        {
-            let state = self.state.lock().unwrap();
-            let ws = state.workspaces.get(&onto).ok_or_else(|| {
+        // **D194 — a BRANCH READ, so it reads as of `onto`'s fork.** These images are what the
+        // target branch sees: `row_image` is documented as "the target's current image of a row",
+        // the pick compares each op's before-image against it, and `commit_all` stages it as the
+        // row's `before` — which is what lands in `base_rows`. Reading main's current state here
+        // would both judge the pick against rows the branch cannot see and plant a non-fork-point
+        // image in `base_rows`. Contrast `evaluate_merge`, which decides what to write to main and
+        // reads main as it stands.
+        //
+        // `staged_here` is every row the branch has staged at all, deleted ones included, so the
+        // second pass below reads ONLY rows the branch never touched. It used to ask whether an
+        // image had been found, and a row staged `Deleted` records none — so the second pass read
+        // the deleted row back from the shared tables and the pick staged it into existence again
+        // (`a_pick_onto_a_row_the_target_deleted_is_refused_rather_than_resurrecting_it`).
+        let (at, staged_here) = {
+            let mut state = self.state.lock().unwrap();
+            let (at, _) = state.pin(onto, &ctx.txn).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {onto}"))
             })?;
+            let ws = &state.workspaces[&onto];
+            let mut staged_here: BTreeSet<(u32, u64)> = BTreeSet::new();
             for key in &rows_touched {
+                if ws.rows.get(key).is_some() {
+                    staged_here.insert(*key);
+                }
                 match ws.rows.get(key) {
                     Some(RowState::Present(v)) => {
                         images.insert(*key, v.clone());
@@ -3856,12 +4962,13 @@ impl AgentRuntime {
                     }
                 }
             }
-        }
+            (at, staged_here)
+        };
         // Rows the branch has never touched are read from the shared tables, by point lookup
         // against the primary key carried in the op's own before-image. A scan here would make a
         // pick of three cells cost O(table), which is the defect D69 removed from `merge`.
         for key in &rows_touched {
-            if images.contains_key(key) {
+            if images.contains_key(key) || staged_here.contains(key) {
                 continue;
             }
             let Some(op) = log.ops.values().find(|o| (o.tbl.0, o.row.0) == *key) else { continue };
@@ -3877,7 +4984,7 @@ impl AgentRuntime {
                 operator: TokenType::Equal,
                 right: Box::new(value_expr(&before)),
             };
-            for row in scan_table_where(&op.table, None, Some(&pred), &ctx.read())? {
+            for row in scan_table_where(&op.table, None, Some(&pred), &ctx.read(), Arc::clone(&at))? {
                 if row_id_of(&row).0 == key.1 {
                     images.insert(*key, row);
                 }
@@ -4215,14 +5322,28 @@ impl AgentRuntime {
         }
 
         // Both workspaces, taken together under one lock so they describe the same instant.
-        let (src, tgt, policy) = {
-            let state = self.state.lock().unwrap();
-            let src = state.workspaces.get(&source).ok_or_else(|| {
-                FerroError::Branch(format!("no agent session on branch {source}"))
-            })?;
-            let tgt = state.workspaces.get(&target).ok_or_else(|| {
-                FerroError::Branch(format!("no agent session on branch {target}"))
-            })?;
+        //
+        // **D194: and the target's view, pinned.** A row only the source touched is staged onto
+        // the target with `before` = what the TARGET sees of it, and that `before` is what lands
+        // in the target's `base_rows`. Taking it from the source's `base_rows` is right only when
+        // the two read main at the same instant — true for two children of one live parent, which
+        // share their parent's snapshot, and false for two trunk forks with a commit between them.
+        // `same_view` says which; when it is false the target's image is looked up through its own
+        // snapshot, below.
+        let (src, tgt, policy, tgt_at, same_view) = {
+            let mut state = self.state.lock().unwrap();
+            if !state.workspaces.contains_key(&source) {
+                return Err(FerroError::Branch(format!("no agent session on branch {source}")));
+            }
+            let (tgt_at, _) = state
+                .pin(target, &ctx.txn)
+                .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {target}")))?;
+            let src = &state.workspaces[&source];
+            let tgt = &state.workspaces[&target];
+            let same_view = src
+                .fork_snapshot
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &tgt_at) || (s.high_water == tgt_at.high_water && s.active == tgt_at.active));
             (
                 SiblingSide {
                     rows: src.rows.clone(),
@@ -4241,6 +5362,8 @@ impl AgentRuntime {
                     base_shapes: tgt.base_shapes.clone(),
                 },
                 state.policy.clone(),
+                tgt_at,
+                same_view,
             )
         };
 
@@ -4287,8 +5410,18 @@ impl AgentRuntime {
             let on_target = match tgt.rows.get(&(*t, *r)) {
                 Some(RowState::Present(v)) => Some(v.clone()),
                 Some(RowState::Deleted) => None,
-                // The target never touched this row, so it still sees the fork point's image.
-                None => base.clone(),
+                // The target never touched this row, so it sees the image its own snapshot has —
+                // which is the source's fork-point image when the two share a view (D194).
+                None if same_view => base.clone(),
+                None => match base.as_ref().or(match after {
+                    RowState::Present(v) => Some(v),
+                    RowState::Deleted => None,
+                }) {
+                    Some(img) => self.row_at(&ctx.read(), &table, (*t, *r), &img[0], Arc::clone(&tgt_at))?,
+                    // Neither side has an image: a delete of a row the source never saw. Nothing
+                    // below reads `on_target` for that arm.
+                    None => None,
+                },
             };
             let mut applied_ops: Vec<Op> = Vec::new();
             let mut discarded = Vec::new();
@@ -4367,7 +5500,8 @@ impl AgentRuntime {
                             // three-way merge rather than a replay. `concurrent_op` cannot answer
                             // here: it reads `state.applied`, the log of what has been PUBLISHED,
                             // and a sibling has published nothing.
-                            let theirs = self.sibling_op(&tgt, tbl, row, col, b, idx);
+                            let theirs =
+                                self.sibling_op(&tgt, tbl, row, col, b, idx, on_target.as_ref());
                             let cell = CellMerge {
                                 tbl,
                                 row,
@@ -4532,6 +5666,7 @@ impl AgentRuntime {
     /// has been PUBLISHED to the shared tables. A sibling branch has published nothing, so asking
     /// it returns `None` for every cell and the merge degenerates to a replay of the source over
     /// the target — no conflict ever detected. The sibling's frame is where its writes are.
+    #[allow(clippy::too_many_arguments)]
     fn sibling_op(
         &self,
         tgt: &SiblingSide,
@@ -4540,6 +5675,7 @@ impl AgentRuntime {
         col: ColId,
         base: &[Value],
         idx: usize,
+        on_target: Option<&Vec<Value>>,
     ) -> Option<OpKind> {
         let ops: Vec<OpKind> = ours_ops_on_cell(&tgt.ops, tbl, row, col);
         if !ops.is_empty() {
@@ -4548,12 +5684,46 @@ impl AgentRuntime {
         // The target moved the cell without an op recorded against it — a whole-row write, for
         // instance. The move is still real, so it is reported as the assignment it amounts to
         // rather than dropped, which would read as "the sibling did not touch this cell".
-        match tgt.rows.get(&(tbl.0, row.0)) {
-            Some(RowState::Present(v)) if v.get(idx) != base.get(idx) => {
-                v.get(idx).cloned().map(OpKind::Assign)
-            }
+        //
+        // Read from `on_target`, the image the target SEES, rather than from its staged rows
+        // alone (D194): a row the target never touched still differs from the source's base when
+        // the target forked after main moved it, and that move is just as real.
+        match on_target {
+            Some(v) if v.get(idx) != base.get(idx) => v.get(idx).cloned().map(OpKind::Assign),
             _ => None,
         }
+    }
+
+    /// **D194.** One row of the shared tables as the snapshot `at` has it, found by primary key —
+    /// a point lookup, as `evaluate_merge` and `cherry_pick` do it, so the cost is O(log N) and
+    /// never a scan. `key` is the row's `(table id, row id)`, checked against what comes back
+    /// because the planner's pushdown is a hint, not a filter.
+    fn row_at(
+        &self,
+        ctx: &ReadCtx,
+        table: &str,
+        key: (u32, u64),
+        pk: &Value,
+        at: Arc<Snapshot>,
+    ) -> Result<Option<Vec<Value>>, FerroError> {
+        let entry = ctx
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| FerroError::Bind(format!("unknown table: {table}")))?;
+        let pk_col = entry
+            .schema
+            .columns
+            .first()
+            .map(|c| c.name.clone())
+            .ok_or_else(|| FerroError::Bind(format!("'{table}' has no columns")))?;
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::ColumnRef { table: None, column: pk_col }),
+            operator: TokenType::Equal,
+            right: Box::new(value_expr(pk)),
+        };
+        Ok(scan_table_where(table, None, Some(&pred), ctx, at)?
+            .into_iter()
+            .find(|row| row_id_of(row).0 == key.1))
     }
 
     /// **Score a merge without performing it.**
@@ -4789,7 +5959,13 @@ impl AgentRuntime {
                         operator: TokenType::Equal,
                         right: Box::new(value_expr(&key)),
                     };
-                    for row in scan_table_where(name, None, Some(&pred), &ctx.read())? {
+                    // **CURRENT, deliberately (D194).** This is the merge deciding what to write
+                    // to main, so it reads main as it stands: `now` in the three-way comparison
+                    // below, against `base_rows` (the fork) and the branch's own `after`. Reading
+                    // the branch's `fork_snapshot` here would make `now == base` for every row and
+                    // publish over every concurrent write as if there had been none.
+                    let now = ctx.txn.read_snapshot_cached();
+                    for row in scan_table_where(name, None, Some(&pred), &ctx.read(), now)? {
                         current.insert((t, row_id_of(&row).0), row);
                     }
                 }
@@ -5474,8 +6650,10 @@ impl AgentRuntime {
         // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
         // numbering is unchanged: the same ops, in the same order, get the same sequence values.
         //
-        // **And the reservation is checked for freshness against an INDEPENDENT record before the
-        // publish transaction opens.** The invariant that matters is the one the assertion in
+        // **And the reservation is checked for freshness against an INDEPENDENT record before
+        // anything is published** (before the publish transaction applies a row; since D194's
+        // Amendment 7 the transaction itself is begun first, and a refusal aborts it). The
+        // invariant that matters is the one the assertion in
         // `record_applied` describes and cannot test: no two versions ever share a `begin_ts`. That
         // assertion compares the reservation to a re-count of the same `rows` list the stamping loop
         // walks, so both sides are the same sum and no input can falsify it. `State::applied` can:
@@ -5491,15 +6669,14 @@ impl AgentRuntime {
         // ALREADY broken for a leaked reservation on every ORDINARY refusal — and the schema
         // refusals above fire whenever an agent stages an edit its table cannot take, which is a
         // thing that happens.
-        let reserved: std::ops::Range<u64> = {
-            let mut state = self.state.lock().unwrap();
-            let base = state.apply_seq;
-            fresh_reservation(highest_applied_seq(&state.applied), base)
-                .map_err(FerroError::Merge)?;
-            state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
-            base..state.apply_seq
-        };
-
+        //
+        // **The publish transaction begins FIRST (D194, Amendment 7)**, so the reservation can
+        // register it in the same step: from the reservation until `record_applied`, a pin must
+        // ask whether its snapshot contains this publish (`pin_seq`), and that needs the txn. It
+        // begins in the same place relative to everything a snapshot can see, because visibility
+        // comes at commit. A fork between the begin and the reservation sees neither, and pairs
+        // its snapshot with the old `apply_seq`.
+        //
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
@@ -5510,6 +6687,20 @@ impl AgentRuntime {
         // inside a transaction, so the edits could never have run inside this one; they ran
         // before it opened.
         let publish_txn = ctx.txn.begin()?;
+        let (reserved, _publishing): (std::ops::Range<u64>, PublishingEntry<'_>) = {
+            let mut state = self.state.lock().unwrap();
+            let base = state.apply_seq;
+            if let Err(e) = fresh_reservation(highest_applied_seq(&state.applied), base) {
+                drop(state);
+                ctx.txn.abort(publish_txn)?;
+                return Err(FerroError::Merge(e));
+            }
+            state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
+            let reserved = base..state.apply_seq;
+            // `register` takes the lock guard and releases it before the entry exists, so the
+            // entry can never be dropped while this thread still holds the lock its `Drop` takes.
+            (reserved, PublishingEntry::register(state, &self.state, base, publish_txn))
+        };
         // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
         //
         // The loop below already stamps each version's author through `apply_in`, and
@@ -5552,7 +6743,13 @@ impl AgentRuntime {
         }
         ctx.txn.commit(publish_txn)?;
 
-        self.record_applied(
+        // **Kept, not `?`-ed (D194 Amendment 12, F1).** The only error `record_applied` can return
+        // is an author stamp's, and it comes after the publish committed and every version was
+        // recorded. Returning on it here skipped the attestation and the seal below, which left a
+        // published branch LIVE. A second MERGE would then publish it again, and an ABANDON would
+        // drop the capture of a merge whose rows are in main. So the merge is finished first and
+        // the error reported after.
+        let authorship = self.record_applied(
             from,
             snapshot.txn,
             &rows,
@@ -5560,7 +6757,7 @@ impl AgentRuntime {
             &merge_id,
             &images,
             reserved,
-        )?;
+        );
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -5572,7 +6769,24 @@ impl AgentRuntime {
         // affordable. See the field docs on `AgentRuntime::attested` for why fork and commit get
         // no such commitment.
         self.attest_merge(into, self.branches.next_epoch(), &images);
-        self.seal(from, true)?;
+        // Both results are reported (Amendment 13, B): a seal that also fails must not hide that
+        // authorship is incomplete.
+        match (authorship, self.seal(from, true)) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(sealing)) => return Err(sealing),
+            (Err(stamping), Ok(())) => {
+                return Err(FerroError::Merge(format!(
+                    "merge {merge_id} was published and sealed, but recording who wrote its rows \
+                     failed: {stamping}"
+                )))
+            }
+            (Err(stamping), Err(sealing)) => {
+                return Err(FerroError::Merge(format!(
+                    "merge {merge_id} was published, but recording who wrote its rows failed \
+                     ({stamping}), and sealing its branch then failed too ({sealing})"
+                )))
+            }
+        }
 
         Ok(MergeReport {
             blind_writes,
@@ -5703,7 +6917,24 @@ impl AgentRuntime {
         reserved: std::ops::Range<u64>,
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
+        // **D194.** These versions become nameable in this lock acquisition, so the merge stops
+        // counting as publishing in the same one. A pin taken after this sees both. A pin taken
+        // before the commit excludes the merge and sits at its start. A pin taken between the
+        // commit and here contains the merge, so its reads are refused until this runs
+        // (`record_read`, Amendment 7).
+        let registered = state.publishing.remove(&reserved.start);
+        debug_assert!(
+            registered.is_some(),
+            "merge {merge_id} recorded versions it never registered as publishing (reserved \
+             {reserved:?})"
+        );
         let mut written: Vec<WriteRecord> = Vec::new();
+        // **D194, Amendment 10 (C2): nothing in this pass can fail.** The author stamps are the one
+        // fallible call here, and they come after every version, valued write, capture and merge
+        // record is in memory. When a stamp sat inside this loop and failed, the publish had
+        // already committed, so the rows were visible and the later versions unnamed: an exact read
+        // of such a row named the version before it, and nothing refused that read.
+        let mut stamps: Vec<(u32, u64)> = Vec::new();
         let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
@@ -5740,7 +6971,7 @@ impl AgentRuntime {
                     rid: RecordId { page_id: 0, slot_num: 0 },
                     begin_ts: seq,
                 };
-                state.versions.insert((op.tbl.0, op.row.0), v);
+                state.publish_version(v);
                 // **The valued writes a scan's retained region is checked against.** One per COLUMN
                 // of each image, because `PredicateSummary::covers` matches a write only against the
                 // column its predicate names: a summary over `qty` cannot see a write recorded
@@ -5767,10 +6998,7 @@ impl AgentRuntime {
                 if seen.is_empty() {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
-                // Authorship of the published row, kept past `seal` AND past the process
-                // (exit criterion 9). This is the write that makes `who_wrote_row` durable.
-                self.prov_store
-                    .stamp_row(op.tbl.0, op.row.0, snapshot.prov)?;
+                stamps.push((op.tbl.0, op.row.0));
             }
         }
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
@@ -5816,7 +7044,36 @@ impl AgentRuntime {
             merge_id.to_string(),
             MergeRecord { branch, txns: vec![txn] },
         );
-        Ok(())
+        // Authorship of each published row, kept past `seal` AND past the process (exit criterion
+        // 9). This is the write that makes `who_wrote_row` durable. Last, so that a failure here
+        // leaves authorship incomplete and nothing else.
+        //
+        // **Best-effort, and never stale (Amendment 13, D).** Stopping at the first failure left
+        // every later row naming its PREVIOUS author: a version this merge replaced. So a row whose
+        // stamp fails is cleared to "nobody on record", and the loop goes on. A row that can be
+        // neither stamped nor cleared is named in the error. A durable store that refuses both is
+        // poisoned, and a poisoned store refuses to say who wrote any row (`durable.rs`).
+        let mut first_failure: Option<FerroError> = None;
+        let mut unstamped: Vec<(u32, u64)> = Vec::new();
+        let mut uncleared: Vec<(u32, u64)> = Vec::new();
+        for (tbl, row) in stamps {
+            if let Err(e) = self.prov_store.stamp_row(tbl, row, snapshot.prov) {
+                unstamped.push((tbl, row));
+                if self.prov_store.stamp_row(tbl, row, ProvId::NONE).is_err() {
+                    uncleared.push((tbl, row));
+                }
+                if first_failure.is_none() {
+                    first_failure = Some(e);
+                }
+            }
+        }
+        match first_failure {
+            None => Ok(()),
+            Some(e) => Err(FerroError::Provenance(format!(
+                "{e}; rows left unattributed (table, row): {unstamped:?}; of those, rows whose \
+                 previous author could not be cleared: {uncleared:?}"
+            ))),
+        }
     }
 
     // ---- ABANDON ---------------------------------------------------------------------------
@@ -6667,6 +7924,99 @@ fn fresh_reservation(highest: Option<u64>, base: u64) -> Result<(), String> {
     }
 }
 
+/// **D194 — the merge clock that a snapshot taken now pairs with.** This is `apply_seq`, unless a
+/// merge has reserved sequence numbers whose publish `snap` does not contain. Then it is the start
+/// of the earliest such reservation, so a pin never claims a version its snapshot lacks (see
+/// `State::publishing`).
+///
+/// A txn the snapshot includes has finished before it. If it committed, the snapshot holds its
+/// rows. If it aborted, no version will be recorded for it.
+///
+/// ⚠ **Exact only while at most one merge is publishing.** A merge holds `&mut Catalog` from
+/// reservation to record, so one catalog guarantees that. Two catalogs over one database break it
+/// two ways, and each has a `debug_assert` that names it:
+/// - Two merges commit out of order, which puts a CONTAINED reservation above an excluded one. No
+///   single seq is then consistent: the lower one treats the contained merge as "theirs", although
+///   its rows are in the snapshot.
+/// - A later merge records while an earlier one is still publishing, which puts a recorded version
+///   (`recorded`, the last `applied` seq) above the seq this returns.
+fn pin_seq(
+    publishing: &BTreeMap<u64, u64>,
+    apply_seq: u64,
+    recorded: Option<u64>,
+    snap: &Snapshot,
+) -> u64 {
+    let excluded = publishing
+        .iter()
+        .filter(|&(_, &t)| !snap.includes(t))
+        .map(|(&start, _)| start)
+        .min();
+    if let Some(lowest) = excluded {
+        debug_assert!(
+            publishing.iter().all(|(&start, &t)| start < lowest || !snap.includes(t)),
+            "a merge the snapshot contains is publishing above one it does not ({publishing:?}): \
+             no single fork_seq matches this snapshot"
+        );
+    }
+    let seq = excluded.unwrap_or(apply_seq);
+    debug_assert!(
+        recorded.is_none_or(|r| r <= seq),
+        "version {recorded:?} is recorded above the seq {seq} a snapshot taken now pairs with \
+         ({publishing:?}): a pin at it would read that version as never published"
+    );
+    seq
+}
+
+/// **D194 — takes a merge's entry out of `State::publishing` on EVERY way out of `merge`.**
+///
+/// `register` inserts the entry and returns the guard in one call, so there is no way to write one
+/// without the other. `record_applied` removes the entry when it records the versions. Without the
+/// guard, every other exit would leave the entry behind: a refused `bind_run`, a failed `apply_in`,
+/// a failed commit. Removing twice is a no-op.
+///
+/// A stranded entry would not mis-pair a pin, because it names a txn that has finished and that
+/// every later snapshot contains. It would still break things for good:
+/// - it refuses every `REBASE`;
+/// - it refuses every exact-version read through a pin above its start, as a merge that never
+///   records.
+///
+/// The one way to strand an entry is the poisoned-lock skip in `Drop`, which runs only after a
+/// holder of the state lock has panicked.
+struct PublishingEntry<'a> {
+    state: &'a Mutex<State>,
+    start: u64,
+}
+
+impl<'a> PublishingEntry<'a> {
+    /// Register a merge's reservation under the lock the caller already holds, and arm the entry's
+    /// removal. `locked` must come from `state`. That is not checked: std gives no way to ask a
+    /// guard for its mutex, and every caller passes `self.state.lock()` beside `&self.state`.
+    ///
+    /// It takes `locked` by value and releases it BEFORE the entry exists. The `Drop` relocks
+    /// `state`, so an entry alive while this thread held the lock would deadlock on the first
+    /// panic or `?` that dropped it there. Taking the guard makes that unrepresentable, instead of
+    /// a rule the caller has to keep.
+    fn register(
+        mut locked: std::sync::MutexGuard<'a, State>,
+        state: &'a Mutex<State>,
+        start: u64,
+        txn: u64,
+    ) -> Self {
+        locked.publishing.insert(start, txn);
+        drop(locked);
+        PublishingEntry { state, start }
+    }
+}
+
+impl Drop for PublishingEntry<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock means a holder has already panicked. Panicking again here would abort.
+        if let Ok(mut state) = self.state.lock() {
+            state.publishing.remove(&self.start);
+        }
+    }
+}
+
 /// Why a read was taken, which is what decides whether it counts as an INSPECTION.
 ///
 /// **Causality and inspection are different questions, and this is the one place they part.** Both
@@ -7103,8 +8453,12 @@ fn apply_dml_in(
 
 /// Every row of a table as the shared (merged) state has it.
 /// Every row of `table`, unfiltered. The callers that diff, merge and sweep want exactly that.
+///
+/// **As main stands NOW** (D194): its callers are the merge's assertion scan and `REVERT`'s undo,
+/// both of which are about to write the shared tables and must see what is there. A branch's
+/// view is never read through this; see `AgentRuntime::visible_rows_where`.
 pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
-    scan_table_where(table, None, None, ctx)
+    scan_table_where(table, None, None, ctx, ctx.txn.read_snapshot_cached())
 }
 
 /// The rows of `table` that satisfy `where_clause`, with the predicate PUSHED INTO THE PLANNER.
@@ -7123,15 +8477,24 @@ pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroEr
 /// path: bind it, and pick the index. Nothing is invented; the predicate was simply never
 /// handed over. `alias` must match the statement's, or the planner cannot bind a qualified
 /// column reference in the predicate.
+///
+/// # `at` — which moment of main is read (D194)
+///
+/// Every caller names it, and there is deliberately no default: the two answers are both right
+/// somewhere and wrong everywhere else, and a default is how the branch read path read main AS OF
+/// NOW for as long as it did. A read ON A BRANCH'S BEHALF passes the branch's pinned
+/// `fork_snapshot` (`visible_rows_where`, `cherry_pick`'s images of the target branch). A read
+/// that DECIDES WHAT TO WRITE TO main passes main's current snapshot — D59's
+/// `read_snapshot_cached`, one Acquire load when no transaction has begun or ended since this
+/// thread last asked (`evaluate_merge`, `scan_table`).
 pub fn scan_table_where(
     table: &str,
     alias: Option<&str>,
     where_clause: Option<&Expr>,
     ctx: &ReadCtx,
+    at: Arc<Snapshot>,
 ) -> Result<Vec<Vec<Value>>, FerroError> {
-    // D59: the cached snapshot — one Acquire load when no transaction has begun or ended
-    // since this thread last asked. `read_snapshot` remains the uncached truth.
-    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot_cached(), txn_id: 0 });
+    let view = Arc::new(ReadView { snapshot: at, txn_id: 0 });
     let stmt = Stmt::Select {
         from: TableRef::plain(table.to_string(), alias.map(|a| a.to_string())),
         columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],
@@ -7424,6 +8787,7 @@ mod tests {
             prov: ProvId::NONE,
             txn: TxnId(txn),
             fork_seq: 0,
+            fork_snapshot: None,
             fork_root: 0,
             // D27 made these structurally shared (`PersistentMap` / `Arc<Vec>`). None of them is
             // read by `txn_refs_of`, which is why the index survived that change untouched — only
@@ -7756,5 +9120,1807 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **D194 step 4 — REBASE refuses, retryably, when the branch or main moves between its phases.**
+    ///
+    /// `rebase` is `rebase_validate` then `rebase_commit`, and the commit re-checks the workspace and
+    /// main's merge clock before it re-pins. This test calls the two phases itself and lands a change
+    /// between them on the same thread, so the interleaving is forced rather than raced: no sleep, no
+    /// second thread, no timing. The only test-only code is this test; the split is production code.
+    ///
+    /// ⚠ No red state exists for it — the re-check shipped with REBASE. What shows it discriminates
+    /// is the pre-registered fire-check (`bench/d194_fork_snapshot/rebase_prereg.md`, Amendment 2 A):
+    /// forcing the re-check to `true` must fail the two `moved while` cases and leave the `sealed`
+    /// case passing, because that one is the workspace-existence check on a different line.
+    #[test]
+    fn rebase_is_refused_retryably_when_the_branch_or_main_moves_between_its_phases() {
+        use crate::execution::executor::run;
+        use crate::execution::session::Session;
+
+        fn same(a: &Option<Arc<Snapshot>>, b: &Option<Arc<Snapshot>>) -> bool {
+            match (a, b) {
+                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        fn parse(sql: &str) -> Stmt {
+            let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+                .scan_tokens()
+                .unwrap();
+            let mut p = crate::parser::parser::Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+            stmts.remove(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("rebase_race.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let wal =
+            Arc::new(crate::wal::log::WalManager::new(dir.path().join("rebase_race.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = Session::with_runtime(rt.clone());
+        for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            if let Err(e) = run(parse(sql), &mut catalog, bp.clone(), txn.clone(), &mut main) {
+                panic!("{sql}: {e}");
+            }
+        }
+        let branch = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        let pin = || {
+            let state = rt.state.lock().unwrap();
+            let ws = &state.workspaces[&branch];
+            let out = (ws.fork_seq, ws.fork_snapshot.clone(), ws.rows.len());
+            out
+        };
+
+        // The control: nothing between the phases, so the commit re-pins.
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        let report = rt.rebase_commit(v).unwrap();
+        assert!(report.rebased, "nothing moved between the phases, yet: {report:?}");
+
+        // Main's merge clock moves between the phases — exactly what a publish's reservation does.
+        let before = pin();
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        rt.state.lock().unwrap().apply_seq += 1;
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("moved while REBASE was validating"), "wrong refusal: {err}");
+        let after = pin();
+        assert_eq!(after.0, before.0, "a refused commit moved fork_seq");
+        assert!(same(&after.1, &before.1), "a refused commit moved the snapshot");
+
+        // The branch stages a write between the phases.
+        let before = pin();
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        let touched = rt.write(&mut ctx, branch, parse("UPDATE t SET v = 11 WHERE id = 1;")).unwrap();
+        assert_eq!(touched, 1, "fixture: the write between the phases staged nothing");
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("moved while REBASE was validating"), "wrong refusal: {err}");
+        let after = pin();
+        assert_eq!(after.0, before.0, "a refused commit moved fork_seq");
+        assert!(same(&after.1, &before.1), "a refused commit moved the snapshot");
+        assert_eq!(after.2, before.2 + 1, "the write that landed between the phases was lost");
+
+        // The branch is abandoned between the phases.
+        let v = rt.rebase_validate(&ctx, branch).unwrap();
+        rt.abandon(branch).unwrap();
+        let err = rt.rebase_commit(v).unwrap_err().to_string();
+        assert!(err.contains("was sealed while REBASE was validating"), "wrong refusal: {err}");
+    }
+
+    // ---- D194 audit, term 1: what `version_history` may forget -----------------------------------
+    //
+    // Pre-registered in `bench/d194_fork_snapshot/rebase_prereg.md`, Amendment 4, before any of
+    // these was written. The first five name only fields and functions that exist at `0570fe8`, so
+    // they compile against the tree that has no retention bound; four of them fail there.
+
+    /// A published version of row `row` of table 1, stamped `seq` — the shape `record_applied`
+    /// hands `publish_version`.
+    fn published(row: u64, seq: u64) -> VersionRef {
+        VersionRef {
+            tbl: TableId(1),
+            row: RowId(row),
+            rid: RecordId { page_id: 0, slot_num: 0 },
+            begin_ts: seq,
+        }
+    }
+
+    /// One op of one merge, published the way `merge` does it: the clock is reserved first
+    /// (`apply_seq` moves), then the version is stamped with the sequence it reserved.
+    fn publish_next(st: &mut State, row: u64) -> u64 {
+        st.apply_seq += 1;
+        let seq = st.apply_seq;
+        st.publish_version(published(row, seq));
+        seq
+    }
+
+    /// A workspace pinned at `seq`, as a fork through `begin_session_pinned*` leaves one.
+    fn pinned(name: &str, txn: u64, seq: u64) -> Workspace {
+        let mut w = ws(name, txn, &[]);
+        w.fork_seq = seq;
+        w.fork_snapshot =
+            Some(Arc::new(Snapshot { high_water: seq + 1, active: std::collections::HashSet::new() }));
+        w
+    }
+
+    fn held(st: &State) -> usize {
+        st.version_history.values().map(Vec::len).sum()
+    }
+
+    /// **With nothing pinned, the history is bounded by the rows, not by the publishes.**
+    ///
+    /// A pin at `F` needs the newest version at or below `F`, and a pin created later is at or above
+    /// `apply_seq`, so with no live pin nothing older than each row's newest entry can ever be asked
+    /// for. At `0570fe8` every publish appended a `u64` that nothing removed: memory O(ops ever).
+    #[test]
+    fn version_history_stays_flat_under_a_publish_loop_with_no_live_pin() {
+        const ROWS: u64 = 4;
+        const MERGES: u64 = 500;
+        let mut st = State::default();
+        for _ in 0..MERGES {
+            for row in 1..=ROWS {
+                publish_next(&mut st, row);
+            }
+        }
+        // The premise: every one of those publishes landed, and nothing was pinned while they did.
+        assert_eq!(st.apply_seq, ROWS * MERGES, "fixture: the clock did not move once per publish");
+        assert_eq!(st.versions.len(), ROWS as usize, "fixture: a row was never published");
+        assert_eq!(
+            st.versions[&(1, ROWS)].begin_ts,
+            ROWS * MERGES,
+            "fixture: `versions` does not hold the last publish"
+        );
+        assert!(st.workspaces.is_empty(), "fixture: a workspace is pinned");
+        assert!(
+            held(&st) <= ROWS as usize,
+            "`version_history` holds {} entries for {ROWS} rows after {MERGES} publishes of each with \
+             no live pin: it grows with publishes, not with rows",
+            held(&st)
+        );
+    }
+
+    /// **A live pin keeps the version it reads, and nothing below it.**
+    ///
+    /// The pin is taken at 3, when the newest version of row 1 was the one stamped 3 — so that is
+    /// what a read through it saw, derived here from the fixture and not from the code. Versions 1
+    /// and 2 are older than anything a pin at or above 3 can read.
+    #[test]
+    fn version_history_keeps_what_a_live_pin_reads_and_nothing_older() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let at = st.apply_seq;
+        assert_eq!(at, 3, "fixture");
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(3)).map(|v| v.begin_ts),
+            Some(3),
+            "a read through the pin at 3 must name the version it saw"
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), None).map(|v| v.begin_ts),
+            Some(103),
+            "a read of main as it stands must name the latest"
+        );
+        let len = st.version_history[&(1, 1)].len();
+        assert!(
+            len <= 101,
+            "row 1 holds {len} history entries. The only live pin is at 3 and reads version 3, so 1 \
+             and 2 are unreachable and at most 101 (3..=103) may be held"
+        );
+    }
+
+    /// **A row holds only the versions some live pin reads, plus its newest** (Amendment 5, item 2).
+    ///
+    /// Keeping everything above the oldest pin is not enough. A pin reads ONE version of each row,
+    /// the newest at or below it, so the versions published between that one and the newest are
+    /// read by nobody. A pin taken later starts above all of them. Row 2 is the harness's case: a
+    /// pin taken before a row's first publish reads no version of it at all, yet under the
+    /// oldest-pin rule alone it would keep every version published after it.
+    ///
+    /// Red at `0570fe8` (row 1 holds 103) and at `7c92d8d`, which carries the oldest-pin rule alone
+    /// (row 1 holds 101).
+    #[test]
+    fn version_history_holds_only_the_versions_live_pins_read() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        for _ in 0..100 {
+            publish_next(&mut st, 2);
+        }
+        // Row 1: the pin at 3 reads version 3, the fixture's last publish before the pin.
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(at)).map(|v| v.begin_ts),
+            Some(3),
+            "the pin at 3 must still name the version it reads"
+        );
+        let row1 = st.version_history[&(1, 1)].len();
+        assert!(
+            row1 <= 2,
+            "row 1 holds {row1} history entries. The only live pin reads version 3; versions 4..=102 \
+             are read by no pin, live or future, so at most 2 (3 and the newest) may be held"
+        );
+        // Row 2: first published after the pin, so the pin reads no version of it.
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(2), Some(at)),
+            None,
+            "the pin at 3 predates every version of row 2"
+        );
+        let row2 = st.version_history[&(1, 2)].len();
+        assert!(
+            row2 <= 1,
+            "row 2 holds {row2} history entries; no live pin reads any of them, so only the newest \
+             may be held"
+        );
+    }
+
+    /// **Sealing the oldest pin frees what only it held — without waiting for the row to be written
+    /// again.** Trimming only at publish would strand the history of every row nobody publishes
+    /// after the pin goes, which is O(ops published while the pin lived) that is never returned.
+    #[test]
+    fn version_history_is_freed_when_the_oldest_pin_is_sealed() {
+        let mut st = State::default();
+        for _ in 0..3 {
+            publish_next(&mut st, 1);
+        }
+        let old = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, old));
+        for _ in 0..100 {
+            publish_next(&mut st, 1);
+        }
+        let young = st.apply_seq;
+        st.insert_workspace(BranchId::new(8, 0), pinned("b_8", 101, young));
+        // The premise, identical at both commits: the old pin still reads its own version.
+        assert_eq!(st.version_seen(TableId(1), RowId(1), Some(old)).map(|v| v.begin_ts), Some(3));
+
+        assert!(st.remove_workspace(&BranchId::new(7, 0)).is_some(), "fixture: b_7 was not live");
+        // No publish after the seal: the row is never written again in this test.
+        assert_eq!(
+            st.version_history[&(1, 1)].len(),
+            1,
+            "the only remaining pin is at {young} and reads version {young}; everything older was \
+             held for the sealed pin alone"
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(young)).map(|v| v.begin_ts),
+            Some(young),
+            "freeing took the version the remaining pin reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(8, 0)).is_some(), "fixture: b_8 was not live");
+        assert_eq!(held(&st), 1, "with no pin left, one entry per published row");
+    }
+
+    /// **A read taken through a pin that is released before the read is recorded must not record a
+    /// version it did not see.**
+    ///
+    /// The interleaving is forced on one thread, the way the REBASE race test above forces its own:
+    /// the branch is pinned at 3, main publishes 4 and 5, and the branch is re-pinned to 5 (what a
+    /// `REBASE` on another thread does in-process; pgwire excludes it) — and only then does the
+    /// read that went through the pin at 3 reach `record_read`. The version it saw is 3, from the
+    /// fixture.
+    ///
+    /// ⚠ No red state: at `0570fe8` nothing is pruned, so the history still names 3 and this passes.
+    /// It exists for the retention bound, which CAN drop 3 once no live pin is at or below it; the
+    /// pre-registered mutant M14 (the refusal removed) is what shows it discriminates.
+    #[test]
+    fn version_history_never_names_a_version_a_read_did_not_see() {
+        use crate::provenance::readset::ReadSet;
+
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let at = st.apply_seq;
+            st.insert_workspace(b, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+            publish_next(&mut st, 1);
+            publish_next(&mut st, 1);
+            let now = st.apply_seq;
+            let snap = Arc::new(Snapshot {
+                high_water: now + 1,
+                active: std::collections::HashSet::new(),
+            });
+            assert!(st.repin(b, snap, now), "fixture: the branch is not live");
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let out = rt.record_read(
+            b,
+            TableId(1),
+            AccessShape::IndexLookup,
+            &[(RowId(1), row)],
+            None,
+            None,
+            ReadPurpose::Inspection,
+            Some(3),
+        );
+        match out {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("was released while this read ran"), "refused for the wrong reason: {e}");
+            }
+            Ok(()) => {
+                let st = rt.state.lock().unwrap();
+                let named: Vec<u64> = st.captures[&100]
+                    .read_sets()
+                    .iter()
+                    .filter_map(|rs| match rs {
+                        ReadSet::ExactVersions(vs) => Some(vs.clone()),
+                        ReadSet::Predicate(_) => None,
+                    })
+                    .flatten()
+                    .filter(|v| v.row == RowId(1))
+                    .map(|v| v.begin_ts)
+                    .collect();
+                assert_eq!(
+                    named,
+                    vec![3],
+                    "the read went through the pin at 3 and saw version 3; recording anything else \
+                     is a premise it never had, and a REVERT edge to the wrong merge"
+                );
+            }
+        }
+    }
+
+    /// **The same bound, through real merges.** Each iteration forks a pinned branch, updates two
+    /// rows and merges — so while the merge publishes, its own pin IS live, and it is the seal right
+    /// after that has to free the entry the pin held. Measured at two points and compared: a slope,
+    /// not one number.
+    #[test]
+    fn version_history_stays_flat_under_a_merge_loop_through_sql() {
+        use crate::execution::executor::run;
+        use crate::execution::session::Session;
+
+        fn parse(sql: &str) -> Stmt {
+            let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+                .scan_tokens()
+                .unwrap();
+            let mut p = crate::parser::parser::Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+            stmts.remove(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("history_loop.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(
+            crate::wal::log::WalManager::new(dir.path().join("history_loop.wal")).unwrap(),
+        );
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = Session::with_runtime(rt.clone());
+        for sql in [
+            "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+            "INSERT INTO t VALUES (1, 10);",
+            "INSERT INTO t VALUES (2, 20);",
+        ] {
+            if let Err(e) = run(parse(sql), &mut catalog, bp.clone(), txn.clone(), &mut main) {
+                panic!("{sql}: {e}");
+            }
+        }
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        // (history entries, rows in `versions`, live workspaces, ops ever applied)
+        let census = || {
+            let st = rt.state.lock().unwrap();
+            (held(&st), st.versions.len(), st.workspaces.len(), st.applied.len())
+        };
+
+        const MERGES: usize = 40;
+        let mut after_ten = None;
+        for i in 1..=MERGES {
+            let run_id = format!("r{i}");
+            let b = rt
+                .begin_session_pinned(
+                    RunIdentity { agent_id: "a", run_id: Some(run_id.as_str()), model: None, prompt: None },
+                    BranchId::TRUNK,
+                    &txn,
+                )
+                .unwrap()
+                .branch;
+            for id in [1, 2] {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                let n = rt.write(&mut ctx, b, parse(&sql)).unwrap();
+                assert_eq!(n, 1, "fixture: merge {i} staged nothing for row {id}");
+            }
+            let report = rt.merge(&mut ctx, b).unwrap();
+            assert!(report.applied_to_target, "fixture: merge {i} did not publish: {:?}", report.outcome);
+            if i == 10 {
+                after_ten = Some(census());
+            }
+        }
+        let (h10, ..) = after_ten.unwrap();
+        let (h40, rows, live, applied) = census();
+        assert_eq!(live, 0, "fixture: a branch is still live, so a pin is still held");
+        assert!(applied >= 2 * MERGES, "fixture: {MERGES} merges of 2 rows applied only {applied} ops");
+        assert_eq!(
+            h40, h10,
+            "`version_history` went from {h10} entries after 10 merges to {h40} after {MERGES}, with no \
+             pin live between merges: it grows with merges, not with rows"
+        );
+        assert!(h40 <= rows, "{h40} history entries for {rows} published rows");
+    }
+
+    /// A database with a transaction manager and nothing in it, for tests that need real
+    /// snapshots. The `TempDir` is returned so it outlives the files.
+    fn txn_fixture(name: &str) -> (tempfile::TempDir, Arc<BufferPoolManager>, Catalog, Arc<TxnManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join(format!("{name}.db")))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(
+            crate::wal::log::WalManager::new(dir.path().join(format!("{name}.wal"))).unwrap(),
+        );
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        (dir, bp, catalog, txn)
+    }
+
+    /// **D194, Amendment 6: a pin taken while a merge publishes does not claim the merge's
+    /// versions.**
+    ///
+    /// The window is forced on one thread by doing what `merge` does from its reservation until
+    /// its record. It begins the publish transaction, reserves two sequence numbers, and
+    /// registers them through `PublishingEntry::register`, the call `merge` makes. Nothing is
+    /// committed yet. A fork taken inside the window, and a lazy pin taken there, must each pair a
+    /// snapshot that cannot see the publish with a seq below it. Once the publish commits, a fork
+    /// must claim it. Dropping the guard must then take the entry out.
+    ///
+    /// Mutant-only red, because it names `PublishingEntry`. M15 (`pin_seq` returns `apply_seq`)
+    /// fails it at the first `fork_seq` assertion, and M16 (`register` inserts nothing) fails it
+    /// there too.
+    #[test]
+    fn a_pin_taken_while_a_merge_publishes_does_not_claim_its_versions() {
+        let (_dir, _bp, _catalog, txn) = txn_fixture("publishing");
+        let rt = AgentRuntime::new();
+        let id = |run: &'static str| RunIdentity {
+            agent_id: "a",
+            run_id: Some(run),
+            model: None,
+            prompt: None,
+        };
+        let pin_of = |b: BranchId| {
+            let st = rt.state.lock().unwrap();
+            let ws = &st.workspaces[&b];
+            (ws.fork_seq, ws.fork_snapshot.clone().expect("fixture: the branch is not pinned"))
+        };
+
+        let t = txn.begin().unwrap();
+        let (start, entry) = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 2;
+            (start, PublishingEntry::register(st, &rt.state, start, t))
+        };
+
+        let during = rt.begin_session_pinned(id("during"), BranchId::TRUNK, &txn).unwrap().branch;
+        let (seq, snap) = pin_of(during);
+        assert!(!snap.includes(t), "fixture: the snapshot contains a publish that never committed");
+        assert_eq!(seq, start, "a fork inside the publish window claims versions its snapshot lacks");
+
+        let lazy = rt.begin_session_as(id("lazy"), BranchId::TRUNK).unwrap().branch;
+        let (_, seq) = rt.state.lock().unwrap().pin(lazy, &txn).expect("fixture: lazy is not live");
+        assert_eq!(seq, start, "a lazy pin inside the publish window claims versions its snapshot lacks");
+
+        txn.commit(t).unwrap();
+        let after = rt.begin_session_pinned(id("after"), BranchId::TRUNK, &txn).unwrap().branch;
+        let (seq, snap) = pin_of(after);
+        assert!(snap.includes(t), "fixture: a snapshot taken after the commit does not contain it");
+        assert_eq!(seq, start + 2, "a fork after the commit must claim the publish it can see");
+
+        drop(entry);
+        assert!(
+            rt.state.lock().unwrap().publishing.is_empty(),
+            "the guard did not take its entry out"
+        );
+    }
+
+    /// **D194, Amendment 6: REBASE refuses, retryably, while a merge is publishing.** No consistent
+    /// instant exists inside that window. The anti-vacuity half: with the entry gone, the same
+    /// branch validates.
+    #[test]
+    fn rebase_is_refused_while_a_merge_publishes() {
+        let (_dir, bp, mut catalog, txn) = txn_fixture("rebase_publishing");
+        let rt = AgentRuntime::new();
+        let branch = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let ctx = ExecCtx { catalog: &mut catalog, bp, txn: txn.clone() };
+
+        let t = txn.begin().unwrap();
+        let entry = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 1;
+            PublishingEntry::register(st, &rt.state, start, t)
+        };
+        let err = rt.rebase_validate(&ctx, branch).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("is publishing")),
+            "REBASE inside a publish window must refuse, and say why: {err:?}"
+        );
+
+        drop(entry);
+        assert!(rt.rebase_validate(&ctx, branch).is_ok(), "with no merge publishing, REBASE validates");
+    }
+
+    /// **D194, Amendment 7 item 4: a read through a pin that claims a merge the history has not
+    /// recorded yet refuses.**
+    ///
+    /// The fixture is the state between a merge's commit and its `record_applied`: an entry
+    /// registered through `PublishingEntry::register`, and a branch pinned above its start. That
+    /// is the seq `pin_seq` gives a snapshot that contains the merge. `record_read` reads only the
+    /// seq, so the fixture's own snapshot (from `pinned`, which does not include txn 99) plays no
+    /// part. The history still ends at version 3, so a read through that pin could only name 3,
+    /// for a row whose image already carried the merge.
+    ///
+    /// Three reads must NOT be refused (Amendment 8):
+    /// - one through a pin AT the start, which is a pin taken inside the window;
+    /// - a row-targeting read through the pin above;
+    /// - a full-scan inspection through it.
+    ///
+    /// Neither of the last two names a version. The anti-vacuity half: once the entry is gone, the
+    /// refused read is retained.
+    ///
+    /// Mutant-only red, because it names `PublishingEntry`. M19 (the refusal removed) fails the
+    /// first assertion. M20 (`<=`) fails the pin-at-start read, M21 (no shape conjunct) the full
+    /// scan, and M22 (no purpose conjunct) the row-targeting read.
+    #[test]
+    fn version_history_is_not_asked_for_a_merge_it_has_not_recorded() {
+        let rt = AgentRuntime::new();
+        let (above, at_start) = (BranchId::new(7, 0), BranchId::new(8, 0));
+        let (start, entry) = {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let start = st.apply_seq;
+            st.apply_seq += 2;
+            (start, PublishingEntry::register(st, &rt.state, start, 99))
+        };
+        let pinned_at = {
+            let mut st = rt.state.lock().unwrap();
+            let at = st.apply_seq;
+            st.insert_workspace(above, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, above));
+            st.insert_workspace(at_start, pinned("b_8", 101, start));
+            st.captures.insert(101, TxnCapture::new(TxnId(101), ProvId::NONE, at_start));
+            at
+        };
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let read = |b: BranchId, shape: AccessShape, purpose: ReadPurpose, through: u64| {
+            rt.record_read(
+                b,
+                TableId(1),
+                shape,
+                &[(RowId(1), row.clone())],
+                None,
+                None,
+                purpose,
+                Some(through),
+            )
+        };
+        let exact = || read(above, AccessShape::IndexLookup, ReadPurpose::Inspection, pinned_at);
+        let err = exact().err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("has not recorded its versions yet")),
+            "a read through a pin above an unrecorded merge must refuse, and say why: {err:?}"
+        );
+        assert!(
+            read(at_start, AccessShape::IndexLookup, ReadPurpose::Inspection, start).is_ok(),
+            "a pin AT the entry's start excludes the merge, so the history names what it saw"
+        );
+        assert!(
+            read(above, AccessShape::IndexLookup, ReadPurpose::RowTargeting, pinned_at).is_ok(),
+            "a row-targeting read records no version, so there is nothing it could mis-name"
+        );
+        assert!(
+            read(above, AccessShape::FullScan, ReadPurpose::Inspection, pinned_at).is_ok(),
+            "a full-scan inspection records a predicate at `observed_at`, not a version"
+        );
+        drop(entry);
+        assert!(exact().is_ok(), "with no merge publishing, the same read is retained");
+    }
+
+    /// **A read whose pin was released still retains what names no version** (Amendment 9). The
+    /// fixture is the one in `..._never_names_a_version_a_read_did_not_see`: pinned at 3, main
+    /// publishes 4 and 5, re-pinned to 5, and 3 is no longer a live pin. A full-scan inspection
+    /// records a predicate, and a row-targeting read records a region. Neither consults the
+    /// history, so neither is refused.
+    ///
+    /// No red state: it names nothing new, so it compiles at `0570fe8` and passes there. M23 (the
+    /// `released` filter back to `purpose == Inspection`) fails it at the full-scan read.
+    #[test]
+    fn version_history_released_pin_still_retains_reads_that_name_no_version() {
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            for _ in 0..3 {
+                publish_next(&mut st, 1);
+            }
+            let at = st.apply_seq;
+            st.insert_workspace(b, pinned("b_7", 100, at));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+            publish_next(&mut st, 1);
+            publish_next(&mut st, 1);
+            let now = st.apply_seq;
+            let snap = Arc::new(Snapshot {
+                high_water: now + 1,
+                active: std::collections::HashSet::new(),
+            });
+            assert!(st.repin(b, snap, now), "fixture: the branch is not live");
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let read = |shape: AccessShape, purpose: ReadPurpose| {
+            let matched = [(RowId(1), row.clone())];
+            rt.record_read(b, TableId(1), shape, &matched, None, None, purpose, Some(3))
+        };
+        assert!(
+            read(AccessShape::FullScan, ReadPurpose::Inspection).is_ok(),
+            "a full-scan inspection records a predicate at `observed_at`, not a version"
+        );
+        assert!(
+            read(AccessShape::IndexLookup, ReadPurpose::RowTargeting).is_ok(),
+            "a row-targeting read records a region, not a version"
+        );
+    }
+
+    /// **`pin_seq`'s two-catalog assertions have to be able to FIRE** (Amendment 8). With one
+    /// catalog neither case can arise, which is why nothing else reaches them. Here, a snapshot
+    /// excludes the merge that reserved at 5 and contains the one that reserved at 7.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no single fork_seq")]
+    fn pin_seq_names_a_contained_merge_above_an_excluded_one() {
+        let snap = Snapshot { high_water: 100, active: std::collections::HashSet::from([50]) };
+        let publishing = BTreeMap::from([(5, 50), (7, 60)]);
+        pin_seq(&publishing, 9, None, &snap);
+    }
+
+    /// The other assertion: version 9 was recorded while nothing is publishing, but `apply_seq`
+    /// says 5. No pin at 5 could read version 9 as anything but never published.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is recorded above")]
+    fn pin_seq_names_a_recorded_version_above_its_seq() {
+        let snap = Snapshot { high_water: 100, active: std::collections::HashSet::new() };
+        pin_seq(&BTreeMap::new(), 5, Some(9), &snap);
+    }
+
+    /// **The pin audit has to be able to FAIL at a door**, in the way `txn_refs`' audit is shown to
+    /// above. An under-count is simulated by reaching past the doors and forgetting a live pin.
+    /// That is the mistake the doors exist to prevent, and left alone it would let the horizon pass
+    /// a live pin.
+    ///
+    /// It names `retention`, so it cannot compile against `0570fe8`, and it landed with the field.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pins disagree with a scan")]
+    fn version_history_pin_audit_fires_on_a_desynchronised_index() {
+        let mut st = State::default();
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, 0));
+        assert_eq!(st.retention.pins.get(&0), Some(&1), "fixture: the pin was not indexed");
+        st.retention.pins.clear();
+        st.insert_workspace(BranchId::new(8, 0), ws("b_8", 101, &[]));
+    }
+
+    // ---- D194 cost review (Amendment 10): retention by LIVE pins, whatever their age ----------
+    //
+    // `frontier/d194_cost_review.md` @ `9ab4e83`: with an old pin live, or a chain of children
+    // inheriting one pin, the history grew with merges at `4436e7f`. The flat SQL test above held no
+    // live pin between merges, which is the one regime where the oldest-pin rule frees anything.
+    // W1–W3 and C2 name only fields and functions that exist at `0570fe8`; they fail at `4436e7f`.
+
+    /// One statement, parsed.
+    fn parse_one(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// `(Σ entries, Σ capacity, every row's capacity within 2·len + 4)` over every row's history.
+    /// Capacity as well as length: a `Vec` that is drained keeps its allocation.
+    fn history_footprint(st: &State) -> (usize, usize, bool) {
+        let entries = st.version_history.values().map(Vec::len).sum();
+        let capacity = st.version_history.values().map(Vec::capacity).sum();
+        let tight = st.version_history.values().all(|h| h.capacity() <= 2 * h.len() + 4);
+        (entries, capacity, tight)
+    }
+
+    /// `t (id, v)` holding rows `1..=rows` with `v = 10·id`, and a runtime beside it.
+    #[allow(clippy::type_complexity)]
+    fn sql_fixture(
+        name: &str,
+        rows: i32,
+    ) -> (tempfile::TempDir, Arc<BufferPoolManager>, Catalog, Arc<TxnManager>, Arc<AgentRuntime>) {
+        let (dir, bp, mut catalog, txn) = txn_fixture(name);
+        let rt = Arc::new(AgentRuntime::new());
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut sql = vec!["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);".to_string()];
+        sql.extend((1..=rows).map(|i| format!("INSERT INTO t VALUES ({i}, {});", i * 10)));
+        for q in sql {
+            let out = crate::execution::executor::run(
+                parse_one(&q),
+                &mut catalog,
+                bp.clone(),
+                txn.clone(),
+                &mut main,
+            );
+            if let Err(e) = out {
+                panic!("{q}: {e}");
+            }
+        }
+        (dir, bp, catalog, txn, rt)
+    }
+
+    /// One merge from trunk, the way the lane's harness makes them: fork a pinned branch, add 1 to
+    /// `v` in every row, merge.
+    fn merge_round(rt: &AgentRuntime, ctx: &mut ExecCtx, txn: &TxnManager, rows: i32, run_id: &str) {
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "w", run_id: Some(run_id), model: None, prompt: None },
+                BranchId::TRUNK,
+                txn,
+            )
+            .unwrap()
+            .branch;
+        for id in 1..=rows {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            let n = rt.write(ctx, b, parse_one(&sql)).unwrap();
+            assert_eq!(n, 1, "fixture: {run_id} staged nothing for row {id}");
+        }
+        let report = rt.merge(ctx, b).unwrap();
+        assert!(report.applied_to_target, "fixture: {run_id} did not publish: {:?}", report.outcome);
+    }
+
+    /// **W1: merges beside an OLD live pin leave the history flat.** OLD is pinned before any
+    /// version exists, so it reads none; each merge's own pin reads the version its merge
+    /// supersedes, and must take that entry with it when it seals, even though OLD is older.
+    ///
+    /// At `4436e7f` every merge left one entry per row behind: 20 after merge 10, 80 after 40.
+    #[test]
+    fn version_history_stays_flat_under_merges_beside_an_old_pin() {
+        const ROWS: i32 = 2;
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("w1", ROWS);
+        let old = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "old", run_id: Some("old"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        let census = || {
+            let st = rt.state.lock().unwrap();
+            (history_footprint(&st), st.versions.len(), st.workspaces.len())
+        };
+        let mut after_ten = None;
+        for i in 1..=40 {
+            merge_round(&rt, &mut ctx, &txn, ROWS, &format!("w{i}"));
+            if i == 10 {
+                after_ten = Some(census());
+            }
+        }
+        let ((e10, c10, tight10), ..) = after_ten.unwrap();
+        let ((e40, c40, tight40), rows, live) = census();
+        assert_eq!(live, 1, "fixture: OLD should be the one live branch");
+        assert!(rt.state.lock().unwrap().workspaces.contains_key(&old), "fixture: OLD is not live");
+        assert_eq!(rows, ROWS as usize, "fixture: every row should have a published version");
+        assert_eq!(
+            e40, e10,
+            "`version_history` went from {e10} entries after 10 merges to {e40} after 40, beside one \
+             old pin that reads none of them: it grows with merges"
+        );
+        assert!(e40 <= rows, "{e40} entries for {rows} rows, and no live pin reads an old version");
+        assert!(tight10 && tight40, "a row keeps capacity beyond 2·len + 4");
+        assert_eq!(c40, c10, "capacity grew from {c10} to {c40} with merges");
+    }
+
+    /// **W2: a chain of children inheriting ONE pin leaves the history flat.** Each round forks a
+    /// child from the chain's head, abandons the head and runs one merge from trunk, so never more
+    /// than three branches are live while the pin itself lives for every merge. The pin reads one
+    /// old version of each row; everything the merges' own pins read must go when they seal.
+    ///
+    /// At `4436e7f` the inherited pin held the horizon, and the history grew with every round.
+    #[test]
+    fn version_history_stays_flat_under_a_chain_that_inherits_one_pin() {
+        const ROWS: i32 = 2;
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("w2", ROWS);
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        merge_round(&rt, &mut ctx, &txn, ROWS, "w0");
+        let mut head = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "chain", run_id: Some("c0"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let s0 = rt.state.lock().unwrap().workspaces[&head].fork_seq;
+        let footprint = || history_footprint(&rt.state.lock().unwrap());
+        let mut at_ten = None;
+        for i in 1..=40 {
+            let run = format!("c{i}");
+            let child = rt
+                .begin_session_pinned(
+                    RunIdentity { agent_id: "chain", run_id: Some(&run), model: None, prompt: None },
+                    head,
+                    &txn,
+                )
+                .unwrap()
+                .branch;
+            rt.abandon(head).unwrap();
+            head = child;
+            merge_round(&rt, &mut ctx, &txn, ROWS, &format!("w{i}"));
+            if i == 10 {
+                at_ten = Some(footprint());
+            }
+        }
+        let (e10, _, tight10) = at_ten.unwrap();
+        let (e40, _, tight40) = footprint();
+        let st = rt.state.lock().unwrap();
+        assert_eq!(st.workspaces.len(), 1, "fixture: only the chain's head should be live");
+        assert_eq!(st.workspaces[&head].fork_seq, s0, "fixture: the head does not hold the inherited pin");
+        // Per row: the version the pin reads, the newest, and garbage below half the row.
+        let bound = 3 * ROWS as usize;
+        assert!(
+            e10 <= bound && e40 <= bound,
+            "`version_history` holds {e10} entries after 10 rounds and {e40} after 40; one live pin \
+             reads one old version per row, so at most {bound}"
+        );
+        assert!(tight10 && tight40, "a row keeps capacity beyond 2·len + 4");
+        // Bounded, and still exact for the pin that is live: the version it read is the newest one
+        // at or below it, read here from `applied`, not from the history under test.
+        let tbl = table_id("t");
+        for id in 1..=ROWS as u64 {
+            let want = st
+                .applied
+                .iter()
+                .filter(|a| a.tbl == tbl && a.row == RowId(id) && a.seq <= s0)
+                .map(|a| a.seq)
+                .max();
+            assert!(want.is_some(), "fixture: row {id} had no version before the pin");
+            assert_eq!(
+                st.version_seen(tbl, RowId(id), Some(s0)).map(|v| v.begin_ts),
+                want,
+                "the chain's pin no longer names the version of row {id} it read"
+            );
+        }
+    }
+
+    /// **W3: an entry goes when its LAST reader leaves, even with an older pin live, and its
+    /// capacity goes with it.** Fifty pins each read a different version of one row. Pins 50..2
+    /// leave; only pin 1's version and the newest are still read by anyone.
+    ///
+    /// At `4436e7f` nothing was freed while pin 1, the oldest, lived: 51 entries.
+    #[test]
+    fn version_history_frees_an_entry_when_its_last_reader_leaves_and_returns_the_capacity() {
+        let mut st = State::default();
+        publish_next(&mut st, 1);
+        for j in 1..=50u64 {
+            let at = st.apply_seq;
+            st.insert_workspace(BranchId::new(j, 0), pinned(&format!("b_{j}"), 100 + j, at));
+            publish_next(&mut st, 1);
+        }
+        // Premise: pin j was taken right after version j was published, so it reads version j.
+        for j in [1u64, 25, 50] {
+            assert_eq!(
+                st.version_seen(TableId(1), RowId(1), Some(j)).map(|v| v.begin_ts),
+                Some(j),
+                "fixture: pin {j} does not read version {j}"
+            );
+        }
+        for j in (2..=50u64).rev() {
+            assert!(st.remove_workspace(&BranchId::new(j, 0)).is_some(), "fixture: b_{j} not live");
+        }
+        let h = &st.version_history[&(1, 1)];
+        assert!(
+            h.len() <= 3,
+            "row 1 holds {} entries with one live pin; it reads version 1, and the newest is 51, so at \
+             most 3 (dead below half the row)",
+            h.len()
+        );
+        assert!(
+            h.capacity() <= 2 * h.len() + 4,
+            "row 1 keeps capacity {} for {} entries",
+            h.capacity(),
+            h.len()
+        );
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(1)).map(|v| v.begin_ts),
+            Some(1),
+            "freeing took the version pin 1 reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        let h = &st.version_history[&(1, 1)];
+        assert_eq!(h.len(), 1, "no pin left: the newest entry alone");
+        assert!(h.capacity() <= 6, "row 1 keeps capacity {} for one entry", h.capacity());
+    }
+
+    /// **W4: a departure re-tests at most `DEPARTURE_SWEEP_BUDGET` entries under the lock, and the
+    /// rest of its range is finished by later publishes** (Amendment 10, decision 3). One pin reads
+    /// an old version of `DEPARTURE_SWEEP_BUDGET + 100` rows, then departs.
+    ///
+    /// Mutant-only red: it names the new fields and the budget. M28 (no budget) leaves 0 in
+    /// `readers` after the departure, and M29 (no sweep at publish) leaves 100 after the publishes.
+    #[test]
+    fn version_history_departure_sweep_is_chunked_and_finishes_under_later_publishes() {
+        let n = DEPARTURE_SWEEP_BUDGET as u64 + 100;
+        let mut st = State::default();
+        for row in 1..=n {
+            publish_next(&mut st, row);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for row in 1..=n {
+            publish_next(&mut st, row);
+        }
+        assert_eq!(
+            st.retention.readers.len() as u64,
+            n,
+            "fixture: the pin should read one old version of every row"
+        );
+        assert!(st.remove_workspace(&BranchId::new(7, 0)).is_some(), "fixture: b_7 not live");
+        assert_eq!(
+            st.retention.readers.len(),
+            100,
+            "the departure re-tested a number of entries other than DEPARTURE_SWEEP_BUDGET under \
+             the lock"
+        );
+        assert!(!st.retention.pending.is_empty(), "the rest of the departure's range was not queued");
+        for _ in 0..50 {
+            publish_next(&mut st, n + 1);
+        }
+        assert!(
+            st.retention.readers.is_empty(),
+            "{} entries read by nobody are still indexed after 50 publishes",
+            st.retention.readers.len()
+        );
+        assert!(st.retention.pending.is_empty(), "the queue did not drain");
+        assert_eq!(held(&st) as u64, n + 1, "one entry per row once the sweep has finished");
+    }
+
+    /// A provenance store whose `fail_at`-th `stamp_row` fails. Everything else is the in-memory
+    /// store's.
+    struct FailingStamps {
+        inner: MemProvenanceStore,
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl ProvenanceStore for FailingStamps {
+        fn intern(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
+            self.inner.intern(run)
+        }
+        fn lookup(&self, id: ProvId) -> Result<RunEntity, FerroError> {
+            self.inner.lookup(id)
+        }
+        fn attribute(&self, rid: crate::storage::heap_file_manager::RecordId) -> Result<ProvId, FerroError> {
+            self.inner.attribute(rid)
+        }
+        fn stamp(
+            &self,
+            rid: crate::storage::heap_file_manager::RecordId,
+            id: ProvId,
+        ) -> Result<(), FerroError> {
+            self.inner.stamp(rid, id)
+        }
+        fn page_dictionary_lens(&self) -> Result<Vec<(u32, usize)>, FerroError> {
+            self.inner.page_dictionary_lens()
+        }
+        fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.fail_at {
+                return Err(FerroError::Internal("injected stamp failure".into()));
+            }
+            self.inner.stamp_row(table, row, id)
+        }
+        fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+            self.inner.row_author(table, row)
+        }
+        fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+            self.inner.attributed_rows(table)
+        }
+        fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+            self.inner.forget_table(table)
+        }
+    }
+
+    /// **C2: an author stamp that fails after the publish committed leaves every version
+    /// recorded** (Amendment 10, decision 7). The stamp is the one fallible call in
+    /// `record_applied`, and it used to sit inside the loop that records versions, so an error
+    /// there left the rows committed and the later ones unnamed: exact reads of them would name
+    /// the version before, with nothing to refuse them.
+    ///
+    /// At `4436e7f` the second stamp's failure returned before row 3's version was recorded.
+    #[test]
+    fn record_applied_records_every_version_before_a_failed_stamp() {
+        let (_dir, bp, mut catalog, txn) = txn_fixture("c2");
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut run_main = |sql: &str, catalog: &mut Catalog| {
+            crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), &mut main)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        run_main("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog);
+        for id in 1..=3 {
+            run_main(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog);
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+        }
+        // Premise: the publish had committed, so main shows every update.
+        let rows = match run_main("SELECT id, v FROM t;", &mut catalog) {
+            crate::execution::executor::Outcome::Rows(r) => r,
+            _ => panic!("fixture: expected rows"),
+        };
+        for row in &rows {
+            match (&row[0], &row[1]) {
+                (Value::Integer(id), Value::Integer(v)) => {
+                    assert_eq!(*v, id * 10 + 1, "fixture: row {id} was not published")
+                }
+                other => panic!("fixture: not an (INTEGER, INTEGER) row: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 3, "fixture: expected three rows");
+        let st = rt.state.lock().unwrap();
+        let tbl = table_id("t");
+        for id in 1..=3u64 {
+            assert!(
+                st.versions.contains_key(&(tbl.0, id)),
+                "row {id} was published and committed, but its version was never recorded: an exact \
+                 read of it names the version before, and nothing refuses that read"
+            );
+        }
+    }
+
+    // ---- D194 cost review Q7 (Amendment 11): an unpinned read names what its SCAN saw ----------
+    //
+    // `visible_rows_where` scans with no lock held and `record_read` relocks, so a merge can land
+    // between the two. A read through a pin was already answered as of the pin. These drive a read
+    // of TRUNK, which no workspace pins, through the same two calls `select` makes, and land the
+    // merge between them on one thread.
+
+    /// A branch forked from TRUNK and pinned, to own the capture a read is recorded against.
+    fn reader(rt: &AgentRuntime, txn: &TxnManager, run: &str) -> BranchId {
+        rt.begin_session_pinned(
+            RunIdentity { agent_id: "reader", run_id: Some(run), model: None, prompt: None },
+            BranchId::TRUNK,
+            txn,
+        )
+        .unwrap()
+        .branch
+    }
+
+    /// The versions a capture names for one row, from its exact read sets.
+    fn named_versions(st: &State, branch: BranchId, row: RowId) -> Vec<u64> {
+        use crate::provenance::readset::ReadSet;
+        let txn = st.workspaces[&branch].txn;
+        st.captures[&txn.0]
+            .read_sets()
+            .iter()
+            .filter_map(|rs| match rs {
+                ReadSet::ExactVersions(vs) => Some(vs.clone()),
+                ReadSet::Predicate(_) => None,
+            })
+            .flatten()
+            .filter(|v| v.row == row)
+            .map(|v| v.begin_ts)
+            .collect()
+    }
+
+    /// **The forward window:** R scans TRUNK and sees m0's version of row 1; W's merge then
+    /// publishes a newer one; only then is R's exact read recorded. The read may be refused, or may
+    /// name m0's version. It must never name W's, which is a version it did not see. That version
+    /// is what the merge premise check would compare against itself, and what would draw a REVERT
+    /// edge from W instead of from m0.
+    ///
+    /// R is forked before m0, so its own pin is not the scan's seq, and the read cannot be answered
+    /// through a live pin by coincidence.
+    ///
+    /// At `b4cfce3` the unpinned read carried no `seen_through`, and it named W's version.
+    #[test]
+    fn an_unpinned_read_never_names_a_version_published_after_its_scan() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("q7_forward", 2);
+        let r = reader(&rt, &txn, "r");
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            merge_round(&rt, &mut ctx, &txn, 2, "m0");
+        }
+        let tbl = table_id("t");
+        let saw = {
+            let st = rt.state.lock().unwrap();
+            st.applied.iter().filter(|a| a.tbl == tbl && a.row == RowId(1)).map(|a| a.seq).max()
+        };
+        let saw = saw.expect("fixture: m0 published no version of row 1");
+        let (rows, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            merge_round(&rt, &mut ctx, &txn, 1, "w");
+        }
+        let matched: Vec<(RowId, Vec<Value>)> =
+            rows.into_iter().filter(|(rid, _)| *rid == RowId(1)).collect();
+        assert_eq!(matched.len(), 1, "fixture: the scan did not return row 1");
+        assert_eq!(matched[0].1[1], Value::Integer(11), "fixture: the scan should have seen m0's value");
+        let out = rt.record_read(
+            r,
+            tbl,
+            AccessShape::IndexLookup,
+            &matched,
+            None,
+            None,
+            ReadPurpose::Inspection,
+            seen,
+        );
+        match out {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("was released while this read ran"), "refused for the wrong reason: {e}");
+            }
+            Ok(()) => assert_eq!(
+                named_versions(&rt.state.lock().unwrap(), r, RowId(1)),
+                vec![saw],
+                "the scan saw version {saw} of row 1, and the capture names another"
+            ),
+        }
+    }
+
+    /// **The reverse window:** a merge has committed but not recorded, so a snapshot taken now
+    /// contains its rows while `versions` does not yet hold its versions. It is modelled as a
+    /// registered reservation whose publish txn has committed. An exact read whose scan contains
+    /// that merge must refuse: the version it saw has no name yet.
+    ///
+    /// At `b4cfce3` the unpinned read carried no `seen_through`, so it was retained and named
+    /// whatever `versions` held.
+    #[test]
+    fn an_unpinned_read_whose_snapshot_holds_an_unrecorded_merge_refuses() {
+        let (_dir, bp, catalog, txn, rt) = sql_fixture("q7_reverse", 1);
+        let r = reader(&rt, &txn, "r");
+        let t = txn.begin().unwrap();
+        txn.commit(t).unwrap();
+        let entry = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 1;
+            PublishingEntry::register(st, &rt.state, start, t)
+        };
+        let (rows, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        let matched: Vec<(RowId, Vec<Value>)> =
+            rows.into_iter().filter(|(rid, _)| *rid == RowId(1)).collect();
+        assert_eq!(matched.len(), 1, "fixture: the scan did not return row 1");
+        let err = rt
+            .record_read(
+                r,
+                table_id("t"),
+                AccessShape::IndexLookup,
+                &matched,
+                None,
+                None,
+                ReadPurpose::Inspection,
+                seen,
+            )
+            .err()
+            .map(|e| e.to_string());
+        drop(entry);
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("has not recorded its versions yet")),
+            "an exact read whose snapshot contains an unrecorded merge must refuse: {err:?}"
+        );
+    }
+
+    /// **The predicate clock:** R full-scans TRUNK before W's merge and is recorded after it. A
+    /// scan's REVERT edges are decided by `observed_at` against each write's `begin_ts`, so R's
+    /// clock must be its scan's. Then `REVERT MERGE <W>` is not blocked by R, which never saw W's
+    /// write.
+    ///
+    /// The positive control: R2 scans after W and is blocked on, so the edge mechanism is live.
+    ///
+    /// At `b4cfce3` R's clock was taken at record time, after W, so the revert was blocked by R.
+    #[test]
+    fn an_unpinned_scan_is_not_a_dependent_of_a_merge_published_after_it() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("q7_revert", 2);
+        let r = reader(&rt, &txn, "r");
+        let r2 = reader(&rt, &txn, "r2");
+        let tbl = table_id("t");
+        let read_trunk = |catalog: &Catalog| {
+            let read = ReadCtx { catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        let (rows, seen) = read_trunk(&catalog);
+        let merge_id = {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            let w = reader(&rt, &txn, "w");
+            let n = rt.write(&mut ctx, w, parse_one("UPDATE t SET v = v + 1 WHERE id = 1;")).unwrap();
+            assert_eq!(n, 1, "fixture: W staged nothing");
+            let report = rt.merge(&mut ctx, w).unwrap();
+            assert!(report.applied_to_target, "fixture: W did not publish: {:?}", report.outcome);
+            report.merge_id
+        };
+        rt.record_read(r, tbl, AccessShape::FullScan, &rows, None, None, ReadPurpose::Inspection, seen)
+            .unwrap();
+        let (rows2, seen2) = read_trunk(&catalog);
+        rt.record_read(r2, tbl, AccessShape::FullScan, &rows2, None, None, ReadPurpose::Inspection, seen2)
+            .unwrap();
+        let (r_txn, r2_txn) = {
+            let st = rt.state.lock().unwrap();
+            (st.workspaces[&r].txn, st.workspaces[&r2].txn)
+        };
+        let plan = {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.revert_merge(&mut ctx, &merge_id, RevertMode::Halt).unwrap()
+        };
+        assert!(
+            plan.blocked_by.contains(&r2_txn),
+            "positive control: a scan recorded after W must block W's revert: {:?}",
+            plan.blocked_by
+        );
+        assert!(
+            !plan.blocked_by.contains(&r_txn),
+            "R scanned before W published and never saw W's write, yet it blocks W's revert: {:?}",
+            plan.blocked_by
+        );
+    }
+
+    // ---- Amendment 12: a fresh review of `4436e7f..ff971ee` -------------------------------------
+
+    /// **F1: a merge whose author stamp fails is still finished.** The publish had committed and
+    /// its versions were recorded, and the stamp's error used to return before `attest_merge` and
+    /// `seal`. That left a published branch LIVE: a second MERGE would publish it again, and an
+    /// ABANDON would drop the capture of a merge whose rows are in main.
+    ///
+    /// At `ff971ee` the branch is still live after the failed stamp.
+    #[test]
+    fn a_merge_whose_author_stamp_fails_is_still_sealed() {
+        let (_dir, bp, mut catalog, txn) = txn_fixture("f1_sealed");
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut run_main = |sql: &str, catalog: &mut Catalog| {
+            crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), &mut main)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        run_main("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut catalog);
+        for id in 1..=3 {
+            run_main(&format!("INSERT INTO t VALUES ({id}, {});", id * 10), &mut catalog);
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let b_txn = rt.state.lock().unwrap().workspaces[&b].txn;
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+            {
+                let st = rt.state.lock().unwrap();
+                assert!(
+                    !st.workspaces.contains_key(&b),
+                    "the merge published, yet its branch is still live and can be merged again"
+                );
+                assert!(
+                    st.published_txns.contains(&b_txn.0),
+                    "the merge published, yet its txn is not recorded as published, so an ABANDON \
+                     would drop the capture REVERT needs"
+                );
+            }
+            assert!(rt.merge(&mut ctx, b).is_err(), "a second MERGE of a published branch was accepted");
+        }
+        let rows = match run_main("SELECT id, v FROM t;", &mut catalog) {
+            crate::execution::executor::Outcome::Rows(r) => r,
+            _ => panic!("fixture: expected rows"),
+        };
+        assert_eq!(rows.len(), 3, "fixture: expected three rows");
+        for row in &rows {
+            match (&row[0], &row[1]) {
+                (Value::Integer(id), Value::Integer(v)) => {
+                    assert_eq!(*v, id * 10 + 1, "row {id} did not move exactly once")
+                }
+                other => panic!("fixture: not an (INTEGER, INTEGER) row: {other:?}"),
+            }
+        }
+    }
+
+    /// **F6: a read that carries no seq is refused.** Every read path pairs its snapshot with one,
+    /// so `None` could only come from a new caller. Accepting it would bring back Q7: the latest
+    /// version named for a row the scan may not have seen, and a clock taken at record time.
+    ///
+    /// At `ff971ee` it was accepted.
+    #[test]
+    fn a_read_without_a_paired_seq_is_refused() {
+        let rt = AgentRuntime::new();
+        let b = BranchId::new(7, 0);
+        {
+            let mut st = rt.state.lock().unwrap();
+            st.insert_workspace(b, pinned("b_7", 100, 0));
+            st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, b));
+        }
+        let row = vec![Value::Integer(1), Value::Integer(10)];
+        let err = rt
+            .record_read(
+                b,
+                TableId(1),
+                AccessShape::IndexLookup,
+                &[(RowId(1), row)],
+                None,
+                None,
+                ReadPurpose::Inspection,
+                None,
+            )
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("carries no seq")),
+            "a read with no paired seq must be refused: {err:?}"
+        );
+    }
+
+    /// **F4: an unpinned scan inside a publish window pairs with the window's start.** The
+    /// reservation's txn has not committed, so the scan's snapshot cannot contain it, and its seq
+    /// must not claim the reserved numbers. Mutant-only: M37 (`read_now` returning `apply_seq`)
+    /// fails it.
+    #[test]
+    fn an_unpinned_scan_inside_a_publish_window_pairs_with_its_start() {
+        let (_dir, bp, catalog, txn, rt) = sql_fixture("f4_window", 1);
+        let t = txn.begin().unwrap();
+        let (start, entry) = {
+            let mut st = rt.state.lock().unwrap();
+            let start = st.apply_seq;
+            st.apply_seq += 2;
+            (start, PublishingEntry::register(st, &rt.state, start, t))
+        };
+        let (_, seen) = {
+            let read = ReadCtx { catalog: &catalog, bp: bp.clone(), txn: txn.clone() };
+            rt.visible_rows_where(&read, Some(BranchId::TRUNK), "t", None, None, None).unwrap()
+        };
+        drop(entry);
+        assert_eq!(
+            seen,
+            Some(start),
+            "a scan whose snapshot cannot see the reserved publish claimed its sequence numbers"
+        );
+    }
+
+    // ---- Amendment 13: review 6 (`frontier/d194_review6.md` @ `8a87787`) ------------------------
+
+    /// `t (id, v)` holding rows `1..=rows` with `v = 10·id`, over a runtime whose `fail_at`-th
+    /// author stamp fails (`FailingStamps`).
+    #[allow(clippy::type_complexity)]
+    fn failing_stamp_fixture(
+        name: &str,
+        rows: i32,
+        fail_at: usize,
+    ) -> (tempfile::TempDir, Arc<BufferPoolManager>, Catalog, Arc<TxnManager>, Arc<AgentRuntime>) {
+        let (dir, bp, mut catalog, txn) = txn_fixture(name);
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = Arc::new(FailingStamps {
+            inner: MemProvenanceStore::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_at,
+        });
+        let rt = Arc::new(rt);
+        let mut main = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut sql = vec!["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);".to_string()];
+        sql.extend((1..=rows).map(|i| format!("INSERT INTO t VALUES ({i}, {});", i * 10)));
+        for q in sql {
+            let out = crate::execution::executor::run(
+                parse_one(&q),
+                &mut catalog,
+                bp.clone(),
+                txn.clone(),
+                &mut main,
+            );
+            if let Err(e) = out {
+                panic!("{q}: {e}");
+            }
+        }
+        (dir, bp, catalog, txn, rt)
+    }
+
+    /// One statement through the SQL executor, on `session`.
+    fn exec_sql(
+        sql: &str,
+        session: &mut crate::execution::session::Session,
+        catalog: &mut Catalog,
+        bp: &Arc<BufferPoolManager>,
+        txn: &Arc<TxnManager>,
+    ) -> Result<crate::execution::executor::Outcome, FerroError> {
+        crate::execution::executor::run(parse_one(sql), catalog, bp.clone(), txn.clone(), session)
+    }
+
+    /// **A: a connection whose MERGE published, and then failed at the author stamp, is no longer
+    /// bound to the branch that MERGE sealed.** The binding is decided by whether the runtime still
+    /// holds a workspace for the branch, not by whether `merge` returned `Ok`.
+    ///
+    /// At `0fdcd81` the connection stayed bound to the reaped branch, and could not begin another
+    /// session.
+    #[test]
+    fn a_session_whose_merge_published_but_failed_is_unbound() {
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("a_merge_unbind", 3, 2);
+        let mut s = crate::execution::session::Session::with_runtime(rt.clone());
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut s, &mut catalog, &bp, &txn).unwrap();
+        let b = s.agent.as_ref().expect("fixture: no agent session").branch;
+        for id in 1..=3 {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            exec_sql(&sql, &mut s, &mut catalog, &bp, &txn).unwrap();
+        }
+        let err = exec_sql("MERGE;", &mut s, &mut catalog, &bp, &txn).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+            "fixture: the MERGE should fail at the injected stamp, got {err:?}"
+        );
+        assert!(
+            !rt.state.lock().unwrap().workspaces.contains_key(&b),
+            "fixture: the MERGE should have sealed the branch"
+        );
+        assert!(s.agent.is_none(), "the connection is still bound to a branch that no longer exists");
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r2';", &mut s, &mut catalog, &bp, &txn)
+            .expect("the connection could not begin a session after a MERGE that published");
+    }
+
+    /// **A, for ABANDON: a connection whose branch was sealed by another connection is unbound by
+    /// its own ABANDON, even though that ABANDON fails.**
+    ///
+    /// At `0fdcd81` the failed ABANDON left the binding, so the connection stayed stuck until it
+    /// reconnected.
+    #[test]
+    fn a_session_whose_branch_was_abandoned_elsewhere_is_unbound_by_its_own_abandon() {
+        let (_dir, bp, mut catalog, txn, rt) = sql_fixture("a_abandon_unbind", 1);
+        let mut s1 = crate::execution::session::Session::with_runtime(rt.clone());
+        let mut s2 = crate::execution::session::Session::with_runtime(rt.clone());
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut s1, &mut catalog, &bp, &txn).unwrap();
+        let name = s1.agent.as_ref().expect("fixture: no agent session").branch_name.clone();
+        exec_sql(&format!("ABANDON BRANCH {name};"), &mut s2, &mut catalog, &bp, &txn).unwrap();
+        assert!(
+            exec_sql("ABANDON;", &mut s1, &mut catalog, &bp, &txn).is_err(),
+            "fixture: abandoning a branch that is already sealed should fail"
+        );
+        assert!(s1.agent.is_none(), "the connection is still bound to a branch that no longer exists");
+        exec_sql("BEGIN AGENT SESSION AS 'a' RUN 'r2';", &mut s1, &mut catalog, &bp, &txn)
+            .expect("the connection could not begin a session after its branch was sealed");
+    }
+
+    /// **F: a merge whose author stamp fails is attested exactly once**: one `Merge` entry on its
+    /// target, and one `Reap` closing the branch's chain.
+    ///
+    /// Mutant-only: M39, skipping `attest_merge` on the authorship-error path, fails it.
+    #[test]
+    fn a_merge_whose_author_stamp_fails_is_attested_once() {
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("f_attested", 3, 2);
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "a", run_id: Some("r"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        let merges_on_trunk = |rt: &AgentRuntime| {
+            rt.attested_entries(BranchId::TRUNK).iter().filter(|e| e.op == BranchOp::Merge).count()
+        };
+        let before = merges_on_trunk(&rt);
+        {
+            let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+            for id in 1..=3 {
+                let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+                assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+            }
+            let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+                "fixture: the merge should fail at the injected stamp, got {err:?}"
+            );
+        }
+        assert_eq!(merges_on_trunk(&rt), before + 1, "the published merge was not attested exactly once");
+        let chain = rt.attested_entries(b);
+        assert_eq!(chain.last().map(|e| e.op), Some(BranchOp::Reap), "the branch's chain is not closed");
+        assert_eq!(
+            chain.iter().filter(|e| e.op == BranchOp::Reap).count(),
+            1,
+            "the branch's chain was closed more than once"
+        );
+    }
+
+    /// **D: a row the failed stamp missed never names its PREVIOUS author.** Run A's merge
+    /// attributes rows 1–3. Run B's merge publishes all three, and its second author stamp fails.
+    /// Every row must then name B, or no one. Naming A would describe a version B's merge replaced.
+    ///
+    /// At `0fdcd81` the loop stopped at the failure, so the failed row and every row after it kept
+    /// naming run A.
+    #[test]
+    fn a_row_the_failed_stamp_missed_never_names_its_previous_author() {
+        // Calls 1–3 are run A's stamps; call 5 is run B's second.
+        let (_dir, bp, mut catalog, txn, rt) = failing_stamp_fixture("d_author", 3, 5);
+        let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+        merge_round(&rt, &mut ctx, &txn, 3, "rA");
+        for id in 1..=3u64 {
+            assert_eq!(
+                rt.who_wrote_row("t", RowId(id)).map(|e| e.run_id),
+                Some("rA".to_string()),
+                "fixture: run A's merge should attribute row {id}"
+            );
+        }
+        let b = rt
+            .begin_session_pinned(
+                RunIdentity { agent_id: "w", run_id: Some("rB"), model: None, prompt: None },
+                BranchId::TRUNK,
+                &txn,
+            )
+            .unwrap()
+            .branch;
+        for id in 1..=3 {
+            let sql = format!("UPDATE t SET v = v + 1 WHERE id = {id};");
+            assert_eq!(rt.write(&mut ctx, b, parse_one(&sql)).unwrap(), 1, "fixture: row {id}");
+        }
+        let err = rt.merge(&mut ctx, b).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("injected stamp failure")),
+            "fixture: run B's merge should fail at the injected stamp, got {err:?}"
+        );
+        for id in 1..=3u64 {
+            let who = rt.who_wrote_row("t", RowId(id)).map(|e| e.run_id);
+            assert_ne!(
+                who.as_deref(),
+                Some("rA"),
+                "row {id} still names run rA, whose version run rB's published merge replaced"
+            );
+        }
+    }
+
+    // ---- Amendment 14: E, review 6's FIFO turnover ---------------------------------------------
+
+    /// Review 6's fixture: `cold` rows whose old versions P0, P1 and P2 all read, and `hot` rows
+    /// whose old versions only P0 reads. Returns the state and the three pins (as branches 1–3).
+    fn fifo_turnover_fixture(cold: u64, hot: u64) -> (State, u64, u64, u64) {
+        let mut st = State::default();
+        for row in 1..=cold + hot {
+            publish_next(&mut st, row);
+        }
+        let p0 = st.apply_seq;
+        st.insert_workspace(BranchId::new(1, 0), pinned("b_1", 101, p0));
+        for row in cold + 1..=cold + hot {
+            publish_next(&mut st, row);
+        }
+        let p1 = st.apply_seq;
+        st.insert_workspace(BranchId::new(2, 0), pinned("b_2", 102, p1));
+        // A filler: a new row, which supersedes nothing, so P2 is a distinct instant from P1.
+        publish_next(&mut st, cold + hot + 1);
+        let p2 = st.apply_seq;
+        st.insert_workspace(BranchId::new(3, 0), pinned("b_3", 103, p2));
+        for row in 1..=cold {
+            publish_next(&mut st, row);
+        }
+        (st, p0, p1, p2)
+    }
+
+    /// How many of the rows in `rows` still have a superseded version held for some reader.
+    fn held_for(st: &State, rows: std::ops::RangeInclusive<u64>) -> usize {
+        st.retention.readers.values().filter(|(_, row, _)| rows.contains(row)).count()
+    }
+
+    /// **E (review 6): under oldest-first turnover, what only departed pins read is freed.** P0
+    /// departs, then P1, with no publish in between. The hot rows' old versions were read by P0
+    /// alone, so nothing needs them. The cold rows' old versions are still read by P2.
+    ///
+    /// At `9998180` all 100 hot versions were still held. Each departure queued `(0, p]`, and the
+    /// sweep spent its whole budget re-testing cold entries that P1 and P2 still read, restarting
+    /// at 0 each time.
+    #[test]
+    fn version_history_fifo_turnover_frees_what_only_departed_pins_read() {
+        let (cold, hot) = (DEPARTURE_SWEEP_BUDGET as u64 + 1000, 100u64);
+        let (mut st, _p0, _p1, p2) = fifo_turnover_fixture(cold, hot);
+        assert_eq!(held_for(&st, cold + 1..=cold + hot), hot as usize, "fixture: P0's hot versions");
+        assert_eq!(held_for(&st, 1..=cold), cold as usize, "fixture: the cold versions");
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        let still = held_for(&st, cold + 1..=cold + hot);
+        assert_eq!(
+            still, 0,
+            "{still} hot versions are still held after P0, the only pin that read them, departed"
+        );
+        // Row r's first version was stamped r, and P2 still reads it.
+        for row in [1, cold / 2, cold] {
+            assert_eq!(
+                st.version_seen(TableId(1), RowId(row), Some(p2)).map(|v| v.begin_ts),
+                Some(row),
+                "P2 no longer names the version of cold row {row} it reads"
+            );
+        }
+    }
+
+    /// **E's visit counter: each departure touches only the entries it read highest.** The same
+    /// fixture. P0's departure processes its 100 hot entries, and P1's processes nothing. P1 read
+    /// the cold versions too, but P2 reads them higher, so they are never P1's to test.
+    ///
+    /// Mutant-only: it reads `visits`. M45, which also queues the next higher pin, fails it.
+    #[test]
+    fn version_history_each_departure_touches_only_what_it_read_highest() {
+        let (cold, hot) = (DEPARTURE_SWEEP_BUDGET as u64 + 1000, 100u64);
+        let (mut st, ..) = fifo_turnover_fixture(cold, hot);
+        let before = st.retention.visits;
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert_eq!(st.retention.visits - before, hot, "P0's departure touched other than its own bucket");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        assert_eq!(
+            st.retention.visits - before,
+            hot,
+            "P1's departure touched entries a higher pin reads"
+        );
+        assert!(st.retention.pending.is_empty(), "the queue did not drain");
+        assert_eq!(held_for(&st, 1..=cold), cold as usize, "a cold version P2 reads was freed");
+    }
+
+    /// **Every unit of sweep work costs budget, and the queue drains.** This is the intent of
+    /// Amendment 12's retired budget test, restated for the bucket queue. Ten entries sit in one
+    /// departed pin's bucket. A sweep with budget 2 processes exactly 2. The next sweep processes
+    /// the other 8, and the pin leaves the queue in the step that empties its bucket, at no extra
+    /// cost.
+    ///
+    /// Mutant-only: M47 (the bucket-emptied check dropped) and M48 (the budget ignored) fail it.
+    #[test]
+    fn version_history_sweep_charges_one_unit_per_entry_and_drains() {
+        let mut st = State::default();
+        for row in 1..=10u64 {
+            publish_next(&mut st, row);
+        }
+        let at = st.apply_seq;
+        st.insert_workspace(BranchId::new(7, 0), pinned("b_7", 100, at));
+        for row in 1..=10u64 {
+            publish_next(&mut st, row);
+        }
+        assert_eq!(st.retention.readers.len(), 10, "fixture: the pin should read ten old versions");
+        // Remove the workspace without the departure's own sweep, so the queue is swept by hand.
+        let ws = st.workspaces.remove(&BranchId::new(7, 0)).expect("fixture: b_7 not live");
+        st.drop_txn_refs(&ws);
+        st.retention.pins.remove(&at);
+        st.retention.pending.insert(at);
+        let before = st.retention.visits;
+        st.sweep_pending(2);
+        assert_eq!(st.retention.visits - before, 2, "a sweep with budget 2 did other than 2 units");
+        assert_eq!(st.retention.readers.len(), 8, "a sweep with budget 2 freed other than 2 entries");
+        assert!(st.retention.pending.contains(&at), "the pin left the queue with entries in its bucket");
+        st.sweep_pending(100);
+        assert_eq!(st.retention.visits - before, 10, "draining ten entries took other than ten units");
+        assert!(st.retention.readers.is_empty(), "the bucket did not drain");
+        assert!(st.retention.pending.is_empty(), "a drained pin stayed queued");
+    }
+
+    /// **An entry read by two pins is handed down, not freed, when the higher one departs.** This
+    /// replaces Amendment 12's interval-algebra test as the test of the queue's structure. P1 < P2
+    /// both read version `h` of row 1. P2's departure moves the entry to P1's bucket, and P1 still
+    /// names it. P1's departure then frees it.
+    ///
+    /// Mutant-only: it reads `by_reader`. M46 (hand-down replaced by free) fails it.
+    #[test]
+    fn version_history_hands_an_entry_down_to_its_next_reader() {
+        let mut st = State::default();
+        publish_next(&mut st, 1);
+        let h = st.apply_seq;
+        let p1 = st.apply_seq;
+        st.insert_workspace(BranchId::new(1, 0), pinned("b_1", 101, p1));
+        publish_next(&mut st, 2);
+        let p2 = st.apply_seq;
+        st.insert_workspace(BranchId::new(2, 0), pinned("b_2", 102, p2));
+        publish_next(&mut st, 1);
+        assert!(st.retention.by_reader.contains(&(p2, h)), "fixture: P2 should be h's highest reader");
+        assert!(st.remove_workspace(&BranchId::new(2, 0)).is_some(), "fixture: b_2 not live");
+        assert!(st.retention.readers.contains_key(&h), "P1 still reads h, yet it was freed");
+        assert!(st.retention.by_reader.contains(&(p1, h)), "h was not handed down to P1's bucket");
+        assert_eq!(
+            st.version_seen(TableId(1), RowId(1), Some(p1)).map(|v| v.begin_ts),
+            Some(h),
+            "P1 no longer names the version it reads"
+        );
+        assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
+        assert!(!st.retention.readers.contains_key(&h), "no pin reads h, yet it is still held");
+        assert!(st.retention.by_reader.is_empty() && st.retention.pending.is_empty());
     }
 }

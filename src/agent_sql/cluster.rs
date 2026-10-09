@@ -1171,10 +1171,26 @@ impl ClusterAgents {
                     // `pgwire`'s catalog is one `Mutex<Catalog>` shared by every connection, so no
                     // other statement runs at all while this merge holds it. What is left is a
                     // suffix replayed onto this node by a promotion, and an I/O error.
+                    let from = eval.from;
                     let report = self.runtime.publish_evaluation(ctx, eval).map_err(|e| {
-                        FerroError::Merge(format!(
-                            "round {round} committed the merge of {cid} and every node has sealed                              it, but publishing its rows here then failed: {e}. This merge cannot                              be re-run — the branch is no longer live — and the target does not                              hold what the cluster agreed it would"
-                        ))
+                        // Whether the rows landed is read from the runtime's own record, not from
+                        // `e`'s wording (D194 Amendment 13, C). A merge record exists exactly when
+                        // the publish committed and its versions were recorded, which is also when
+                        // a later failure, such as recording authorship, can still return `Err`.
+                        match self.runtime.published_merge_of(from) {
+                            Some(merge_id) => FerroError::Merge(format!(
+                                "round {round} committed the merge of {cid} and every node has \
+                                 sealed it; its rows landed here as {merge_id}, but finishing it \
+                                 then failed: {e}. This merge cannot be re-run: the branch is no \
+                                 longer live"
+                            )),
+                            None => FerroError::Merge(format!(
+                                "round {round} committed the merge of {cid} and every node has \
+                                 sealed it, but publishing its rows here then failed: {e}. This \
+                                 merge cannot be re-run: the branch is no longer live, and the \
+                                 target does not hold what the cluster agreed it would"
+                            )),
+                        }
                     })?;
                     return Ok(ClusterMergeReport {
                         report,

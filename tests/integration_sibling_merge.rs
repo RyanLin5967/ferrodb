@@ -559,3 +559,47 @@ fn the_index_hydrates_from_the_catalog_rather_than_from_a_fork_hook() {
     let second = db.runtime.fork_point(a1, b).unwrap();
     assert_eq!(first, second, "a warm index disagreed with a cold one");
 }
+
+/// **D194: a row the target never touched is compared against what the TARGET sees.**
+///
+/// Two trunk forks read main at two different instants when main commits between them. `a` reads
+/// row 2 at 200 and adds 1; main then sets row 2 to 250; `b` forks after that, so `b` sees 250 and
+/// never touches row 2. The source's fork-point image (200) is therefore NOT the target's, and
+/// using it as the target's image — as the path did while every branch read main as of now —
+/// would stage 201 onto a branch that sees 250 and record 200 as its before-image: a move of
+/// main's that `b` absorbed at its fork, silently undone on `b`. The target's own snapshot shows
+/// the move, the merge sees it as the opaque assignment it is, and under the default REJECT policy
+/// that conflicts with `a`'s add.
+#[test]
+fn a_row_only_the_source_touched_is_compared_against_the_targets_own_fork_image() {
+    let mut db = Db::new();
+    db.seed(); // (1, 100, 0), (2, 200, 0)
+
+    let (a, mut sa) = db.fork_from("agent-a", None);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut sa);
+
+    let mut main = db.session();
+    db.ok("UPDATE inventory SET qty = 250 WHERE id = 2;", &mut main);
+
+    let (b, mut sb) = db.fork_from("agent-b", None);
+    db.ok("UPDATE inventory SET qty = 101 WHERE id = 1;", &mut sb);
+
+    let (na, nb) = (branch_name(a), branch_name(b));
+    assert_eq!(db.qty(&na, 2), Some(201), "fixture: a does not hold its own add over its fork image");
+    assert_eq!(db.qty(&nb, 2), Some(250), "fixture: b does not see main's move, which it forked after");
+
+    let rt = db.rt();
+    let (bp, txn) = (db.bp.clone(), db.txn.clone());
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = rt.merge_into(&mut ctx, a, b).unwrap();
+    drop(ctx);
+    assert!(
+        report.outcome.is_conflict(),
+        "b saw row 2 at 250 and a added 1 to 200; composing them as if b still saw 200 is the \
+         silent undo this refuses. Got {:?}",
+        report.outcome
+    );
+    assert!(!report.applied, "a conflicting merge must stage nothing");
+    assert_eq!(db.qty(&nb, 2), Some(250), "b's view of row 2 was overwritten by a refused merge");
+    assert_eq!(db.qty(&nb, 1), Some(101), "b lost its own row");
+}

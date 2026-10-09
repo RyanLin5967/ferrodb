@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::agent_sql::changeset::{ChangeSet, MergeReport};
 use crate::agent_sql::simulate::SimulationReport;
-use crate::agent_sql::runtime::ExecCtx;
+use crate::agent_sql::runtime::{ExecCtx, RebaseReport};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundAgentStmt, BoundColumn};
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -34,6 +34,8 @@ pub enum AgentOutput {
     /// `SIMULATE` — every candidate's score and what became of it.
     Simulation(Box<SimulationReport>),
     Abandoned { branch: String },
+    /// `REBASE` — D194 step 4: the branch re-pinned to main as of now, or why nothing changed.
+    Rebase(RebaseReport),
     Revert(RevertPlan),
     Affected(usize),
 }
@@ -46,6 +48,10 @@ impl Display for AgentOutput {
             AgentOutput::Merge(m) => write!(f, "{}", m),
             AgentOutput::Simulation(s) => write!(f, "{}", s),
             AgentOutput::Abandoned { branch } => write!(f, "abandoned {}", branch),
+            AgentOutput::Rebase(r) => match r.detail() {
+                None => write!(f, "rebased {} to fork seq {}", r.branch, r.fork_seq_after),
+                Some(why) => write!(f, "{}", why),
+            },
             AgentOutput::Revert(p) => {
                 if p.is_blocked() {
                     write!(
@@ -150,6 +156,22 @@ fn abandoned_columns() -> Vec<BoundColumn> {
     vec![col("abandon", "branch", DataType::Varchar(32), false)]
 }
 
+/// `REBASE` — one row, always: a refusal is a verdict, and dropping it for want of rows would read as
+/// success. `detail` is NULL exactly when the branch was rebased.
+fn rebase_columns() -> Vec<BoundColumn> {
+    let q = "rebase";
+    vec![
+        col(q, "branch", DataType::Varchar(32), false),
+        col(q, "rebased", DataType::Boolean, false),
+        col(q, "fork_seq_before", DataType::BigInt, false),
+        col(q, "fork_seq_after", DataType::BigInt, false),
+        col(q, "moved_rows", DataType::Integer, false),
+        col(q, "moved_premises", DataType::Integer, false),
+        col(q, "moved_shapes", DataType::Integer, false),
+        col(q, "detail", DataType::Varchar(1024), true),
+    ]
+}
+
 fn revert_columns() -> Vec<BoundColumn> {
     let q = "revert";
     vec![
@@ -176,6 +198,7 @@ pub fn columns_for_stmt(stmt: &Stmt) -> Option<Vec<BoundColumn>> {
         Stmt::Diff { .. } => Some(diff_columns()),
         Stmt::Merge { .. } => Some(merge_columns()),
         Stmt::Abandon { .. } => Some(abandoned_columns()),
+        Stmt::Rebase { .. } => Some(rebase_columns()),
         Stmt::RevertMerge { .. } => Some(revert_columns()),
         _ => None,
     }
@@ -281,6 +304,19 @@ impl AgentOutput {
                 abandoned_columns(),
                 vec![vec![text(branch.clone())]],
             ),
+            AgentOutput::Rebase(r) => NamedRows::new(
+                rebase_columns(),
+                vec![vec![
+                    text(r.branch.to_string()),
+                    Value::Boolean(r.rebased),
+                    Value::BigInt(r.fork_seq_before as i64),
+                    Value::BigInt(r.fork_seq_after as i64),
+                    Value::Integer(r.moved_rows.len() as i32),
+                    Value::Integer(r.moved_premises.len() as i32),
+                    Value::Integer(r.moved_shapes.len() as i32),
+                    r.detail().map(text).unwrap_or(Value::Null),
+                ]],
+            ),
             AgentOutput::Revert(p) => {
                 let ids = |v: &[crate::tel::ids::TxnId]| {
                     if v.is_empty() {
@@ -362,6 +398,7 @@ pub fn is_agent_stmt(stmt: &Stmt) -> bool {
         | Stmt::Diff { .. }
         | Stmt::Merge { .. }
         | Stmt::Abandon { .. }
+        | Stmt::Rebase { .. }
         | Stmt::RevertMerge { .. }
         | Stmt::Simulate { .. } => true,
         Stmt::Select { from, .. } => from.as_of.is_some(),
@@ -448,7 +485,12 @@ pub fn run_agent_stmt_staged(
             // there is no route by which a prompt becomes a durable copy of what it contained.
             // STAGED: everything but the fsync, which leaves through `pending` so it can be
             // awaited once the caller has dropped its statement-wide catalog guard.
-            let (s, durability) = runtime.begin_session_as_staged(
+            //
+            // PINNED (D194): the branch reads main as of THIS statement for the rest of its life,
+            // not as of whichever statement it happens to be running. The transaction manager is
+            // in hand here, so there is no reason to leave the pin to the branch's first read and
+            // let main's commits in between show through.
+            let (s, durability) = runtime.begin_session_pinned_staged(
                 crate::agent_sql::runtime::RunIdentity {
                     agent_id: &agent_id,
                     run_id: run_id.as_deref(),
@@ -456,6 +498,7 @@ pub fn run_agent_stmt_staged(
                     prompt: prompt.as_deref(),
                 },
                 parent,
+                &ctx.txn,
             )?;
             *pending = Some(durability);
             session.agent = Some(s.clone());
@@ -465,26 +508,38 @@ pub fn run_agent_stmt_staged(
             Ok(Outcome::Agent(AgentOutput::Diff(runtime.diff(&mut ctx, branch)?)))
         }
         BoundAgentStmt::Merge { branch } => {
-            let report = runtime.merge(&mut ctx, branch)?;
+            let merged = runtime.merge(&mut ctx, branch);
+            // **The binding follows the runtime's state, not the result (D194 Amendment 13, A).**
             // A conflicting merge publishes nothing and leaves the branch alive, so the agent can
-            // fix the violated predicate and merge again.
-            if report.applied_to_target && current == Some(branch) {
+            // fix the violated predicate and merge again. A published merge seals it, and that
+            // includes one that then failed to record its authors and returned `Err`: the branch is
+            // gone either way, and a connection left bound to it could do nothing but reconnect.
+            if current == Some(branch) && !runtime.has_live_workspace(branch) {
                 session.agent = None;
             }
-            Ok(Outcome::Agent(AgentOutput::Merge(report)))
+            Ok(Outcome::Agent(AgentOutput::Merge(merged?)))
         }
         BoundAgentStmt::Abandon { branch } => {
-            runtime.abandon(branch)?;
+            let abandoned = runtime.abandon(branch);
             let name = session
                 .agent
                 .as_ref()
                 .filter(|a| a.branch == branch)
                 .map(|a| a.branch_name.clone())
                 .unwrap_or_else(|| branch.to_string());
-            if current == Some(branch) {
+            // As for MERGE: a branch that is no longer live, whether this ABANDON sealed it or
+            // something else did first, leaves the connection unbound.
+            if current == Some(branch) && !runtime.has_live_workspace(branch) {
                 session.agent = None;
             }
+            abandoned?;
             Ok(Outcome::Agent(AgentOutput::Abandoned { branch: name }))
+        }
+        BoundAgentStmt::Rebase { branch } => {
+            // A refusal is Ok with `rebased = false` and the reasons, like a conflicting MERGE: it
+            // is a verdict the agent acts on, not a failure of the statement. The session keeps its
+            // branch either way.
+            Ok(Outcome::Agent(AgentOutput::Rebase(runtime.rebase(&mut ctx, branch)?)))
         }
         BoundAgentStmt::RevertMerge { merge_id, mode } => {
             let plan = runtime.revert_merge(&mut ctx, &merge_id, mode)?;
@@ -645,6 +700,42 @@ mod tests {
             })),
             ("Affected", AgentOutput::Affected(3)),
         ]
+    }
+
+    /// **`REBASE`'s row is as wide as its columns, and `detail` is NULL exactly when it rebased.**
+    ///
+    /// Its own test rather than two entries in `every_variant`, which is an existing test's fixture.
+    #[test]
+    fn a_rebase_report_row_matches_its_declared_columns() {
+        let refused = RebaseReport {
+            branch: BranchId::new(3, 0),
+            rebased: false,
+            fork_seq_before: 2,
+            fork_seq_after: 2,
+            moved_rows: vec![("t".into(), RowId(u64::MAX))],
+            moved_premises: vec![(TableId(1), RowId(7), 0, 4)],
+            moved_shapes: Vec::new(),
+        };
+        let rebased = RebaseReport {
+            rebased: true,
+            fork_seq_after: 5,
+            moved_rows: Vec::new(),
+            moved_premises: Vec::new(),
+            ..refused.clone()
+        };
+        for (what, r) in [("refused", refused), ("rebased", rebased)] {
+            let t = AgentOutput::Rebase(r.clone()).to_rows();
+            assert_eq!(t.rows.len(), 1, "{what}: a REBASE verdict must be one row");
+            assert_eq!(t.rows[0].len(), t.columns.len(), "{what}: row and columns disagree");
+            let at = t.column_index("detail").expect("declared");
+            assert_eq!(
+                matches!(t.rows[0][at], Value::Null),
+                r.rebased,
+                "{what}: `detail` must be NULL exactly when the branch was rebased"
+            );
+            let cols = columns_for_stmt(&Stmt::Rebase { branch: None }).expect("REBASE has columns");
+            assert_eq!(cols.len(), t.columns.len(), "{what}: described and produced columns disagree");
+        }
     }
 
     /// **Every row is exactly as wide as the declared column list.**
