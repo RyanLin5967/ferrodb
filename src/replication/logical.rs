@@ -1171,9 +1171,10 @@ impl LogicalDecoder {
                 // whose buffer is discarded whole. `Begin`, `TxnEnd` and `Checkpoint` carry no row
                 // data, and neither does `HeapRelease`: it is a committed transaction freeing bytes
                 // its delete kept for a rollback that did not happen (D213), and the delete itself
-                // was already decoded. None of them produce events.
+                // was already decoded. Nor does `HeapInitPage` (D268): a page was made, and no row
+                // moved. None of them produce events.
                 RecKind::Begin | RecKind::TxnEnd | RecKind::Checkpoint | RecKind::Clr { .. }
-                | RecKind::HeapRelease { .. } => {}
+                | RecKind::HeapRelease { .. } | RecKind::HeapInitPage { .. } => {}
             }
 
             if next <= lsn {

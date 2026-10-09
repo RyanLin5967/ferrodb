@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}, wal::txn::TxnManager};
+use crate::wal::log::RecKind;
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE, MAX_TUPLE_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
@@ -34,7 +36,7 @@ impl HeapFileManager {
     pub fn read(&self, record_id: RecordId) -> Result<Tuple, FerroError>{
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
-        let page = Page::deserialize(frame.data)?;
+        let page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let tuple = page.read(record_id.slot_num as usize)?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(record_id.page_id, false);
@@ -65,18 +67,43 @@ impl HeapFileManager {
     /// the page it added last time and adds nothing. That is not hypothetical — it hung
     /// `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`, a 200-row
     /// ALTER needing eleven pages, for eighteen minutes with no output.
+    ///
+    /// **D268: the page's init record comes first, and the listing waits for it.** A power loss can
+    /// drop every page-file write since the last checkpoint and keep the log. A page reused from a
+    /// dropped table then reverted to its old owner's image, with its own id, and a listed page whose
+    /// image never reached disk was zeros; when no durable record named the page (an uncommitted
+    /// insert, or a reservation), nothing could put it right. Now the record is appended before the
+    /// page is listed, with no frame lock held. The page's empty image carries its LSN, so a later
+    /// unlogged write (which never assigns `lsn`) keeps an image redo recognises as this page's own.
+    /// And the directory frame that lists the page carries it too (`Frame::gate_lsn`), so the listing
+    /// cannot reach disk before the record is durable.
     fn add_empty_page(&self) -> Result<u32, FerroError> {
         let new_page_id = self.buffer_pool_manager.new_page()?;
         self.buffer_pool_manager.unpin_page(new_page_id, false);
+        let init_lsn = self.log_init_page(new_page_id)?;
         let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let empty_page = Page::empty(new_page_id);
+        let mut empty_page = Page::empty(new_page_id);
+        empty_page.lsn = init_lsn;
         frame.data = empty_page.serialize()?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(new_page_id, true);
         let free_space = (PAGE_SIZE - HEADER_SIZE) as u16;
-        self.add_to_directory(new_page_id, free_space)?;
+        self.add_to_directory_gated(new_page_id, free_space, init_lsn)?;
         Ok(new_page_id)
+    }
+
+    /// D268: log `page_id`'s init record and return its LSN. With a transaction, on its chain; without
+    /// one (`catalog::alter`'s unlogged rewrite and its reservation), under transaction 0 through the
+    /// pool's WAL, as `RunIdentity`'s declarations are. 0 when there is no log at all (a pool with no
+    /// WAL attached, as bare unit-test pools are): nothing recovers such a page, so nothing is ordered.
+    fn log_init_page(&self, page_id: u32) -> Result<u64, FerroError> {
+        let dir_root = self.first_directory_page_id;
+        match (&self.txn, self.buffer_pool_manager.wal.get()) {
+            (Some(txn), _) => txn.log_init_page(self.txn_id, dir_root, page_id),
+            (None, Some(wal)) => wal.append(0, 0, &RecKind::HeapInitPage { dir_root, page_id }),
+            (None, None) => Ok(0),
+        }
     }
 
     /// Free space this heap holds across every data page, as the page directory reports it.
@@ -154,7 +181,7 @@ impl HeapFileManager {
     fn insert_into(&self, page_id: u32, tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(page_id, frame.data)?;
         let tuple_bytes = tuple.data.clone();
         let slot_num = page.insert(tuple)?;
         if let Some(txn) = &self.txn {
@@ -172,7 +199,7 @@ impl HeapFileManager {
     pub fn update(&self, record_id: RecordId, new_tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         let new_bytes = new_tuple.data.clone();
         let clone = Tuple::new(new_tuple.data.clone());
@@ -239,7 +266,7 @@ impl HeapFileManager {
 
                 let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
                 let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-                let mut page = Page::deserialize(frame.data)?;
+                let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
                 self.take_off_page(&mut page, record_id, &old_bytes)?;
                 frame.data = page.serialize()?;
                 drop(frame);
@@ -277,7 +304,7 @@ impl HeapFileManager {
     pub fn delete(&self, record_id: RecordId) -> Result<(), FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frame_write(frame_i);
-        let mut page = Page::deserialize(frame.data)?;
+        let mut page = Page::deserialize_at(record_id.page_id, frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         self.take_off_page(&mut page, record_id, &old_bytes)?;
         frame.data = page.serialize()?;
@@ -339,6 +366,13 @@ impl HeapFileManager {
     }
 
     pub fn add_to_directory(&self, new_page_id: u32, free_space: u16) -> Result<(), FerroError> {
+        self.add_to_directory_gated(new_page_id, free_space, 0)
+    }
+
+    /// [`Self::add_to_directory`], with every directory frame it dirties for this listing held back
+    /// from the disk until the log is durable past `gate` (D268: the page's init record; see
+    /// `Frame::gate_lsn`). A gate of 0 holds nothing back.
+    fn add_to_directory_gated(&self, new_page_id: u32, free_space: u16, gate: u64) -> Result<(), FerroError> {
         let mut dir_page_id = self.first_directory_page_id;
         loop {
             let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
@@ -348,6 +382,7 @@ impl HeapFileManager {
             match dir.add_entry(new_page_id, free_space) {
                 Ok(_) => {
                     frame.data = dir.serialize();
+                    frame.gate_lsn.fetch_max(gate, Ordering::SeqCst);
                     drop(frame);
                     self.buffer_pool_manager.unpin_page(dir_page_id, true);
                     return Ok(());
@@ -361,6 +396,7 @@ impl HeapFileManager {
                         {
                             let mut frame = self.buffer_pool_manager.frame_write(frame_i);
                             frame.data = dir.serialize();
+                            frame.gate_lsn.fetch_max(gate, Ordering::SeqCst);
                         }
                         self.buffer_pool_manager.unpin_page(dir_page_id, true);
                         let new_frame_i = self.buffer_pool_manager.fetch_page(new_dir_id)?;
@@ -369,6 +405,7 @@ impl HeapFileManager {
                         {
                             let mut new_frame = self.buffer_pool_manager.frame_write(new_frame_i);
                             new_frame.data = new_dir.serialize();
+                            new_frame.gate_lsn.fetch_max(gate, Ordering::SeqCst);
                         }
                         self.buffer_pool_manager.unpin_page(new_dir_id, true);
                         return Ok(());
@@ -551,6 +588,50 @@ mod tests {
         }
         let tuples: Result<Vec<_>, _> = hfm.scan().collect();
         assert_eq!(tuples.unwrap().len(), 5);
+    }
+
+    /// D256: `what`'s outcome on a page it must refuse as corrupt, naming it with `named`.
+    fn refused_naming(what: &str, named: &str, got: std::thread::Result<Result<(), FerroError>>) {
+        match got {
+            Ok(Err(FerroError::Corruption(msg))) => {
+                assert!(msg.contains(named), "{what} refused the page without naming it ({named:?}): {msg}")
+            }
+            Ok(Err(e)) => panic!("{what} failed, but not as corruption: {e}"),
+            Ok(Ok(())) => panic!("{what} SUCCEEDED on an all-zero page"),
+            Err(p) => panic!(
+                "{what} PANICKED ({}) on an all-zero page instead of refusing it",
+                p.downcast_ref::<String>().map(String::as_str).or(p.downcast_ref::<&str>().copied()).unwrap_or("no text")
+            ),
+        }
+    }
+
+    /// D256: a data page the directory lists, whose bytes are all zero: what the page holds when its
+    /// write never reached disk. Every reader and writer of the heap must refuse it, naming the page
+    /// (a zero page's header names page 0), and none may panic. Lane report: artie-research
+    /// `frontier/lane_d256_heap_page.md` §2, test 11.
+    #[test]
+    fn a_listed_page_that_is_all_zero_is_refused_by_every_reader_naming_it() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let (hfm, _dir) = setup();
+        let schema = test_schema();
+        let row = |id: i32| Tuple::serialize(&[Value::Integer(id), Value::Varchar("hello".into())], &schema, 0).unwrap();
+        let rid = hfm.insert(row(1)).unwrap();
+        assert_ne!(rid.page_id, 0, "premise: page 0 is the allocation bitmap, so a zero page's header names another page");
+        let bp = hfm.buffer_pool_manager.clone();
+        let frame_i = bp.fetch_page(rid.page_id).unwrap();
+        let mut frame = bp.frame_write(frame_i);
+        frame.data = [0u8; PAGE_SIZE];
+        drop(frame);
+        bp.unpin_page(rid.page_id, true);
+
+        let named = format!("heap page {} ", rid.page_id);
+        refused_naming("a scan", &named, catch_unwind(AssertUnwindSafe(|| hfm.scan().collect::<Result<Vec<_>, _>>().map(|_| ()))));
+        refused_naming("a read", &named, catch_unwind(AssertUnwindSafe(|| hfm.read(rid).map(|_| ()))));
+        refused_naming("an update", &named, catch_unwind(AssertUnwindSafe(|| hfm.update(rid, row(2)).map(|_| ()))));
+        refused_naming("a delete", &named, catch_unwind(AssertUnwindSafe(|| hfm.delete(rid))));
+        // The directory still lists the page with the room it had, so the insert is sent to it.
+        refused_naming("an insert", &named, catch_unwind(AssertUnwindSafe(|| hfm.insert(row(3)).map(|_| ()))));
     }
 
 }

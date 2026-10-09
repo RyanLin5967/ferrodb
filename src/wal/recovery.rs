@@ -49,25 +49,14 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             }
             _ => {}
         }
-        match &rec.kind {
-            RecKind::Commit | RecKind::TxnEnd => {
-                ended.insert(rec.txn_id);
-                if matches!(rec.kind, RecKind::Commit) {
-                    committed.insert(rec.txn_id);
-                }
+        if matches!(rec.kind, RecKind::Commit | RecKind::TxnEnd) {
+            ended.insert(rec.txn_id);
+            if matches!(rec.kind, RecKind::Commit) {
+                committed.insert(rec.txn_id);
             }
-            RecKind::HeapDelete { dir_root, page_id, .. } | RecKind::HeapInsert { dir_root, page_id, .. } | RecKind::HeapUpdate { dir_root, page_id, .. }
-            | RecKind::HeapRelease { dir_root, page_id, .. } => {
-                touched.insert((*dir_root, *page_id));
-            }
-            RecKind::Clr { redo, .. } => {
-                if let RecKind::HeapInsert { dir_root, page_id, ..} | RecKind::HeapDelete { dir_root, page_id, ..} | 
-                RecKind::HeapUpdate { dir_root, page_id, .. } = redo.as_ref() {
-                    touched.insert((*dir_root, *page_id));
-                }
-            }
-            _ => {}
         }
+        // The pages redo below writes, from the one exhaustive list redo uses too.
+        touched.extend(rec.kind.heap_page());
     }
     // F4: the counter is a leader-granted range now, not an atomic. The call is the same
     // statement it always was -- "at least this much was issued" -- and is still monotone; it
@@ -88,22 +77,26 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     touched.sort_unstable();
 
     // restore pages with broken file extensions
+    //
+    // **D267: and mark each page the log names allocated.** Its bitmap bit was set by an unsynced
+    // write, and a power loss can drop it while the log, which a COMMIT syncs, keeps the page's
+    // records. Redo then rebuilds the page and the directory repair lists it, and without this the
+    // next `allocate` handed it to a second owner. `open_recovered`'s checkpoint makes the bit
+    // durable. Cost, stated: a page of a table that a later `DropTable` in this log dropped is
+    // claimed too, and leaks. It is never handed to two owners.
     let bp = &txn.bp;
     for (_, page_id) in &touched {
         if bp.disk_manager.read(*page_id).is_err() {
             bp.disk_manager.write(*page_id, &Page::empty(*page_id).serialize()?)?;
         }
+        bp.disk_manager.claim(*page_id)?;
     }
 
     // redo. A `Clr` goes in whole: `redo_one` applies the record it carries, and has to know it
     // came from a CLR (D213).
     for rec in &records {
-        match &rec.kind {
-            RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. }
-            | RecKind::HeapRelease { .. } | RecKind::Clr { .. } => {
-                redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
-            }
-            _ => {}
+        if rec.kind.heap_page().is_some() {
+            redo_one(bp, rec.lsn, &rec.kind, !legacy)?;
         }
     }
 
@@ -134,7 +127,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         let hfm = HeapFileManager::open(*dir_root, bp.clone());
         let frame_i = bp.fetch_page(*page_id)?;
         let frame = bp.frames[frame_i].read().unwrap();
-        let page = Page::deserialize(frame.data)?;
+        let page = Page::deserialize_at(*page_id, frame.data)?;
         drop(frame);
         bp.unpin_page(*page_id, false);
         let free = page.get_free_space_end() - page.get_free_space_start();
@@ -199,18 +192,37 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
         RecKind::Clr { redo, .. } => (redo.as_ref(), true),
         other => (other, false),
     };
-    let page_id = match op {
-        RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..}
-        | RecKind::HeapRelease { page_id, .. } => *page_id,
-        _ => return Ok(())
+    // From `kind`, not `op`: a CLR carrying a CLR writes no page, and `heap_page` says so.
+    let Some((_, page_id)) = kind.heap_page() else {
+        return Ok(());
     };
     let frame_i = bp.fetch_page(page_id)?;
     let mut frame = bp.frame_write(frame_i);
     let stored_id = u32::from_be_bytes(frame.data[1..5].try_into().unwrap());
-    let mut page = if stored_id != page_id {
-        Page::empty(page_id)
-    } else {    
-        Page::deserialize(frame.data)?
+    let mut page = match op {
+        // **D268: a page's init record resets the page**, unless it already holds its own image at or
+        // past this record, which the LSN gate below then skips as usual.
+        //
+        // A reused page keeps its old owner's image on disk, with its own id, and a listed page whose
+        // image never reached disk is zeros. A power loss can drop every page write since the last
+        // checkpoint and keep the log. Redo parsed such an image and applied the new owner's first
+        // insert onto it: a live slot 0 refused the restore at every open, and a free one took the row
+        // while the old owner's other rows stayed. Any image here that is not this page's own at or
+        // past this record predates the page: a previous owner's, zeros, or another structure's. So a
+        // refused parse is not an error in this arm; everywhere else it still is (D256).
+        //
+        // Gated, not an unconditional reset (PostgreSQL's `XLogInitBufferForRedo`), because this
+        // engine writes heap pages without logging in one place: `catalog::alter::rewrite_heap`
+        // through `HeapFileManager::open`. Those writes never assign `lsn`, and the page's image
+        // carries this record's LSN from its creation (`HeapFileManager::add_empty_page`), so under a
+        // kept log a page holding such rows is its own image at this LSN, and is kept
+        // (`tests/d268_power_loss_redo.rs`, tests 3 and 11).
+        RecKind::HeapInitPage { .. } => match Page::deserialize_at(page_id, frame.data) {
+            Ok(own) if own.page_id == page_id && own.lsn >= lsn => own,
+            _ => Page::empty(page_id),
+        },
+        _ if stored_id != page_id => Page::empty(page_id),
+        _ => Page::deserialize_at(page_id, frame.data)?,
     };
 
     if page.lsn >= lsn {
@@ -232,7 +244,18 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind, retire_forwar
             }
         }
         RecKind::HeapUpdate { slot, new, .. } => page.update(*slot as usize, Tuple::new(new.to_vec()))?,
-        _ => unreachable!()
+        // The page selection above already made it empty; only its LSN moves.
+        RecKind::HeapInitPage { .. } => {}
+        // `heap_page` named a page, so `op` is one of the kinds above. Listed rather than `_`, so a
+        // new kind is a compile error here too.
+        RecKind::Begin
+        | RecKind::Commit
+        | RecKind::Abort
+        | RecKind::TxnEnd
+        | RecKind::Checkpoint
+        | RecKind::Ddl { .. }
+        | RecKind::RunIdentity { .. }
+        | RecKind::Clr { .. } => unreachable!(),
     }
     page.lsn = lsn;
     frame.data = page.serialize()?;

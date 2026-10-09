@@ -19,7 +19,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::replication::{ReplicaApplier, ReplicationSource};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_page::Page;
-use ferrodb::wal::log::{RecKind, WalManager};
+use ferrodb::wal::log::{crc32, RecKind, WalManager};
 
 /// A primary with a WAL, and a replica with its own pages.
 struct Pair {
@@ -568,4 +568,65 @@ fn an_alter_wrapped_in_a_clr_still_halts_the_replica() {
         .expect_err("an AlterColumn wrapped in a Clr walked straight past the guard");
     assert!(format!("{err}").contains("DIVERGED"), "{err}");
     assert!(applier.diverged().is_some(), "the divergence was not latched");
+}
+
+/// **D267, the replica's way in: a replica marks every page it applies as allocated.**
+///
+/// The applier writes an empty page for each page a record names that its file does not hold yet,
+/// then applies the record, and until D267 it never set that page's bitmap bit. A promoted replica's
+/// allocator then hands out the lowest clear bit, a page holding a row the primary committed. Page 1
+/// is the first page a fresh file's allocator hands out, so it is where the collision shows.
+/// Lane report: artie-research `frontier/lane_d268_power_loss_redo.md` §2, test 4.
+#[test]
+fn a_replica_does_not_hand_out_a_page_it_applied() {
+    let p = pair("claim");
+    let src = ReplicationSource::new(&p.primary_wal);
+    let applier = ReplicaApplier::new(Arc::clone(&p.replica_bp), src.start_lsn());
+
+    primary_insert(&p.primary_wal, 1, 1, 0, 0x33);
+    ship_all(&p, &applier);
+    let held = {
+        let idx = p.replica_bp.fetch_page(1).expect("fetch");
+        let page = Page::deserialize(p.replica_bp.frames[idx].read().unwrap().data).expect("page");
+        p.replica_bp.unpin_page(1, false);
+        page.read(0).map(|t| t.data)
+    };
+    assert_eq!(held.ok(), Some(tuple(0x33)), "premise: the replica does not hold the shipped row on page 1");
+
+    let next = p.replica_bp.disk_manager.allocate().expect("allocate");
+    assert_ne!(next, 1, "the replica's allocator handed out page 1, which holds a row it applied");
+}
+
+/// **D277: a short record inside a frame whose CRC matches is refused, never a panic.**
+///
+/// The applier checks a frame's length, CRC and LSN, then hands its record to `RecKind::deserialize`,
+/// whose heap arms indexed their slices unchecked. So a peer could crash a replica with one frame: a
+/// tag-5 record cut after its `dir_root`, framed and checksummed correctly. Lane report:
+/// artie-research `frontier/lane_d268_power_loss_redo.md` §2.2 E, test 10.
+#[test]
+fn a_short_frame_with_a_valid_crc_is_refused_not_a_panic() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let p = pair("short");
+    let start = ReplicationSource::new(&p.primary_wal).start_lsn();
+    let applier = ReplicaApplier::new(Arc::clone(&p.replica_bp), start);
+
+    // |total u32|lsn u64|prev_lsn u64|txn_id u64| the record |crc32 u32|
+    let record = [5u8, 0, 0, 0, 1];
+    let total = 4 + 24 + record.len() + 4;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(total as u32).to_be_bytes());
+    frame.extend_from_slice(&start.to_be_bytes());
+    frame.extend_from_slice(&0u64.to_be_bytes());
+    frame.extend_from_slice(&1u64.to_be_bytes());
+    frame.extend_from_slice(&record);
+    let crc = crc32(&frame);
+    frame.extend_from_slice(&crc.to_be_bytes());
+    assert_eq!(frame.len(), total, "premise: the frame is not the length it declares");
+
+    match catch_unwind(AssertUnwindSafe(|| applier.apply(start, &frame))) {
+        Err(_) => panic!("a replica PANICKED on a short record in a frame whose CRC matched"),
+        Ok(Ok(lsn)) => panic!("a short record was applied, and the replica moved to {lsn}"),
+        Ok(Err(e)) => assert!(format!("{e}").contains("kind 5"), "refused, but without naming the record's kind: {e}"),
+    }
+    assert_eq!(applier.applied_lsn(), start, "the refused batch moved the replica");
 }

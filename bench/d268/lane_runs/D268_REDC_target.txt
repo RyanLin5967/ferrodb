@@ -1,0 +1,58 @@
+# 2026-09-24T22:09:02Z HEAD=d3c6a9b dirty=0
+# cmd: cargo test --no-fail-fast --test d268_power_loss_redo
+2026-09-24T22:09:02Z d256 acquiring (5s poll), pid 83839
+2026-09-24T22:09:02Z d256 ACQUIRED: 83839 d256 2026-09-24T22:09:02Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.58s
+     Running tests/d268_power_loss_redo.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d268_power_loss_redo-4442d6828909e198)
+
+running 8 tests
+test d268_a_directory_frame_never_reaches_disk_before_its_init_record ... FAILED
+test d268_an_init_record_keeps_a_page_holding_unlogged_rows_written_after_it ... ok
+test d268_an_init_insert_keeps_a_page_that_already_holds_its_own_later_image ... ok
+test a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns ... FAILED
+test d268_a_reused_page_whose_writes_were_lost_holds_only_its_new_owners_rows ... ok
+test d267_after_a_power_loss_the_allocator_does_not_hand_out_a_page_the_log_rebuilt ... ok
+test d268_a_listed_page_whose_image_never_reached_disk_is_initialised_by_redo_after_an_uncommitted_insert ... FAILED
+test d268_a_reserved_page_whose_image_never_reached_disk_is_initialised_by_redo ... FAILED
+
+failures:
+
+---- d268_a_directory_frame_never_reaches_disk_before_its_init_record stdout ----
+
+thread 'd268_a_directory_frame_never_reaches_disk_before_its_init_record' (357886717) panicked at tests/d268_power_loss_redo.rs:334:9:
+an uncommitted insert's page, flush_page: the directory reached the page file before any log sync, so its listing can outlive the page's init record
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns stdout ----
+
+thread 'a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns' (357886715) panicked at tests/d268_power_loss_redo.rs:370:5:
+assertion `left == right` failed: COMMIT returned Ok, and the committed row did not survive the crash
+  left: []
+ right: [[192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192]]
+
+---- d268_a_listed_page_whose_image_never_reached_disk_is_initialised_by_redo_after_an_uncommitted_insert stdout ----
+
+thread 'd268_a_listed_page_whose_image_never_reached_disk_is_initialised_by_redo_after_an_uncommitted_insert' (357886718) panicked at tests/d268_power_loss_redo.rs:234:19:
+B's scan refused the listed page 2, whose image never reached disk: DATA CORRUPTION: heap page 2 cannot be read (its header names page 0): every byte is zero: nothing was written here, or the write never reached disk
+
+---- d268_a_reserved_page_whose_image_never_reached_disk_is_initialised_by_redo stdout ----
+
+thread 'd268_a_reserved_page_whose_image_never_reached_disk_is_initialised_by_redo' (357886719) panicked at tests/d268_power_loss_redo.rs:260:19:
+B's scan refused the reserved page 2, whose image never reached disk: DATA CORRUPTION: heap page 2 cannot be read (its header names page 0): every byte is zero: nothing was written here, or the write never reached disk
+
+
+failures:
+    a_commit_whose_record_begins_at_the_flushed_end_is_durable_when_commit_returns
+    d268_a_directory_frame_never_reaches_disk_before_its_init_record
+    d268_a_listed_page_whose_image_never_reached_disk_is_initialised_by_redo_after_an_uncommitted_insert
+    d268_a_reserved_page_whose_image_never_reached_disk_is_initialised_by_redo
+
+test result: FAILED. 4 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--test d268_power_loss_redo`
+error: 1 target failed:
+    `--test d268_power_loss_redo`
+2026-09-24T22:09:05Z d256 rc=101
+2026-09-24T22:09:05Z d256 released (owner matched)
+# rc=101 end=2026-09-24T22:09:05Z

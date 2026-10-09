@@ -167,7 +167,7 @@ pub const MAX_CONFIG_NODES: usize = 1024;
 /// `RecKind::Ddl`'s tag in `wal::log`. Named here because [`Command::Catalog`] is carried *as* one
 /// of those records, and because the tag has to be checked before the record is handed to
 /// `RecKind::deserialize` — see [`decode_catalog`].
-const RECKIND_DDL_TAG: u8 = 9;
+const RECKIND_DDL_TAG: u8 = crate::wal::log::WalTag::Ddl as u8;
 
 // ---------------------------------------------------------------------------------------------
 // Encoding

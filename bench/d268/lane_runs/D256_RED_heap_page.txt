@@ -1,0 +1,160 @@
+# 2026-09-24T21:59:17Z HEAD=1f1d422 dirty=0
+# cmd: cargo test --no-fail-fast --lib storage::heap_page::tests::
+2026-09-24T21:59:17Z d256 acquiring (5s poll), pid 66357
+2026-09-24T22:04:09Z d256 ACQUIRED: 66357 d256 2026-09-24T22:04:09Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d268.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.13s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 17 tests
+test storage::heap_page::tests::test_exact_bytes ... ok
+test storage::heap_page::tests::test_basic ... ok
+test storage::heap_page::tests::a_restore_into_a_free_slot_without_room_is_refused_and_changes_nothing ... ok
+test storage::heap_page::tests::a_retired_slot_reads_as_deleted_keeps_its_bytes_and_is_restored_in_place ... ok
+test storage::heap_page::tests::releasing_a_retired_slot_frees_its_bytes ... ok
+test storage::heap_page::tests::only_a_live_slot_is_retired_and_only_a_retired_one_is_released ... ok
+test storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused ... FAILED
+test storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused ... FAILED
+test storage::heap_page::tests::a_shrink_keeps_the_slots_capacity_so_growing_back_is_in_place ... ok
+test storage::heap_page::tests::d256::a_page_of_another_type_is_refused ... FAILED
+test storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused ... FAILED
+test storage::heap_page::tests::d256::a_free_space_end_that_disagrees_with_the_slots_is_refused ... FAILED
+test storage::heap_page::tests::d256::a_slot_running_past_the_end_of_the_page_is_refused ... FAILED
+test storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so ... FAILED
+test storage::heap_page::tests::d256::free_space_that_ends_before_it_starts_is_refused ... FAILED
+test storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts ... FAILED
+test storage::heap_page::tests::d256::every_page_the_writer_produces_is_one_the_reader_accepts ... ok
+
+failures:
+
+---- storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused' (357332197) panicked at src/storage/heap_page.rs:110:50:
+range end index 4 out of range for slice of length 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused' (357332197) panicked at src/storage/heap_page.rs:569:27:
+a slot array 2 bytes long: PANICKED (range end index 4 out of range for slice of length 2) instead of refusing
+
+---- storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused' (357332196) panicked at src/storage/heap_page.rs:106:34:
+slice index starts at 23 but ends at 19
+
+thread 'storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused' (357332196) panicked at src/storage/heap_page.rs:569:27:
+a slot array starting at byte 19, inside the 23-byte header: PANICKED (slice index starts at 23 but ends at 19) instead of refusing
+
+---- storage::heap_page::tests::d256::a_page_of_another_type_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_page_of_another_type_is_refused' (357332194) panicked at src/storage/heap_page.rs:568:30:
+a page of type 1: ACCEPTED
+
+---- storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused' (357332195) panicked at src/storage/heap_page.rs:106:34:
+range end index 4099 out of range for slice of length 4096
+
+thread 'storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused' (357332195) panicked at src/storage/heap_page.rs:569:27:
+a slot array ending at byte 4099 of 4096: PANICKED (range end index 4099 out of range for slice of length 4096) instead of refusing
+
+---- storage::heap_page::tests::d256::a_free_space_end_that_disagrees_with_the_slots_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_free_space_end_that_disagrees_with_the_slots_is_refused' (357332193) panicked at src/storage/heap_page.rs:568:30:
+free space ending at byte 3000 over tuples beginning at 3946: ACCEPTED
+
+---- storage::heap_page::tests::d256::a_slot_running_past_the_end_of_the_page_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::a_slot_running_past_the_end_of_the_page_is_refused' (357332198) panicked at src/storage/heap_page.rs:568:30:
+a live slot holding bytes 3996..4097: ACCEPTED
+
+---- storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so stdout ----
+
+thread 'storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so' (357332199) panicked at src/storage/heap_page.rs:106:34:
+slice index starts at 23 but ends at 0
+
+thread 'storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so' (357332199) panicked at src/storage/heap_page.rs:569:27:
+an all-zero page: PANICKED (slice index starts at 23 but ends at 0) instead of refusing
+
+---- storage::heap_page::tests::d256::free_space_that_ends_before_it_starts_is_refused stdout ----
+
+thread 'storage::heap_page::tests::d256::free_space_that_ends_before_it_starts_is_refused' (357332201) panicked at src/storage/heap_page.rs:568:30:
+free space from byte 27 to byte 25: ACCEPTED
+
+---- storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts stdout ----
+
+thread 'storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts' (357332202) panicked at src/storage/heap_page.rs:143:37:
+range end index 883 out of range for slice of length 876
+
+thread 'storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts' (357332202) panicked at src/storage/heap_page.rs:766:31:
+iteration 0: PANICKED (range end index 883 out of range for slice of length 876) on a damaged page
+
+
+failures:
+    storage::heap_page::tests::d256::a_free_space_end_that_disagrees_with_the_slots_is_refused
+    storage::heap_page::tests::d256::a_page_of_another_type_is_refused
+    storage::heap_page::tests::d256::a_slot_array_running_past_the_page_is_refused
+    storage::heap_page::tests::d256::a_slot_array_starting_inside_the_header_is_refused
+    storage::heap_page::tests::d256::a_slot_array_that_disagrees_with_the_slot_count_is_refused
+    storage::heap_page::tests::d256::a_slot_running_past_the_end_of_the_page_is_refused
+    storage::heap_page::tests::d256::an_all_zero_page_is_refused_and_says_so
+    storage::heap_page::tests::d256::free_space_that_ends_before_it_starts_is_refused
+    storage::heap_page::tests::d256::no_bytes_panic_the_reader_or_a_page_it_accepts
+
+test result: FAILED. 8 passed; 9 failed; 0 ignored; 0 measured; 1690 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`
+error: 1 target failed:
+    `--lib`
+2026-09-24T22:04:34Z d256 rc=101
+2026-09-24T22:04:34Z d256 released (owner matched)
+# rc=101 end=2026-09-24T22:04:34Z

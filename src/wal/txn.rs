@@ -704,6 +704,12 @@ impl TxnManager {
         self.append_chained(txn_id, &RecKind::HeapInsert { dir_root, page_id, slot, tuple: tuple.to_vec() })
     }
 
+    /// D268: `page_id` was made for the heap at `dir_root` (see `RecKind::HeapInitPage`). On the
+    /// transaction's chain, where its undo skips it: nothing undoes a page's creation.
+    pub fn log_init_page(&self, txn_id: u64, dir_root: u32, page_id: u32) -> Result<u64, FerroError> {
+        self.append_chained(txn_id, &RecKind::HeapInitPage { dir_root, page_id })
+    }
+
     pub fn log_delete(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16, old: &[u8]) -> Result<u64, FerroError> {
         self.append_chained(txn_id, &RecKind::HeapDelete { dir_root, page_id, slot, old: old.to_vec() })
     }
@@ -1176,7 +1182,7 @@ impl TxnManager {
     {
         let frame_i = self.bp.fetch_page(page_id)?;
         let mut frame = self.bp.frame_write(frame_i);
-        let undone = Page::deserialize(frame.data).and_then(|mut page| {
+        let undone = Page::deserialize_at(page_id, frame.data).and_then(|mut page| {
             undo(&mut page)?;
             page.serialize()?;
             Ok(page)
