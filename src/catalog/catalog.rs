@@ -67,6 +67,11 @@ pub struct Catalog {
     /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
     /// write statement no longer invalidates every reader's cache.
     epoch: u64,
+    /// D230 review 3, F2: the transaction manager's catalog persist debt, when attached
+    /// (`owe_persists_to`; `open_recovered` does it). `persist` sets it on failure and clears it on
+    /// success, and every checkpoint keeps the log while it is set. `None` for a catalog built
+    /// outside `open_recovered` (tests), which then behaves as before.
+    persist_debt: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Which list of its table a [`BuiltIndex`] joins when it is attached (D271).
@@ -103,11 +108,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None};
         catalog.load()?;
         Ok(catalog)
     }
@@ -710,12 +715,42 @@ impl Catalog {
             Ok(()) => Ok(()),
             Err(e) => {
                 undo(self);
+                // D230 review 7, F-D: write the restored records back. The refused persist may have
+                // rewritten some catalog pages in the pool before it failed, and it left a persist
+                // owed (F2), which keeps every later log until some persist succeeds. This one
+                // usually does, since the entry that could not be written is gone; if it fails too,
+                // the debt stays set and the log stays kept, which is the safe direction.
+                let _ = self.persist();
                 Err(e)
             }
         }
     }
 
+    /// Share the transaction manager's catalog persist debt with this catalog (D230 review 3, F2).
+    /// From here on a failed `persist` marks a persist as owed and a successful one clears it, and
+    /// `TxnManager::checkpoint_or_keep_held` keeps the log while one is owed.
+    pub fn owe_persists_to(&mut self, debt: Arc<std::sync::atomic::AtomicBool>) {
+        self.persist_debt = Some(debt);
+    }
+
+    /// Write every table's record to the catalog pages, and settle the persist debt either way (D230
+    /// review 3, F2): owed after a failure, cleared after a success. A successful persist rewrites
+    /// every catalog page from the in-memory records, so the page it leaves in the pool is current.
     pub fn persist(&self) -> Result<(), FerroError> {
+<<<<<<< ours
+||||||| base
+        let mut curr_page_id = self.first_catalog_page_id;
+=======
+        let written = self.write_pages();
+        if let Some(debt) = &self.persist_debt {
+            debt.store(written.is_err(), Ordering::SeqCst);
+        }
+        written
+    }
+
+    fn write_pages(&self) -> Result<(), FerroError> {
+        let mut curr_page_id = self.first_catalog_page_id;
+>>>>>>> theirs
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
         // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
         // same two tables produced a different on-disk layout on every run. Nothing can rely on the
@@ -725,6 +760,7 @@ impl Catalog {
         let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
         sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
+<<<<<<< ours
         // **Everything that can refuse happens before the first catalog write** (D270). This used to
         // be one loop that read page k, allocated page k+1 when page k ended the old chain, and THEN
         // wrote page k, so an error at turn k >= 2 left pages 1..k-1 rewritten over the old tail: a
@@ -749,6 +785,27 @@ impl Catalog {
             let last = layout.len() - 1;
             layout[last].add_entry(entry.clone())?;
         }
+||||||| base
+        loop {
+            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
+
+            let mut page = {
+                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                CatalogPage::deserialize(frame.data)?
+            };
+=======
+        loop {
+            // D230 review 8/9 (R8-1, R9-5): a `crate::cow::PageHandle`, the existing pin guard. Its own
+            // doc records that every pin leak in this codebase came from a hand-written unpin on an
+            // error path, and this loop had one on every `?` between a fetch and its unpin: one leaked
+            // pin per refused persist (`tests/d141_long_identifier.rs`). A pinned page cannot be freed,
+            // so a later `drop_table`,
+            // or a persist that orphans the page, failed with `PagePinned`. The handle unpins on every
+            // return, and marks the page dirty only through `write()`. In `h.write().data = x?` the
+            // right side is evaluated first, so a failed serialize never marks the page dirty.
+            let handle = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), curr_page_id)?;
+            let mut page = CatalogPage::deserialize(handle.read().data)?;
+>>>>>>> theirs
 
         // 2. Serialize every page ONCE, with placeholder links. Every length-prefix refusal comes
         //    from here, so these images are the encoder's whole answer: no entry is serialized twice.
@@ -779,6 +836,7 @@ impl Catalog {
             id = page?.next_catalog_page;
         }
 
+<<<<<<< ours
         // 4. Allocate every page the layout needs beyond the chain, before any catalog write. Each
         //    new page is stamped as an empty catalog page as soon as it exists, so nothing that later
         //    links to it can read back a zero page. If an allocation refuses, the pages this call
@@ -790,6 +848,43 @@ impl Catalog {
                 Err(e) => {
                     self.release_catalog_pages(&fresh);
                     return Err(e);
+||||||| base
+            let has_more = iter.peek().is_some();
+            let mut orphan_head = 0;
+            if has_more {
+                if page.next_catalog_page == 0 {
+                    let new_id = self.buffer_pool.new_page()?;
+                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
+                    // zero-filled page, and the next turn of this loop deserializes whatever is at
+                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
+                    // with format byte 0. That used to parse as an accidentally-empty page because
+                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
+                    // is between initialising the page here and teaching the format allowlist to
+                    // accept all-zeroes, which would let a genuinely corrupt page through.
+                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
+                    {
+                        let mut frame = self.buffer_pool.frame_write(frame_i);
+                        frame.data = CatalogPage::new(new_id).serialize()?;
+                    }
+                    self.buffer_pool.unpin_page(new_id, true);
+                    page.next_catalog_page = new_id;
+=======
+            let has_more = iter.peek().is_some();
+            let mut orphan_head = 0;
+            if has_more {
+                if page.next_catalog_page == 0 {
+                    let new_id = self.buffer_pool.new_page()?;
+                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
+                    // zero-filled page, and the next turn of this loop deserializes whatever is at
+                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
+                    // with format byte 0. That used to parse as an accidentally-empty page because
+                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
+                    // is between initialising the page here and teaching the format allowlist to
+                    // accept all-zeroes, which would let a genuinely corrupt page through.
+                    let stamped = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), new_id)?;
+                    stamped.write().data = CatalogPage::new(new_id).serialize()?;
+                    page.next_catalog_page = new_id;
+>>>>>>> theirs
                 }
             }
         }
@@ -806,6 +901,7 @@ impl Catalog {
             self.write_catalog_page(page_id, &images[k])?;
         }
 
+<<<<<<< ours
         // 6. Free the old chain's pages past the new end, already unlinked by step 5's last write. A
         //    failure here comes after the new image is complete: the error is returned, and the pages
         //    hold the image while the caller's undo rolls memory back.
@@ -838,6 +934,45 @@ impl Catalog {
             Err(e) => {
                 self.release_catalog_pages(&[new_id]);
                 Err(e)
+||||||| base
+            let next = page.next_catalog_page;
+
+            {
+                let mut frame = self.buffer_pool.frame_write(frame_i);
+                frame.data = page.serialize()?;
+            }
+            self.buffer_pool.unpin_page(curr_page_id, true);
+
+            if !has_more {
+                let mut free_id = orphan_head;
+                while free_id != 0 {
+                    let frame_i = self.buffer_pool.fetch_page(free_id)?;
+                    let next_orphan = {
+                        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                        CatalogPage::deserialize(frame.data)?.next_catalog_page
+                    };
+
+                    self.buffer_pool.unpin_page(free_id, false);
+                    self.buffer_pool.delete_page(free_id)?;
+                    free_id = next_orphan;
+                }
+                break;
+=======
+            let next = page.next_catalog_page;
+            handle.write().data = page.serialize()?;
+            drop(handle);
+
+            if !has_more {
+                let mut free_id = orphan_head;
+                while free_id != 0 {
+                    let orphan = crate::cow::PageHandle::fetch(self.buffer_pool.clone(), free_id)?;
+                    let next_orphan = CatalogPage::deserialize(orphan.read().data)?.next_catalog_page;
+                    drop(orphan);
+                    self.buffer_pool.delete_page(free_id)?;
+                    free_id = next_orphan;
+                }
+                break;
+>>>>>>> theirs
             }
         }
     }
@@ -862,27 +997,43 @@ impl Catalog {
 
     // traverses catalog pages and loads into hashmap
     pub fn load(&mut self) -> Result<(), FerroError> {
-        let mut curr_page_id = self.first_catalog_page_id;
-        loop{
-            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
-            let cat_page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                CatalogPage::deserialize(frame.data)?
-            };
-            self.buffer_pool.unpin_page(curr_page_id, false);
-            for entry in cat_page.entries {
-                self.tables.insert(entry.name.clone(), entry);
-            }
-            if cat_page.next_catalog_page == 0 {
-                break;
-            }
-            curr_page_id = cat_page.next_catalog_page;
+        let pool = self.buffer_pool.clone();
+        let entries = Self::read_entries(self.first_catalog_page_id, |page_id| {
+            let frame_i = pool.fetch_page(page_id)?;
+            let data = pool.frames[frame_i].read().unwrap().data;
+            pool.unpin_page(page_id, false);
+            Ok(data)
+        })?;
+        for entry in entries {
+            self.tables.insert(entry.name.clone(), entry);
         }
         // Seed the shared root cells from the records just loaded.
         self.sync_root_cells();
         // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.
         self.epoch += 1;
         Ok(())
+    }
+
+    /// The table entries of the catalog page chain that starts at `first`, each page read with
+    /// `read_page`. **It constructs no `Catalog`, seeds no root cell, and opens nothing**: it only
+    /// decodes. `load` reads the chain through the buffer pool. The clean exit's error message reads
+    /// it from the `DiskManager` (`clean_exit::unpersisted_roots`), which is what the next open will
+    /// see (D230 review 3, F1 and F5). A read-back that went through `Catalog::open` instead would
+    /// be a second way to open a database, which `open_path_allowlist` refuses.
+    pub fn read_entries(
+        first: u32,
+        mut read_page: impl FnMut(u32) -> Result<[u8; crate::storage::disk_manager::PAGE_SIZE], FerroError>,
+    ) -> Result<Vec<TableEntry>, FerroError> {
+        let mut entries = Vec::new();
+        let mut curr_page_id = first;
+        loop {
+            let cat_page = CatalogPage::deserialize(read_page(curr_page_id)?)?;
+            entries.extend(cat_page.entries);
+            if cat_page.next_catalog_page == 0 {
+                return Ok(entries);
+            }
+            curr_page_id = cat_page.next_catalog_page;
+        }
     }
 
     pub fn analyze(&mut self, table: &str) -> Result<(), FerroError> {

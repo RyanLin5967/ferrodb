@@ -191,7 +191,9 @@ fn a_clean_exit_after_a_failed_publish_leaves_a_catalog_that_opens() {
 
     // 3. The clean exit, through the function `run_cli` calls, then the arena and the branch
     //    catalog dropped. Nothing else holds the branch catalog's pool.
-    exit_sequence(&branches, &txn, &store, &dir.path().join("f7.arena")).expect("the clean exit");
+    // Since the merge with D230 the exit persists the database catalog before its checkpoint, so it
+    // takes that catalog too: the one this fixture created in `run_cli`'s order.
+    exit_sequence(&branches, &_catalog, &txn, &store, &dir.path().join("f7.arena")).expect("the clean exit");
     drop(store);
     drop(branches);
 
