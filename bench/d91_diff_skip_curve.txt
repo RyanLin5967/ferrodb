@@ -1,5 +1,5 @@
-d91 — subtree-skipping structural diff, cost curve at 23057d96d3cc
-run at unix 1789966329
+d91 — subtree-skipping structural diff, cost curve at a1a66074bc27
+run at unix 1789967687
 
 Question: is cow::diff::diff O(delta · log_m N), or O(N) with a skip counter
 bolted on? delta is held at exactly 4 modified rows; N is the only axis.
@@ -7,8 +7,14 @@ bolted on? delta is held at exactly 4 modified rows; N is the only axis.
 Instruments:
   new_visited   cow::diff::DiffStats::visited — nodes whose payload was decoded
                 by the synchronised descent. THE CLAIM.
-  new_skipped   DiffReport::skipped_subtrees (events) and skipped_node_count()
-                (exact nodes under them; an audit walk, not part of the diff).
+  skip_pid      skips won by PAGE IDENTITY alone — free, exact in this store, no
+                hashing. Within one lineage an unchanged subtree IS the same page.
+  skip_cid      skips that needed the supplied NodeIdentity, i.e. two DISTINCT
+                pages holding the same rows. Only this tier can be wrong, and
+                only a content digest can win it. Zero means the digest
+                contributed nothing on this workload — see the note below.
+  skipped nodes exact nodes under the skipped subtrees (an audit walk, run after
+                the diff and not part of its cost).
   old_touched   walk_pages(base)+walk_pages(head) — what CowTree::diff must
                 enumerate before it can prune. THE CONTROL.
   old_examined  CowTree::diff's own pages_examined. It reports the DECODE half
@@ -17,22 +23,49 @@ Instruments:
 All three paths were asserted to return the same 4 Modified rows at every N;
 a row that did not would have aborted the run rather than been banked.
 
-      N   nodes  depth | new_visited  new_visited  skipped  skipped |  old_touched  old_examined
-                       |    (pageid)       (hash)  subtree    nodes |     (control)              
--------  ------  ----- | -----------  -----------  -------  ------- |  -----------  ------------
-   1000      19      2 |          10           10       14       14 |           38            10
-   4000      73      2 |          10           10       68       68 |          146            10
-  16000     294      3 |          16           16      286      286 |          588            16
-  64000    1178      3 |          18           18      369     1169 |         2356            18
- 256000    4713      3 |          18           18      384     4704 |         9426            18
+MEASURE LOCK / LOAD. The counter columns are INTEGERS produced by structural
+decisions, not timings, so fleet load cannot move them. Checked rather than
+asserted: four runs on this box — three with no measure lock at loads 20-50,
+one holding it — produced identical counter columns. The wall-clock table is
+the only load-sensitive part of this file and carries its own lock stamp.
 
+      N   nodes  depth | visited  visited | skip_pid  skip_cid  skip_cid  skipped |  old_touched  old_examined
+                       | (pageid)  (hash) |   (both)  (pageid)    (hash)    nodes |     (control)              
+-------  ------  ----- | -------  ------- | --------  --------  --------  ------- |  -----------  ------------
+   1000      19      2 |      10       10 |       14         0         0       14 |           38            10
+   4000      73      2 |      10       10 |       68         0         0       68 |          146            10
+  16000     294      3 |      16       16 |      286         0         0      286 |          588            16
+  64000    1178      3 |      18       18 |      369         0         0     1169 |         2356            18
+ 256000    4713      3 |      18       18 |      384         0         0     4704 |         9426            18
+
+
+WALL CLOCK. Fleet measure lock: held, load_at_acquire=16 (upper bound, box not quiet)
+⛔ THESE DURATIONS ARE INADMISSIBLE AND ARE NOT A RESULT. The harness refuses
+them on its own evidence:
+  t_old fell from 4.395505625s at N=64000 to 111.602208ms at N=256000 — a 39x inversion against a
+  control whose page count ROSE 4x over the same step.
+Roughly a dozen sibling agents compile on this box; the measure lock excludes
+other MEASURERS but cannot make the machine quiet, and it did not. The rows
+are printed below only so the refusal can be checked, NOT to be quoted. No
+timing claim is made by this file. The counter table above is the result.
       N | t_new_pageid  t_new_hash      t_old | t_stamp (write-time cid, NOT diff cost)
 ------- | ------------  ----------  --------- | --------------------------------------
-   1000 | 154.292µs     104.125µs   467.875µs | 290.166µs
-   4000 | 124.333µs     105.458µs   1.348042ms | 990.125µs
-  16000 | 189.375µs     221.625µs   5.352458ms | 4.031042ms
-  64000 | 799.333µs     488.75µs    84.954291ms | 14.568958ms
- 256000 | 301.541µs     276.292µs   355.434791ms | 78.356ms
+   1000 | 102.208µs     104.459µs   460.166µs | 295.042µs
+   4000 | 118.041µs     112.875µs   1.219792ms | 1.175458ms
+  16000 | 209.25µs      308.75µs    6.070875ms | 4.002917ms
+  64000 | 48.458416ms   10.84075ms  4.395505625s | 19.582375ms
+ 256000 | 459.042µs     244.583µs   111.602208ms | 98.713417ms
+
+WHICH TIER DID THE WORK: skip_cid is 0 at every N, for BOTH providers.
+Every skip here was won by page identity alone — a u32 compare, no hashing,
+no warm-up. On this workload (one lineage, a fork plus four overwrites) the
+content digest contributed NOTHING, and the curve above would be unchanged
+if it did not exist. That is the honest reading and it follows from the
+store's design: within a lineage an unchanged subtree IS the same page, so
+there is nothing left for a digest to find. A content id earns its cost only
+where page ids CANNOT match — two branches that never shared a page, or a
+subtree rewritten to identical content. Neither occurs here. Anyone quoting
+this table as evidence FOR content addressing would be quoting it backwards.
 
 SLOPE, 1000 -> 256000 (256x in N):
   new_visited      10 -> 18     = 1.80x
