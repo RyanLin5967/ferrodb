@@ -16,6 +16,50 @@ use crate::storage::index_page::{entry_too_large, first_entry_over_bound, OPEN_T
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
+/// **Which index of a table a shared root cell belongs to: its KIND and its column** (D208).
+///
+/// A B-tree index and a full-text index may cover the same column (each `create_*` refuses only a
+/// duplicate of its own kind), and they are two different trees. Keyed by the column alone they
+/// shared ONE cell. The first index created seeded it, the other opened the first one's tree
+/// through it, and that index's next write repointed its durable record there as well, orphaning
+/// its own tree. A full-text index created second lost every posting it was built with. A B-tree
+/// index created second lost every row it was built over, and so did any B-tree index after a
+/// rebuild, which stored the posting tree's root into the one cell last
+/// (`tests/root_cell_is_per_index.rs`).
+///
+/// The column is generic so that one definition serves both the lookup (`IndexTree<&str>`, no
+/// allocation at the caller) and the map key (`IndexTree<String>`). The primary index is the
+/// `None` beside it in [`Catalog::root_cell`], so a primary index "on a column" cannot be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IndexTree<C> {
+    /// A B-tree index, in `TableEntry::indexes`: keyed `(value, pk)`.
+    Secondary(C),
+    /// A full-text index, in `TableEntry::fulltext_indexes`: keyed `(token, pk)`.
+    FullText(C),
+}
+
+impl<'a> IndexTree<&'a str> {
+    fn owned(self) -> IndexTree<String> {
+        match self {
+            IndexTree::Secondary(c) => IndexTree::Secondary(c.to_string()),
+            IndexTree::FullText(c) => IndexTree::FullText(c.to_string()),
+        }
+    }
+}
+
+impl IndexTree<String> {
+    /// The borrowed form [`Catalog::root_cell`] takes.
+    pub fn borrowed(&self) -> IndexTree<&str> {
+        match self {
+            IndexTree::Secondary(c) => IndexTree::Secondary(c.as_str()),
+            IndexTree::FullText(c) => IndexTree::FullText(c.as_str()),
+        }
+    }
+}
+
+/// A shared root cell's key: the table, then `None` for its primary index or the index's identity.
+type RootKey = (String, Option<IndexTree<String>>);
+
 #[derive(Clone)]
 pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
@@ -55,9 +99,10 @@ pub struct Catalog {
     /// `read_leaf_for` compared a private value against itself — it could never fire. Handing
     /// every statement the SAME cell is what makes that guard live. See `SCALE-DESIGN` D53.
     ///
-    /// Keyed `(table, None)` for the primary index and `(table, Some(column))` for a secondary or
-    /// full-text one.
-    roots: HashMap<(String, Option<String>), Arc<AtomicU32>>,
+    /// Keyed `(table, None)` for the primary index and `(table, Some(IndexTree::..(column)))` for
+    /// a secondary or full-text one: by index KIND as well as column, because the two kinds on one
+    /// column are two trees. See [`IndexTree`] (D208).
+    roots: HashMap<RootKey, Arc<AtomicU32>>,
     /// Bumped by every change to the SCHEMA — and deliberately **not** by a root move.
     ///
     /// A reader caches a snapshot of this catalog and re-takes it only when this number changes.
@@ -89,10 +134,13 @@ impl Catalog {
 
     /// The SHARED root cell for a tree, or `None` if this catalog has never seen it.
     ///
+    /// `index` is `None` for the table's primary index, and otherwise names the index by kind and
+    /// column: a B-tree index and a full-text index on one column are two trees with two cells.
+    ///
     /// Read-only and lock-free: the map is populated by [`Catalog::sync_root_cells`] from the
     /// `&mut self` paths, so a reader holding only `&Catalog` does a plain hash lookup.
-    pub fn root_cell(&self, table: &str, column: Option<&str>) -> Option<Arc<AtomicU32>> {
-        self.roots.get(&(table.to_string(), column.map(|c| c.to_string()))).cloned()
+    pub fn root_cell(&self, table: &str, index: Option<IndexTree<&str>>) -> Option<Arc<AtomicU32>> {
+        self.roots.get(&(table.to_string(), index.map(|i| i.owned()))).cloned()
     }
 
     /// The schema epoch. A reader compares this with one relaxed load and re-snapshots only when
@@ -115,24 +163,113 @@ impl Catalog {
     /// split has advanced it past the value recorded on the catalog page, and clobbering it would
     /// hand the next reader a root that has moved. A missing cell has no such history, so seeding
     /// it from the durable record is right.
+    ///
+    /// **Retires the cell of every tree the catalog no longer records, one index at a time.** A
+    /// cell kept for a tree that is gone would be inherited by the next tree created under the same
+    /// key, since the step above never overwrites. Retiring by whole table covered `DROP TABLE`
+    /// only. By key it also covers one index leaving while the other kind on the same column stays:
+    /// that one's cell is still wanted, so it is kept, `Arc` and all (D208).
+    ///
+    /// ⚠ **The retire runs only when this does.** A DROP that fails at its persist returns before
+    /// its sync, and the dead key keeps its cell. The CREATE side is what closes that
+    /// (`install_fresh_cell`, F4 of the D208 review), not this.
     pub fn sync_root_cells(&mut self) {
-        let mut want: Vec<((String, Option<String>), u32)> = Vec::new();
+        let mut want: Vec<(RootKey, u32)> = Vec::new();
         for (name, entry) in self.tables.iter() {
             want.push(((name.clone(), None), entry.primary_index_root));
             for idx in entry.indexes.iter() {
-                want.push(((name.clone(), Some(idx.column_name.clone())), idx.root_page_id));
+                want.push(((name.clone(), Some(IndexTree::Secondary(idx.column_name.clone()))), idx.root_page_id));
             }
             for ft in entry.fulltext_indexes.iter() {
-                want.push(((name.clone(), Some(ft.column_name.clone())), ft.root_page_id));
+                want.push(((name.clone(), Some(IndexTree::FullText(ft.column_name.clone()))), ft.root_page_id));
             }
         }
+        let live: std::collections::HashSet<&RootKey> = want.iter().map(|(key, _)| key).collect();
+        self.roots.retain(|key, _| live.contains(key));
         for (key, root) in want {
             self.roots.entry(key).or_insert_with(|| Arc::new(AtomicU32::new(root)));
         }
-        // Drop cells for tables this catalog no longer holds, so a DROP+CREATE of the same name
-        // cannot inherit the old tree's pointer.
-        let live: std::collections::HashSet<&String> = self.tables.keys().collect();
-        self.roots.retain(|(t, _), _| live.contains(t));
+    }
+
+    /// The root a tree IS at: its shared cell's value, or the record for a tree the catalog never
+    /// gave a cell. **One source of truth** (D208 review 2, C4): every statement descends the cell,
+    /// and a record can LAG it. An INSERT that split a root through the shared handle and then
+    /// failed before its root sync leaves the record on the pre-split page. That page is now the new
+    /// root's LEFT CHILD: a leaf if the tree was one level deep, an internal node if it was deeper
+    /// (D208 review 3, C3). Anything that reads a whole tree from its root must read it from here.
+    pub(crate) fn live_root(&self, table: &str, index: Option<IndexTree<&str>>, recorded: u32) -> u32 {
+        self.root_cell(table, index).map_or(recorded, |cell| cell.load(Ordering::Acquire))
+    }
+
+    /// Bring every INDEX record of `table` up to its shared cell (D208 review 2, C4). This is the rule
+    /// ALTER's `finish` follows for the primary index (D214), applied to the B-tree and full-text
+    /// indexes.
+    ///
+    /// ALTER's one persist writes every record of the table, so a record that lagged its cell was
+    /// written as it was. In memory that is harmless, because statements descend the cell. But the
+    /// persisted record is what an open that does not rebuild would seed its cell from. `pub(crate)`
+    /// for `catalog::alter`, and for `wal::recovery::rebuild_indexes`, which frees each old index
+    /// tree from its record. It never writes a cell.
+    pub(crate) fn catch_up_index_records(&mut self, table: &str) {
+        let Some(entry) = self.tables.get_mut(table) else { return };
+        for idx in entry.indexes.iter_mut() {
+            if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::Secondary(idx.column_name.clone())))) {
+                idx.root_page_id = cell.load(Ordering::Acquire);
+            }
+        }
+        for ft in entry.fulltext_indexes.iter_mut() {
+            if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::FullText(ft.column_name.clone())))) {
+                ft.root_page_id = cell.load(Ordering::Acquire);
+            }
+        }
+    }
+
+    /// Install a FRESH shared cell for a tree the caller has just created and made durable (F4 of
+    /// the D208 review).
+    ///
+    /// `sync_root_cells` never overwrites, and it retires a dead key only when it runs. A DROP
+    /// whose persist fails returns before its sync, and so leaves the dead tree's cell under the
+    /// key. A CREATE of the same key then inherited that cell and descended a FREED tree. A
+    /// brand-new tree has no legitimate holder, so replacing whatever is there is always right,
+    /// and it makes the inheritance unrepresentable instead of depending on a retire having run.
+    ///
+    /// The root is read from the RECORD the caller has just written, so the cell cannot disagree
+    /// with it, however the caller computed it. A missing record installs nothing:
+    /// `sync_root_cells` then retires the key.
+    fn install_fresh_cell(&mut self, table: &str, index: Option<IndexTree<&str>>) {
+        let Some(entry) = self.tables.get(table) else { return };
+        let root = match index {
+            None => Some(entry.primary_index_root),
+            Some(IndexTree::Secondary(c)) => entry.indexes.iter().find(|i| i.column_name == c).map(|i| i.root_page_id),
+            Some(IndexTree::FullText(c)) => entry.fulltext_indexes.iter().find(|i| i.column_name == c).map(|i| i.root_page_id),
+        };
+        if let Some(root) = root {
+            self.roots.insert((table.to_string(), index.map(|i| i.owned())), Arc::new(AtomicU32::new(root)));
+        }
+    }
+
+    /// Carry a renamed column's index cells to its new name — D208, the rename exit.
+    ///
+    /// The cell is keyed by column NAME, so a rename that left it behind broke the key's claim to
+    /// be the index's identity, twice over. The renamed index found no cell and opened a private
+    /// root (the D53 hazard) until the next `sync_root_cells` seeded a second cell for the same
+    /// tree. And an index later built on a new column taking the old name INHERITED the renamed
+    /// index's tree through the old cell, because `sync_root_cells` never overwrites
+    /// (`tests/root_cell_is_per_index.rs::an_index_on_a_reused_column_name_does_not_inherit_the_renamed_columns_tree`).
+    ///
+    /// Moved, not re-created: a statement holding the `Arc` keeps following the same tree, and
+    /// there stays one cell per tree, which is D205's reason for storing into cells rather than
+    /// replacing them. `pub(crate)` for `catalog::alter`, which calls it under the exclusive
+    /// catalog lock in the rename chain's own order, so `a -> b` then `b -> c` ends at `c`.
+    pub(crate) fn rename_root_cells(&mut self, table: &str, from: &str, to: &str) {
+        for (old, new) in [
+            (IndexTree::Secondary(from), IndexTree::Secondary(to)),
+            (IndexTree::FullText(from), IndexTree::FullText(to)),
+        ] {
+            if let Some(cell) = self.roots.remove(&(table.to_string(), Some(old.owned()))) {
+                self.roots.insert((table.to_string(), Some(new.owned())), cell);
+            }
+        }
     }
 
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
@@ -186,6 +323,8 @@ impl Catalog {
         self.persist_or_undo(|c| {
             c.tables.remove(&name);
         })?;
+        // A brand-new tree gets a brand-new cell, whatever a dead tree left under the key.
+        self.install_fresh_cell(&name, None);
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -343,6 +482,7 @@ impl Catalog {
                 e.indexes.pop();
             }
         })?;
+        self.install_fresh_cell(&table, Some(IndexTree::Secondary(column)));
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -435,6 +575,7 @@ impl Catalog {
                 e.fulltext_indexes.pop();
             }
         })?;
+        self.install_fresh_cell(&table, Some(IndexTree::FullText(column)));
         // The set of trees changed, so seed (or retire) their shared root cells, and tell
         // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
@@ -459,17 +600,22 @@ impl Catalog {
     /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
     /// where those pages are.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
+        // Every tree is freed from its LIVE root, its shared cell, and not from the record (D208
+        // review 2, C4). A record that lags its cell names the pre-split page, which is now the new
+        // root's left child (a leaf if the tree was one level deep, an internal node otherwise; D208
+        // review 3, C3). Freeing from it frees that left part and leaks the rest of the tree
+        // (`tests/root_cell_is_per_index.rs`, T12).
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;
             (
                 entry.first_directory_page_id,
                 entry.time_travel_root,
-                entry.primary_index_root,
+                self.live_root(name, None, entry.primary_index_root),
                 // B8: the full-text roots go in the SAME list because the trees are the same type,
                 // and leaving them out would leak one tree per full-text index on every DROP TABLE
                 // — the E69 gap, re-opened by a second index list.
-                entry.indexes.iter().map(|i| i.root_page_id)
-                    .chain(entry.fulltext_indexes.iter().map(|i| i.root_page_id))
+                entry.indexes.iter().map(|i| self.live_root(name, Some(IndexTree::Secondary(&i.column_name)), i.root_page_id))
+                    .chain(entry.fulltext_indexes.iter().map(|i| self.live_root(name, Some(IndexTree::FullText(&i.column_name)), i.root_page_id)))
                     .collect::<Vec<_>>(),
             )
         };
@@ -496,7 +642,9 @@ impl Catalog {
         self.persist()?;
         // Keep the SHARED cell in step with the durable record. A split stores into the cell and
         // then calls this, so the two usually already agree; a caller that sets the root directly
-        // (tests, ALTER) would otherwise leave the cell pointing at the old tree.
+        // (tests) would otherwise leave the cell pointing at the old tree. ALTER does not come
+        // through here: it plans from the cell, rewrites through it, and its `finish` writes the
+        // record FROM the cell, in its one persist (D214).
         if let Some(cell) = self.roots.get(&(table.to_string(), None)) {
             cell.store(new_root, Ordering::Release);
         }
@@ -507,7 +655,7 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.indexes.iter_mut().find(|ind| ind.column_name == column).ok_or(FerroError::KeyNotFound)?.root_page_id = new_root;
         self.persist()?;
-        if let Some(cell) = self.roots.get(&(table.to_string(), Some(column.to_string()))) {
+        if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::Secondary(column.to_string())))) {
             cell.store(new_root, Ordering::Release);
         }
         Ok(())
@@ -516,12 +664,14 @@ impl Catalog {
     /// B8 — the `update_index_root` of the full-text list. Separate because the two lists are
     /// separate: resolving a full-text column name inside `indexes` would either miss (and leave a
     /// split tree's new root unrecorded, losing every posting added since) or hit a same-named
-    /// B-tree index and overwrite ITS root with a token tree's.
+    /// B-tree index and overwrite ITS root with a token tree's. The cell is the full-text one for
+    /// the same reason (D208): keyed by column alone, this store landed in the B-tree index's cell
+    /// whenever that index had been created first.
     pub fn update_fulltext_root(&mut self, table: &str, column: &str, new_root: u32) -> Result<(), FerroError> {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.fulltext_indexes.iter_mut().find(|ind| ind.column_name == column).ok_or(FerroError::KeyNotFound)?.root_page_id = new_root;
         self.persist()?;
-        if let Some(cell) = self.roots.get(&(table.to_string(), Some(column.to_string()))) {
+        if let Some(cell) = self.roots.get(&(table.to_string(), Some(IndexTree::FullText(column.to_string())))) {
             cell.store(new_root, Ordering::Release);
         }
         Ok(())

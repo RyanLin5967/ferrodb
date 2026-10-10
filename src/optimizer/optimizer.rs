@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::HashSet, ops::Bound, sync::Arc};
 
-use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::ReadView};
+use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::{Catalog, IndexTree}, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::ReadView};
 
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     match lp {
@@ -86,7 +86,10 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             }
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
-            let sec_tree = match catalog.root_cell(&table, Some(&col_name)) {
+            // The B-tree index's own cell (D208). A full-text index on the same column has one
+            // too, and keyed by column alone this scan descended the posting tree whenever the
+            // full-text index was created first, or after any rebuild.
+            let sec_tree = match catalog.root_cell(&table, Some(IndexTree::Secondary(&col_name))) {
                 Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
                 None => BPlusTreeManager::<(Value, Value), ()>::open(sec_root, bp.clone()),
             };

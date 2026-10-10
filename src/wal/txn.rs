@@ -364,6 +364,14 @@ pub fn index_undo_failures() -> u64 {
 /// transaction: DROP and ALTER refuse while any transaction is active (`drop_checkpointed`,
 /// `Catalog::alter_table`), and `Catalog::sync_root_cells` keeps the existing cell for a live
 /// table (`or_insert_with`).
+///
+/// D208 added two more writers of the cell map, and neither can reach a cell this holds, which is
+/// always a table's PRIMARY cell `(t, None)`:
+/// - `Catalog::rename_root_cells` MOVES cells on a column rename, and only index keys.
+/// - `Catalog::install_fresh_cell` REPLACES the cell under a key a CREATE has just made. It touches
+///   `(t, None)` only in CREATE TABLE, for a name absent from the catalog. No open transaction can
+///   have written such a table, and CREATE TABLE runs under `ddl_checkpointed`, which refuses while
+///   any transaction is active.
 pub struct PrimaryWrite {
     pub root: Arc<AtomicU32>,
     pub key: Value,
