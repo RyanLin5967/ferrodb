@@ -909,7 +909,15 @@ pub fn verify_frame<'a>(key: &Key, signed: &'a [u8]) -> Result<&'a [u8], FerroEr
 #[cfg(test)]
 #[path = "tests_signing.rs"]
 mod tests_signing;
+<<<<<<< HEAD
 
 #[cfg(test)]
 #[path = "tests_f7_attack.rs"]
 mod tests_f7_attack;
+||||||| d4e9280
+=======
+
+#[cfg(test)]
+#[path = "tests_f7_keyattack.rs"]
+mod tests_f7_keyattack;
+>>>>>>> origin/F7-atk-key
