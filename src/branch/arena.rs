@@ -272,8 +272,8 @@ struct StoreState {
     current: HashMap<BranchId, ArenaId>,
     /// **D85.** Arenas restored from an image whose `next_free` may be UNDERSTATED.
     ///
-    /// `alloc_for` advances `next_free` without persisting — the `persist_if_configured` sites are
-    /// all off the page path — so an extent checkpointed while empty and then filled comes back
+    /// `alloc_for` advances `next_free` without persisting — the persist sites are all off the page
+    /// path — so an extent checkpointed while empty and then filled comes back
     /// reading zero. `load_state` already handles the ALLOCATION consequence by clearing
     /// `current`; this handles the COLLECTION one, which was silent data loss: with `next_free`
     /// at 0, `retire_arenas_by_rule` parked none of a live child's pages and `extent_is_empty`
@@ -285,7 +285,24 @@ struct StoreState {
     /// resolve_fill`], which recovers the true value by probing.
     fill_unknown: std::collections::HashSet<ArenaId>,
     /// Pages logically freed but still visible to some live child. Slow-path reaping parks here.
-    pending: Vec<PendingFree>,
+    ///
+    /// **D183 de-dup at push: one entry per `(page, arena)`, the first.** See [`PendingLog`].
+    pending: PendingLog,
+    /// **D183.** Arenas whose `recycled` list or `next_free` has moved since the durable file was
+    /// last brought level with memory, and which therefore have to ride the next tail record.
+    ///
+    /// This is the list-shaped state `:2220` named as the reason the reclamation sites could not
+    /// use a delta. It is a *set of arenas* rather than a list of pages because the record carries
+    /// each one's recycled list **absolutely**: a record of pushes would be wrong the moment a
+    /// page came back out of the list again, and an absolute list costs at most `page_count`
+    /// entries for an extent the caller was already walking page by page.
+    ///
+    /// **It lives inside `StoreState` and not beside it, and that is the whole of its
+    /// correctness.** `release_page` pushes the page and marks the arena in ONE critical section,
+    /// and a record builder takes the set and reads the lists it names in ONE critical section.
+    /// Split across two locks in either order there is an interleaving where a push is neither in
+    /// the record nor still marked — which is a page that never comes back.
+    recycled_dirty: std::collections::HashSet<ArenaId>,
     /// The authority epoch each live extent was **claimed** under.
     ///
     /// Kept beside `extents` rather than inside `ArenaExtent`, because that type is a durable
@@ -352,6 +369,14 @@ pub struct ArenaPageStore {
     /// instant depends on the sweep cadence rather than on anything being measured. This counter
     /// is incremented at the two sites that park a page and nowhere else, so it is immune to all
     /// of that.
+    ///
+    /// **Since D183 de-dup at push, those two sites are [`Self::push_pending_recorded`] and
+    /// [`Self::push_pending_unrecorded`], and they count only a push that LANDED.** A push of a
+    /// page already pending is skipped by [`PendingLog::push_if_absent`]
+    /// and adds no entry, so it adds no count: the total is the number of entries that ever
+    /// entered the log, which a duplicate park no longer inflates. Before the de-dup a resumed
+    /// reap's re-park of an already-pending page counted twice; a figure measured then can read
+    /// higher than the same run measures now.
     pending_pushed: AtomicU64,
     /// The authority epoch this store's in-memory state belongs to.
     ///
@@ -406,6 +431,16 @@ pub struct ArenaPageStore {
     /// full image rewrite, exactly as [`Self::pending_version`] does for the pending-free log. One
     /// rewrite per burst of reuse, not one per pop — the flag stays set until a persist happens.
     recycled_reissued: AtomicBool,
+    /// **D183 tail replay: an OBSERVING counter, compiled into test builds only.** Counts the
+    /// pending-free log entries [`Self::replay_tail`] visited. That is every element a scan of the
+    /// log walks, plus every entry a record carries.
+    ///
+    /// Per store, not process-wide, so parallel tests in the lib binary cannot add to each other's
+    /// window. Read it before and after one `restore` to scope it to one replay. It is bumped
+    /// where the work happens, never computed from a `len()` after the fact. See
+    /// `frontier/lane_d183_tail_replay.md` in artie-research.
+    #[cfg(test)]
+    replay_pending_visits: AtomicU64,
 }
 
 /// **D81 — the append-only tail, and what this process is allowed to assume about the file.**
@@ -430,8 +465,8 @@ pub struct ArenaPageStore {
 ///
 /// So this mutex is held across `reserve` + the `state` mutation + the append, on both delta
 /// paths. It is **outermost**: taken before `state`, before the catalog's locks and before
-/// `REPLACE_LOCK`, and never acquired while any of them is held. Every `persist_if_configured`
-/// call site already drops the `state` guard before persisting, which is what makes that rule
+/// `REPLACE_LOCK`, and never acquired while any of them is held. Every persist site takes it
+/// before `state` and holds both only for the snapshot it encodes, which is what makes that rule
 /// satisfiable rather than aspirational.
 ///
 /// # What a tail record does NOT carry, and why that is not a hole
@@ -475,6 +510,33 @@ pub struct ArenaPageStore {
 ///     first persist rewrites the image, which drops the torn bytes. So a good record can never
 ///     end up sitting behind a bad one, which is the one arrangement the reader cannot recover
 ///     from (it must stop at the first bad record, and would then silently discard the good one).
+/// **D183.** What a `take_pending` handed out, so the matching `put_pending` can describe the
+/// drain by difference instead of by restating the whole log. See [`PersistState::drain_mark`].
+struct DrainMark {
+    rewrites: u64,
+    base_version: u64,
+    taken: Vec<(PageId, ArenaId)>,
+}
+
+/// **D183 — parked entries still owed a `TAIL_PAGES_PARKED` record, bound to the persist guard.**
+///
+/// `push_pending_recorded` first took `&mut PersistState`, so a push made without the guard stopped
+/// compiling. That bound the PUSH and not the SPAN: dropping the guard and taking it again between
+/// the push loop and the append still compiled, and re-opened exactly the window it was written to
+/// close — a `take_pending` in the gap reads `level == true` for a file that does not yet list the
+/// entries, cuts a `DrainMark` on that false premise, and the park's record then lands behind the
+/// drain's and puts a released page back in the durable log. Fire-checked (`d183-reverify`, M8,
+/// `bench/d183_reverify.txt`): at `4b1ab2d` that spelling compiled and the whole lib target passed
+/// (1673 passed, 0 failed), because nothing races two threads on one store's durability path.
+///
+/// This holds the guard's `&mut` borrow for as long as any entry is owed a record, so releasing the
+/// guard before the append — or before [`ArenaPageStore::abandon_park`] on the append's failure
+/// arm — is a borrow error rather than a review finding.
+struct RecordedParks<'g> {
+    persist: &'g mut PersistState,
+    parked: Vec<PendingFree>,
+}
+
 struct PersistState {
     /// Bytes of the image THIS process last wrote to `checkpoint_path`, or 0 for "none".
     image_bytes: u64,
@@ -503,6 +565,40 @@ struct PersistState {
     /// serialises, so a push racing the write is recorded as still-dirty and costs one extra
     /// rewrite — never a missed one.
     durable_pending_version: u64,
+    /// **D183.** Proof that the durable pending-free log is still the one `take_pending` handed
+    /// out, so `put_pending` may describe the drain by what it REMOVED instead of restating the
+    /// whole log.
+    ///
+    /// `rewrites` and `durable_pending_version` as they stood at the take, plus the KEYS the take
+    /// handed out.
+    ///
+    /// **THREE things can make the durable log stop being the pre-take log, and the two counters
+    /// only see two of them.** A full image rewrite publishes the drained, empty log and moves
+    /// `rewrites`; another record that carries the whole log moves `durable_pending_version`. The
+    /// third is [`ArenaPageStore::TAIL_PAGES_PARKED`], which APPENDS to the durable log and moves
+    /// **neither** — `persist_delta_locked`'s `pending_covered` is `None` for it precisely because
+    /// it leaves the log's accounting where it found it.
+    ///
+    /// ⚠ **An earlier version of this comment said "exactly two", and was wrong.** What actually
+    /// covers the third is the subset test in `put_pending`: a parked record landing between the
+    /// take and the put also pushes its entry into memory, so the log being put back holds a key
+    /// the take never handed out, `kept ⊄ taken`, and the absolute record is written instead. The
+    /// counters are not the whole guard and this comment must not claim they are.
+    ///
+    /// ⛔ **The keys are carried because `put_pending`'s contract is "the log is now exactly
+    /// this", NOT "I released what I dropped".** An earlier draft derived the removals from
+    /// `release_page` instead, on the reasoning that `drain_pending_seeded` releases every entry
+    /// it drops. It does — but `put_pending` is public and
+    /// `putting_the_pending_log_back_reaches_the_durable_map` calls it with a subset and no
+    /// releases at all, which that draft turned into a durable log with four entries where a full
+    /// rewrite gives two. The removals are therefore computed from what the drain TOOK against
+    /// what it PUT BACK, which needs no assumption about any other method.
+    ///
+    /// `None` means "do not try", and every ambiguous case resolves to it: a second drain
+    /// overlapping this one, a take whose log was not level with memory to begin with, a log
+    /// larger than [`ArenaPageStore::DRAIN_MARK_CAP`], a map loaded from elsewhere. The absolute
+    /// record is always correct, so the fallback costs bytes and never correctness.
+    drain_mark: Option<DrainMark>,
     /// Full-image rewrites and tail appends this store has performed.
     ///
     /// Per-STORE, where `storage::atomic_file`'s counters are per-process. Both exist and neither
@@ -511,6 +607,10 @@ struct PersistState {
     /// The quantity this row is about is an integer, so it is worth being able to assert exactly.
     rewrites: u64,
     appends: u64,
+    /// Drains whose record `put_pending` did not write because it would have carried nothing:
+    /// no removal and no recycled list. Each one moved `durable_pending_version` exactly as the
+    /// record's append would have. See [`ArenaPageStore::TAIL_PENDING_DRAINED`].
+    elided: u64,
 }
 
 impl ArenaPageStore {
@@ -603,7 +703,8 @@ impl ArenaPageStore {
                 extents: HashMap::new(),
                 recycled: HashMap::new(),
                 current: HashMap::new(),
-                pending: Vec::new(),
+                pending: PendingLog::default(),
+                recycled_dirty: std::collections::HashSet::new(),
                 claim_epoch: HashMap::new(),
                 shadow_base: HashMap::new(),
             }),
@@ -617,11 +718,15 @@ impl ArenaPageStore {
                 tail_bytes: 0,
                 image_epoch: crate::cluster::epoch(),
                 durable_pending_version: 0,
+                drain_mark: None,
                 rewrites: 0,
                 appends: 0,
+                elided: 0,
             }),
             pending_version: AtomicU64::new(0),
             recycled_reissued: AtomicBool::new(false),
+            #[cfg(test)]
+            replay_pending_visits: AtomicU64::new(0),
         })
     }
 
@@ -850,6 +955,10 @@ impl ArenaPageStore {
                     false
                 } else {
                     slot.push(page_id);
+                    // **D183 — marked in the SAME critical section as the push.** See
+                    // [`StoreState::recycled_dirty`]: a mark that can land on the other side of
+                    // the push is a page that is neither in the next record nor still owed one.
+                    st.recycled_dirty.insert(arena);
                     true
                 }
             }
@@ -971,13 +1080,108 @@ impl ArenaPageStore {
         Ok(Some(encoded))
     }
 
+    /// Push onto the pending-free log as part of a change a tail record is about to describe.
+    ///
+    /// **The [`RecordedParks`] is the point.** A caller can only build one from the persist guard,
+    /// and it keeps that guard borrowed until the entries it collects are written, so "mutate the
+    /// log under the lock that orders the records, and keep it until the record lands" stops being
+    /// a rule in a comment and becomes the only spelling that compiles. The defect this replaces
+    /// was exactly a push that happened outside it while a comment three functions away asserted
+    /// the invariant — see `retire_arenas_by_rule`. An earlier version took `&mut PersistState`,
+    /// which bound the push but not the span to the append; see [`RecordedParks`].
+    ///
+    /// The caller must append a record covering `parks.parked` before the borrow ends, or route
+    /// through [`Self::abandon_park`] — still holding it — if it cannot.
+    fn push_pending_recorded(&self, parks: &mut RecordedParks<'_>, entry: PendingFree) {
+        // **D183 de-dup at push.** A page already pending keeps its first entry, and the record must
+        // describe only what memory took, so a skipped push is not in `parked`. The replay would skip
+        // it first-wins anyway; leaving it out keeps the record equal to the change.
+        if self.state.lock().unwrap().pending.push_if_absent(entry) {
+            parks.parked.push(entry);
+            // **D144** counts the parks that landed, here and in `push_pending_unrecorded` only —
+            // see [`ArenaPageStore::pending_pushed`].
+            self.pending_pushed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Push onto the pending-free log with NO record describing it, and say so durably.
+    ///
+    /// The other discipline, and the reason the pair exists rather than one function: `free_page`
+    /// parks on the page path, which must not take a durability mutex. Such a push bumps
+    /// [`Self::pending_version`] instead, which makes the next persist a full image rewrite. Both
+    /// are correct; what is not correct is a push that does neither, and neither of these two
+    /// functions can be that.
+    fn push_pending_unrecorded(&self, entry: PendingFree) {
+        let mut st = self.state.lock().unwrap();
+        // **D183 de-dup at push.** A skipped push changed nothing, so it announces nothing. A bump here
+        // would force a full image rewrite of a log the file already holds: the rule `take_pending`
+        // keeps for a drain that took nothing.
+        if st.pending.push_if_absent(entry) {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+            // **D144** — see `push_pending_recorded`: a skipped push parked nothing and counts nothing.
+            self.pending_pushed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Take the pending-free log for re-evaluation.
     pub fn take_pending(&self) -> Vec<PendingFree> {
         // **D81.** Draining the log changes it and persists nothing; no tail record describes
         // that, so the next claim must rewrite the image rather than append behind a file that
         // still lists these entries. See [`PersistState::durable_pending_version`].
-        self.pending_version.fetch_add(1, Ordering::SeqCst);
-        std::mem::take(&mut self.state.lock().unwrap().pending)
+        //
+        // **D183 — bumped INSIDE the `state` lock, and that is what makes the counter readable.**
+        // `put_pending` now vouches for a version it read beside the log itself; bumped outside,
+        // a reader holding `state` can see the new version before the change it announces, and
+        // would record a log it has not written as durable.
+        //
+        // ⭐ **D183 — AND ONLY WHEN IT ACTUALLY TOOK SOMETHING. This was the largest of the four
+        // rewrite sites and neither the design entry nor the row's own counter test had it in
+        // scope.** The bump means "the log changed and no record says so". Draining a log that
+        // was ALREADY EMPTY changes nothing: memory held `[]` before and holds `[]` after, so the
+        // durable file cannot have been made stale by it. The unconditional bump therefore
+        // announced a change that did not happen, and `persist_delta_locked`'s third condition
+        // turned the next delta — any delta, from any caller — into a full image rewrite.
+        //
+        // `Reaper::reap` runs `drain_pending_seeded` on EVERY reap, leaf or interior, and its
+        // first act is this call. So every reap forced the NEXT reap's first `free_arena` into a
+        // full rewrite, and the leaf path — which the measurement that opened this row called
+        // free — was paying one full image rewrite per branch. Measured through the real reaper
+        // at `753b266`: LEAF 8/16 branches -> 7/15 rewrites, slope exactly 1.0 per branch, and an
+        // empty drain placed between two `free_arena` calls turns `(0 rewrites, 2 appends)` into
+        // `(1, 1)`. Both are pinned in `mod d183_adversary`.
+        //
+        // The guard stays exactly as strong: every drain that removes an entry still bumps, and
+        // `put_pending`'s record is what discharges it afterwards.
+        //
+        // **`persist` is taken FIRST and only for this**, per the outermost rule in
+        // [`PersistState`]. It is here so the mark below is cut from the same instant as the take:
+        // read afterwards, a rewrite landing in between would be invisible to it and the drain
+        // record would describe a log the file no longer holds.
+        let mut persist = self.persist.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        // BEFORE the bump. The mark is only usable if the durable log was level with memory at
+        // this instant — otherwise the file is already missing an entry (an unrecorded
+        // `park_or_release`, say) and removing from it would leave it missing.
+        let version = self.pending_version.load(Ordering::SeqCst);
+        let level = persist.durable_pending_version == version;
+        let taken = st.pending.take_all();
+        if !taken.is_empty() {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+        }
+        // A second drain overlapping this one poisons the mark: two takes cannot both be "the
+        // log the file still holds", and `put_pending` has no way to tell whose entries it has.
+        let overlapping = persist.drain_mark.is_some();
+        persist.drain_mark =
+            if taken.is_empty() || !level || overlapping || taken.len() > Self::DRAIN_MARK_CAP {
+                None
+            } else {
+                Some(DrainMark {
+                    rewrites: persist.rewrites,
+                    base_version: version,
+                    taken: taken.iter().map(|p| (p.page_id, p.arena_id)).collect(),
+                })
+            };
+        taken
     }
 
     /// Put entries that are still pinned back on the pending-free log, and checkpoint.
@@ -985,10 +1189,161 @@ impl ArenaPageStore {
     /// This is the closing half of `reaper::drain_pending`'s read-modify-write: by the time it runs,
     /// the reclaimable pages have been released into their extents' recycled lists and the survivors
     /// are back on the log. That whole shape lives only in the free-space map, so it persists here
-    /// for the same reason `free_arena` does — once per drain, which is once per reap.
+    /// for the same reason `free_arena` does: once per drain, which is once per reap. The exception
+    /// is a drain that removed nothing and owes no recycled list. It persists NOTHING, because the
+    /// record would describe no change (see the elision below and [`Self::TAIL_PENDING_DRAINED`]).
     pub fn put_pending(&self, entries: Vec<PendingFree>) -> Result<(), FerroError> {
-        self.state.lock().unwrap().pending.extend(entries);
-        self.persist_if_configured()
+        // **D183 — a delta, not the whole image.** What this call changes is the pending-free log
+        // and the recycled lists of the extents the drain released into; that is list-shaped
+        // state, which is why it used to rewrite everything, and
+        // [`Self::TAIL_PENDING_REPLACED`] is the record that describes it.
+        //
+        // **Outermost, and held across the mutation AND the append**, per [`PersistState`]: a
+        // record that REPLACES the log has to be written in the order the log actually changed,
+        // or a `TAIL_PAGES_PARKED` cut by a concurrent reap lands on the wrong side of it.
+        let mut persist = self.persist.lock().unwrap();
+        // ⭐ **Which record, and it is the difference between linear and quadratic.**
+        //
+        // The absolute one restates the WHOLE log, and the log is also in the image, so once it
+        // has grown past roughly a third of the map every such record exceeds `compact_threshold`
+        // and each drain costs a full rewrite again. Measured through the real reaper before this
+        // branch existed: interior reaps settled at **0.58 rewrites per branch over 8…128
+        // branches** — a better constant than the 2.0 they started at, and the same Θ(N²) class.
+        //
+        // The drain record instead names only what LEFT the log, which is what actually changed.
+        // It is usable exactly when the durable log is still the one `take_pending` handed out;
+        // [`PersistState::drain_mark`] is that proof, and every ambiguous case resolves to the
+        // absolute record, which is always correct.
+        let mark = persist.drain_mark.take();
+        let (payload, dirty, covered, kind, says_nothing) = {
+            let mut st = self.state.lock().unwrap();
+            // **D183 de-dup at push**: an entry whose page is already pending again is skipped, first
+            // wins. Only a park between the take and this put can do that.
+            //   * A RECORDED park (a retire) could not append its record: the take's bump left the log
+            //     unlevel, so it rewrote the image, which moved `rewrites` and voids `mark` below. This
+            //     put then restates the log, REPLACED.
+            //   * An UNRECORDED park (`free_page` of a page this drain holds: a double free no caller
+            //     makes) moves neither counter, so this put still goes DRAINED. Memory keeps the new
+            //     entry and the file the taken one, until the next persist rewrites, because `covered`
+            //     below is `base + 1` and the park bumped past it. That is the window every unrecorded
+            //     park already has. (With the drain elision below, a DRAINED that removed nothing and
+            //     owes no recycled list is not written at all; it moves `durable_pending_version` to
+            //     the same `covered`, so the park's bump still forces that rewrite.)
+            st.pending.extend_absent(entries);
+            let dirty = std::mem::take(&mut st.recycled_dirty);
+            // ⚠ **`dirty` alone, where `retire_arenas_by_rule` passes `dirty ∪ rec.arenas`, and
+            // the asymmetry is deliberate.** That site unions in the arenas it WALKED because it
+            // can raise an extent's `next_free` (through `resolve_fill`) and park every page of an
+            // extent without ever calling `release_page` on it — so its walked set is not covered
+            // by the marks. A drain's only mutation is `release_page`, which marks its arena in
+            // the same critical section as the push, so here the marks ARE the complete set. If a
+            // drain ever gains a second mutator, this line has to gain its union too.
+            // Read under the SAME lock as the log this encodes. See `persist_delta_locked`'s
+            // `pending_covered`: a version read outside would vouch for a push the record misses.
+            let version = self.pending_version.load(Ordering::SeqCst);
+
+            // Nothing may have moved the durable log since the take: a full image rewrite
+            // publishes the drained log (moves `rewrites`), and any other record that carries the
+            // log moves `durable_pending_version`. `removed` is then the difference between what
+            // the drain TOOK and what it PUT BACK — no assumption about who released what.
+            //
+            // A caller that puts back a key the take did not hand out is describing a log this
+            // record cannot reach by removal alone, so that falls back too.
+            let plan = mark.as_ref().filter(|m| {
+                m.rewrites == persist.rewrites && m.base_version == persist.durable_pending_version
+            });
+            let removed: Option<Vec<(PageId, ArenaId)>> = plan.and_then(|m| {
+                let kept: std::collections::HashSet<(PageId, ArenaId)> =
+                    st.pending.iter().map(|p| (p.page_id, p.arena_id)).collect();
+                let held: std::collections::HashSet<(PageId, ArenaId)> =
+                    m.taken.iter().copied().collect();
+                if kept.iter().any(|k| !held.contains(k)) {
+                    return None;
+                }
+                Some(m.taken.iter().copied().filter(|k| !kept.contains(k)).collect())
+            });
+
+            let mut p = Vec::new();
+            p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            let kind = match &removed {
+                Some(rm) => {
+                    p.extend_from_slice(&(rm.len() as u32).to_be_bytes());
+                    for (page, arena) in rm {
+                        p.extend_from_slice(&page.to_be_bytes());
+                        p.extend_from_slice(&arena.0.to_be_bytes());
+                    }
+                    Self::TAIL_PENDING_DRAINED
+                }
+                None => {
+                    p.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
+                    for e in st.pending.iter() {
+                        Self::encode_pending_entry(&mut p, e);
+                    }
+                    Self::TAIL_PENDING_REPLACED
+                }
+            };
+            Self::encode_arena_sections(&mut p, &st, &dirty);
+            // The drain record discharges exactly the take's own bump and nothing else, so it
+            // vouches for `base + 1`. Anything that bumped alongside it stays undescribed and the
+            // next persist rewrites, which is the same conservative direction as everywhere else.
+            let covered = match (&removed, &mark) {
+                (Some(_), Some(m)) => m.base_version + 1,
+                _ => version,
+            };
+            // A difference record with no removal and no recycled list: the same no-section rule
+            // `encode_arena_sections` applies, so "says nothing" is decided from what the record
+            // WOULD hold, not from how the drain went.
+            let says_nothing = matches!(&removed, Some(rm) if rm.is_empty())
+                && dirty.iter().all(|a| !st.extents.contains_key(a));
+            (p, dirty, covered, kind, says_nothing)
+        };
+        // **D183 tail replay — a drain that changed nothing writes nothing.**
+        //
+        // `drain_pending_seeded` puts the log back on EVERY reap whose drain found entries, and
+        // while a live child pins them it releases none. Each such drain used to append a
+        // `TAIL_PENDING_DRAINED` naming no removal and no arena: one fsync for a record that
+        // changes nothing in the file except the `live` snapshot. That is one fsync per interior
+        // reap on top of its `TAIL_PAGES_PARKED`, and one more record for every open after an
+        // unclean exit to replay.
+        //
+        // The record's only durable EFFECT was to move `durable_pending_version` to `covered`, the
+        // take's own bump. The drain mark proves the durable log is still the log the take handed
+        // out, and nothing left it, so that move is TRUE without the bytes. It is made here
+        // directly.
+        //
+        // ⚠ **Only in place of an APPEND.** If `persist_delta_locked` would REWRITE instead (no
+        // image yet, the authority moved, a recycled page was reissued, or the tail is full), a
+        // rewrite was already owed for a reason unrelated to this drain. The record falls through
+        // and pays it exactly as before. An elision that swallowed an owed rewrite would leave
+        // `recycled_reissued`'s window open, and that window is a live page freed, not a leak.
+        //
+        // What the file loses: the `live` snapshot this record would have carried. A drain that
+        // released nothing did not move `live_pages` itself, so the snapshot is stale only by
+        // pages allocated since the last record. Those pages' `next_free` is not in the file
+        // either, and the next record of any kind re-snapshots it.
+        if says_nothing
+            && self.checkpoint_path.lock().unwrap().is_some()
+            && self.delta_would_append(&persist, 9 + payload.len() as u64, Some(covered))
+        {
+            persist.durable_pending_version = covered;
+            persist.elided += 1;
+            return Ok(());
+        }
+        if let Err(e) = self.persist_delta_locked(&mut persist, kind, &payload, Some(covered)) {
+            // Nothing reached the file, so the arenas this record named are still owed one.
+            // Re-marking rather than assuming: an arena dirtied again while the append was in
+            // flight is already back in the set and `extend` leaves it there.
+            self.state.lock().unwrap().recycled_dirty.extend(dirty);
+            // **D183 — and the log itself is now ahead of the file with nothing saying so.** This
+            // used to be safe by accident: `take_pending` bumped unconditionally, so the caller
+            // had always bumped before reaching here. The conditional bump removed that
+            // guarantee — a `put_pending` after an EMPTY take, or from any caller that did not
+            // take at all, extends the log and bumps nothing. Same repair `abandon_park` makes,
+            // and for the same reason.
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// True iff `arena` is live and every page ever handed out from it has been released.
@@ -1066,10 +1421,18 @@ impl ArenaPageStore {
             high = i + 1;
         }
         let mut st = self.state.lock().unwrap();
-        if let Some(e) = st.extents.get_mut(&arena) {
-            if high > e.next_free {
+        let raised = match st.extents.get_mut(&arena) {
+            Some(e) if high > e.next_free => {
                 e.next_free = high;
+                true
             }
+            _ => false,
+        };
+        if raised {
+            // **D183.** The probe moved a number the durable image records, and it is the number
+            // `extent_is_empty` compares the recycled count against. Owed to the next record for
+            // the same reason a recycled push is.
+            st.recycled_dirty.insert(arena);
         }
         st.fill_unknown.remove(&arena);
     }
@@ -1098,33 +1461,110 @@ impl ArenaPageStore {
         rec: &BranchRecord,
         free_epoch: Epoch,
     ) -> Result<u32, FerroError> {
-        let mut released = 0u32;
+        // ⛔⛔ **D183 — TWO PHASES, AND THE SPLIT IS A CORRECTNESS FIX, NOT A TIDY-UP.**
+        //
+        // This loop used to DECIDE and MUTATE together, holding only `state`, and take `persist`
+        // afterwards to write its record. That put a pending-log mutation outside the lock whose
+        // entire job is to make the durable record order equal the in-memory mutation order — the
+        // rule [`PersistState`] states and every other delta site obeys. The hole it opened, found
+        // by review and reproduced from the committed blob at `149666b`:
+        //
+        //   1. this loop pushes entry K under `state`, and is descheduled before taking `persist`;
+        //   2. a concurrent drain's `take_pending` takes `persist` + `state`, SEES K, and cuts a
+        //      [`PersistState::drain_mark`] asserting "the durable log is the log I just took" —
+        //      which is false, because K's record has not been appended yet;
+        //   3. the drain releases K and its `TAIL_PENDING_DRAINED` removes K from a durable log
+        //      that never had it: a no-op;
+        //   4. this loop finally appends `TAIL_PAGES_PARKED`, putting K back.
+        //
+        // Replay then holds an entry memory dropped, for a page that is also in the recycled list.
+        // **Removal is idempotent but it does not COMMUTE with an append**, so no amount of
+        // care in the replay arms can fix step 4 — the order itself has to be impossible.
+        //
+        // Gated today only by the per-statement lock that serialises reaps, which `reaper.rs`'s
+        // own D124 note says W4 removes. Latent, and armed by a change already on the roadmap.
+        //
+        // PHASE 1 decides and mutates nothing durable: page reads and catalog queries, which are
+        // what would make holding the lock across the whole loop expensive. **The decision is
+        // stable across the phase boundary** because `reap` publishes `Reaping` before calling
+        // this, `BranchRecord::check_readable` refuses that state, and `fork` calls it — so no new
+        // live child of this branch can appear in between, which is the only way a page decided
+        // reclaimable could become pinned. The reverse (a pinned page becoming reclaimable) parks
+        // a page the next drain releases, which is the safe direction and already possible.
+        let mut plan: Vec<(PageId, ArenaId, Epoch, bool)> = Vec::new();
         for arena in rec.arenas.iter().copied() {
             // **D85.** `allocated_pages` is `(0..next_free)`, so an understated `next_free` makes
             // this loop park NONE of a live child's pages. Probe first.
             self.resolve_fill(arena);
             for page_id in self.allocated_pages(arena) {
+                // Nothing has been parked yet, so an error here needs no repair — which is why
+                // these are plain `?` where they used to route through `abandon_park`.
                 let birth = self.page_birth(page_id)?;
                 // The reclamation rule as an index question rather than an array walk: is
                 // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
                 // structure that can answer it without holding every child resident.
-                if !self.catalog.live_child_in_epoch_range(
-                    rec.branch_id.id,
-                    birth,
+                let pinned =
+                    self.catalog.live_child_in_epoch_range(rec.branch_id.id, birth, free_epoch)?;
+                plan.push((page_id, arena, birth, pinned));
+            }
+        }
+
+        // PHASE 2 applies and records with `persist` held throughout, exactly as `free_arena` and
+        // `put_pending` do. What is newly serialised against extent claims is one `evict` per
+        // released page — the same work `free_arena` already does under this lock — and not the
+        // page reads and catalog queries, which stayed in phase 1.
+        let mut persist = self.persist.lock().unwrap();
+        // ⭐ **D183 de-dup at push: a page already PENDING is decided by its entry, not again here.**
+        // `allocated_pages` lists a parked page, because parking does not recycle it, so this loop
+        // used to decide such a page a second time (`frontier/catalog_root_and_park_adversary.md` §B1
+        // @ `a4b48ea`). Two ways to get here:
+        //   * a resumed reap: this branch's own earlier attempt parked it, and the `Reaping ->
+        //     Reaped` flip never happened;
+        //   * its owner's `free_page` parked it while the owner was live.
+        // Still pinned, it was parked twice. Unpinned, it was RELEASED while its entry stayed in the
+        // log, so one page was both pending and recycled and the next drain released it again: a
+        // no-op only while nothing reissues it in between (§B2-B3).
+        //
+        // Skipping it moves nothing that matters. In-process the entry's free came first, so its range
+        // `[birth, e_f)` lies inside this call's `[birth, free_epoch)`: "unpinned here" implies
+        // "unpinned for the entry", and the drain `reap` runs next releases it in the same reap. What
+        // is lost is a pin for children forked after the page was freed, which cannot see it (§B3).
+        // After a restart the two epochs can be in either order, but the owner is Reaping, so no child
+        // of it forked between them and the two decisions are equal (§B2 point 1).
+        //
+        // Filtered under `persist` and `state` together. ⚠ Two blind spots, both closed today by
+        // something other than this filter:
+        //   * Between this filter and `release_page` below, only an UNRECORDED push can land, since
+        //     recorded ones need `persist`. That is `free_page`, and `free_page` of a page whose owner is
+        //     Reaping does not happen, because a Reaping owner writes nothing (§B2 reason 2). On the
+        //     park arm, `push_if_absent` closes the gap anyway.
+        //   * An entry a drain is HOLDING, between its `take_pending` and its `put_pending`, is not in
+        //     the log, so this filter cannot see it. A retire in that window can release K, and the
+        //     drain then puts `K(e_f)` back: K is pending and recycled. The statement lock keeps every
+        //     retire out of a drain's window (§B2 reason 4). Closing it without that lock means deciding
+        //     against the page's incarnation, which is the `release_page` check recorded as a
+        //     precondition for removing the lock (lane AMENDMENT 3, review F1).
+        let plan: Vec<(PageId, ArenaId, Epoch, bool)> = {
+            let st = self.state.lock().unwrap();
+            plan.into_iter()
+                .filter(|&(page, arena, _, _)| !st.pending.contains((page, arena)))
+                .collect()
+        };
+        let mut released = 0u32;
+        let mut parks = RecordedParks { persist: &mut persist, parked: Vec::new() };
+        for (page_id, arena, birth, pinned) in plan {
+            if !pinned {
+                self.release_page(page_id, arena);
+                released += 1;
+            } else {
+                let entry = PendingFree {
+                    page_id,
+                    arena_id: arena,
+                    birth_epoch: birth,
                     free_epoch,
-                )? {
-                    self.release_page(page_id, arena);
-                    released += 1;
-                } else {
-                    self.state.lock().unwrap().pending.push(PendingFree {
-                        page_id,
-                        arena_id: arena,
-                        birth_epoch: birth,
-                        free_epoch,
-                        owner: rec.branch_id,
-                    });
-                    self.pending_pushed.fetch_add(1, Ordering::Relaxed);
-                }
+                    owner: rec.branch_id,
+                };
+                self.push_pending_recorded(&mut parks, entry);
             }
         }
         // The slow path changes the durable map every bit as much as the fast one: pages recycled
@@ -1133,8 +1573,90 @@ impl ArenaPageStore {
         // pending entries are gone so `drain_pending` never revisits them, the extent's durable
         // `next_free` is above its recycled count so `extent_is_empty` refuses, and nothing points
         // at the arena any more. Once per branch reaped, not once per page.
-        self.persist_if_configured()?;
+        //
+        // **D183 — and it is a 9+N·32-byte record now, not the whole 48·L-byte image.** This was
+        // `persist_if_configured`, i.e. `persist_full_locked` unconditionally: one full rewrite per
+        // INTERIOR branch reaped, never consulting `compact_threshold`, so `sum(48·i) = 24·N²`
+        // bytes over a run of N such reaps. That is the shape D81 took off the fork door, alive on
+        // the reap door, and it opens on exactly the predicate this project is aimed at — a reaped
+        // branch having live children, i.e. deep fork chains. The record describes what the loop
+        // above actually did: the entries it parked, and the recycled lists and fills of the
+        // arenas it walked. The existing threshold decides when to compact, as it does for a claim.
+        //
+        // **The guard taken at the top of phase 2 is STILL HELD here, and that is the fix.** The
+        // mutations above, this snapshot and the append below are one critical section, so the
+        // order records reach the file is the order memory changed in — which is what
+        // [`PersistState`] requires and what the old two-phase-lock shape violated. Re-acquiring
+        // it here would deadlock: `std::sync::Mutex` is not reentrant, and doing exactly that is
+        // how this comment came to be written.
+        let (payload, dirty) = {
+            let mut st = self.state.lock().unwrap();
+            let dirty = std::mem::take(&mut st.recycled_dirty);
+            // **Every extent this call WALKED, not only the ones it released into.** An extent
+            // whose pages were all parked is never marked by `release_page`, and its `next_free`
+            // may still be the image's — `alloc_in_arena` advances that number and persists
+            // nothing (see [`PersistState`]). The full rewrite this record replaces wrote the
+            // true value, so leaving it out is a real divergence, and it is the one direction that
+            // matters: an UNDERSTATED durable `next_free` is what makes `extent_is_empty` call an
+            // extent that still holds a live child's pages collectable. D85's `fill_unknown` still
+            // catches it on restore; writing the number down is better than being caught.
+            // `an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite` failed
+            // on exactly this field before the union was added.
+            //
+            // Free asymptotically: the loop above already visited every page of every one of them.
+            let mut covered = dirty.clone();
+            covered.extend(rec.arenas.iter().copied());
+            let mut p = Vec::new();
+            p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+            p.extend_from_slice(&(parks.parked.len() as u32).to_be_bytes());
+            for e in &parks.parked {
+                Self::encode_pending_entry(&mut p, e);
+            }
+            Self::encode_arena_sections(&mut p, &st, &covered);
+            (p, dirty)
+        };
+        // `None`: this record carries its OWN parked entries and nobody else's, so it is only
+        // correct against a durable log already level with memory. See `persist_delta_locked`.
+        if let Err(e) =
+            self.persist_delta_locked(&mut *parks.persist, Self::TAIL_PAGES_PARKED, &payload, None)
+        {
+            // Nothing reached the file. Put the marks back — and the record that was going to
+            // describe the parked entries did not land either, so they are in exactly the state
+            // `abandon_park` exists for.
+            //
+            // **With the guard STILL HELD.** This arm used to `drop(persist)` first, which left a
+            // gap in which a `take_pending` read `level == true` for a file missing every entry
+            // parked above — the ordering defect again, on the failure arm. `parks` borrows the
+            // guard, so that `drop` no longer compiles here.
+            self.state.lock().unwrap().recycled_dirty.extend(dirty);
+            return self.abandon_park(&parks.parked, e);
+        }
         Ok(released)
+    }
+
+    /// Give up on a `retire_arenas_by_rule` that did not get its record written, without leaving
+    /// the entries it already parked invisible.
+    ///
+    /// **They are in memory and in no record**, and the pushes themselves do not bump
+    /// [`Self::pending_version`] precisely because the record at the end of the loop describes
+    /// them. Returning without that record would leave the counter saying the durable log is level
+    /// with memory when it is short by everything parked so far — so the next claim would happily
+    /// append behind a file that does not list them, and a crash before the next compaction leaks
+    /// every one. Marking the log dirty makes the next persist a full rewrite instead.
+    ///
+    /// Only one way out of that method comes here now: a failure to append at the end, which is the
+    /// easy one to miss, because by then the payload has been built and it *looks* finished. (An
+    /// error inside the decision loop used to come here too; since the two-phase split that loop
+    /// parks nothing, so it returns with a plain `?`.) Called with the persist guard still held, so
+    /// the bump lands before any `take_pending` can read the counter — see [`RecordedParks`].
+    ///
+    /// The recycled lists need no equivalent from the loop: `release_page` marks its arena in
+    /// [`StoreState::recycled_dirty`] as it goes, and the loop never takes that set.
+    fn abandon_park<T>(&self, parked: &[PendingFree], e: FerroError) -> Result<T, FerroError> {
+        if !parked.is_empty() {
+            self.pending_version.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(e)
     }
 
     fn page_birth(&self, page_id: PageId) -> Result<Epoch, FerroError> {
@@ -1179,6 +1701,16 @@ impl ArenaPageStore {
     /// Serialize the free-space map and pending-free log.
     pub fn state_bytes(&self) -> Vec<u8> {
         let st = self.state.lock().unwrap();
+        self.state_bytes_locked(&st)
+    }
+
+    /// [`Self::state_bytes`] against a `state` lock the caller already holds.
+    ///
+    /// **D183** split this out for one reason: `persist_full_locked` has to clear
+    /// [`StoreState::recycled_dirty`] and serialise the image without letting go in between. Same
+    /// bytes, same order, same CRC — `two_stores_in_the_same_state_checkpoint_byte_identical_images`
+    /// still pins them.
+    fn state_bytes_locked(&self, st: &StoreState) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(Self::STATE_VERSION);
         b.extend_from_slice(&self.space.base_page.to_be_bytes());
@@ -1244,12 +1776,9 @@ impl ArenaPageStore {
 
         b.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
         for p in st.pending.iter() {
-            b.extend_from_slice(&p.page_id.to_be_bytes());
-            b.extend_from_slice(&p.arena_id.0.to_be_bytes());
-            b.extend_from_slice(&p.birth_epoch.0.to_be_bytes());
-            b.extend_from_slice(&p.free_epoch.0.to_be_bytes());
-            b.extend_from_slice(&p.owner.id.to_be_bytes());
-            b.extend_from_slice(&p.owner.generation.to_be_bytes());
+            // **D183** — the same five fields the tail records write, written once. The image's
+            // layout is unchanged; what changed is that there is now only one place it is spelled.
+            Self::encode_pending_entry(&mut b, p);
         }
 
         let crc = crc32(&b);
@@ -1336,13 +1865,7 @@ impl ArenaPageStore {
         let n = c.u32()? as usize;
         let mut pending = Vec::with_capacity(n);
         for _ in 0..n {
-            pending.push(PendingFree {
-                page_id: c.u32()?,
-                arena_id: ArenaId(c.u32()?),
-                birth_epoch: Epoch(c.u64()?),
-                free_epoch: Epoch(c.u64()?),
-                owner: BranchId::new(c.u64()?, c.u32()?),
-            });
+            pending.push(Self::decode_pending_entry(&mut c)?);
         }
         if c.at != c.b.len() {
             return Err(BranchError::Arena(format!(
@@ -1405,7 +1928,13 @@ impl ArenaPageStore {
                 extents,
                 recycled,
                 current,
-                pending,
+                // **D183 de-dup at push**, applied to a log this process did not build: an image written
+                // before the rule can list a page twice, and it loads first-wins, as its tail replays.
+                pending: PendingLog::from_entries(pending),
+                // Nothing is dirty against a file this process did not write: `image_bytes` was
+                // just reset to 0 above, so the next persist is a full rewrite and carries
+                // everything anyway.
+                recycled_dirty: std::collections::HashSet::new(),
                 claim_epoch,
                 // Deliberately NOT restored from the image: see the field's own doc. A cold map
                 // makes the next shadow a chain root, which can only shorten chains.
@@ -1442,9 +1971,42 @@ impl ArenaPageStore {
     const TAIL_ARENA_CLAIMED: u8 = 1;
     /// A whole extent was freed. `free_arena`'s fast path.
     const TAIL_EXTENT_FREED: u8 = 2;
+    /// **D183.** The interval rule ran over a reaped branch's extents: entries were APPENDED to
+    /// the pending-free log and the arenas it walked have new recycled lists.
+    /// `retire_arenas_by_rule`'s record — the reap slow path, which used to rewrite the whole
+    /// image once per interior branch.
+    const TAIL_PAGES_PARKED: u8 = 3;
+    /// **D183.** The pending-free log was REPLACED wholesale, and the arenas the drain released
+    /// into have new recycled lists. `put_pending`'s record when it cannot prove the durable log
+    /// is still the one the drain took — always correct, and O(the whole log).
+    const TAIL_PENDING_REPLACED: u8 = 4;
+    /// **D183.** A drain removed exactly these entries from the pending-free log.
+    /// `put_pending`'s record when [`PersistState::drain_mark`] proves the durable log is the one
+    /// `take_pending` handed out — **O(released) rather than O(the whole log)**, which is what
+    /// keeps a run of interior reaps linear in bytes instead of quadratic.
+    ///
+    /// **Never written empty.** A drain that removed nothing and owes no recycled list would
+    /// produce a record with no removal and no section. `put_pending` writes no record for it and
+    /// moves `durable_pending_version` itself, but only where the record would have been
+    /// APPENDED; an owed rewrite is still paid. See the elision in `put_pending` and
+    /// `a_drain_that_released_nothing_writes_no_record_and_leaves_the_log_level`.
+    const TAIL_PENDING_DRAINED: u8 = 5;
     /// Kinds this build understands. An allowlist for the same reason `READABLE_STATE_VERSIONS`
     /// is one.
-    const KNOWN_TAIL_KINDS: &'static [u8] = &[Self::TAIL_ARENA_CLAIMED, Self::TAIL_EXTENT_FREED];
+    const KNOWN_TAIL_KINDS: &'static [u8] = &[
+        Self::TAIL_ARENA_CLAIMED,
+        Self::TAIL_EXTENT_FREED,
+        Self::TAIL_PAGES_PARKED,
+        Self::TAIL_PENDING_REPLACED,
+        Self::TAIL_PENDING_DRAINED,
+    ];
+
+    /// Largest pending-free log for which a drain will be tracked key by key.
+    ///
+    /// Past it [`PersistState::drain_mark`] is not taken at all and `put_pending` writes the
+    /// absolute record, so the transient 8 bytes per entry this costs is bounded by a constant
+    /// and not by a workload. A bound rather than a warning.
+    const DRAIN_MARK_CAP: usize = 1 << 16;
 
     /// Below this the tail may grow freely however small the image is.
     ///
@@ -1464,6 +2026,95 @@ impl ArenaPageStore {
     /// It also bounds the file at 1.5x the image and the replay at half of it.
     fn compact_threshold(image_bytes: u64) -> u64 {
         (image_bytes / 2).max(Self::TAIL_COMPACT_FLOOR_BYTES)
+    }
+
+    /// One pending-free entry, in exactly the 32-byte layout [`Self::state_bytes`] writes.
+    ///
+    /// Shared with the image on purpose: `putting_the_pending_log_back_reaches_the_durable_map`
+    /// and this row's own restore test both compare a replayed log against one a full rewrite
+    /// produced, and two spellings of the same five fields is the way that comparison silently
+    /// starts measuring the encoder instead of the mechanism.
+    fn encode_pending_entry(b: &mut Vec<u8>, p: &PendingFree) {
+        b.extend_from_slice(&p.page_id.to_be_bytes());
+        b.extend_from_slice(&p.arena_id.0.to_be_bytes());
+        b.extend_from_slice(&p.birth_epoch.0.to_be_bytes());
+        b.extend_from_slice(&p.free_epoch.0.to_be_bytes());
+        b.extend_from_slice(&p.owner.id.to_be_bytes());
+        b.extend_from_slice(&p.owner.generation.to_be_bytes());
+    }
+
+    fn decode_pending_entry(c: &mut StateCursor) -> Result<PendingFree, FerroError> {
+        // Field order is read order: this mirrors `encode_pending_entry` above, which mirrors
+        // `state_bytes`.
+        Ok(PendingFree {
+            page_id: c.u32()?,
+            arena_id: ArenaId(c.u32()?),
+            birth_epoch: Epoch(c.u64()?),
+            free_epoch: Epoch(c.u64()?),
+            owner: BranchId::new(c.u64()?, c.u32()?),
+        })
+    }
+
+    /// **D183.** The per-extent half of a reclamation record: for every arena owed one, its
+    /// `next_free` and its whole recycled list, **absolutely**.
+    ///
+    /// Absolute rather than incremental, and the difference is not a style choice. A record of
+    /// "these pages joined the list" is only true if nothing ever takes one back out, and
+    /// `alloc_in_arena` pops from exactly this list. An absolute list is what the extent *is* at
+    /// the moment the record is cut, so it is also idempotent on replay and immune to the order
+    /// two records for one arena reach the file in.
+    ///
+    /// Cost: at most `page_count` ids for an extent whose pages the caller was already visiting
+    /// one at a time, so it does not change the order of the work that produced it.
+    ///
+    /// Arenas no longer in `extents` are SKIPPED, which is what makes this record commute with
+    /// [`Self::TAIL_EXTENT_FREED`]: whichever order the two land in, replay ends with the extent
+    /// gone and nothing re-describing it. `release_page` makes the same test in memory.
+    ///
+    /// Sorted, for the reason `state_bytes` sorts: these bytes reach a file and go under a CRC.
+    fn encode_arena_sections(
+        b: &mut Vec<u8>,
+        st: &StoreState,
+        dirty: &std::collections::HashSet<ArenaId>,
+    ) {
+        let mut ids: Vec<ArenaId> =
+            dirty.iter().copied().filter(|a| st.extents.contains_key(a)).collect();
+        ids.sort_unstable();
+        b.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        let empty = Vec::new();
+        for a in ids {
+            b.extend_from_slice(&a.0.to_be_bytes());
+            b.extend_from_slice(&st.extents[&a].next_free.to_be_bytes());
+            let rec = st.recycled.get(&a).unwrap_or(&empty);
+            b.extend_from_slice(&(rec.len() as u32).to_be_bytes());
+            for p in rec {
+                b.extend_from_slice(&p.to_be_bytes());
+            }
+        }
+    }
+
+    /// Replay of [`Self::encode_arena_sections`]. Counts are **pushed, never reserved**: the CRC
+    /// is checked before this runs, but a count that decides an allocation is a habit worth not
+    /// having in a file parser — `StateCursor` bounds every read, so a bad count fails as
+    /// "truncated".
+    fn apply_arena_sections(c: &mut StateCursor, st: &mut StoreState) -> Result<(), FerroError> {
+        let n = c.u32()? as usize;
+        for _ in 0..n {
+            let arena = ArenaId(c.u32()?);
+            let next_free = c.u32()?;
+            let rn = c.u32()? as usize;
+            let mut r = Vec::new();
+            for _ in 0..rn {
+                r.push(c.u32()?);
+            }
+            // Read the whole section before deciding, so a skipped arena still advances the
+            // cursor. Skipping the BYTES would desynchronise every section behind it.
+            if let Some(ext) = st.extents.get_mut(&arena) {
+                ext.next_free = next_free;
+                st.recycled.insert(arena, r);
+            }
+        }
+        Ok(())
     }
 
     fn encode_tail_record(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -1492,11 +2143,6 @@ impl ArenaPageStore {
         g.image_epoch = crate::cluster::epoch();
     }
 
-    fn persist_if_configured(&self) -> Result<(), FerroError> {
-        let mut g = self.persist.lock().unwrap();
-        self.persist_full_locked(&mut g)
-    }
-
     /// Rewrite the whole image and drop the tail with it.
     ///
     /// `replace_atomically` renames a fresh inode over the target, so the previous tail goes away
@@ -1510,12 +2156,25 @@ impl ArenaPageStore {
         // Reading it afterwards would do the opposite: record a change as durable that the image
         // does not contain.
         let pending_version = self.pending_version.load(Ordering::SeqCst);
-        // Cleared BEFORE the image is serialised, and that order is what makes it safe without
-        // holding `state` across the write: a pop landing in between sets it again, and the image
-        // — read afterwards from live memory — contains that pop anyway. Clearing AFTER would do
-        // the opposite, dropping the flag for a pop the image does not contain.
-        self.recycled_reissued.store(false, Ordering::SeqCst);
-        let written = self.checkpoint_with(&OsFileOps, &p)?;
+        // **D183 — the clear and the serialisation are ONE critical section.** A full image is
+        // every arena's recycled list, so nothing is owed a record afterwards. Clearing on either
+        // side of the serialisation instead leaves an interleaving where a `release_page` lands
+        // in the gap: cleared but not written, i.e. a page that comes back in no record and no
+        // image. That is why `state_bytes` was split rather than called.
+        //
+        // **And `recycled_reissued` (main, `97b4564`) is cleared in the SAME section.** A pop sets
+        // it while holding `state` (see `alloc_in_arena`), so clearing it here, under that lock and
+        // before `state_bytes_locked` reads memory, cannot drop a pop the image does not contain:
+        // a pop either precedes this section (the image has it) or follows it (and sets the flag
+        // again). Main's order — clear, then serialise — made atomic by the lock D183 takes here.
+        let bytes = {
+            let mut st = self.state.lock().unwrap();
+            st.recycled_dirty.clear();
+            self.recycled_reissued.store(false, Ordering::SeqCst);
+            self.state_bytes_locked(&st)
+        };
+        replace_atomically(&OsFileOps, &p, &bytes).map_err(|e| FerroError::Io(e.to_string()))?;
+        let written = bytes.len();
         g.image_bytes = written as u64;
         g.tail_bytes = 0;
         g.image_epoch = crate::cluster::epoch();
@@ -1534,25 +2193,47 @@ impl ArenaPageStore {
     ///     record describes.
     ///   * the pending-free log changed — see [`PersistState::durable_pending_version`].
     ///   * the tail would exceed [`Self::compact_threshold`] — the amortisation bound.
+    ///
+    /// # `pending_covered` — **D183**
+    ///
+    /// `None` is the original rule and the one every record that does not mention the pending log
+    /// must use: append only while the durable log still equals the in-memory one, because such a
+    /// record leaves the log exactly as it found it.
+    ///
+    /// `Some(v)` says "after this record the durable log is at version `v`", so the third
+    /// condition does not apply. **TWO different records pass it and they earn it two different
+    /// ways — do not add a third by reading only one of them:**
+    ///
+    ///   * [`Self::TAIL_PENDING_REPLACED`] carries the WHOLE log. It does not need the log to be
+    ///     clean, it MAKES it clean, so any `v` it read under the same `state` lock as the log it
+    ///     encoded is true by construction.
+    ///   * [`Self::TAIL_PENDING_DRAINED`] carries only REMOVALS and makes nothing clean. It is
+    ///     correct only against a durable log that already equals the one `take_pending` handed
+    ///     out, and its whole safety is [`PersistState::drain_mark`] plus `put_pending`'s subset
+    ///     test. Passing `Some(v)` for it is a claim those two guards have to have checked first.
+    ///
+    /// ⚠ An earlier version of this paragraph said `Some(v)` was "for a record that carries the
+    /// WHOLE log — today only `TAIL_PENDING_REPLACED`", which was false the moment the drain
+    /// record existed. A future kind added on the strength of that sentence would skip the third
+    /// condition with no equivalent of `drain_mark` behind it, and the failure would be a durable
+    /// log silently short an entry. In every case `v` must be read under the same `state` lock as
+    /// the log the record describes; a `v` read anywhere else claims durability for a push the
+    /// record does not contain.
+    ///
+    /// ⚠ [`Self::TAIL_PAGES_PARKED`] passes `None` deliberately even though it APPENDS to the
+    /// log. It carries its own entries and nobody else's, so it is only correct against a durable
+    /// log that is already level with memory — which is precisely what `None` demands.
     fn persist_delta_locked(
         &self,
         g: &mut PersistState,
         kind: u8,
         payload: &[u8],
+        pending_covered: Option<u64>,
     ) -> Result<(), FerroError> {
         let path = self.checkpoint_path.lock().unwrap().clone();
         let Some(p) = path else { return Ok(()) };
         let rec = Self::encode_tail_record(kind, payload);
-        if g.image_bytes == 0
-            || g.image_epoch != crate::cluster::epoch()
-            || g.durable_pending_version != self.pending_version.load(Ordering::SeqCst)
-            // A recycled page was handed out again and no record kind can describe that: the
-            // claim record carries no recycled list and the free record removes one. The only
-            // honest answer is to stop appending. See [`Self::recycled_reissued`] — this is the
-            // one condition here whose absence is a live page freed rather than a leak.
-            || self.recycled_reissued.load(Ordering::SeqCst)
-            || g.tail_bytes + rec.len() as u64 > Self::compact_threshold(g.image_bytes)
-        {
+        if !self.delta_would_append(g, rec.len() as u64, pending_covered) {
             // The rewrite folds in the mutation this record described, because `state_bytes`
             // serialises live memory and the caller has already applied it. So the record is
             // simply not needed, rather than needed and skipped.
@@ -1561,7 +2242,49 @@ impl ArenaPageStore {
         append_durably(&OsFileOps, &p, &rec).map_err(|e| FerroError::Io(e.to_string()))?;
         g.tail_bytes += rec.len() as u64;
         g.appends += 1;
+        if let Some(v) = pending_covered {
+            g.durable_pending_version = v;
+        }
         Ok(())
+    }
+
+    /// Whether [`Self::persist_delta_locked`] would APPEND a record of `rec_len` bytes (true) or
+    /// rewrite the whole image (false). The four conditions are documented there.
+    ///
+    /// One function, so the append path and `put_pending`'s elision of a record with nothing to
+    /// say cannot disagree about when appending is allowed. See
+    /// [`Self::TAIL_PENDING_DRAINED`]: an elision stands in for an APPEND and never for an owed
+    /// rewrite.
+    fn delta_would_append(
+        &self,
+        g: &PersistState,
+        rec_len: u64,
+        pending_covered: Option<u64>,
+    ) -> bool {
+        !(g.image_bytes == 0
+            || g.image_epoch != crate::cluster::epoch()
+            || (pending_covered.is_none()
+                && g.durable_pending_version != self.pending_version.load(Ordering::SeqCst))
+            // A recycled page was handed out again and no record kind can describe that: the
+            // claim record carries no recycled list and the free record removes one. The only
+            // honest answer is to stop appending. See [`Self::recycled_reissued`] — this is the
+            // one condition here whose absence is a live page freed rather than a leak.
+            || self.recycled_reissued.load(Ordering::SeqCst)
+            || g.tail_bytes + rec_len > Self::compact_threshold(g.image_bytes))
+    }
+
+    /// Drains `put_pending` answered with no record at all, because the drain changed nothing a
+    /// record could carry. See [`Self::TAIL_PENDING_DRAINED`].
+    #[cfg(test)]
+    pub(crate) fn elided_drains(&self) -> u64 {
+        self.persist.lock().unwrap().elided
+    }
+
+    /// Pending-free log entries tail replay has visited over this store's life. The unit is
+    /// defined on the `replay_pending_visits` field.
+    #[cfg(test)]
+    pub(crate) fn replay_pending_visits(&self) -> u64 {
+        self.replay_pending_visits.load(Ordering::SeqCst)
     }
 
     /// `(full rewrites, tail appends)` this store has performed against its armed path.
@@ -1572,6 +2295,35 @@ impl ArenaPageStore {
     pub(crate) fn persist_counters(&self) -> (u64, u64) {
         let g = self.persist.lock().unwrap();
         (g.rewrites, g.appends)
+    }
+
+    /// **D183.** The record kinds actually present in the tail of `path`, in file order.
+    ///
+    /// **Ask the artifact, not the code that wrote it.** `persist_counters` says how many records
+    /// were appended and says nothing about WHICH, so a test whose site silently fell back to a
+    /// different record — `TAIL_PENDING_REPLACED` where `TAIL_PENDING_DRAINED` was the point —
+    /// reads exactly like one where it did not. This parses the file the same way `replay_tail`
+    /// does and returns what is there.
+    ///
+    /// Stops at the first torn or unparseable frame, like the replayer; it is an instrument for
+    /// tests, so it reports what it can see rather than refusing.
+    #[cfg(test)]
+    pub(crate) fn tail_kinds(path: &std::path::Path) -> Vec<u8> {
+        let Ok(buf) = std::fs::read(path) else { return Vec::new() };
+        let Ok(n) = Self::image_len(&buf) else { return Vec::new() };
+        let mut kinds = Vec::new();
+        let mut at = n;
+        while at + 9 <= buf.len() {
+            let kind = buf[at];
+            if kind == 0 {
+                break;
+            }
+            let len = u32::from_be_bytes(buf[at + 1..at + 5].try_into().unwrap()) as usize;
+            let Some(total) = len.checked_add(9).filter(|t| at + *t <= buf.len()) else { break };
+            kinds.push(kind);
+            at += total;
+        }
+        kinds
     }
 
     /// How many bytes of `buf` the IMAGE occupies, including its trailing CRC32.
@@ -1664,6 +2416,42 @@ impl ArenaPageStore {
     /// A zero `kind` is treated as unwritten space rather than an unknown kind: a crash can expose
     /// a zero-filled extension, and kinds start at 1 precisely so that reads as "nothing here".
     fn replay_tail(&self, tail: &[u8]) -> Result<u64, FerroError> {
+        // **D183 tail replay: index the pending-free log ONCE per replay, not once per record.**
+        //
+        // Three record kinds change the log, and each used to walk ALL of it for every record:
+        // * `TAIL_PAGES_PARKED` built a `HashSet` of every key;
+        // * `TAIL_PENDING_DRAINED` ran `retain` over it, even for a record naming nothing;
+        // * `TAIL_EXTENT_FREED` ran `retain` over it.
+        //
+        // D183 made the slow reap and the drain APPEND instead of rewriting the image, so a tail
+        // now spans many reaps before `compact_threshold` folds it back into an image. Replaying
+        // one therefore cost O(records x P), paid on the one open where speed matters most: the
+        // open after an unclean exit. A clean CLI exit writes a full image first (the exit
+        // `store.checkpoint` in `src/cli/cli.rs`), so it never reaches this path with a long tail.
+        //
+        // Now the log is taken out of `state` once and indexed at most once (O(P)), by the first
+        // record that touches it. A tail with no such record, which is every clean open, does no
+        // work on the log at all. Every record then applies ITS OWN entries by key, and the result
+        // is written back once. Total: O(P + tail records + the entries they carry).
+        // [`PendingReplay`] states the rules it has to keep, and
+        // `replay_of_the_pending_log_keeps_every_rule_the_per_record_scans_had` and
+        // `a_repark_of_a_key_already_in_the_log_keeps_the_first_entry` pin them.
+        let mut pending = PendingReplay::new(std::mem::take(&mut self.state.lock().unwrap().pending));
+        let applied = self.replay_records(tail, &mut pending);
+        // Written back on the error path too. The open fails either way, but a store whose log
+        // has quietly vanished is not a state any caller should be able to observe.
+        let (log, visits) = pending.finish();
+        self.state.lock().unwrap().pending = log;
+        #[cfg(test)]
+        self.replay_pending_visits.fetch_add(visits, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let _ = visits;
+        applied
+    }
+
+    /// The record loop of [`Self::replay_tail`]: frame, check and apply each record in order,
+    /// with the pending-free log held in `pending` for the whole replay.
+    fn replay_records(&self, tail: &[u8], pending: &mut PendingReplay) -> Result<u64, FerroError> {
         let mut at = 0usize;
         while at < tail.len() {
             let rest = &tail[at..];
@@ -1700,13 +2488,18 @@ impl ArenaPageStore {
                 ))
                 .into());
             }
-            self.apply_tail_record(kind, &rest[5..total - 4])?;
+            self.apply_tail_record(kind, &rest[5..total - 4], pending)?;
             at += total;
         }
         Ok(at as u64)
     }
 
-    fn apply_tail_record(&self, kind: u8, payload: &[u8]) -> Result<(), FerroError> {
+    fn apply_tail_record(
+        &self,
+        kind: u8,
+        payload: &[u8],
+        pending: &mut PendingReplay,
+    ) -> Result<(), FerroError> {
         let mut c = StateCursor { b: payload, at: 0 };
         match kind {
             Self::TAIL_ARENA_CLAIMED => {
@@ -1773,7 +2566,8 @@ impl ArenaPageStore {
                     // `free_arena` drops this arena's parked entries too, and so must replay:
                     // a pending entry naming a freed extent would send `drain_pending` looking
                     // for pages in a range that has already gone back on the free list.
-                    st.pending.retain(|p| p.arena_id != arena);
+                    // By arena index: this arena's own entries, not the whole log.
+                    pending.remove_arena(arena);
                     // `shadow_base` and `current` need no repair. `shadow_base` is not persisted
                     // at all (see its doc: a cold map only shortens chains), and `current` is
                     // cleared by `load_state` and never set by a replayed claim.
@@ -1787,6 +2581,133 @@ impl ArenaPageStore {
                     .push(start_page);
                 saturating_sub_atomic(&self.reserved_pages, page_count);
                 // Absolute, for the reason spelled out under the claim record above.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — the reap slow path's delta.** `retire_arenas_by_rule` parked these entries
+            // and recycled the rest of the pages it walked; this is that call, replayed.
+            Self::TAIL_PAGES_PARKED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut parked = Vec::new();
+                for _ in 0..n {
+                    parked.push(Self::decode_pending_entry(&mut c)?);
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // **Idempotent by key, and that is a durability property rather than tidiness.**
+                    // This record APPENDS, so replaying it behind another record that already
+                    // holds these entries must not double them — otherwise the log comes back with
+                    // the same page twice and `pending_len` disagrees with a full rewrite.
+                    //
+                    // ⚠ **The race this comment used to cite is gone**: it said a concurrent drain
+                    // could cut its record between this caller's in-memory push and its append.
+                    // `retire_arenas_by_rule` now holds `persist` across both, so that
+                    // interleaving cannot be produced. What remains is the ordinary reason a
+                    // replayed log record should be idempotent — a resumed reap re-parking the
+                    // same page, and replay being re-runnable at all.
+                    //
+                    // The FIRST entry for a key wins, and that is the one that MATCHES MEMORY
+                    // rather than the one that is safest in isolation. A page parked twice — a
+                    // resumed reap re-entering a `Reaping` branch is the reachable way — carries
+                    // the same `birth_epoch` and owner, so only `free_epoch` can differ, and a
+                    // narrower `[birth, free)` pins FEWER children, i.e. releases more readily.
+                    // That is not a reason to prefer it; the reason is that `drain_pending`
+                    // decides on whichever entry it meets FIRST in `st.pending`, which is the
+                    // earlier park, which is also the first to reach the log. Keeping the later
+                    // one instead would make a restarted database release a page on a different
+                    // rule than the running one does.
+                    //
+                    // **Since de-dup at push, memory never holds the second entry at all**: every push
+                    // is first-wins (`PendingLog`), so this arm and memory keep the same one by
+                    // construction. `finish` also builds first-wins, so what this lookup still buys is
+                    // no slot per re-park, which
+                    // `a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot` pins.
+                    //
+                    // "Already in the log" is asked of the replay's key index. This used to be a
+                    // `HashSet` rebuilt from the WHOLE log for every parked record.
+                    for e in parked {
+                        // Dead arena: `TAIL_EXTENT_FREED` landed first, and its replay drops every
+                        // pending entry naming the extent. Re-adding one here would send
+                        // `drain_pending` hunting for a page in a range already back on the free
+                        // list — the very thing that record's own comment refuses.
+                        if !st.extents.contains_key(&e.arena_id) {
+                            continue;
+                        }
+                        // `push` indexes the key, so a repeat later in THIS record is skipped
+                        // too, as the per-record set skipped it.
+                        if !pending.contains((e.page_id, e.arena_id)) {
+                            pending.push(e);
+                        }
+                    }
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
+                // Absolute, for the reason spelled out under the claim record above.
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — `put_pending`'s delta.** The closing half of `take_pending`'s
+            // read-modify-write: the log is not appended to, it is REPLACED by what the drain put
+            // back, which is why this one record can also discharge every earlier unrecorded
+            // change to the log.
+            Self::TAIL_PENDING_REPLACED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut log = Vec::new();
+                for _ in 0..n {
+                    log.push(Self::decode_pending_entry(&mut c)?);
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    log.retain(|p| st.extents.contains_key(&p.arena_id));
+                    // Re-indexed from this record's own entries: O(n) for the n it carries, plus
+                    // dropping the index it replaces.
+                    pending.replace(log);
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
+                self.live_pages.store(live, Ordering::SeqCst);
+            }
+            // **D183 — the small half of `put_pending`.** Everything the drain reclaimed left the
+            // log; everything else in it is untouched, which is why this record does not have to
+            // name the survivors.
+            Self::TAIL_PENDING_DRAINED => {
+                let live = c.u32()?;
+                let n = c.u32()? as usize;
+                // `Vec::new`, not `with_capacity(n)`: `n` comes off the file before its entries do,
+                // and a corrupt count must fail on the cursor, not on an allocation.
+                let mut removed = Vec::new();
+                for _ in 0..n {
+                    let page = c.u32()?;
+                    let arena = ArenaId(c.u32()?);
+                    removed.push((page, arena));
+                }
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // Idempotent: removing a key that is not there is the identity, so replaying
+                    // this record twice is the same as replaying it once.
+                    //
+                    // ⛔ **IDEMPOTENT IS NOT COMMUTATIVE, and an earlier version of this comment
+                    // claimed it "can sit on either side of a `TAIL_EXTENT_FREED` or a
+                    // `TAIL_PAGES_PARKED` for the same pages". That is false by inspection**:
+                    // PARKED pushes key K if absent and this removes K, so `[DRAINED][PARKED]`
+                    // ends with K in the log and `[PARKED][DRAINED]` without it. Removal commutes
+                    // with removal, not with an append.
+                    //
+                    // What makes the order safe is not this arm — it is that `persist` is held
+                    // across the mutation AND the append at every site that writes one of these
+                    // records, so the file order equals the memory order. `retire_arenas_by_rule`
+                    // did not do that until the fix its own comment now describes, and that was
+                    // the defect. Idempotence here is a second line, not the guarantee.
+                    //
+                    // By key: the entries this record names, every copy of each, and nothing
+                    // else. This used to be a `retain` over the WHOLE log, including for a record
+                    // that names nothing. `put_pending` used to write one on every drain that
+                    // released nothing; since the drain elision it writes one only for such a
+                    // drain that owes a recycled list, but files written before it still hold
+                    // them, and replay walks those.
+                    for key in removed {
+                        pending.remove_key(key);
+                    }
+                    Self::apply_arena_sections(&mut c, &mut st)?;
+                }
                 self.live_pages.store(live, Ordering::SeqCst);
             }
             other => {
@@ -1912,6 +2833,276 @@ impl ArenaPageStore {
         // the one arrangement `replay_tail` cannot recover from. See [`PersistState`].
         store.checkpoint_to(path.to_path_buf());
         Ok(store)
+    }
+}
+
+use pending_log::PendingLog;
+
+/// **D183 de-dup at push: the pending-free log holds at most ONE entry per `(page, arena)`, the first.**
+///
+/// A module of its own so its two fields are private and cannot drift apart. Every way into the log
+/// goes through [`PendingLog::push_if_absent`], so a second entry for a page is unrepresentable rather
+/// than something each call site has to avoid. That includes a log restored from an image,
+/// or from a REPLACED record, written before this rule existed: [`PendingLog::from_entries`] keeps the
+/// first entry for each key, which is the rule the tail replay has always applied to PARKED records. So
+/// memory and its replayed file are built by the same rule and cannot disagree about a page's entry.
+///
+/// **Why the FIRST.** A page is logically freed once. A later entry for it comes from deciding it again:
+/// a resumed reap, or the owner's retire of a page it had already freed. In-process that decision is at
+/// a later free epoch, which can only widen the pin range, and only to children forked after the page was
+/// freed, which cannot see it (`frontier/catalog_root_and_park_adversary.md` §B3 @ `a4b48ea`). After a
+/// restart the epochs can be in either order, and for a Reaping owner the two decisions are equal (§B2).
+///
+/// Cost: `push_if_absent`, `contains` and `take_all` are O(1); `remove_arena` is the O(P) `retain` that
+/// `free_arena` always did. The key set is about 10-16 bytes per entry beside a 40-byte `PendingFree`
+/// (INFERRED from layout, not measured).
+mod pending_log {
+    use crate::branch::record::PendingFree;
+    use crate::branch::types::{ArenaId, PageId};
+    use std::collections::HashSet;
+
+    #[derive(Clone, Default)]
+    pub(super) struct PendingLog {
+        /// Log order: the order each key was first pushed.
+        entries: Vec<PendingFree>,
+        /// The keys of `entries`, exactly, one each.
+        keys: HashSet<(PageId, ArenaId)>,
+    }
+
+    impl PendingLog {
+        /// The first entry for each key, in order. Later entries for a key already seen are dropped.
+        pub(super) fn from_entries(entries: impl IntoIterator<Item = PendingFree>) -> PendingLog {
+            let mut log = PendingLog::default();
+            log.extend_absent(entries);
+            log
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        pub(super) fn contains(&self, key: (PageId, ArenaId)) -> bool {
+            self.keys.contains(&key)
+        }
+
+        pub(super) fn iter(&self) -> std::slice::Iter<'_, PendingFree> {
+            self.entries.iter()
+        }
+
+        /// Append `e` at the END unless an entry for its key is already in the log. Returns whether it
+        /// did, so a caller that records or announces its pushes can skip exactly the ones that changed
+        /// nothing.
+        pub(super) fn push_if_absent(&mut self, e: PendingFree) -> bool {
+            if !self.keys.insert((e.page_id, e.arena_id)) {
+                return false;
+            }
+            self.entries.push(e);
+            true
+        }
+
+        pub(super) fn extend_absent(&mut self, entries: impl IntoIterator<Item = PendingFree>) {
+            for e in entries {
+                self.push_if_absent(e);
+            }
+        }
+
+        /// Empty the log and hand back its entries in order. O(1): both fields are swapped out, not
+        /// cleared.
+        pub(super) fn take_all(&mut self) -> Vec<PendingFree> {
+            self.keys = HashSet::new();
+            std::mem::take(&mut self.entries)
+        }
+
+        /// Drop every entry of `arena`.
+        pub(super) fn remove_arena(&mut self, arena: ArenaId) {
+            let keys = &mut self.keys;
+            self.entries.retain(|p| {
+                if p.arena_id != arena {
+                    return true;
+                }
+                keys.remove(&(p.page_id, p.arena_id));
+                false
+            });
+        }
+
+        /// The entries, for a caller that takes the whole log apart.
+        pub(super) fn into_entries(self) -> Vec<PendingFree> {
+            self.entries
+        }
+    }
+
+    impl std::fmt::Debug for PendingLog {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list().entries(self.entries.iter()).finish()
+        }
+    }
+
+    /// Test-only: compare with the `Vec` this log used to be, so the tests written against it read
+    /// unchanged.
+    #[cfg(test)]
+    impl PartialEq<Vec<PendingFree>> for PendingLog {
+        fn eq(&self, other: &Vec<PendingFree>) -> bool {
+            &self.entries == other
+        }
+    }
+}
+
+use pending_replay::PendingReplay;
+
+/// **D183 tail replay: the pending-free log, indexed at most once for a whole replay.**
+///
+/// A module of its own so the log's slots are PRIVATE, and `apply_tail_record` changes the log only
+/// through these methods. ⚠ **That narrows the instrument's blind spot; it does not remove it.** The
+/// counter sees a rescan only if the rescan bumps `visits`. A scan written inside this module without
+/// that bump is invisible to the count test. Mutant MR5 in `frontier/lane_d183_tail_replay.md` is
+/// exactly that, and it is expected to survive. Outside the module a rescan is not possible at all,
+/// because `st.pending` is empty for the whole replay.
+///
+/// **Lazily.** The log is indexed by the first record that touches it (`index`). A replay where no
+/// record does, which covers an empty tail (every clean open) and a tail of claims only, does no work
+/// on the log. That is what the per-record code did there.
+///
+/// **The rules it keeps**, each one what a per-record scan of `Vec<PendingFree>` did:
+/// * order is log order, and an entry pushed after a removal goes to the END;
+/// * [`PendingReplay::contains`] means "some live entry has this key". PARKED asks it before every
+///   push, so the FIRST entry for a key wins, within one record as well as across records;
+/// * [`PendingReplay::remove_key`] removes EVERY live entry with the key (a `retain`), and a
+///   missing key is a no-op;
+/// * [`PendingReplay::remove_arena`] removes every live entry of the arena;
+/// * [`PendingReplay::replace`] takes the new log first-wins per key. Only a REPLACED record written
+///   before de-dup at push can carry a key twice, because it restated a memory log that held one twice.
+///
+/// **The result is a [`PendingLog`], built by [`PendingLog::from_entries`] in the one pass `finish`
+/// already made, so it holds each key once, the first, whatever the records said.** Every removal
+/// (DRAINED, EXTENT_FREED, REPLACED) removes all copies of a key, so the first copy always sits where the
+/// correct entry would. That makes PARKED's `contains` a bound on transient slots and no longer what
+/// keeps the result duplicate-free: mutant MC1 (`contains` always false) is equivalent in the log's
+/// CONTENTS from the de-dup fix on. Its cost role, no slot per re-park, is pinned by
+/// `a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot`, which kills MC1 at 98 visits
+/// against 34 (lane AMENDMENTS 3-4). For the same reason no key ever has two live slots here, so
+/// `remove_key`'s every-copy loop never meets a second copy (mutant MC2 is equivalent).
+///
+/// Cost: indexing and `finish` are one pass each over the log, and only if some record touched it.
+/// Every other method is O(1) plus the entries it actually removes; `remove_arena` also walks that
+/// arena's positions that other records already removed. Each position is pushed once and dropped at
+/// most once, so a whole replay is O(P + records + the entries the records carry), and O(records)
+/// when no record touches the log.
+mod pending_replay {
+    use super::pending_log::PendingLog;
+    use crate::branch::record::PendingFree;
+    use crate::branch::types::{ArenaId, PageId};
+    use std::collections::HashMap;
+
+    pub(super) struct PendingReplay {
+        /// The log as the replay found it, until a record first touches it. [`Self::index`] moves
+        /// it into `slots`.
+        untouched: Option<PendingLog>,
+        /// Log order. `None` is an entry a later record removed; [`Self::finish`] drops the holes.
+        slots: Vec<Option<PendingFree>>,
+        /// LIVE slots per key, oldest first. A key is absent once its last live slot goes.
+        by_key: HashMap<(PageId, ArenaId), Vec<usize>>,
+        /// Every slot ever pushed for an arena, live or not. A removed one costs one skip in
+        /// [`Self::remove_arena`], never a scan of anything else.
+        by_arena: HashMap<ArenaId, Vec<usize>>,
+        /// Entries visited: every push, lookup and slot touched, plus the passes of `finish` and
+        /// `replace`. Read by the test-only counter `ArenaPageStore::replay_pending_visits`.
+        visits: u64,
+    }
+
+    impl PendingReplay {
+        /// Hold `log` unindexed. O(1).
+        pub(super) fn new(log: PendingLog) -> PendingReplay {
+            PendingReplay {
+                untouched: Some(log),
+                slots: Vec::new(),
+                by_key: HashMap::new(),
+                by_arena: HashMap::new(),
+                visits: 0,
+            }
+        }
+
+        /// Index the log `new` was given, once, at the first call that needs it. O(its length).
+        fn index(&mut self) {
+            let Some(log) = self.untouched.take() else { return };
+            let log = log.into_entries();
+            self.slots.reserve(log.len());
+            self.by_key.reserve(log.len());
+            for e in log {
+                self.push_indexed(e);
+            }
+        }
+
+        pub(super) fn contains(&mut self, key: (PageId, ArenaId)) -> bool {
+            self.index();
+            self.visits += 1;
+            self.by_key.contains_key(&key)
+        }
+
+        /// Append at the END of the log. Does not deduplicate; callers that must, ask
+        /// [`Self::contains`] first, exactly as the scan they replace did.
+        pub(super) fn push(&mut self, e: PendingFree) {
+            self.index();
+            self.push_indexed(e);
+        }
+
+        fn push_indexed(&mut self, e: PendingFree) {
+            self.visits += 1;
+            let at = self.slots.len();
+            self.slots.push(Some(e));
+            self.by_key.entry((e.page_id, e.arena_id)).or_default().push(at);
+            self.by_arena.entry(e.arena_id).or_default().push(at);
+        }
+
+        /// Remove every live entry with this key.
+        pub(super) fn remove_key(&mut self, key: (PageId, ArenaId)) {
+            self.index();
+            self.visits += 1;
+            let Some(at) = self.by_key.remove(&key) else { return };
+            for i in at {
+                self.visits += 1;
+                self.slots[i] = None;
+            }
+        }
+
+        /// Remove every live entry of this arena.
+        pub(super) fn remove_arena(&mut self, arena: ArenaId) {
+            self.index();
+            let Some(at) = self.by_arena.remove(&arena) else { return };
+            for i in at {
+                self.visits += 1;
+                let Some(e) = self.slots[i].take() else { continue };
+                let key = (e.page_id, e.arena_id);
+                let now_empty = match self.by_key.get_mut(&key) {
+                    Some(v) => {
+                        v.retain(|&j| j != i);
+                        v.is_empty()
+                    }
+                    None => false,
+                };
+                if now_empty {
+                    self.by_key.remove(&key);
+                }
+            }
+        }
+
+        /// The log becomes `log`, first-wins per key, unindexed until something touches it. Costs
+        /// dropping the index it replaces, plus one pass over `log`: the pass that decoding the record
+        /// already made, and uncounted like it.
+        pub(super) fn replace(&mut self, log: Vec<PendingFree>) {
+            let carried = self.visits + self.slots.len() as u64;
+            *self = PendingReplay::new(PendingLog::from_entries(log));
+            self.visits += carried;
+        }
+
+        /// The log in order, holes dropped, first-wins per key, and the visits this replay made.
+        /// O(slots), or O(1) if no record ever touched the log.
+        pub(super) fn finish(self) -> (PendingLog, u64) {
+            if let Some(log) = self.untouched {
+                return (log, self.visits);
+            }
+            let visits = self.visits + self.slots.len() as u64;
+            (PendingLog::from_entries(self.slots.into_iter().flatten()), visits)
+        }
     }
 }
 
@@ -2193,15 +3384,18 @@ impl PageStore for ArenaPageStore {
             // checkpoints the next claim wrote it down as a side effect. A tail record does not,
             // so this marks the log changed and the next claim rewrites the image instead of
             // appending. See [`PersistState::durable_pending_version`].
-            self.pending_version.fetch_add(1, Ordering::SeqCst);
-            self.state.lock().unwrap().pending.push(PendingFree {
+            //
+            // **D183 — the bump is INSIDE the lock, for the reason `take_pending` gives.** The
+            // push and the announcement of the push have to be one step, or a record builder
+            // holding `state` reads the new version and the old log. That pairing is what
+            // `push_pending_unrecorded` exists to make unskippable.
+            self.push_pending_unrecorded(PendingFree {
                 page_id,
                 arena_id: arena,
                 birth_epoch: header.birth_epoch,
                 free_epoch,
                 owner,
             });
-            self.pending_pushed.fetch_add(1, Ordering::Relaxed);
         } else {
             self.release_page(page_id, arena);
         }
@@ -2275,18 +3469,20 @@ impl PageStore for ArenaPageStore {
         // already in use. Ordered AFTER the catalog write so a crash between the two leaves an
         // extent recorded as reserved but unreferenced, which leaks; the other order aliases.
         //
-        // **D81 — THIS is the wall, and it is the only site that changes shape.** D79 measured the
-        // whole 48·L-byte image being re-serialised and re-fsynced here, once per new branch, for
-        // `sum(48·i) = 24·N²` bytes over a run. It now appends 45 bytes and fsyncs once, and the
-        // image is rewritten only when the tail has grown past half of it.
+        // **D81 — THIS is the wall on the FORK door.** D79 measured the whole 48·L-byte image
+        // being re-serialised and re-fsynced here, once per new branch, for `sum(48·i) = 24·N²`
+        // bytes over a run. It now appends 45 bytes and fsyncs once, and the image is rewritten
+        // only when the tail has grown past half of it.
         //
-        // The other three `persist_if_configured` sites keep the full rewrite deliberately. They
-        // fire once per REAP, not once per branch created, and each one changes list-shaped state
-        // — the pending-free log, per-extent recycled lists — that a per-extent record does not
-        // describe. They double as compaction points, so leaving them whole costs a bounded tail
-        // rather than a missing guarantee. ⚠ The condition under which that stops being the right
-        // call, stated rather than discovered: a workload that reaps as often as it forks pays a
-        // full rewrite per reap and only half of this row's benefit.
+        // ⚠ **D183 corrected this note, which was wrong in both halves.** It said there were
+        // "three other `persist_if_configured` sites"; there were TWO (`retire_arenas_by_rule` and
+        // `put_pending`), and it said keeping them whole cost "a bounded tail rather than a missing
+        // guarantee". It cost neither: `persist_full_locked` never consults `compact_threshold`, so
+        // those two were not amortised at all — one full image rewrite per INTERIOR branch reaped,
+        // `24·N²` bytes again, on the door that opens for deep fork chains. The condition this note
+        // named as hypothetical ("a workload that reaps as often as it forks") is the one the
+        // project is aimed at. Both sites are deltas now; see [`Self::TAIL_PAGES_PARKED`] and
+        // [`Self::TAIL_PENDING_REPLACED`], and `persist_if_configured` is gone with them.
         let payload = {
             let mut p = Vec::with_capacity(36);
             p.extend_from_slice(&arena.0.to_be_bytes());
@@ -2304,7 +3500,7 @@ impl PageStore for ArenaPageStore {
             p.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
             p
         };
-        self.persist_delta_locked(&mut persist, Self::TAIL_ARENA_CLAIMED, &payload)?;
+        self.persist_delta_locked(&mut persist, Self::TAIL_ARENA_CLAIMED, &payload, None)?;
         Ok(arena)
     }
 
@@ -2356,7 +3552,7 @@ impl PageStore for ArenaPageStore {
         let mut st = self.state.lock().unwrap();
         let ext = st.extents.remove(&arena);
         st.recycled.remove(&arena);
-        st.pending.retain(|p| p.arena_id != arena);
+        st.pending.remove_arena(arena);
         st.claim_epoch.remove(&arena);
         // **D99 — the one per-arena map this used to leave behind.** `load_state` seeds
         // `fill_unknown` with EVERY restored extent and only `resolve_fill` ever clears an id
@@ -2367,6 +3563,10 @@ impl PageStore for ArenaPageStore {
         // on a path whose whole job is to give per-arena state back, and at 10^6 restored extents
         // it is the set, not the leak, that is the wrong shape.
         st.fill_unknown.remove(&arena);
+        // **D183 — and the same argument, one row later.** This extent's recycled list no longer
+        // exists, so nothing is owed a record for it. Left behind, the id would make every later
+        // reclamation record re-encode an arena that `TAIL_EXTENT_FREED` has already removed.
+        st.recycled_dirty.remove(&arena);
         // **D102 — the whole extent's ids stop naming these pages, so their bases stop being
         // theirs.** `release_page` does this one id at a time; freeing an extent bypasses it
         // entirely (that bypass is the reaper's fast path and the reason arenas exist), so the
@@ -2446,7 +3646,7 @@ impl PageStore for ArenaPageStore {
             payload.extend_from_slice(&start.to_be_bytes());
             payload.extend_from_slice(&pages.to_be_bytes());
             payload.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
-            self.persist_delta_locked(&mut persist, Self::TAIL_EXTENT_FREED, &payload)?;
+            self.persist_delta_locked(&mut persist, Self::TAIL_EXTENT_FREED, &payload, None)?;
         }
         Ok(allocated)
     }
@@ -3839,6 +5039,484 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **D183 — what the two STORE METHODS cost per call. ⛔ NOT what a reap costs.**
+    ///
+    /// ⛔⛔ **THIS TEST'S ORIGINAL NAME AND HEADLINE WERE WRONG AND WERE ACTED ON.** It was
+    /// called `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends` and its
+    /// band read "LEAF 8/16 -> rewrites 0/0; INTERIOR 8/16 -> rewrites 8/16 — one full image
+    /// rewrite per interior branch reaped, zero for a leaf". **It never calls `Reaper::reap`.**
+    /// It hand-rolls the two lines at `reaper.rs:679-687` and therefore never runs
+    /// `drain_pending`, which is half of what a reap does and the source of the leaf path's
+    /// entire cost. A design entry and an implementation brief were both written against that
+    /// number before `mod d183_adversary` measured the real thing and refuted BOTH halves of it:
+    /// through `TwoTierReaper::reap` the leaf slope was 1.0 per branch, not 0, and the interior
+    /// slope 2.0, not 1.0.
+    ///
+    /// ⇒ **For what a reap costs, read `d183adv_a1_what_the_real_reaper_costs` and
+    /// `d183adv_a5_the_interior_cost_is_no_longer_a_class`.** This test is kept because a
+    /// per-method cost is a real thing to know and the two methods are this row's subject — but
+    /// it is a measurement of `retire_arenas_by_rule` and `free_arena` called directly, and its
+    /// numbers must never again be quoted as the cost of reaping anything.
+    ///
+    /// D81 replaced the per-fork full image rewrite with a 45-byte delta append and its note
+    /// called that "the only site that changes shape". `retire_arenas_by_rule` ended in
+    /// `persist_if_configured`, which was `persist_full_locked` unconditionally — it never
+    /// consulted `compact_threshold`, so it was not amortised at all.
+    ///
+    /// **⭐ THIS TEST HAS BEEN INVERTED. It pinned a WALL and now pins the FIX.** The wall, as
+    /// this hand-rolled loop measured it at `630afaa` — kept because a before/after with only the
+    /// after is a claim rather than a measurement, and kept labelled because these four cells are
+    /// exactly the numbers that misled the row:
+    ///
+    /// | arm | branches | rewrites | appends |
+    /// |---|---|---|---|
+    /// | LEAF | 8 / 16 | **0 / 0** | 24 / 48 |
+    /// | INTERIOR | 8 / 16 | **8 / 16** | 0 / 0 |
+    ///
+    /// One full image rewrite per interior branch reaped, zero deltas — `sum(48·i) = 24·N²` bytes
+    /// — against a leaf control that paid zero at both sizes.
+    ///
+    /// **After D183's THREE new tail record kinds** — [`ArenaPageStore::TAIL_PAGES_PARKED`],
+    /// [`ArenaPageStore::TAIL_PENDING_DRAINED`] and its always-correct fallback
+    /// [`ArenaPageStore::TAIL_PENDING_REPLACED`] — plus the conditional `take_pending` bump,
+    /// measured 2026-09-23 on this branch. ⚠ The two kinds named in the first version of this
+    /// band are NOT the ones that deliver the headline: the drain record and the conditional bump
+    /// are, and `d183adv_a5_the_interior_cost_is_no_longer_a_class` has the evidence.
+    ///
+    /// | arm | branches | rewrites | appends |
+    /// |---|---|---|---|
+    /// | LEAF | 8 / 16 | 0 / 0 | 24 / 48 |
+    /// | INTERIOR | 8 / 16 | **0 / 1** | **8 / 15** |
+    ///
+    /// **Pre-registered from the SOURCE, and stated as what must be TRUE rather than as the
+    /// numbers above.** The reaper calls `retire_arenas_by_rule` once per branch and that method
+    /// persists exactly once, so the two counters must still SUM to one per interior branch — the
+    /// site fires as often as it ever did. What D183 changed is which counter each one lands in:
+    /// `persist_delta_locked` now rewrites only when the tail would pass
+    /// `compact_threshold(image_bytes) = max(image/2, 4096)`, so the rewrites over the loop are
+    /// bounded by the BYTES it appends and not by the branch count. Hence the inverted assertion:
+    /// **rewrites must grow more slowly than appends** — 1 against 7 here, and 8 against 0 under
+    /// the defect, which is what makes it discriminating rather than merely satisfied.
+    ///
+    /// The single rewrite at 16 is a COMPACTION and not the old per-branch cost: the fixture's own
+    /// 48 claim records have already put ~2.2 KiB on the tail before the reap loop starts, so the
+    /// 4 KiB floor is crossed part way through. That is the amortisation rule working, and it is
+    /// why the assertion is about the slope rather than about zero.
+    ///
+    /// Two sizes, so the claim is a SLOPE and not a ratio, and both arms in the same run so the
+    /// leaf arm is a live control rather than a remembered number.
+    ///
+    /// ⚠ `new_with(true)` — the catalog that SHIPS. `Harness::new()` is the log catalog, whose
+    /// `live_children` lives in the record; a reclamation test on it proves nothing about the
+    /// shipped path. That is D19, and this test would be worthless without it.
+    #[test]
+    fn d183_what_the_two_reclamation_store_methods_cost_per_call() {
+        fn run(branches: usize, interior: bool) -> (u64, u64) {
+            let h = Harness::new_with(true);
+            let path = std::env::temp_dir().join(format!(
+                "ferro-arena-d183-{}-{}-{}.bin",
+                std::process::id(),
+                branches,
+                interior
+            ));
+            let _ = std::fs::remove_file(&path);
+            h.store.checkpoint_to(path.clone());
+
+            let mut ids = Vec::new();
+            for _ in 0..branches {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                for _ in 0..4 {
+                    h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                }
+                if interior {
+                    // Forked AFTER those pages were born, so the interval rule must PARK them
+                    // and the reaper is forced down the slow side of `reaper.rs:679`.
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                }
+                ids.push(b.branch_id);
+            }
+
+            // Count only the reap loop: everything above is fixture.
+            let (r0, a0) = h.store.persist_counters();
+
+            // Exactly what `reaper.rs:679-687` does, per branch, on each side of the predicate.
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                if interior {
+                    h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+                } else {
+                    for arena in rec.arenas.iter().copied() {
+                        h.store.free_arena(arena).unwrap();
+                    }
+                }
+            }
+
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+
+        let (leaf_r8, leaf_a8) = run(8, false);
+        let (leaf_r16, leaf_a16) = run(16, false);
+        let (int_r8, int_a8) = run(8, true);
+        let (int_r16, int_a16) = run(16, true);
+
+        println!("D183 reap cost -- (full rewrites, delta appends) over the reap loop only");
+        println!("  LEAF      8: rewrites={leaf_r8:3} appends={leaf_a8:3}");
+        println!("  LEAF     16: rewrites={leaf_r16:3} appends={leaf_a16:3}");
+        println!("  INTERIOR  8: rewrites={int_r8:3} appends={int_a8:3}");
+        println!("  INTERIOR 16: rewrites={int_r16:3} appends={int_a16:3}");
+
+        // Anti-vacuity: a fixture that reaped nothing satisfies every shape assertion below.
+        assert!(leaf_a8 + leaf_r8 > 0, "fixture: the leaf arm persisted nothing at all");
+        assert!(int_r8 + int_a8 > 0, "fixture: the interior arm persisted nothing at all");
+
+        // The SITE still fires once per interior branch — `retire_arenas_by_rule` persists exactly
+        // once and the reaper calls it once per branch. D183 changed which counter it lands in,
+        // not how often it runs, and stating that separately is what stops a "fix" that simply
+        // stopped persisting from passing the slope assertion below.
+        assert_eq!(
+            (int_r8 + int_a8, int_r16 + int_a16),
+            (8, 16),
+            "the interior reap no longer persists exactly once per branch: 8->({int_r8},{int_a8}) \
+             16->({int_r16},{int_a16}); a reap that persists LESS often is data loss, not a fix"
+        );
+
+        // ⭐ THE INVERTED PRE-REGISTERED SHAPE. Before D183 this read `int_r16 - int_r8 == 8`:
+        // rewrites rose one-for-one with branches and appends never moved (8 vs 0). The fix makes
+        // the interior door a delta, so the growth must land in the APPENDS and the rewrites must
+        // be whatever the amortisation rule leaves behind — strictly less.
+        assert!(
+            int_r16 - int_r8 < int_a16 - int_a8,
+            "interior reaps still rewrite the image per branch: rewrites {int_r8}->{int_r16} \
+             (+{}) against appends {int_a8}->{int_a16} (+{})",
+            int_r16 - int_r8,
+            int_a16 - int_a8
+        );
+
+        // THE CONTROL, AND IT MUST NOT HAVE MOVED. The leaf door was already a delta before this
+        // row and D183 did not touch `free_arena`. A leaf arm that changed would mean the two
+        // halves of the before/after came from two different bases rather than that the interior
+        // arm improved.
+        assert_eq!(
+            (leaf_r8, leaf_r16),
+            (0, 0),
+            "the leaf control moved: it paid {leaf_r8}/{leaf_r16} rewrites where it paid 0/0 at \
+             630afaa, so this run is not comparable with the recorded before"
+        );
+        assert_eq!(
+            leaf_a16,
+            leaf_a8 * 2,
+            "the leaf control's appends stopped being linear in branches ({leaf_a8}->{leaf_a16})"
+        );
+    }
+
+    /// ⭐ **D183's load-bearing test: the delta must reproduce the full rewrite EXACTLY.**
+    ///
+    /// The row's whole argument is that the pending-free log and the per-extent recycled lists can
+    /// be described by a tail record instead of by re-serialising the map. That is a claim about
+    /// bytes, so it is asserted in bytes: run an interior reap AND the drain's read-modify-write
+    /// against an armed path, then compare a store restored from `image + tail` against a store
+    /// restored from a full image of the same live state. If the replay of
+    /// [`ArenaPageStore::TAIL_PAGES_PARKED`] and [`ArenaPageStore::TAIL_PENDING_REPLACED`] drops,
+    /// duplicates or reorders one entry, the two images differ and this fails.
+    ///
+    /// **Byte-identity is the right instrument and `pending_len()` is not.** A count agrees with a
+    /// full rewrite while naming different pages; `state_bytes` carries every field of every entry
+    /// plus every recycled id, under a CRC32.
+    ///
+    /// ⛔⛔ **IT COMPARES AFTER *EACH* RECORD, AND THAT IS NOT THOROUGHNESS — IT IS THE ONLY WAY
+    /// THE FIRST RECORD IS TESTED AT ALL.** An end-only version of this test was **fire-checked
+    /// and PASSED with `TAIL_PAGES_PARKED` dropping a parked entry**: the drain's record restates
+    /// the log afterwards, so a downstream record that re-states the same state masks every mutant
+    /// of the one in front of it. The parked record is therefore compared while it is still the
+    /// last word on the log, before the drain runs.
+    ///
+    /// ⚠ **Anti-vacuity, at each stage, and in two forms.** A site that quietly fell back to
+    /// `persist_full_locked` would of course match a full rewrite, so each stage pins that it
+    /// APPENDED and did not rewrite — and, because a count cannot say WHICH record was appended,
+    /// each stage also reads the kind back out of the file with [`ArenaPageStore::tail_kinds`].
+    /// `TAIL_PENDING_REPLACED` is the always-correct fallback for the drain, so without that
+    /// second check this test would pass while never exercising the difference record at all.
+    /// Same for the fixture: it asserts the reap both parked and released pages, because a log
+    /// with nothing in it round-trips trivially.
+    ///
+    /// The crash this stands in for is the one `arena.rs`'s own note names: a kill after
+    /// `mark_reaped`, whose branch record no longer points at the arenas, so the parked entries and
+    /// the recycled pages exist ONLY in this file.
+    #[test]
+    fn an_interior_reap_replayed_from_the_tail_is_byte_identical_to_a_full_rewrite() {
+        // The catalog that ships — D19. The interval rule is asked of an INDEX here, not of a vec
+        // in the record, so the fixture's "some pinned, some not" split is decided by the code
+        // that runs in production.
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-control-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        // Born BEFORE the child forked, so the child can see them and the interval rule parks them.
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        // Born AFTER it forked: no live child's fork epoch lies in [birth, free), so these are
+        // RELEASED into the extent's recycled list rather than parked. Both halves of the record
+        // are therefore non-empty, which a fixture that parks everything cannot test.
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(9)).unwrap();
+        }
+
+        // `image + tail` must serialise to exactly what a full rewrite of the live state would.
+        let same_as_a_full_rewrite = |stage: &str| {
+            // The full rewrite, taken at a path that is NOT the armed one so the tail accounting
+            // this test is measuring is left alone.
+            h.store.checkpoint(&control).unwrap();
+            let from_tail = h.fresh_store();
+            assert!(from_tail.restore(&armed).unwrap(), "{stage}: the armed path holds nothing");
+            let from_image = h.fresh_store();
+            assert!(from_image.restore(&control).unwrap());
+            assert_eq!(
+                from_tail.pending_len(),
+                from_image.pending_len(),
+                "{stage}: the replayed pending-free log has {} entries where a full rewrite gives \
+                 {}",
+                from_tail.pending_len(),
+                from_image.pending_len()
+            );
+            assert_eq!(
+                from_tail.state_bytes(),
+                from_image.state_bytes(),
+                "{stage}: a store restored from image+tail is not byte-identical to one restored \
+                 from a full image of the same state — the D183 delta does not reproduce what it \
+                 replaced"
+            );
+        };
+
+        // ── STAGE 1: the reap slow path alone. `TAIL_PAGES_PARKED` is the last word on the log
+        // here, so this is the only place its pending half can be observed at all.
+        let (r0, a0) = h.store.persist_counters();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert!(released > 0, "fixture: nothing was released, so no recycled list changed");
+        let parked = h.store.pending_len();
+        assert!(parked > 0, "fixture: nothing was parked, so the pending log never changed");
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the interior reap did not APPEND: rewrites +{}, appends +{}. A fallback to the full \
+             rewrite would make the comparison below vacuously true",
+            r1 - r0,
+            a1 - a0
+        );
+        // **Ask the FILE which record it wrote.** The counter says one append happened; it cannot
+        // say which kind, and a restore that matches a full rewrite passes just as well when the
+        // wrong record produced it.
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PAGES_PARKED),
+            "stage 1 wrote {:?}, not a parked record",
+            ArenaPageStore::tail_kinds(&armed)
+        );
+        same_as_a_full_rewrite("after the interior reap");
+
+        // ── STAGE 2: the drain's read-modify-write on top, spelled exactly as
+        // `reaper::drain_pending_seeded` spells it — take the whole log, hand one page back, put
+        // the survivors. This is what reaches `TAIL_PENDING_DRAINED`.
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), parked, "fixture: the take did not see the parked entries");
+        h.store.release_page(taken[0].page_id, taken[0].arena_id);
+        h.store.put_pending(taken[1..].to_vec()).unwrap();
+        let (r2, a2) = h.store.persist_counters();
+        assert_eq!(
+            (r2 - r1, a2 - a1),
+            (0, 1),
+            "putting the log back did not APPEND: rewrites +{}, appends +{}",
+            r2 - r1,
+            a2 - a1
+        );
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+            "stage 2 wrote {:?}; the DIFFERENCE record is the one this row added and the absolute \
+             fallback would hide every defect in it",
+            ArenaPageStore::tail_kinds(&armed)
+        );
+        assert!(
+            h.store.pending_len() < parked,
+            "fixture: the drain put back everything it took, so the drain record describes no \
+             change at all"
+        );
+        same_as_a_full_rewrite("after the drain put the log back");
+
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// ⭐ **D183 — the fallback is the correctness backstop, so it gets its own test.**
+    ///
+    /// `put_pending` writes the O(released) difference record only while
+    /// [`PersistState::drain_mark`] proves the durable log is the one `take_pending` handed out.
+    /// Every other case is supposed to write the O(whole log) absolute record instead, and that
+    /// branch is what makes the optimisation safe rather than merely fast.
+    ///
+    /// **Nothing else reaches it.** Every other drain in the suite satisfies the proof, so the
+    /// fallback would be dead code that still compiles — and a weakened proof (one that said
+    /// "usable" always) would pass every other test in this file. Each arm below invalidates the
+    /// proof a different way, asserts from the FILE that the absolute record was chosen, and then
+    /// requires the restore to be byte-identical to a full rewrite anyway.
+    #[test]
+    fn a_drain_that_cannot_prove_the_log_falls_back_to_the_absolute_record() {
+        // `invalidate` runs between the take and the put.
+        fn case(tag: &str, invalidate: impl Fn(&Harness, &std::path::Path)) {
+            let h = Harness::new_with(true);
+            let armed = std::env::temp_dir()
+                .join(format!("ferro-arena-d183-fb-{}-{}.bin", std::process::id(), tag));
+            let _ = std::fs::remove_file(&armed);
+            h.store.checkpoint_to(armed.clone());
+
+            let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            for _ in 0..4 {
+                h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            }
+            h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+            let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+            let taken = h.store.take_pending();
+            assert!(taken.len() >= 2, "{tag} fixture: the reap parked too little to drop one");
+            invalidate(&h, &armed);
+            h.store.release_page(taken[0].page_id, taken[0].arena_id);
+            h.store.put_pending(taken[1..].to_vec()).unwrap();
+
+            let kinds = ArenaPageStore::tail_kinds(&armed);
+            assert!(
+                kinds.is_empty()
+                    || kinds.last().copied() != Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+                "{tag}: the difference record was written although its proof was invalidated \
+                 ({kinds:?})"
+            );
+
+            let control = std::env::temp_dir()
+                .join(format!("ferro-arena-d183-fbc-{}-{}.bin", std::process::id(), tag));
+            h.store.checkpoint(&control).unwrap();
+            let from_tail = h.fresh_store();
+            assert!(from_tail.restore(&armed).unwrap());
+            let from_image = h.fresh_store();
+            assert!(from_image.restore(&control).unwrap());
+            assert_eq!(
+                from_tail.state_bytes(),
+                from_image.state_bytes(),
+                "{tag}: the fallback did not reproduce a full rewrite"
+            );
+            let _ = std::fs::remove_file(&armed);
+            let _ = std::fs::remove_file(&control);
+        }
+
+        // A full image rewrite publishes the DRAINED, empty log, so the file no longer holds the
+        // entries the take handed out and removing from it would remove nothing. `rewrites` moves.
+        case("rewrite", |h, armed| h.store.checkpoint(armed).unwrap());
+
+        // A second drain: two takes cannot both be "the log the file still holds", and neither
+        // put can say whose entries it is holding.
+        case("overlap", |h, _| {
+            let _ = h.store.take_pending();
+        });
+    }
+
+    /// **D183 — a `put_pending` whose record fails must leave the log reading DIRTY.**
+    ///
+    /// Review axis 2b, fixed at `4b1ab2d` and pinned by nothing until this test: the re-verify's
+    /// mutant M9 (the bump on this arm removed) passed the whole lib target on both `4b1ab2d` and
+    /// the merged tree (`bench/d183_reverify.txt`).
+    ///
+    /// The arm used to be safe by accident — `take_pending` bumped unconditionally, so every caller
+    /// arrived here already dirty. The conditional bump removed that: a `put_pending` with no
+    /// preceding take (or after an EMPTY one) extends the log and bumps nothing, so if its append
+    /// fails, the counters still say the durable log is level with memory. The next persist then
+    /// APPENDS behind a file that does not list the entry, and a crash before the next compaction
+    /// loses it — `drain_pending` never revisits an entry the file does not hold.
+    ///
+    /// The append is made to fail by turning the armed file into a DIRECTORY for the one call, which
+    /// fails the same way on every platform and needs no permission bits. Two assertions, and both
+    /// are needed: the persist after the failure must be a REWRITE (the mechanism), and `image +
+    /// tail` must restore byte-identical to a full image of live memory (the durable state). The
+    /// second was fire-checked on its own, with the first removed.
+    #[test]
+    fn a_put_pending_whose_record_fails_leaves_the_log_dirty() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-putfail-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-putfail-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_dir(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        // The image is now current and the log level: the only thing that could carry the entry
+        // below to the file afterwards is a record, or a rewrite the counters force.
+        h.store.checkpoint(&armed).unwrap();
+        let (r0, a0) = h.store.persist_counters();
+
+        let saved = std::fs::read(&armed).unwrap();
+        std::fs::remove_file(&armed).unwrap();
+        std::fs::create_dir(&armed).unwrap();
+        let entry = PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner: b.branch_id,
+        };
+        let put = h.store.put_pending(vec![entry]);
+        std::fs::remove_dir(&armed).unwrap();
+        std::fs::write(&armed, &saved).unwrap();
+        assert!(put.is_err(), "fixture: the append did not fail, so the failure arm never ran");
+        assert_eq!(
+            h.store.persist_counters(),
+            (r0, a0),
+            "fixture: the failed put_pending still persisted something"
+        );
+        assert_eq!(h.store.pending_len(), 1, "fixture: put_pending did not keep the entry in memory");
+
+        // Any persist at all: a claim, which carries no pending log.
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(spare.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "the persist after a failed put_pending APPENDED ({} rewrites, {} appends) behind a \
+             file that does not list the entry it left in memory",
+            r1 - r0,
+            a1 - a0
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the durable pending-free log is short the entry a failed put_pending left in memory: \
+             a crash now loses it"
+        );
+
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
     /// ⭐ **A recycled page handed out again must reach the durable map, or a live extent is freed.**
     ///
     /// `extent_is_empty` is `recycled >= next_free`. A durable recycled list that still names a
@@ -3956,6 +5634,945 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ---- D183 tail replay: O(records + their own entries), not O(records x pending log) ----------
+
+    /// **D183 tail replay.** An image holding `p0` parked entries, then a tail of `rounds` rounds.
+    /// Each round writes one record of every kind that touches the pending-free log, through the
+    /// real writers:
+    /// * `TAIL_PAGES_PARKED` with one entry: `retire_arenas_by_rule` over a branch with one page
+    ///   and a live child.
+    /// * `TAIL_PENDING_DRAINED` removing one entry: a take, then a put of all but the oldest entry,
+    ///   which is `drain_pending` finding exactly one entry releasable.
+    /// * `TAIL_EXTENT_FREED` of an extent with nothing parked in it: a claim, then `free_arena`.
+    ///
+    /// Claims ride along as `TAIL_ARENA_CLAIMED`. The log stays at `p0` entries throughout, so
+    /// every record replays against a log of the same size.
+    ///
+    /// Returns how many pending entries the tail's records CARRY. It is counted here as they are
+    /// written, never read back from the counter under test.
+    fn parked_image_then_mixed_tail(
+        h: &Harness,
+        armed: &std::path::Path,
+        p0: usize,
+        rounds: usize,
+    ) -> usize {
+        h.store.checkpoint_to(armed.to_path_buf());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..p0 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), p0, "fixture: the image must hold {p0} parked entries");
+        // The image. Every parked entry is in it and the tail starts empty.
+        h.store.checkpoint(armed).unwrap();
+        assert!(
+            ArenaPageStore::tail_kinds(armed).is_empty(),
+            "fixture: the tail did not start empty"
+        );
+        let (r0, _) = h.store.persist_counters();
+
+        let mut carried = 0usize;
+        for _ in 0..rounds {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            let rec = h.catalog.get_raw(b.branch_id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+            carried += 1;
+
+            let taken = h.store.take_pending();
+            assert_eq!(taken.len(), p0 + 1, "fixture: the park did not reach the log");
+            h.store.put_pending(taken[1..].to_vec()).unwrap();
+            carried += 1;
+
+            let c = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let arena = h.store.arena_for(c.branch_id).unwrap();
+            h.store.free_arena(arena).unwrap();
+        }
+        let (r1, _) = h.store.persist_counters();
+        assert_eq!(
+            r1, r0,
+            "fixture: the tail was compacted into a new image, so it no longer holds every record \
+             this fixture wrote"
+        );
+        assert_eq!(h.store.pending_len(), p0, "fixture: each round must add one entry and drop one");
+        carried
+    }
+
+    /// ⭐ **Replay visits each record's OWN entries, plus one pass over the log. It does not visit
+    /// the whole log once per record.**
+    ///
+    /// At `731a7fa` three replay arms walked the entire pending-free log for every record:
+    /// * `TAIL_PAGES_PARKED` built a `HashSet` of it;
+    /// * `TAIL_PENDING_DRAINED` ran `retain` over it, even for a record naming nothing;
+    /// * `TAIL_EXTENT_FREED` ran `retain` over it.
+    ///
+    /// D183 turned full rewrites into these records, so a tail now spans many reaps before
+    /// `compact_threshold` folds it into an image. An open after an unclean exit paid
+    /// O(records x P). A clean CLI exit compacts, so only the crash path paid, and that is the
+    /// path where a fast open matters.
+    ///
+    /// The bound is the fix's claim, stated from the fixture. It allows one pass to index the
+    /// image's log, one visit per entry a record carries, one per record, and one pass to write
+    /// the log back: `2 x (P0 + carried) + records`. A per-record rescan costs about
+    /// `records x P0` instead. With `P0 = 64` and `12` rounds that is 236 allowed against roughly
+    /// 2,300 at `731a7fa` (instrument commit `54c66b9`), so the red and the green are an order of
+    /// magnitude apart rather than a hair.
+    #[test]
+    fn replaying_the_tail_visits_each_records_own_entries_not_the_whole_log() {
+        const P0: usize = 64;
+        const ROUNDS: usize = 12;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-visits-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let carried = parked_image_then_mixed_tail(&h, &armed, P0, ROUNDS);
+
+        // Ask the artifact which records it holds, rather than trusting the writers' routing.
+        let kinds = ArenaPageStore::tail_kinds(&armed);
+        let count = |k: u8| kinds.iter().filter(|&&x| x == k).count();
+        assert_eq!(
+            (
+                count(ArenaPageStore::TAIL_PAGES_PARKED),
+                count(ArenaPageStore::TAIL_PENDING_DRAINED),
+                count(ArenaPageStore::TAIL_EXTENT_FREED),
+            ),
+            (ROUNDS, ROUNDS, ROUNDS),
+            "fixture: the tail does not hold one parked, one drained and one freed record per \
+             round: {kinds:?}"
+        );
+
+        let target = h.fresh_store();
+        let v0 = target.replay_pending_visits();
+        assert!(target.restore(&armed).unwrap());
+        let visits = target.replay_pending_visits() - v0;
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 count test: replay visits = {visits}");
+        assert_eq!(target.pending_len(), P0, "the replayed log is not the log the tail describes");
+
+        // Anti-vacuity: every carried entry is visited at least once, so a counter that is not
+        // wired reads below this and cannot pass the bound by reading zero.
+        assert!(
+            visits >= carried as u64,
+            "the counter saw {visits} visits for a tail carrying {carried} entries: it is not wired"
+        );
+        let bound = 2 * (P0 + carried) as u64 + kinds.len() as u64;
+        assert!(
+            visits <= bound,
+            "replay visited {visits} pending-log entries for a tail of {} records carrying \
+             {carried} entries over a {P0}-entry log; allowed {bound}. A per-record scan of the \
+             log visits about {} x {P0}",
+            kinds.len(),
+            kinds.len()
+        );
+
+        // The tail was REPLAYED, not skipped (review F2). A store that replayed no record would
+        // pass every bound above, since it visits only the image's log, and its pending log would
+        // still be the image's original 64 entries. Memory holds entries 13..64 plus the 12
+        // re-parks, and a full image of memory is the independent reference.
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-visits-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint(&control).unwrap();
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            target.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from image + tail is not the map a full image of memory holds, so \
+             the visit count above was taken over a replay that skipped records"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// The same image and tail through the real writers, restored and compared byte for byte with
+    /// a full image of live memory.
+    ///
+    /// This passes BEFORE the replay index (`731a7fa`) and must still pass after it. That makes it
+    /// the differential for the rewrite: the index has to leave the log in the order, and with
+    /// the entries, that the per-record scans produced.
+    #[test]
+    fn a_mixed_tail_over_a_parked_image_replays_byte_identical_to_a_full_rewrite() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-mixed-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-replay-mixed-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        parked_image_then_mixed_tail(&h, &armed, 16, 6);
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "a parked image plus a tail of parked, drained, claimed and freed records does not \
+             restore to the map a full rewrite holds"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// Every rule the pending-log arms of `apply_tail_record` state, on one hand-built tail, against
+    /// a log derived BY HAND from those rules. The rules:
+    /// * PARKED skips a key already in the log (first wins), a key repeated inside the same record,
+    ///   and an entry naming a freed arena;
+    /// * a key removed and parked again goes to the END;
+    /// * REPLACED drops dead arenas. Since de-dup at push it also keeps only the FIRST entry for a
+    ///   key it carries twice, so no key reaches the log twice (`replace` is first-wins, and T6,
+    ///   `a_replaced_record_carrying_duplicates_replays_to_the_first_of_each`, pins it);
+    /// * DRAINED removes EVERY entry with a key, and a key that is absent is a no-op;
+    /// * EXTENT_FREED removes every entry of its arena, and later parks into it are skipped.
+    ///
+    /// The real writers never produce most of these shapes, which is exactly why they are built by
+    /// hand: an index that is right only for the shapes the writers happen to produce today is not
+    /// the per-record scan's equal. Passes at `731a7fa`; must pass after the index.
+    #[test]
+    fn replay_of_the_pending_log_keeps_every_rule_the_per_record_scans_had() {
+        let h = Harness::new();
+        let branches: Vec<BranchId> = (0..3)
+            .map(|_| h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id)
+            .collect();
+        let arenas: Vec<ArenaId> =
+            branches.iter().map(|b| h.store.arena_for(*b).unwrap()).collect();
+        let (a1, a2, a3) = (arenas[0], arenas[1], arenas[2]);
+        let owner = branches[0];
+        let dead = ArenaId(u32::MAX - 7);
+        let e = |page: PageId, arena: ArenaId| PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner,
+        };
+        let (x1, x2, x3) = (e(101, a1), e(102, a2), e(103, a1));
+        let (y1, w, v1, v2, u) = (e(201, a3), e(301, a2), e(401, a1), e(402, a2), e(501, a2));
+        // Unarmed store: this seeds memory only, which is what an image load leaves behind.
+        h.store.put_pending(vec![x1, x2, x3]).unwrap();
+
+        let live = h.store.live_page_count().unwrap();
+        let with_entries = |kind: u8, es: &[PendingFree]| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&(es.len() as u32).to_be_bytes());
+            for x in es {
+                ArenaPageStore::encode_pending_entry(&mut p, x);
+            }
+            p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+            ArenaPageStore::encode_tail_record(kind, &p)
+        };
+        let drained = |keys: &[(PageId, ArenaId)]| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for (page, arena) in keys {
+                p.extend_from_slice(&page.to_be_bytes());
+                p.extend_from_slice(&arena.0.to_be_bytes());
+            }
+            p.extend_from_slice(&0u32.to_be_bytes());
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PENDING_DRAINED, &p)
+        };
+        let (a2_start, a2_pages) = {
+            let st = h.store.state.lock().unwrap();
+            let ext = st.extents.get(&a2).expect("fixture: a2 is a live extent");
+            (ext.start_page, ext.page_count)
+        };
+        let freed_a2 = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&a2.0.to_be_bytes());
+            p.extend_from_slice(&a2_start.to_be_bytes());
+            p.extend_from_slice(&a2_pages.to_be_bytes());
+            p.extend_from_slice(&live.to_be_bytes());
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_EXTENT_FREED, &p)
+        };
+        let key = |x: &PendingFree| (x.page_id, x.arena_id);
+
+        let parked = ArenaPageStore::TAIL_PAGES_PARKED;
+        let replaced = ArenaPageStore::TAIL_PENDING_REPLACED;
+        // Two replays, with the log checked BETWEEN them. The REPLACED record in the second half
+        // overwrites everything the first half did, so a single check at the end cannot see a
+        // first-wins or in-record de-dup failure: fresh-context review F1 traced a `contains`
+        // that always answered "absent" passing the one-replay version of this test.
+        let replay = |tail: &[u8]| {
+            let applied = h.store.replay_tail(tail).unwrap();
+            assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+            h.store.state.lock().unwrap().pending.clone()
+        };
+
+        let mut first = Vec::new();
+        // [x1 x2 x3] -> x2 already there, y1 twice in one record, one dead arena -> [x1 x2 x3 y1]
+        first.extend(with_entries(parked, &[x2, y1, y1, e(901, dead)]));
+        // x1 goes, an absent key is a no-op -> [x2 x3 y1]
+        first.extend(drained(&[key(&x1), (999, a3)]));
+        // x1 again goes to the END -> [x2 x3 y1 x1]
+        first.extend(with_entries(parked, &[x1]));
+        assert_eq!(
+            replay(&first),
+            vec![x2, x3, y1, x1],
+            "first-wins, in-record de-dup, the dead-arena skip or re-park-goes-last is broken"
+        );
+
+        let mut second = Vec::new();
+        // wholesale: dead arena dropped, and x3's second copy dropped first-wins -> [x3 w]
+        second.extend(with_entries(replaced, &[x3, x3, w, e(902, dead)]));
+        // x3 goes -> [w]. (Before de-dup at push the log held x3 twice here, and both went.)
+        second.extend(drained(&[key(&x3)]));
+        // -> [w v1 v2]
+        second.extend(with_entries(parked, &[v1, v2]));
+        // v1 is live, in an arena that stays live: first wins, so nothing changes -> [w v1 v2]
+        second.extend(with_entries(parked, &[v1]));
+        // a2 freed: w and v2 go, and a2 is dead from here on -> [v1]
+        second.extend(freed_a2);
+        // a park into the freed arena is skipped; one into a live arena lands -> [v1 x3]
+        second.extend(with_entries(parked, &[u, x3]));
+        assert_eq!(
+            replay(&second),
+            vec![v1, x3],
+            "the replayed pending log breaks a rule the per-record scans kept (order, first-wins, \
+             dead-arena skip, duplicate handling)"
+        );
+    }
+
+    /// **The FIRST entry for a key wins, which is the rule the PARKED arm's comment gives, pinned with
+    /// entries that can be told apart.** A resumed reap re-parks a page with the same `birth_epoch`
+    /// and owner but, possibly, a different `free_epoch`. `drain_pending` decides on the first entry
+    /// it meets, so replay must keep that one, not the later one.
+    ///
+    /// The rules test above re-parks an entry byte-identical to the one in the log, so it pins "no
+    /// duplicate" and not WHICH copy survives: a last-wins index passes it (lead review F1, mutant
+    /// MC6). Here the two entries differ in `free_epoch` only.
+    ///
+    /// Passes at `731a7fa` (the per-record `HashSet` kept the first) and must pass with the index.
+    #[test]
+    fn a_repark_of_a_key_already_in_the_log_keeps_the_first_entry() {
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let parked = |free: u64| PendingFree {
+            page_id: 11,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(free),
+            owner,
+        };
+        let (first, again) = (parked(2), parked(5));
+        let live = h.store.live_page_count().unwrap();
+        let record = |e: &PendingFree| {
+            let mut p = live.to_be_bytes().to_vec();
+            p.extend_from_slice(&1u32.to_be_bytes());
+            ArenaPageStore::encode_pending_entry(&mut p, e);
+            p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+            ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PAGES_PARKED, &p)
+        };
+        let mut tail = record(&first);
+        tail.extend(record(&again));
+
+        let applied = h.store.replay_tail(&tail).unwrap();
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        let log = h.store.state.lock().unwrap().pending.clone();
+        assert_eq!(
+            log,
+            vec![first],
+            "a re-park of a key already in the log did not keep the FIRST entry (free_epoch 2)"
+        );
+    }
+
+    /// **A clean open does no work on the pending-free log** (lead review F4). The CLI's clean exit
+    /// writes a full image (`store.checkpoint` in `src/cli/cli.rs`), so the next open replays an
+    /// EMPTY tail. The per-record code did nothing there. An index built up front would cost two
+    /// passes over the log on every open, for nothing.
+    #[test]
+    fn a_clean_open_does_no_work_on_the_pending_log() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-clean-open-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..16 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), 16, "fixture: the retire parked 16 pages");
+        h.store.checkpoint(&armed).unwrap();
+        assert!(ArenaPageStore::tail_kinds(&armed).is_empty(), "fixture: the tail is not empty");
+
+        let target = h.fresh_store();
+        let v0 = target.replay_pending_visits();
+        assert!(target.restore(&armed).unwrap());
+        assert_eq!(target.pending_len(), 16, "the image's pending log did not come back");
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 clean open: replay visits = {}", target.replay_pending_visits() - v0);
+        assert_eq!(
+            target.replay_pending_visits() - v0,
+            0,
+            "replaying an EMPTY tail still walked the pending log"
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    // ---- D183 de-dup at push: one entry per (page, arena), in memory and in the file ----------------
+    //
+    // Lane AMENDMENT 2, from `frontier/catalog_root_and_park_adversary.md` §B1-B5 @ `a4b48ea`. Hardening,
+    // not a live double free (the adversary refuted that, B2): a page parked twice is decided twice.
+
+    /// A parent with `pages` pages, a live child that pins every one of them, and the parent published
+    /// `Reaping`, which is what `reap` does before it retires anything. Returns the record `reap` reads.
+    fn reaping_parent_pinned_by_a_child(h: &Harness, pages: usize) -> BranchRecord {
+        use crate::branch::types::BranchState;
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..pages {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        assert_eq!(rec.state, BranchState::Reaping, "fixture: the parent is not Reaping");
+        rec
+    }
+
+    /// The pending-free log in order. Reads it through `iter`, so it means the same thing whatever
+    /// type holds the log.
+    fn pending_of(store: &ArenaPageStore) -> Vec<PendingFree> {
+        store.state.lock().unwrap().pending.iter().copied().collect()
+    }
+
+    fn free_epochs(store: &ArenaPageStore) -> Vec<Epoch> {
+        pending_of(store).iter().map(|p| p.free_epoch).collect()
+    }
+
+    /// ⭐ **A resumed reap parks each page ONCE, in memory and in the file.**
+    ///
+    /// `reap` publishes `Reaping`, then `retire_arenas_by_rule` parks every pinned page. If the
+    /// `Reaping -> Reaped` flip never happens (an `Err` after the retire, or a crash), the resumed `reap`
+    /// draws a NEW free epoch and retires again. `allocated_pages` still lists a parked page, because
+    /// parking does not recycle it, so at `bfe55a8` every page was parked a second time. Memory held
+    /// `[K(e1), K(e2)]` while the tail replayed first-wins to `[K(e1)]`, so the store and its own file
+    /// disagreed.
+    ///
+    /// This is the in-process resume: a second `reap` of a branch still `Reaping`, as a `seal` retry does.
+    /// The restart resume is the next test.
+    #[test]
+    fn a_resumed_reap_parks_each_page_once_in_memory_and_in_the_replayed_file() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-resumed-reap-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-resumed-reap-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        // An image of the fixture, so the tail below holds the two retires and nothing else.
+        h.store.checkpoint(&armed).unwrap();
+
+        let e1 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e1).unwrap();
+        assert_eq!(
+            free_epochs(&h.store),
+            vec![e1; PAGES],
+            "fixture: the first retire did not park every page"
+        );
+        let e2 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e2).unwrap();
+        assert_eq!(
+            free_epochs(&h.store),
+            vec![e1; PAGES],
+            "the resumed retire parked pages that were already pending (the copies free at {e2:?}); \
+             the first entry for a page must stay the only one"
+        );
+
+        // Ask the artifact: each retire wrote its record, so the replay has the second one to apply.
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed),
+            vec![ArenaPageStore::TAIL_PAGES_PARKED; 2],
+            "fixture: the tail does not hold exactly one parked record per retire"
+        );
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        assert_eq!(free_epochs(&from_tail), vec![e1; PAGES], "fixture: the replay is not first-wins");
+        h.store.checkpoint(&control).unwrap();
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from its own file is not the store that wrote it"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// The resume the adversary traced first (B1 steps 1-6): the retire parks, the process dies before
+    /// the `Reaped` flip, and the next open restores the file, re-arms it (`reopen_from_checkpoint` ends
+    /// in `checkpoint_to`) and resumes the reap with a new free epoch. At `bfe55a8` the resumed store held
+    /// every page twice, and so did every image it wrote.
+    #[test]
+    fn a_reap_resumed_after_a_restart_parks_each_page_once() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-restart-resume-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        let e1 = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, e1).unwrap();
+
+        // The flip to `Reaped` never happened. A new process opens the file.
+        let resumed = h.fresh_store();
+        assert!(resumed.restore(&armed).unwrap());
+        resumed.checkpoint_to(armed.clone());
+        assert_eq!(
+            free_epochs(&resumed),
+            vec![e1; PAGES],
+            "fixture: the first retire's parks are not in the file"
+        );
+
+        resumed.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(
+            free_epochs(&resumed),
+            vec![e1; PAGES],
+            "the reap resumed after a restart parked every page a second time"
+        );
+        let reopened = h.fresh_store();
+        assert!(reopened.restore(&armed).unwrap());
+        assert_eq!(
+            free_epochs(&reopened),
+            vec![e1; PAGES],
+            "the file the resumed reap wrote parks every page a second time"
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// The crash-free shape (B1): the owner freed a page while it was live, and a live child pinned it,
+    /// so `free_page` parked it at e_f. Reaping the owner on the slow path then decided that page again.
+    /// Still pinned, it was parked a second time at `bfe55a8`.
+    #[test]
+    fn a_retire_does_not_repark_a_page_its_owner_already_parked() {
+        use crate::branch::types::BranchState;
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let pages: Vec<PageId> = (0..PAGES)
+            .map(|_| h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap())
+            .collect();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let e_f = h.catalog.next_epoch();
+        h.store.free_page(pages[0], e_f).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: the child pins the freed page, so it parks");
+
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        let log = pending_of(&h.store);
+        assert_eq!(log.len(), PAGES, "the retire parked a page its owner had already parked: {log:?}");
+        let p0: Vec<Epoch> =
+            log.iter().filter(|p| p.page_id == pages[0]).map(|p| p.free_epoch).collect();
+        assert_eq!(p0, vec![e_f], "the page freed first must keep the entry its own free made");
+    }
+
+    /// **A page already pending is decided by its entry, not again by the retire.** At `bfe55a8` the
+    /// retire RELEASED such a page when it found it unpinned, while its entry stayed in the log: one page
+    /// both pending and recycled. B2 shows the second release is a no-op today; B3 says what makes it
+    /// one, and that the statement lock is part of it.
+    ///
+    /// Shape: a live child `c0` forked BEFORE the pages are born, so it pins none of them and keeps the
+    /// parent's reap on the slow path. Child `c` pins them all, so `free_page(p0)` parks p0. `c` is then
+    /// flipped `Reaped` with no drain behind it, which is exactly what a drain refused by an unreadable
+    /// owner record leaves (D124: it puts the entry back and returns `Err`). The retire finds all four
+    /// pages unpinned. It releases three; p0 belongs to its entry, and the next drain releases it.
+    #[test]
+    fn a_retire_leaves_a_page_already_pending_to_its_entry() {
+        use crate::branch::types::BranchState;
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let birth = h.catalog.next_epoch();
+        let pages: Vec<PageId> = (0..PAGES)
+            .map(|_| h.store.alloc_for(parent.branch_id, PageType::Heap, birth).unwrap())
+            .collect();
+        let c = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let e_f = h.catalog.next_epoch();
+        h.store.free_page(pages[0], e_f).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: c pins the freed page, so it must be parked");
+        h.catalog.set_state(c.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        h.catalog.set_state(c.branch_id, BranchState::Reaping, BranchState::Reaped).unwrap();
+
+        h.catalog.set_state(parent.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        let (log, both) = {
+            let st = h.store.state.lock().unwrap();
+            let log: Vec<PendingFree> = st.pending.iter().copied().collect();
+            let both: Vec<PageId> = log
+                .iter()
+                .filter(|p| st.recycled.get(&p.arena_id).is_some_and(|r| r.contains(&p.page_id)))
+                .map(|p| p.page_id)
+                .collect();
+            (log, both)
+        };
+        assert_eq!(
+            both,
+            Vec::<PageId>::new(),
+            "the retire released a page that was still in the pending-free log: it is now recycled \
+             AND parked, and the next drain releases it a second time"
+        );
+        assert_eq!(released, (PAGES - 1) as u32, "fixture: the three pages nobody freed are unpinned");
+        assert_eq!(
+            log.iter().map(|p| (p.page_id, p.free_epoch)).collect::<Vec<_>>(),
+            vec![(pages[0], e_f)],
+            "the pending page's own entry must be the one that decides it"
+        );
+    }
+
+    /// The drain's window (B1, the adversary's in-process shape seen from the drain): a drain takes the
+    /// whole log, the owner's retire runs again before the drain puts anything back, and the drain then
+    /// puts back every entry it found still pinned. At `bfe55a8` the log held every page twice. Today the
+    /// statement lock keeps a retire out of that window; the log must not depend on it.
+    #[test]
+    fn a_drain_that_meets_a_park_of_a_key_it_took_restates_the_whole_log() {
+        const PAGES: usize = 4;
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-drain-window-{}.bin", std::process::id()));
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-drain-window-c-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint_to(armed.clone());
+        let rec = reaping_parent_pinned_by_a_child(&h, PAGES);
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), PAGES, "fixture: the drain took nothing");
+        // The drain holds every entry, so nothing is pending and every page parks again.
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), PAGES, "fixture: the retire did not park into the drained log");
+        h.store.put_pending(taken).unwrap();
+        assert_eq!(
+            h.store.pending_len(),
+            PAGES,
+            "the drain put back entries for pages the retire had just parked again"
+        );
+
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(&armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "the store restored from its own file is not the store that wrote it"
+        );
+        let _ = std::fs::remove_file(&armed);
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// A REPLACED record written before de-dup at push can carry a key twice, because it restated a
+    /// memory log that held one twice. Replayed, the log keeps the FIRST entry for each key, the rule
+    /// every push now keeps, so a store opened from an old file holds what a store running today would.
+    #[test]
+    fn a_replaced_record_carrying_duplicates_replays_to_the_first_of_each() {
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let entry = |page: PageId, free: u64| PendingFree {
+            page_id: page,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(free),
+            owner,
+        };
+        let (x, w, x_again) = (entry(11, 2), entry(12, 2), entry(11, 5));
+        let mut p = h.store.live_page_count().unwrap().to_be_bytes().to_vec();
+        p.extend_from_slice(&3u32.to_be_bytes());
+        for e in [&x, &w, &x_again] {
+            ArenaPageStore::encode_pending_entry(&mut p, e);
+        }
+        p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+        let tail = ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PENDING_REPLACED, &p);
+
+        let applied = h.store.replay_tail(&tail).unwrap();
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        assert_eq!(
+            pending_of(&h.store),
+            vec![x, w],
+            "a REPLACED record's second entry for a key survived the replay"
+        );
+    }
+
+    /// **Parking a page that is already pending changes nothing, so it owes the file nothing.** An
+    /// unrecorded push bumps `pending_version`, which makes the next persist a full image rewrite. A push
+    /// that skipped must not: the same rule `take_pending` keeps for a drain that took nothing.
+    #[test]
+    fn a_second_park_of_a_page_already_pending_changes_nothing_and_owes_no_rewrite() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-second-park-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let page = h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), 1, "fixture: the child pins the page, so it must be parked");
+        // A claim brings the file level with memory again: that park forced it to rewrite.
+        let c = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(c.branch_id).unwrap();
+
+        let (r0, a0) = h.store.persist_counters();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+        let d = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(d.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.pending_len(), 1, "a second park of a page already pending added an entry");
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the claim after a park that changed nothing rewrote the image ({} rewrites, {} appends)",
+            r1 - r0,
+            a1 - a0
+        );
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// **The PARKED arm's lookup is what keeps a re-park from costing a slot** (lane AMENDMENT 3, review
+    /// F2). Since de-dup at push, `finish` builds the log first-wins, so the lookup no longer decides the
+    /// log's CONTENTS: a PARKED arm that pushed every entry would come back with the same log. What it
+    /// still decides is the cost: without it, every re-park of a key already pending takes a slot that
+    /// `finish` then walks. Resumed reaps written before the fix re-park whole branches this way.
+    ///
+    /// Accounting by hand from `PendingReplay`: indexing the one-entry log is 1 visit, each of the N
+    /// lookups is 1, and `finish` walks 1 slot. So `N + 2`. Pushing without the lookup costs `2N + 2`,
+    /// and a lookup that always answers "absent" costs `3N + 2`.
+    #[test]
+    fn a_repark_of_a_key_already_pending_costs_one_lookup_and_no_slot() {
+        const N: usize = 32;
+        let h = Harness::new();
+        let owner = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
+        let arena = h.store.arena_for(owner).unwrap();
+        let k = PendingFree {
+            page_id: 21,
+            arena_id: arena,
+            birth_epoch: Epoch(1),
+            free_epoch: Epoch(2),
+            owner,
+        };
+        // Unarmed store: this seeds memory only, which is what an image load leaves behind.
+        h.store.put_pending(vec![k]).unwrap();
+        let mut p = h.store.live_page_count().unwrap().to_be_bytes().to_vec();
+        p.extend_from_slice(&(N as u32).to_be_bytes());
+        for i in 0..N {
+            let again = PendingFree { free_epoch: Epoch(3 + i as u64), ..k };
+            ArenaPageStore::encode_pending_entry(&mut p, &again);
+        }
+        p.extend_from_slice(&0u32.to_be_bytes()); // no arena sections
+        let tail = ArenaPageStore::encode_tail_record(ArenaPageStore::TAIL_PAGES_PARKED, &p);
+
+        let v0 = h.store.replay_pending_visits();
+        let applied = h.store.replay_tail(&tail).unwrap();
+        let visits = h.store.replay_pending_visits() - v0;
+        // Printed on every run, so a PASSING run shows the number and not only the bound.
+        println!("D183 T8: replay visits = {visits}");
+        assert_eq!(applied as usize, tail.len(), "fixture: replay stopped before the end");
+        assert_eq!(pending_of(&h.store), vec![k], "a re-park of a key already pending changed the log");
+        assert!(visits >= N as u64, "the counter saw {visits} visits for {N} re-parks: it is not wired");
+        assert!(
+            visits <= N as u64 + 2,
+            "{N} re-parks of one key already pending cost {visits} visits; one lookup each plus the \
+             one-entry log is {}. Each re-park took a slot",
+            N + 2
+        );
+    }
+
+    // ---- D183: a drain that changed nothing writes nothing ----------------------------------
+
+    /// A parent with `pages` pages and a live child forked after them, retired by the interval
+    /// rule, so every page is PARKED by one `TAIL_PAGES_PARKED` record. That record also takes
+    /// every recycled-list mark outstanding at the time.
+    fn armed_with_parked_log(tag: &str, pages: usize) -> (Harness, std::path::PathBuf) {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-{}-{}.bin", std::process::id(), tag));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..pages {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(h.store.pending_len(), pages, "fixture: the retire parked {pages} pages");
+        (h, armed)
+    }
+
+    /// `image + tail` at `armed` restores byte-identical to a full image of live memory.
+    fn tail_matches_a_full_rewrite(h: &Harness, armed: &std::path::Path, tag: &str) {
+        let control = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-c-{}-{}.bin", std::process::id(), tag));
+        let _ = std::fs::remove_file(&control);
+        h.store.checkpoint(&control).unwrap();
+        let from_tail = h.fresh_store();
+        assert!(from_tail.restore(armed).unwrap());
+        let from_image = h.fresh_store();
+        assert!(from_image.restore(&control).unwrap());
+        assert_eq!(
+            from_tail.state_bytes(),
+            from_image.state_bytes(),
+            "{tag}: image + tail does not restore to what a full rewrite of memory holds"
+        );
+        let _ = std::fs::remove_file(&control);
+    }
+
+    /// ⭐ **A drain that released nothing writes no record, and still leaves the log LEVEL.**
+    ///
+    /// This is what `drain_pending_seeded` does on every reap while a live child pins the parked
+    /// pages: take the log, keep everything, put it back. The record for it named no removal and
+    /// no arena, so it cost one fsync per interior reap and one more record for replay to walk.
+    ///
+    /// The record's one durable effect was to discharge the take's `pending_version` bump. The
+    /// elision must make that move itself, or the NEXT record of any kind would find the log
+    /// dirty and rewrite the whole image. That is the second assertion. Its mutant (skip the
+    /// record, forget the move) turns `(0, 1)` into `(1, 0)`.
+    #[test]
+    fn a_drain_that_released_nothing_writes_no_record_and_leaves_the_log_level() {
+        let (h, armed) = armed_with_parked_log("nothing", 4);
+        let kinds0 = ArenaPageStore::tail_kinds(&armed);
+        let (r0, a0) = h.store.persist_counters();
+        let e0 = h.store.elided_drains();
+
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), 4, "fixture: the take did not see the parked entries");
+        h.store.put_pending(taken).unwrap();
+
+        assert_eq!(
+            h.store.elided_drains(),
+            e0 + 1,
+            "the drain that released nothing was not elided (anti-vacuity: without this, the two \
+             assertions below also pass for a store that never reached the elision)"
+        );
+        assert_eq!(
+            h.store.persist_counters(),
+            (r0, a0),
+            "a drain that released nothing still persisted something"
+        );
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed),
+            kinds0,
+            "a drain that released nothing still wrote a record"
+        );
+
+        // The log is level: the next record APPENDS.
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        h.store.arena_for(spare.branch_id).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "the claim after an elided drain did not simply append: the take's pending_version bump \
+             was never discharged, so every elision now costs a full image rewrite later"
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "nothing");
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// An elision stands in for an APPEND. It must never swallow a REWRITE that was already owed.
+    ///
+    /// Here a recycled page is handed out again first, which sets `recycled_reissued`. Only a full
+    /// image rewrite can carry that, because no record kind can say "this recycled page is live
+    /// again", and until it lands a crash would restore an extent that looks empty while it holds
+    /// a live page. The drain that follows releases nothing and owes no arena, so it would be
+    /// elided if the elision ignored what `persist_delta_locked` would have done. It must rewrite.
+    #[test]
+    fn a_drain_with_nothing_to_say_still_pays_a_rewrite_that_was_owed() {
+        let h = Harness::new_with(true);
+        let armed = std::env::temp_dir()
+            .join(format!("ferro-arena-d183-elide-owed-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&armed);
+        h.store.checkpoint_to(armed.clone());
+
+        // A recycled page, not yet reused.
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        h.store.release_page(page, arena);
+        // The parked log. Its record also takes the recycled-list mark `release_page` left, so
+        // the drain below owes no arena.
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        for _ in 0..3 {
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert!(h.store.pending_len() > 0, "fixture: nothing was parked");
+
+        // The reuse. From here a rewrite is owed.
+        let reused = h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(2)).unwrap();
+        assert_eq!(reused, page, "fixture: the allocation did not come from the recycled list");
+
+        let (r0, a0) = h.store.persist_counters();
+        let e0 = h.store.elided_drains();
+        let taken = h.store.take_pending();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.elided_drains(), e0, "an owed rewrite was elided");
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (1, 0),
+            "the drain did not pay the rewrite a reissued recycled page owed"
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "owed");
+        let _ = std::fs::remove_file(&armed);
+    }
+
+    /// A drain that released nothing but owes a recycled list still writes its record: an
+    /// `n = 0` difference record carrying one arena section.
+    ///
+    /// The page released outside the drain marks its arena and persists nothing, so the drain's
+    /// record is the first thing that can carry that list to the file. Eliding it for having "no
+    /// removal" would leave the durable recycled list one page short: a leak of that page after a
+    /// crash, and a restore that disagrees with memory.
+    #[test]
+    fn a_drain_that_released_nothing_still_writes_the_recycled_lists_it_owes() {
+        let (h, armed) = armed_with_parked_log("owes", 4);
+        // Released outside any drain: marked dirty, no record.
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let page = h.store.alloc_in_arena(arena, PageType::Heap, Epoch(1)).unwrap();
+        let (r0, a0) = h.store.persist_counters();
+        h.store.release_page(page, arena);
+        assert_eq!(h.store.persist_counters(), (r0, a0), "fixture: release_page persisted by itself");
+
+        let e0 = h.store.elided_drains();
+        let taken = h.store.take_pending();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        assert_eq!(h.store.elided_drains(), e0, "a drain owing a recycled list was elided");
+        assert_eq!((r1 - r0, a1 - a0), (0, 1), "the drain owing a recycled list did not append");
+        assert_eq!(
+            ArenaPageStore::tail_kinds(&armed).last().copied(),
+            Some(ArenaPageStore::TAIL_PENDING_DRAINED),
+            "the drain wrote {:?}, not its difference record",
+            ArenaPageStore::tail_kinds(&armed)
+        );
+        tail_matches_a_full_rewrite(&h, &armed, "owes");
+        let _ = std::fs::remove_file(&armed);
+    }
+
     #[test]
     fn checkpoint_round_trips_through_a_file() {
         let h = Harness::new();
@@ -3995,8 +6612,8 @@ mod tests {
     /// **D85 diagnostic.** Is `next_free` understated after a crash, and does `extent_is_empty`
     /// then report an extent that still holds pages as empty?
     ///
-    /// `alloc_for` advances `ext.next_free` (`arena.rs`) and does NOT persist. The four
-    /// `persist_if_configured` sites are all off the page path, so a crash can leave the image's
+    /// `alloc_for` advances `ext.next_free` (`arena.rs`) and does NOT persist. The persist sites are
+    /// all off the page path, so a crash can leave the image's
     /// `next_free` behind by up to `ARENA_EXTENT_PAGES` pages. `load_state` knows and says so, and
     /// answers it on the ALLOCATION side by never resuming a restored extent. This asks the
     /// COLLECTION side's question instead: `extent_is_empty` is `recycled >= ext.next_free`.
@@ -4640,12 +7257,43 @@ mod tests {
         let path = arm(&h);
         claim(&h);
         claim(&h);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(0x7f, b"from the future"));
+        let base = std::fs::read(&path).unwrap();
 
-        let restored = h.fresh_store();
-        let err = restored.load_file(&bytes).expect_err("an unknown kind must be refused");
-        assert!(format!("{err}").contains("newer build"), "unhelpful refusal: {err}");
+        // **D183 — the kind that matters is the one JUST PAST the allowlist, not a distant one.**
+        // `0x7f` alone leaves the boundary untested: it is the same refusal whatever the allowlist
+        // holds, so it would keep passing if a future kind were added to the constant and never
+        // given a match arm. The first unknown kind is the one a real downgrade meets — a build
+        // predating this row meets kind 3, and the build after the next row meets one past the end
+        // of today's list. Both spellings are asserted, and `max + 1` is computed from the
+        // allowlist so it tracks it instead of going stale.
+        let past_the_end = ArenaPageStore::KNOWN_TAIL_KINDS.iter().copied().max().unwrap() + 1;
+        for kind in [0x7f, past_the_end] {
+            let mut bytes = base.clone();
+            bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(kind, b"from the future"));
+            let restored = h.fresh_store();
+            let err = restored
+                .load_file(&bytes)
+                .expect_err(&format!("kind {kind} must be refused"));
+            assert!(format!("{err}").contains("newer build"), "unhelpful refusal: {err}");
+        }
+
+        // And every kind the allowlist DOES name must reach a match arm rather than the
+        // "reached apply after the kind allowlist" refusal — a constant added without an arm
+        // fails closed, which is right, but it must not be how a shipped kind behaves.
+        for kind in ArenaPageStore::KNOWN_TAIL_KINDS.iter().copied() {
+            let mut bytes = base.clone();
+            // A deliberately truncated payload: a known kind fails on its own parse, never on the
+            // allowlist. What is asserted is WHICH refusal it is.
+            bytes.extend_from_slice(&ArenaPageStore::encode_tail_record(kind, b""));
+            let restored = h.fresh_store();
+            if let Err(err) = restored.load_file(&bytes) {
+                let m = format!("{err}");
+                assert!(
+                    !m.contains("newer build") && !m.contains("reached apply"),
+                    "kind {kind} is in the allowlist but has no match arm: {m}"
+                );
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4798,5 +7446,733 @@ mod tests {
             claim(&h);
         }
         assert_eq!(h.store.persist_counters(), (0, 0));
+    }
+}
+
+/// **D183 ADVERSARY — an attack on what is now
+/// `d183_what_the_two_reclamation_store_methods_cost_per_call`, and was called
+/// `d183_an_interior_reap_rewrites_the_whole_image_while_a_leaf_reap_appends` when this module
+/// was written. The rename is this module's doing: the old name asserted the thing the attack
+/// refuted.**
+///
+/// The test under attack never calls `Reaper::reap`. It hand-rolls the two sides of
+/// `reaper.rs:679` and counts those. Everything here exists to ask whether that hand-rolled
+/// loop is the thing production runs, whether the counters can be made to move at all, and
+/// whether the slope is a property of BRANCHES or of the fixture's shape.
+///
+/// ⭐ **THESE BANDS PINNED A WALL AND NOW PIN THE FIX. They were written against `630afaa` and
+/// every one of them has been RE-STATED, not deleted.** The attack succeeded: it refuted the
+/// claim that a reap costs one rewrite per interior branch and zero for a leaf, and the numbers
+/// it established — measured through `TwoTierReaper::reap`, the function production calls — are
+/// the baseline the fix is measured against. They are kept in each test's doc band, because a
+/// before/after with only the after is a claim rather than a measurement.
+///
+/// **One invariant runs through all of them and it is what the re-statements are built on: the
+/// NUMBER of durable records per reap did not change. Only the KIND did.** A reap still makes
+/// exactly the same number of writes to `<db>.arena`; each one used to be a full 48·L-byte image
+/// and is now a bounded appended record. Every band therefore asserts the unchanged total AND the
+/// inverted split, so a "fix" that simply stopped persisting — which is data loss, not a fix —
+/// fails the first half while satisfying the second.
+///
+/// ⚠ **On branch `d183-drain-elide` that invariant no longer holds as written, and that is
+/// deliberate.** A drain that released nothing and owes no recycled list now writes NO record
+/// (see `put_pending`), so an interior reap whose live child pins every parked page makes ONE
+/// durable write where it made two. The total that stays invariant is records PLUS elided drains,
+/// and `ArenaPageStore::elided_drains` counts the second term, so "stopped persisting" is still
+/// told apart from "had nothing to persist". The bands in `d183adv_a1_what_the_real_reaper_costs`,
+/// `d183adv_a5_the_interior_cost_is_no_longer_a_class` and
+/// `d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending` still assert the OLD
+/// total. Re-stating them is a test edit, and it waits on a decision
+/// (`frontier/lane_d183_tail_replay.md` §5 in artie-research).
+#[cfg(test)]
+mod d183_adversary {
+    use super::harness::Harness;
+    use super::*;
+    use crate::branch::types::LeaseDeadline;
+    use crate::branch::{Reaper, TwoTierReaper};
+
+    /// Arm the store at a private path and hand back the path so the caller can unlink it.
+    fn armed(tag: &str, n: usize) -> (Harness, std::path::PathBuf) {
+        let h = Harness::new_with(true);
+        let path = std::env::temp_dir()
+            .join(format!("ferro-d183adv-{}-{}-{}.bin", std::process::id(), tag, n));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+        (h, path)
+    }
+
+    /// Build `branches` branches under TRUNK, each with `pages` pages, each optionally forked
+    /// once AFTER its pages were born (which is what makes the interval rule park them).
+    ///
+    /// Returns the branch handles and the total number of arenas they own — the fixture's own
+    /// shape, read from the records rather than assumed.
+    fn build(h: &Harness, branches: usize, pages: usize, interior: bool) -> (Vec<BranchId>, usize) {
+        let mut ids = Vec::new();
+        let mut arenas = 0usize;
+        for _ in 0..branches {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            for _ in 0..pages {
+                h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+            }
+            if interior {
+                h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            }
+            arenas += h.catalog.get_raw(b.branch_id.id).unwrap().arenas.len();
+            ids.push(b.branch_id);
+        }
+        (ids, arenas)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 1 + 5. Does the fixture reach the code under test, and does the REAL reaper agree?
+    // ---------------------------------------------------------------------------------------
+
+    /// The predicate the claim is about, READ, for every branch, on both arms.
+    ///
+    /// The test under attack asserts nothing about `has_live_children`; it picks a side of
+    /// `reaper.rs:679` itself and then reports the cost of the side it picked. If the shipped
+    /// catalog answered `false` for the "interior" fixture, the slow path would never run in
+    /// production and the measured number would be a property of a call nobody makes.
+    #[test]
+    fn d183adv_a1_the_predicate_is_what_the_fixture_assumes() {
+        for (interior, want) in [(false, false), (true, true)] {
+            let (h, path) = armed("a1", interior as usize);
+            let (ids, arenas) = build(&h, 8, 4, interior);
+            assert!(arenas > 0, "fixture: no arenas at all");
+            for id in &ids {
+                let got = h.catalog.has_live_children(id.id).unwrap();
+                assert_eq!(
+                    got, want,
+                    "interior={interior}: has_live_children({}) = {got}, fixture assumes {want}",
+                    id.id
+                );
+            }
+            println!(
+                "A1 interior={interior}: has_live_children = {want} for all 8 branches, \
+                 {arenas} arenas total ({} per branch)",
+                arenas / 8
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The same four cells, measured through `TwoTierReaper::reap` instead of a hand-rolled
+    /// copy of two of its lines.
+    ///
+    /// `reap` is not `retire_arenas_by_rule`. It also runs `drain_pending_seeded`, whose
+    /// `take_pending` bumped `pending_version` UNCONDITIONALLY at `630afaa` and whose
+    /// `put_pending` was another `persist_if_configured` — a function this row deleted. Both are
+    /// inside the per-branch reap, so both belong in any number described as "what a reap costs",
+    /// which is the whole finding of this module.
+    #[test]
+    fn d183adv_a1_what_the_real_reaper_costs() {
+        fn run(branches: usize, interior: bool) -> (u64, u64, u32) {
+            let (h, path) = armed("a1r", branches * 2 + interior as usize);
+            let (ids, _) = build(&h, branches, 4, interior);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            let mut freed = 0u32;
+            for id in ids {
+                freed += reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, freed)
+        }
+
+        let cells = [
+            ("LEAF      8", run(8, false)),
+            ("LEAF     16", run(16, false)),
+            ("INTERIOR  8", run(8, true)),
+            ("INTERIOR 16", run(16, true)),
+        ];
+        println!("A1 REAL `Reaper::reap` -- (full rewrites, delta appends, pages freed)");
+        for (label, (r, a, f)) in cells {
+            println!("  {label}: rewrites={r:3} appends={a:3} pages_freed={f:3}");
+        }
+
+        // Anti-vacuity: an arm that reaped nothing satisfies every shape assertion. The LEAF
+        // arm must return pages; the INTERIOR arm returns NONE (every page is parked for the
+        // live child), so it is checked separately, below, by what it parked.
+        assert!(cells[0].1 .2 > 0 && cells[1].1 .2 > 0, "the leaf arm freed no pages at all");
+        assert_eq!(
+            cells[2].1 .2, 0,
+            "an interior reap returned pages -- the fixture is not parking them"
+        );
+
+        let leaf_slope = cells[1].1 .0 as i64 - cells[0].1 .0 as i64;
+        let int_slope = cells[3].1 .0 as i64 - cells[2].1 .0 as i64;
+        println!("  rewrite slope over 8 more branches: LEAF={leaf_slope}, INTERIOR={int_slope}");
+
+        // ⛔ **THE REFUTATION THIS TEST WAS WRITTEN FOR, AND THE FIX THAT ANSWERED IT.**
+        //
+        // The claim under attack was "one full image rewrite per INTERIOR branch reaped, zero for
+        // a leaf". Through `Reaper::reap` both halves were wrong. Measured at `630afaa`:
+        //
+        //     LEAF      8 -> rewrites  7, appends 17      INTERIOR  8 -> rewrites 16, appends  0
+        //     LEAF     16 -> rewrites 15, appends 33      INTERIOR 16 -> rewrites 32, appends  0
+        //
+        // i.e. interior slope 2.0 per branch and leaf slope 1.0 per branch, not 1.0 and 0.0. The
+        // leaf cost was `take_pending` bumping `pending_version` on an EMPTY log, which forced
+        // the next reap's first `free_arena` into a full rewrite.
+        //
+        // Measured on this branch, same fixture, same instrument:
+        //
+        //     LEAF      8 -> rewrites  0, appends 24      INTERIOR  8 -> rewrites  0, appends 16
+        //     LEAF     16 -> rewrites  0, appends 48      INTERIOR 16 -> rewrites  1, appends 31
+        //
+        // ⚠ The assertions below are NOT those numbers. The two that are exact are the ones that
+        // did not move — the record TOTALS — because they are what makes "the reap still persists
+        // as often as it did" separable from "it persists more cheaply". The rest is stated as a
+        // shape, so that a compaction landing in a different place does not fail a green run.
+
+        // UNCHANGED, BEFORE AND AFTER: one durable record per arena on the leaf path, and two per
+        // branch on the interior path (the reap's record, then the drain's). A reap that stopped
+        // persisting would satisfy every slope assertion below and fail these.
+        assert_eq!(cells[0].1 .0 + cells[0].1 .1, 24, "leaf 8 records != 24 arenas");
+        assert_eq!(cells[1].1 .0 + cells[1].1 .1, 48, "leaf 16 records != 48 arenas");
+        assert_eq!(cells[2].1 .0 + cells[2].1 .1, 16, "interior 8 records != 2 per branch");
+        assert_eq!(cells[3].1 .0 + cells[3].1 .1, 32, "interior 16 records != 2 per branch");
+
+        // THE INVERSION. The leaf arm's rewrites were 1.0 per branch and are now flat at zero —
+        // exact, because `take_pending`'s empty-log bump was the whole of that cost and nothing
+        // in this fixture can reach `compact_threshold` at these sizes.
+        assert_eq!(
+            (cells[0].1 .0, cells[1].1 .0, leaf_slope),
+            (0, 0, 0),
+            "the leaf arm still pays full image rewrites: 8->{}, 16->{}",
+            cells[0].1 .0,
+            cells[1].1 .0
+        );
+        // The interior arm's rewrites were 2.0 per branch with appends structurally impossible.
+        // Now the growth must land in the APPENDS; what rewrites remain are compactions, which
+        // `d183adv_a5_the_interior_cost_is_no_longer_a_class` measures over a real size axis.
+        assert!(
+            int_slope < cells[3].1 .1 as i64 - cells[2].1 .1 as i64,
+            "interior rewrites did not stop tracking branches: rewrites +{int_slope} against \
+             appends +{}",
+            cells[3].1 .1 as i64 - cells[2].1 .1 as i64
+        );
+    }
+
+    /// ⭐ **Is the interior cost still a CLASS, or only a smaller constant?**
+    ///
+    /// This is the question two sizes cannot answer and the reason it gets its own test. A single
+    /// before/after pair moves whether the fix removed a quadratic or merely divided it.
+    ///
+    /// The history, all three points measured with the same instrument on the same fixture:
+    ///
+    /// | | 8 | 16 | 32 | 64 | 128 | rewrites/branch |
+    /// |---|---|---|---|---|---|---|
+    /// | `630afaa` | 16 | 32 | — | — | — | **2.0, flat** |
+    /// | after the first two record kinds | 1 | 5 | 16 | 38 | 74 | **0.58, flat** |
+    /// | after `TAIL_PENDING_DRAINED` | 0 | 1 | 1 | 2 | 3 | **0.062 → 0.023, falling** |
+    ///
+    /// The middle row is the one worth keeping: replacing the two `persist_if_configured` calls
+    /// with records made the constant four times better and left the CLASS untouched, because
+    /// `TAIL_PENDING_REPLACED` restates the whole pending log and the log grows with the branch
+    /// count. Only describing a drain by DIFFERENCE removed the quadratic.
+    ///
+    /// The assertion is therefore about the ratio between the ends of the axis, not about any
+    /// single cell: a per-branch cost that does not fall is a class, whatever its constant.
+    #[test]
+    fn d183adv_a5_the_interior_cost_is_no_longer_a_class() {
+        fn run(branches: usize) -> (u64, u64) {
+            let (h, path) = armed("a5", branches);
+            let (ids, _) = build(&h, branches, 4, true);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+        println!("A5 INTERIOR cost against branches, through the REAL reaper:");
+        let mut rows = Vec::new();
+        for n in [8usize, 16, 32, 64, 128] {
+            let (r, a) = run(n);
+            println!(
+                "  branches={n:4}: rewrites={r:4} appends={a:4}  rewrites/branch={:.3}  \
+                 records/branch={:.3}",
+                r as f64 / n as f64,
+                (r + a) as f64 / n as f64
+            );
+            rows.push((n, r, a));
+        }
+
+        // Anti-vacuity: an axis on which nothing happened proves nothing about its own slope.
+        for (n, r, a) in &rows {
+            assert!(r + a > 0, "branches={n}: the reap loop persisted nothing at all");
+            assert_eq!(
+                r + a,
+                2 * *n as u64,
+                "branches={n}: {} records, not the two per interior branch the reaper makes",
+                r + a
+            );
+        }
+
+        // THE CLASS CLAIM. At `630afaa` this ratio was 2.0 at every size, and after the first two
+        // record kinds it was 0.58 at every size — flat is what a class looks like. It must now
+        // FALL across the axis: the compactions that remain are amortised against an image that
+        // grows, so their share of the work per branch shrinks.
+        let first = rows[1].1 as f64 / rows[1].0 as f64; // 16 branches; 8 is 0 and gives no ratio
+        let last = rows[rows.len() - 1].1 as f64 / rows[rows.len() - 1].0 as f64;
+        assert!(
+            last < first,
+            "rewrites per branch did not fall across the size axis ({first:.3} at 16 -> \
+             {last:.3} at 128): the cost is still a class, not a constant"
+        );
+        // And it must be a small share of the records, not most of them.
+        let (_, r_last, a_last) = rows[rows.len() - 1];
+        assert!(
+            r_last * 10 < a_last,
+            "rewrites are {r_last} against {a_last} appends at the top of the axis"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 2. Can each counter be forced to move on purpose?
+    // ---------------------------------------------------------------------------------------
+
+    /// Push a LEAF arm's tail past `compact_threshold` and see whether its zero survives.
+    ///
+    /// A zero that cannot be made non-zero is not evidence about the leaf path; it is evidence
+    /// the instrument is not wired.
+    #[test]
+    fn d183adv_a2_the_leaf_zero_is_only_a_small_n_zero() {
+        fn leaf(branches: usize) -> (u64, u64) {
+            let (h, path) = armed("a2l", branches);
+            let (ids, _) = build(&h, branches, 4, false);
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                for arena in rec.arenas.iter().copied() {
+                    h.store.free_arena(arena).unwrap();
+                }
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0)
+        }
+        println!("A2 LEAF arm, hand-rolled exactly as the test under attack does it:");
+        let mut first_nonzero = None;
+        for n in [8usize, 16, 64, 256] {
+            let (r, a) = leaf(n);
+            println!("  branches={n:4}: rewrites={r:4} appends={a:4}");
+            if r > 0 && first_nonzero.is_none() {
+                first_nonzero = Some(n);
+            }
+        }
+        match first_nonzero {
+            Some(n) => println!("  -> the leaf arm's rewrite counter FIRES at branches={n}"),
+            None => println!("  -> the leaf arm's rewrite counter could NOT be made to fire"),
+        }
+    }
+
+    /// The INTERIOR arm's `appends = 0` was not a measurement — and now it is.
+    ///
+    /// **At `630afaa` this test recorded a STRUCTURAL zero**: `retire_arenas_by_rule` ended in
+    /// `persist_if_configured` — since deleted — which was `persist_full_locked` with no threshold
+    /// and no delta encoder anywhere on the path, so no fixture could make it append. 32 branches x 64 pages —
+    /// 4x the branches and 8x the pages of the original fixture — gave `rewrites=32 appends=0`.
+    ///
+    /// That is exactly the kind of zero worth re-testing after a change, because a zero which no
+    /// fixture can move is a fact about the code and not about the workload. On this branch the
+    /// same fixture gives **`rewrites=5 appends=27`**: the path now has an encoder on it, the
+    /// total is still one record per branch, and the zero is gone.
+    #[test]
+    fn d183adv_a2_the_interior_zero_appends_is_unfalsifiable() {
+        let (h, path) = armed("a2i", 0);
+        let (ids, _) = build(&h, 32, 64, true);
+        let ep = h.catalog.next_epoch();
+        let (r0, a0) = h.store.persist_counters();
+        for id in ids {
+            let rec = h.catalog.get_raw(id.id).unwrap();
+            h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        }
+        let (r1, a1) = h.store.persist_counters();
+        println!(
+            "A2 INTERIOR, 32 branches x 64 pages (8x the pages, 4x the branches of the original): \
+             rewrites={} appends={}",
+            r1 - r0,
+            a1 - a0
+        );
+        // One durable record per branch, before and after; what changed is which kind.
+        assert_eq!(
+            (r1 - r0) + (a1 - a0),
+            32,
+            "the interior retire is no longer one durable record per branch"
+        );
+        assert!(
+            a1 - a0 > 0,
+            "the interior arm still cannot append: the structural zero this test recorded at \
+             630afaa is back, so nothing on this path reaches an encoder"
+        );
+        assert!(
+            r1 - r0 < a1 - a0,
+            "the interior arm is still mostly full rewrites: {} against {} appends",
+            r1 - r0,
+            a1 - a0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 3. Is the slope a property of branches, or of arenas/pages?
+    // ---------------------------------------------------------------------------------------
+
+    /// Three sizes, three page counts, plus a branch with NO pages at all.
+    ///
+    /// `ARENA_FIRST_EXTENT_PAGES` is 1 and extents double, so 4 pages is 3 arenas and 16 pages
+    /// is 5. If rewrites tracked arenas or pages, these rows would disagree.
+    #[test]
+    fn d183adv_a3_the_slope_is_per_branch_not_per_arena_or_page() {
+        fn interior(branches: usize, pages: usize) -> (u64, u64, usize) {
+            let (h, path) = armed("a3", branches * 100 + pages);
+            let (ids, arenas) = build(&h, branches, pages, true);
+            let ep = h.catalog.next_epoch();
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                let rec = h.catalog.get_raw(id.id).unwrap();
+                h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, arenas)
+        }
+        println!("A3 INTERIOR rewrites against branches x pages (arenas read from the records)");
+        for pages in [0usize, 1, 4, 16] {
+            let mut row = Vec::new();
+            for branches in [8usize, 16, 24] {
+                let (r, a, arenas) = interior(branches, pages);
+                row.push((branches, r, arenas));
+                // **At `630afaa` this asserted `r == branches` and held at every cell** — the
+                // hand-rolled `retire_arenas_by_rule` loop cost exactly one full image rewrite
+                // per branch whatever its arenas or pages. That is the wall this row removes.
+                // What must still hold is the TOTAL: one durable record per branch, which is
+                // what makes "cheaper" separable from "skipped".
+                assert_eq!(
+                    r + a,
+                    branches as u64,
+                    "pages={pages} branches={branches}: {} durable records, not one per branch",
+                    r + a
+                );
+                assert!(
+                    r < branches as u64,
+                    "pages={pages} branches={branches}: rewrites={r} still tracks branches \
+                     one-for-one"
+                );
+            }
+            let s: Vec<String> = row
+                .iter()
+                .map(|(b, r, ar)| format!("b={b} rewrites={r} arenas={ar}"))
+                .collect();
+            // The original question this axis answered is unchanged and still worth asserting:
+            // whatever the cost is, it does not track ARENAS or PAGES — the three page counts
+            // give three different arena counts and the same per-branch record total.
+            println!("  pages/branch={pages:2}: {}", s.join(" | "));
+        }
+    }
+
+    /// The LEAF arm's cost, by contrast, tracks ARENAS and not branches.
+    #[test]
+    fn d183adv_a3_the_leaf_arm_is_counted_per_arena() {
+        println!("A3 LEAF appends against branches x pages");
+        for pages in [1usize, 4, 16] {
+            for branches in [8usize, 16] {
+                let (h, path) = armed("a3l", branches * 100 + pages);
+                let (ids, arenas) = build(&h, branches, pages, false);
+                let (r0, a0) = h.store.persist_counters();
+                for id in ids {
+                    let rec = h.catalog.get_raw(id.id).unwrap();
+                    for arena in rec.arenas.iter().copied() {
+                        h.store.free_arena(arena).unwrap();
+                    }
+                }
+                let (r1, a1) = h.store.persist_counters();
+                println!(
+                    "  pages/branch={pages:2} branches={branches:2}: arenas={arenas:3} \
+                     rewrites={} appends={}",
+                    r1 - r0,
+                    a1 - a0
+                );
+                // One durable record per arena freed -- an append, or a full rewrite when the
+                // tail has outgrown `compact_threshold`. The 16x16 cell is where that happens.
+                assert_eq!(
+                    (a1 - a0) + (r1 - r0),
+                    arenas as u64,
+                    "leaf durable records did not equal the arena count"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // AXIS 4. Is `has_live_children` the splitter, or is it parking / pending_len?
+    // ---------------------------------------------------------------------------------------
+
+    /// A branch with live children whose pages are ALL releasable.
+    ///
+    /// The child is forked BEFORE the pages are born, so `live_child_in_epoch_range` is false
+    /// for every page and nothing is parked. If the cost followed parking or `pending_len`,
+    /// this cell would be cheap. If it follows the predicate, it costs the same rewrite.
+    #[test]
+    fn d183adv_a4_live_children_with_nothing_parked_still_pays() {
+        let branches = 8usize;
+        let (h, path) = armed("a4a", 0);
+        let mut ids = Vec::new();
+        for _ in 0..branches {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            // Child FIRST, so its fork epoch is below every page's birth epoch.
+            h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+            let birth = h.catalog.next_epoch();
+            for _ in 0..4 {
+                h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+            }
+            ids.push(b.branch_id);
+        }
+        for id in &ids {
+            assert!(h.catalog.has_live_children(id.id).unwrap(), "fixture: no live child");
+        }
+        let ep = h.catalog.next_epoch();
+        let (r0, a0) = h.store.persist_counters();
+        let mut released = 0u32;
+        for id in &ids {
+            let rec = h.catalog.get_raw(id.id).unwrap();
+            released += h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        }
+        let (r1, a1) = h.store.persist_counters();
+        let parked = h.store.pending_len();
+        println!(
+            "A4a live children, all pages RELEASABLE: released={released} parked_after={parked} \
+             rewrites={} appends={}",
+            r1 - r0,
+            a1 - a0
+        );
+        assert!(released > 0, "fixture: nothing was released, so nothing was releasable");
+        assert_eq!(parked, 0, "fixture: something was parked after all");
+        // **At `630afaa`: `rewrites=8 appends=0` — a branch that parked NOTHING still paid one
+        // full image rewrite each, which is what established that the cost followed the
+        // `has_live_children` PREDICATE and not parking or `pending_len`.** On this branch the
+        // same fixture gives `rewrites=0 appends=8`. The predicate still decides which door the
+        // reap leaves by; it no longer decides whether the door costs the whole image.
+        assert_eq!(
+            (r1 - r0) + (a1 - a0),
+            branches as u64,
+            "still not one durable record per branch: {} rewrites + {} appends",
+            r1 - r0,
+            a1 - a0
+        );
+        assert_eq!(
+            r1 - r0,
+            0,
+            "a branch that parked nothing still pays {} full image rewrites",
+            r1 - r0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hold the branch shape fixed and flip ONLY `has_live_children`, by reaping the child
+    /// first. Same pages, same arenas, same epochs; one bit different.
+    #[test]
+    fn d183adv_a4_flipping_only_the_predicate_flips_the_cost() {
+        fn run(kill_child: bool) -> (u64, u64, bool) {
+            let (h, path) = armed("a4b", kill_child as usize);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let mut ids = Vec::new();
+            for _ in 0..8 {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                for _ in 0..4 {
+                    h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                }
+                let child = h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                if kill_child {
+                    reaper.reap(child.branch_id).unwrap();
+                }
+                ids.push(b.branch_id);
+            }
+            let pred = h.catalog.has_live_children(ids[0].id).unwrap();
+            // Count only the parents' reaps; the children's are fixture.
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, pred)
+        }
+        let (r_live, a_live, p_live) = run(false);
+        let (r_dead, a_dead, p_dead) = run(true);
+        println!("A4b same shape, only the predicate differs, through the REAL reaper:");
+        println!("  child live  (has_live_children={p_live:5}): rewrites={r_live:3} appends={a_live:3}");
+        println!("  child reaped(has_live_children={p_dead:5}): rewrites={r_dead:3} appends={a_dead:3}");
+        assert!(p_live, "fixture: the live-child arm had no live child");
+        assert!(!p_dead, "fixture: reaping the child did not clear has_live_children");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // MECHANISM. Why the REAL leaf reap pays N-1 rewrites that the hand-rolled loop does not.
+    // ---------------------------------------------------------------------------------------
+
+    /// ⭐ **THE FOURTH REWRITE SITE — found by this test, and the one neither the design entry
+    /// nor the row's own counter test had in scope.**
+    ///
+    /// At `630afaa`, `take_pending` bumped `pending_version` **even when the log it drained was
+    /// empty**, and `persist_delta_locked`'s third condition then forced the NEXT delta to be a
+    /// full image rewrite. `Reaper::reap` calls `drain_pending_seeded` — and therefore
+    /// `take_pending` — at the end of EVERY reap, leaf or not. So the leaf path's cost was not
+    /// what freeing an arena costs; it was that plus one forced rewrite carried over from the
+    /// previous reap's empty drain, which is the whole of the 1.0-rewrites-per-branch the leaf
+    /// arm was measured at.
+    ///
+    /// **Measured here at `630afaa`: two arena frees back to back gave `(0 rewrites, 2 appends)`,
+    /// and the same two frees with an EMPTY `take_pending` between them gave `(1, 1)`.** On this
+    /// branch both give `(0, 2)`: draining a log that was already empty changes nothing in
+    /// memory, so it cannot have made the durable file stale, and the bump is gone.
+    ///
+    /// ⚠ **This is the only test in the file that pins that fix.** Restoring the unconditional
+    /// bump as a mutant leaves every test in `branch::arena::tests` green — checked, 57 passed.
+    #[test]
+    fn d183adv_mech_an_empty_take_pending_no_longer_forces_a_rewrite() {
+        let (h, path) = armed("mech", 0);
+        let (ids, _) = build(&h, 4, 4, false);
+        let recs: Vec<_> =
+            ids.iter().map(|id| h.catalog.get_raw(id.id).unwrap()).collect();
+
+        // Control: two arena frees back to back, no drain in between.
+        let (r0, a0) = h.store.persist_counters();
+        h.store.free_arena(recs[0].arenas[0]).unwrap();
+        h.store.free_arena(recs[0].arenas[1]).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+
+        // Treatment: the SAME two frees, with an empty `take_pending` between them.
+        assert_eq!(h.store.pending_len(), 0, "fixture: the pending log is not empty");
+        h.store.free_arena(recs[1].arenas[0]).unwrap();
+        let drained = h.store.take_pending();
+        assert!(drained.is_empty(), "fixture: the drain was not empty");
+        h.store.free_arena(recs[1].arenas[1]).unwrap();
+        let (r2, a2) = h.store.persist_counters();
+
+        println!("MECH two arena frees, nothing between: rewrites={} appends={}", r1 - r0, a1 - a0);
+        println!(
+            "MECH two arena frees, EMPTY take_pending between: rewrites={} appends={}",
+            r2 - r1,
+            a2 - a1
+        );
+        assert_eq!((r1 - r0, a1 - a0), (0, 2), "control: both frees should have appended");
+        assert_eq!(
+            (r2 - r1, a2 - a1),
+            (0, 2),
+            "an empty drain still forces the following free into a full image rewrite — the \
+             fourth D183 site is back (it read (1, 1) at 630afaa)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Where the interior arm's SECOND rewrite per branch comes from -- and it is not one
+    /// mechanism, it is two, which is why this test names both arms.
+    ///
+    /// ⚠ **This test's first draft asserted that the releasable arm would pay only ONE rewrite,
+    /// because `put_pending` never runs when the drain comes back empty. Its own measurement
+    /// refuted that: the releasable arm pays two as well.** The accounting at `630afaa`, every
+    /// term a counted integer:
+    ///
+    ///   * PARKED (pages first, child after): `retire_arenas_by_rule` = 1 rewrite;
+    ///     `drain_pending_seeded` re-parks the survivors through `put_pending` = 1 rewrite;
+    ///     the extents are NOT empty (pages parked, not recycled) so `sweep_touched_extents`
+    ///     frees nothing. **2 rewrites, 0 appends, 3 arenas untouched.** (8 branches: 16, 0.)
+    ///   * RELEASABLE (child first, pages after): `retire_arenas_by_rule` = 1 rewrite; the
+    ///     drain is empty so `put_pending` does NOT run -- but `take_pending` already bumped
+    ///     `pending_version`, so the FIRST of the three extents `sweep_touched_extents` now
+    ///     frees is forced into a full rewrite by the mechanism pinned in the test above, and
+    ///     the other two append. **2 rewrites, 2 appends, 3 arenas freed.** (8 branches: 16, 16.)
+    ///
+    /// Same headline number, two different mechanisms, neither of them the one the claim under
+    /// attack names.
+    ///
+    /// ⭐ **On this branch both mechanisms are gone and the two arms separate cleanly: PARKED
+    /// gives `(0, 16)` and RELEASABLE `(0, 32)`.** The totals — 16 and 32 durable records for 8
+    /// branches — are unchanged from `630afaa`, which is the point: the reap writes as often as
+    /// it ever did. The releasable arm's 32 is its 8 reap records plus the 24 arena frees its
+    /// sweep now reaches, every one an append. And `put_pending` on its own, which was ONE
+    /// unconditional full rewrite, is now one appended record.
+    #[test]
+    fn d183adv_mech_the_interior_second_rewrite_is_the_drains_put_pending() {
+        fn run(park: bool) -> (u64, u64, usize) {
+            let (h, path) = armed("mech2", park as usize);
+            let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
+            let mut ids = Vec::new();
+            for _ in 0..8 {
+                let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+                if park {
+                    // Pages first, child after: the interval rule must park them.
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, Epoch(1)).unwrap();
+                    }
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                } else {
+                    // Child first, pages after: live child, nothing parkable.
+                    h.catalog.fork(b.branch_id, LeaseDeadline(0)).unwrap();
+                    let birth = h.catalog.next_epoch();
+                    for _ in 0..4 {
+                        h.store.alloc_for(b.branch_id, PageType::Heap, birth).unwrap();
+                    }
+                }
+                assert!(h.catalog.has_live_children(b.branch_id.id).unwrap());
+                ids.push(b.branch_id);
+            }
+            let (r0, a0) = h.store.persist_counters();
+            for id in ids {
+                reaper.reap(id).unwrap();
+            }
+            let (r1, a1) = h.store.persist_counters();
+            let parked = h.store.pending_len();
+            let _ = std::fs::remove_file(&path);
+            (r1 - r0, a1 - a0, parked)
+        }
+        let (r_park, a_park, p_park) = run(true);
+        let (r_free, a_free, p_free) = run(false);
+        println!("MECH2 8 interior branches through the REAL reaper:");
+        println!("  pages PARKED     : rewrites={r_park:3} appends={a_park:3} pending_after={p_park}");
+        println!("  pages RELEASABLE : rewrites={r_free:3} appends={a_free:3} pending_after={p_free}");
+        assert!(p_park > 0, "fixture: the parking arm parked nothing");
+        assert_eq!(p_free, 0, "fixture: the releasable arm parked something");
+
+        // The accounting in the doc comment, pinned. 8 branches, 3 arenas each.
+        //
+        // UNCHANGED from `630afaa`: the record totals. Both arms write exactly as often as they
+        // did, which is what separates "cheaper" from "skipped".
+        assert_eq!(r_park + a_park, 16, "parked arm: not 2 durable records per branch");
+        assert_eq!(r_free + a_free, 32, "releasable arm: not 4 durable records per branch");
+        // INVERTED: neither mechanism costs a full image any more.
+        assert_eq!(
+            (r_park, r_free),
+            (0, 0),
+            "full image rewrites survive on the interior path: parked={r_park}, \
+             releasable={r_free} (both were 16 at 630afaa)"
+        );
+
+        // And the term the parked arm's second rewrite is charged to, priced on its own.
+        let (h, path) = armed("mech3", 0);
+        let (ids, _) = build(&h, 1, 4, true);
+        let rec = h.catalog.get_raw(ids[0].id).unwrap();
+        let ep = h.catalog.next_epoch();
+        h.store.retire_arenas_by_rule(&rec, ep).unwrap();
+        let taken = h.store.take_pending();
+        assert!(!taken.is_empty(), "fixture: the interior branch parked nothing");
+        let (r0, a0) = h.store.persist_counters();
+        h.store.put_pending(taken).unwrap();
+        let (r1, a1) = h.store.persist_counters();
+        println!("MECH3 one put_pending on its own: rewrites={} appends={}", r1 - r0, a1 - a0);
+        assert_eq!(
+            (r1 - r0, a1 - a0),
+            (0, 1),
+            "put_pending is a full image rewrite again — it read (1, 0) at 630afaa, which is \
+             where the interior arm's second rewrite per branch came from"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
