@@ -196,16 +196,23 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
             session.current = Some(txn.begin()?);
             Ok(Outcome::Ok)
         }
-        Stmt::Commit => match session.current.take() {
+        // **D211: the session lets go of its transaction only once the transaction has ended.** Both
+        // arms used `session.current.take()` BEFORE acting. A COMMIT refused because the
+        // transaction's rollback had begun (`TxnManager::commit`), or a ROLLBACK whose undo had no
+        // room, then left the transaction open in the ATT and forgotten by the only session that could
+        // finish it: its rows held, every checkpoint refused, and no ROLLBACK able to reach it.
+        Stmt::Commit => match session.current {
             Some(id) => {
                 txn.commit(id)?;
+                session.current = None;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
         }
-        Stmt::Rollback => match session.current.take() {
+        Stmt::Rollback => match session.current {
             Some(id) => {
                 txn.abort(id)?;
+                session.current = None;
                 Ok(Outcome::Ok)
             }
             None => Err(FerroError::Txn("not in active txn".into()))
@@ -446,19 +453,14 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                 };
                 let view = match txn.snapshot_of(txn_id) {
                     Ok(snapshot) => Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id }),
-                    Err(e) => {
-                        txn.abort(txn_id)?;
-                        session.current = None;
-                        return Err(e)
-                    }
+                    // D211: refused because this transaction's rollback has not finished. Only an
+                    // explicit ROLLBACK retries it, so a refused statement must not start one.
+                    Err(e) if txn.is_aborting(txn_id) => return Err(e),
+                    Err(e) => return Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                 };
                 let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id)), view) {
                     Ok(p) => p,
-                    Err(e) => {
-                        txn.abort(txn_id)?;
-                        session.current = None;
-                        return Err(e);
-                    }
+                    Err(e) => return Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                 };
                 match planned {
                     // No author is attached here, and that is not an omission. DML inside an
@@ -472,15 +474,58 @@ pub fn run_staged(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>,
                             if implicit { txn.commit(txn_id)? };
                             return Ok(Outcome::Affected(count))
                         }
-                        Err(e) => {
-                            txn.abort(txn_id)?;
-                            session.current = None;
-                            Err(e)
-                        }
+                        Err(e) => Err(roll_back_failed_statement(&txn, session, txn_id, e)),
                     },
                     Plan::Read(_) => unreachable!()
                 }
             }
+        }
+    }
+}
+
+/// Roll back the transaction a failed statement ran in, and return the error the caller reports.
+/// D205 (the fresh-context adversary's C1).
+///
+/// This was `txn.abort(id)?; session.current = None; return Err(e)` at three sites. It had two
+/// faults, both reached when `abort` returned `Err`:
+/// - the `?` skipped the reset, so the session kept its transaction id;
+/// - the abort's error replaced the statement's, so the user saw how the cleanup went and not why
+///   the statement failed.
+///
+/// At `c21eaff`, `abort` returned an index-undo error AFTER the transaction had ended, so the
+/// session was left holding a dead id. Now:
+/// - **the abort ended the transaction** (always, unless its heap undo failed; an index-undo
+///   failure is counted in `wal::txn::INDEX_UNDO_FAILURES`, not returned): the session lets go
+///   of it, and the statement's own error is returned UNCHANGED, variant included;
+/// - **the heap undo failed, so the transaction is still open**: the session KEEPS the id, so
+///   `ROLLBACK` can retry the undo. Dropping it would orphan an `Aborting` transaction, which blocks
+///   every checkpoint for the life of the process. The statement's message comes first in the
+///   returned error, which also says the rollback did not finish. Returning the statement's error
+///   alone would let the user carry on inside a transaction they believe was rolled back.
+///
+///   ⛔ **Corrected (D211, re-adversary `fffdc62`).** This said `ROLLBACK` "can resume the undo from
+///   its CLRs", which was false until `TxnManager::undo_then_log`: the failed undo's CLR was already
+///   logged, so a resumed abort skipped it. It also said nothing stopped the user carrying on;
+///   nothing did, because `Aborting` was never read. Since D211, a retry reaches the failed record
+///   itself, and the transaction is refused every statement but ROLLBACK
+///   (`tests/abort_that_cannot_finish.rs`). An undo that never finds room still never finishes;
+///   see `TxnManager::abort`.
+fn roll_back_failed_statement(txn: &TxnManager, session: &mut Session, txn_id: u64, e: FerroError) -> FerroError {
+    match txn.abort(txn_id) {
+        Ok(()) => {
+            session.current = None;
+            e
+        }
+        Err(abort_err) => {
+            let resume = if session.current == Some(txn_id) {
+                "run ROLLBACK to resume it"
+            } else {
+                "recovery finishes it when the database is next opened"
+            };
+            FerroError::Txn(format!(
+                "{e} (and the rollback that followed did not finish: {abort_err}; the transaction \
+                 is still open, so {resume})"
+            ))
         }
     }
 }

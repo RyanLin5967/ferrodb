@@ -8,8 +8,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::TableBranchCatalog;
@@ -20,12 +18,7 @@ use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
-use ferrodb::wal::txn::TxnManager;
-
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -51,32 +44,30 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let existed = Path::new(&db).exists();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&db)
-        .expect("open db");
-    let dm = Arc::new(DiskManager::new(file).unwrap());
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    // D280: the same refusal as the CLI's, through the same function. Released by hand because
-    // `process::exit` runs no destructors, and a lock left behind refuses the next open as stale.
-    let wal = match WalManager::open_for_database(Path::new(&db), &bp.disk_manager) {
-        Ok(w) => Arc::new(w),
+    // **D204: the one open path.** Recovery; every index rebuilt from the recovered heap if
+    // recovery replayed a data record or the stale-indexes marker asks; then a checkpoint after a
+    // rebuild or whenever the log holds records. Through the same function the CLI calls. This
+    // file used to spell the sequence out itself, and from D9 until D202 its copy omitted the
+    // rebuild. Index pages are not logged, so a
+    // row committed after the last checkpoint came back in the heap but not in its primary index: a
+    // lookup by key missed it, and an INSERT of its key was admitted as a second live row
+    // (`tests/pgserver_crash_rebuilds_indexes.rs`). `tests/open_path_allowlist.rs` keeps it from
+    // drifting again. Before the arena below, for the reason given there: the rebuild allocates pages.
+    // It also holds D280's refusal (`WalManager::open_for_database`, inside `open_recovered`): a data
+    // file whose pages carry LSNs its log never issued (a restored backup, a replica's file, a lost
+    // `.wal`) is refused before the log is created, the same refusal as the CLI's.
+    //
+    // On failure: the message, the lock released BY HAND, then `process::exit(1)`. This runs after
+    // the lock, and `process::exit` runs no destructors, so exiting without the `drop` would strand
+    // `<db>.lock` and the next open would refuse it as stale (the reason D204 chose a panic here, and
+    // D280 the explicit drop; the drop keeps D280's exit status and leaves no lock behind either way).
+    let OpenedDatabase { bp, txn, catalog, .. } = match open_recovered(Path::new(&db), &_lock) {
+        Ok(opened) => opened,
         Err(e) => {
             eprintln!("pgserver: {e}");
             drop(_lock);
             std::process::exit(1);
         }
-    };
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
-    recover(&txn).unwrap();
-    let catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
-    } else {
-        Catalog::create(bp.clone()).unwrap()
     };
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
@@ -145,9 +136,10 @@ fn main() {
     // mutex — the same outermost lock a statement takes — so a scan can never run inside a `MERGE`.
     // See `branch::lease_thread` for all three rules and why this is the right lock.
     //
-    // A failure here PANICS rather than exiting, matching every other post-lock failure in this
+    // A failure here PANICS rather than exiting, matching the other post-lock failures in this
     // file (`.expect("bind")`, `.expect("arena")`): a panic unwinds and drops the `DbLock`, and
-    // `process::exit` would strand the lock file on a database this process is not holding.
+    // `process::exit` would strand the lock file on a database this process is not holding. The
+    // one post-lock exit, the open's refusal above, drops the lock by hand before it exits.
     let lease =
         LeaseThread::start(reaper, runtime, ctx.clone() as Arc<dyn RuntimeLock>, interval)
             .unwrap_or_else(|e| panic!("pgserver: {e}"));

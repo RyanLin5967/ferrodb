@@ -152,6 +152,12 @@ impl Modify for Insert {
         // bound is asked here, for every entry the writes below will make, through the one builder
         // of entry shapes (`index_page::row_entry_sizes`, review 7 K9): the primary entry, each
         // secondary entry, and each posting of each distinct token.
+        //
+        // (Merge of D225 with D202: "the abort undoes only the heap" was written before D202. A
+        // rollback now also takes back the primary entry this statement moved, recorded below by
+        // `TxnManager::record_primary_write`, so that particular orphan no longer follows. D202
+        // records primary-index writes only, and asking first still means a refused row writes
+        // nothing at all, so the check stays.)
         let secondary: Vec<usize> = self.secondary_indexes.iter().map(|h| h.col_index).collect();
         let fulltext: Vec<usize> = self.fulltext_indexes.iter().map(|h| h.col_index).collect();
         if let Some((_, len)) = first_entry_over_bound(&vals, true, &secondary, &fulltext)? {
@@ -187,6 +193,9 @@ impl Modify for Insert {
             reused = Some((existing, head));
         }
         let mut tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
+        // What the primary entry holds before this statement: nothing for a new key, the dead
+        // version's slot for a reuse. It is what a rollback must put back (D202).
+        let entry_before = reused.as_ref().map(|(dead_rid, _)| *dead_rid);
         let (rid, index_moved) = match reused {
             Some((dead_rid, dead)) => {
                 // Archived VERBATIM: its `end_ts` is its deleter's and must stay so. UPDATE
@@ -224,6 +233,13 @@ impl Modify for Insert {
         // window a relocated UPDATE already has: `HeapFileManager::update` frees the old slot
         // before this line repoints the entry.
         if index_moved {
+            // **D202 — recorded before the write, so a rollback can take it back.** Index pages are
+            // not logged, and before this a rolled-back INSERT left its key pointing at the slot
+            // `undo_insert` freed: the key then failed every lookup and every INSERT with
+            // `SlotDeleted`. See `TxnManager::record_primary_write`.
+            if let Some(txn) = &self.heap.txn {
+                txn.record_primary_write(self.heap.txn_id, self.primary_index.root_cell(), vals[0].clone(), entry_before);
+            }
             self.primary_index.upsert(vals[0].clone(), rid)?;
         }
         // **E66 — the same de-duplication UPDATE needs, on the path E63 opened.**

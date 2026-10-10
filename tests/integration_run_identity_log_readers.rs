@@ -173,8 +173,10 @@ impl Db {
 /// Both shapes are in the log on purpose, because they exercise different parts of the analysis
 /// pass. A **binding** rides inside a transaction's record chain, so a recovery pass that
 /// mishandled it would corrupt that transaction's `last_lsn` and undo committed work. A
-/// **declaration** carries transaction id 0, which never commits — so it lands in the loser set,
-/// exactly as a `Ddl` record already does, and its chain must terminate rather than walk off.
+/// **declaration** carries transaction id 0, which never commits. Until D216 that put it in the
+/// loser set, exactly as a `Ddl` record, and its chain had to terminate rather than walk off.
+/// Since D216 recovery never takes id 0 for a loser, so the declaration half now requires only
+/// that the analysis pass reads the record without refusing it.
 #[test]
 fn recovery_replays_a_log_holding_both_a_binding_and_a_declaration() {
     let mut d = db();

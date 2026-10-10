@@ -1,0 +1,14 @@
+2026-09-24T22:04:09Z d216-b_green216-d234 acquiring (5s poll), pid 57103
+2026-09-24T22:10:55Z d216-b_green216-d234 ACQUIRED: 57103 d216-b_green216-d234 2026-09-24T22:10:55Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.95s
+     Running tests/d234_decoder_history_still_collapses.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d234_decoder_history_still_collapses-82b72f90a2700691)
+
+running 1 test
+test identical_declarations_under_a_held_pin_do_not_grow_the_decoders_history ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+2026-09-24T22:11:21Z d216-b_green216-d234 rc=0
+2026-09-24T22:11:22Z d216-b_green216-d234 released (owner matched)
+rc=0

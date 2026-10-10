@@ -1,0 +1,231 @@
+2026-09-24T22:11:23Z d216-d_red252-lib_wal acquiring (5s poll), pid 98440
+2026-09-24T22:50:07Z d216-d_red252-lib_wal ACQUIRED: 98440 d216-d_red252-lib_wal 2026-09-24T22:50:07Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2435 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2263:17
+     |
+2263 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2436 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.13s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 74 tests
+test wal::log::tests::test_crc32_val ... ok
+test wal::log::tests::an_older_logs_records_still_decode_after_the_new_tag_was_added ... ok
+test wal::log::tests::create_and_drop_records_keep_their_byte_layout ... ok
+test wal::log::tests::every_column_alteration_survives_the_log_round_trip ... ok
+test wal::log::tests::deserialize_rejects_empty_and_unknown_tag ... ok
+test wal::log::tests::a_truncated_alteration_is_refused_rather_than_panicking ... ok
+test wal::log::tests::a_truncated_run_identity_record_is_refused_rather_than_panicking ... ok
+test wal::log::tests::a_run_identity_record_that_names_no_run_is_refused ... ok
+test wal::log::tests::an_unknown_alteration_tag_is_refused ... ok
+test wal::log::tests::test_reckind_roundtrip ... ok
+test wal::log::tests::test_read_buffer_before_flush ... ok
+test wal::log::tests::flush_up_to_writes_a_record_that_starts_at_the_flushed_point ... FAILED
+test wal::log::tests::test_survives_flush_and_reopen ... ok
+test wal::log::tests::test_lsns_are_monotonic ... ok
+test wal::log::tests::test_flush_up_to_stops_when_durable ... ok
+test wal::log::tests::test_corrupted_last_record_detected ... ok
+test wal::log::tests::the_recovery_scan_stops_at_a_corrupted_record ... ok
+test wal::log::tests::a_record_whose_bytes_were_corrupted_is_refused ... ok
+test wal::recovery::tests::open_recovered_refuses_a_lock_for_another_database_and_opens_with_its_own ... ok
+test wal::recovery::tests::a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point ... FAILED
+test wal::recovery::tests::a_commit_is_durable_when_everything_before_it_was_already_flushed ... FAILED
+test wal::recovery::tests::a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them ... ok
+test wal::recovery::tests::test_insert_survives_crash ... ok
+ferrodb: the rollback of transaction 2 could not undo its primary-index writes (io error: eof before finished reading); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open
+test wal::recovery::tests::sql_crash_recover_rebuild_query ... ok
+test wal::recovery::tests::test_uncommited_rolled_back ... ok
+test wal::recovery::tests::recovery_appends_nothing_for_a_log_of_declarations ... FAILED
+test wal::recovery::tests::an_open_over_an_empty_log_still_declares_every_table ... FAILED
+test wal::recovery::tests::a_clean_restart_after_ddl_does_not_rebuild_the_indexes ... FAILED
+test wal::recovery::tests::an_index_page_reaches_disk_only_after_the_log_records_it_depends_on ... FAILED
+test wal::recovery::tests::a_page_whose_own_record_is_durable_does_not_flush_the_log ... ok
+test wal::recovery::tests::an_index_page_whose_records_are_durable_does_not_flush_the_log ... ok
+test wal::recovery::tests::a_checkpoint_after_a_restart_still_declares_every_table ... FAILED
+test wal::recovery::tests::a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty ... ok
+test wal::recovery::tests::test_update_delete_redo_after_checkpoint ... ok
+test wal::recovery::tests::transaction_id_zero_is_never_handed_out ... FAILED
+test wal::recovery::tests::a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark ... FAILED
+test wal::txn::tests::a_quiet_database_resumes_at_the_readers_own_begin ... ok
+test wal::recovery::tests::a_committed_row_whose_heap_page_reached_disk_still_forces_the_rebuild ... ok
+test wal::recovery::tests::a_crashed_uncommitted_heap_write_still_forces_the_rebuild ... ok
+test wal::recovery::tests::a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes ... FAILED
+test wal::recovery::tests::the_stale_marker_is_honoured_over_an_empty_log ... ok
+test wal::txn::tests::a_reader_is_not_leaked_when_its_txn_end_cannot_be_written ... ok
+test wal::txn::tests::a_second_session_of_one_run_is_the_same_actor_however_the_clock_moved ... ok
+test wal::recovery::tests::a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree ... okferrodb: the rollback of transaction 
+1test wal::txn::tests::a_snapshot_read_resumes_at_the_oldest_transaction_it_excluded ...  could not undo its primary-index writes (okio error: 
+eof before finished readingtest wal::txn::tests::a_refused_binding_leaves_nothing_behind_for_the_commit_to_write ... ok); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open
+
+ferrodb: the rollback of transaction 1 could not undo its primary-index writes (io error: eof before finished reading); the keys it moved fail with SlotDeleted until the indexes are rebuilt at the next open
+test wal::txn::tests::a_snapshot_reader_that_writes_is_refused_and_rolled_back ... ok
+test wal::txn::tests::abort_undoes_recorded_primary_writes_newest_first_and_commit_forgets_them ... ok
+test wal::txn::tests::binding_a_run_with_an_empty_named_field_is_refused ... ok
+test wal::txn::tests::a_snapshot_reader_is_not_leaked_when_its_handoff_cannot_be_pinned ... ok
+test wal::txn::tests::declaring_one_slot_as_two_actors_is_refused ... ok
+test wal::txn::tests::gate_covers_flush_all ... ok
+test wal::txn::tests::interrupted_truncation_self_heals_on_open ... ok
+test wal::txn::tests::an_index_undo_failure_is_counted ... ok
+test wal::txn::tests::gate_flushed_wal_before_page_write ... ok
+test wal::txn::tests::an_index_undo_failure_does_not_fail_an_abort_that_ended_the_transaction ... ok
+test wal::txn::tests::test_visibility_matrix ... ok
+test wal::txn::tests::checkpoint_truncates_and_preserves_data ... ok
+test wal::txn::tests::the_high_water_mark_is_exclusive ... ok
+test wal::txn::tests::test_abort_delete_restores_row ... ok
+test wal::txn::tests::test_abort_insert_removes_rows ... ok
+test wal::txn::tests::test_begin_creates_snapshot ... ok
+test wal::visibility::tests::overwriting_a_version_an_in_flight_transaction_created_is_a_conflict ... ok
+test wal::visibility::tests::an_uncontended_version_and_my_own_write_are_both_writable ... ok
+test wal::visibility::tests::overwriting_a_version_an_in_flight_transaction_deleted_is_a_conflict ... ok
+test wal::recovery::tests::the_open_discards_a_previous_processs_run_declarations ... ok
+test wal::recovery::tests::the_stale_marker_still_forces_the_rebuild_over_a_log_of_declarations ... ok
+test wal::txn::tests::sql_insert_commits_through_run ... ok
+test wal::txn::tests::test_commit_writes_chain_and_flushes ... ok
+test wal::txn::tests::a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it ... FAILED
+test wal::txn::tests::torn_tail_trimmed_on_open ... ok
+test wal::txn::tests::transaction_ids_never_start_at_zero ... ok
+test wal::txn::tests::the_run_identity_record_is_the_last_record_before_its_own_commit ... ok
+test wal::recovery::tests::a_crash_rebuild_of_multi_level_trees_leaves_every_cell_on_its_new_root ... ok
+
+failures:
+
+---- wal::log::tests::flush_up_to_writes_a_record_that_starts_at_the_flushed_point stdout ----
+
+thread 'wal::log::tests::flush_up_to_writes_a_record_that_starts_at_the_flushed_point' (362274149) panicked at src/wal/log.rs:1152:9:
+flush_up_to(34) returned with the record at 34 still only in memory
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- wal::recovery::tests::a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point stdout ----
+
+thread 'wal::recovery::tests::a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point' (362274646) panicked at src/wal/recovery.rs:1450:9:
+a heap page reached the disk while its own HeapInsert was still only in memory
+
+---- wal::recovery::tests::a_commit_is_durable_when_everything_before_it_was_already_flushed stdout ----
+
+thread 'wal::recovery::tests::a_commit_is_durable_when_everything_before_it_was_already_flushed' (362274638) panicked at src/wal/recovery.rs:1418:9:
+assertion `left == right` failed: commit returned Ok, and after a crash the transaction was undone: its Commit never reached the log
+  left: 0
+ right: 1
+
+---- wal::recovery::tests::recovery_appends_nothing_for_a_log_of_declarations stdout ----
+
+thread 'wal::recovery::tests::recovery_appends_nothing_for_a_log_of_declarations' (362274654) panicked at src/wal/recovery.rs:1478:9:
+assertion `left == right` failed: recovery appended to a log of declarations: it took transaction 0 for a loser and aborted it
+  left: (481, 605)
+ right: (481, 539)
+
+---- wal::recovery::tests::an_open_over_an_empty_log_still_declares_every_table stdout ----
+
+thread 'wal::recovery::tests::an_open_over_an_empty_log_still_declares_every_table' (362274652) panicked at src/wal/recovery.rs:1629:9:
+an open over an empty log left table t undeclared: []
+
+---- wal::recovery::tests::a_clean_restart_after_ddl_does_not_rebuild_the_indexes stdout ----
+
+thread 'wal::recovery::tests::a_clean_restart_after_ddl_does_not_rebuild_the_indexes' (362274602) panicked at src/wal/recovery.rs:978:9:
+a clean restart whose log held only DDL re-declarations reported a recovery, so the open rebuilt every index (D216)
+
+---- wal::recovery::tests::an_index_page_reaches_disk_only_after_the_log_records_it_depends_on stdout ----
+
+thread 'wal::recovery::tests::an_index_page_reaches_disk_only_after_the_log_records_it_depends_on' (362274650) panicked at src/wal/recovery.rs:1287:13:
+assertion `left == right` failed: an index page reached the disk while log records appended before it were still only in memory; a crash now leaves an index entry that no surviving record accounts for
+  left: 605
+ right: 721
+
+---- wal::recovery::tests::a_checkpoint_after_a_restart_still_declares_every_table stdout ----
+
+thread 'wal::recovery::tests::a_checkpoint_after_a_restart_still_declares_every_table' (362274405) panicked at src/wal/recovery.rs:1522:9:
+assertion `left == right` failed: the open's checkpoint did not declare t exactly once, with the shape CREATE TABLE gave it
+  left: []
+ right: [[("id", Integer, false), ("v", Integer, true)]]
+
+---- wal::recovery::tests::transaction_id_zero_is_never_handed_out stdout ----
+
+thread 'wal::recovery::tests::transaction_id_zero_is_never_handed_out' (362276390) panicked at src/wal/recovery.rs:1598:9:
+assertion `left != right` failed: a transaction was given id 0, which recovery never undoes and every log reader takes for a declaration
+  left: 0
+ right: 0
+
+---- wal::recovery::tests::a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark stdout ----
+
+thread 'wal::recovery::tests::a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark' (362274647) panicked at src/wal/recovery.rs:1113:9:
+a log holding a transaction that wrote nothing reported a recovery, so the open rebuilt every index
+
+---- wal::recovery::tests::a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes stdout ----
+
+thread 'wal::recovery::tests::a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes' (362274555) panicked at src/wal/recovery.rs:1033:9:
+a clean restart whose log held only run declarations reported a recovery, so the open rebuilt every index (D216)
+
+---- wal::txn::tests::a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it stdout ----
+
+thread 'wal::txn::tests::a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it' (362276466) panicked at src/wal/txn.rs:2252:9:
+assertion `left == right` failed: 5 checkpoints under one held pin wrote (runs, tables) = (200, 5) declarations in 26315 bytes: runs must never be re-declared under a pin, and the schema once, when the pin had passed its last declaration
+  left: (200, 5)
+ right: (0, 1)
+
+
+failures:
+    wal::log::tests::flush_up_to_writes_a_record_that_starts_at_the_flushed_point
+    wal::recovery::tests::a_checkpoint_after_a_restart_still_declares_every_table
+    wal::recovery::tests::a_clean_restart_after_a_run_declaration_does_not_rebuild_the_indexes
+    wal::recovery::tests::a_clean_restart_after_ddl_does_not_rebuild_the_indexes
+    wal::recovery::tests::a_commit_is_durable_when_everything_before_it_was_already_flushed
+    wal::recovery::tests::a_heap_page_waits_for_its_own_record_when_it_starts_at_the_flushed_point
+    wal::recovery::tests::a_log_with_no_data_records_rebuilds_nothing_and_still_raises_the_id_watermark
+    wal::recovery::tests::an_index_page_reaches_disk_only_after_the_log_records_it_depends_on
+    wal::recovery::tests::an_open_over_an_empty_log_still_declares_every_table
+    wal::recovery::tests::recovery_appends_nothing_for_a_log_of_declarations
+    wal::recovery::tests::transaction_id_zero_is_never_handed_out
+    wal::txn::tests::a_kept_checkpoint_re_declares_no_run_and_the_schema_only_when_a_pin_has_passed_it
+
+test result: FAILED. 62 passed; 12 failed; 0 ignored; 0 measured; 1626 filtered out; finished in 6.85s
+
+error: test failed, to rerun pass `--lib`
+2026-09-24T22:50:34Z d216-d_red252-lib_wal rc=101
+2026-09-24T22:50:34Z d216-d_red252-lib_wal released (owner matched)
+rc=101

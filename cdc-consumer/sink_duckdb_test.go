@@ -465,7 +465,7 @@ func TestALaterCreateTableThatDisagreesIsRefused(t *testing.T) {
 	}
 }
 
-// Re-emission is the COMMON case: a CREATE_TABLE is re-sent at every checkpoint of the source. The
+// Re-emission is the COMMON case: a CREATE_TABLE is re-sent at every truncating checkpoint of the source. The
 // refusal above must not fire on it, or every table breaks on its second checkpoint.
 func TestARepeatedIdenticalCreateTableIsStillANoOp(t *testing.T) {
 	s := newSink(t)

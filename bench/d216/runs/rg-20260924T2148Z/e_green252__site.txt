@@ -1,0 +1,15 @@
+2026-09-24T23:04:14Z d216-e_green252-site acquiring (5s poll), pid 65955
+2026-09-24T23:04:14Z d216-e_green252-site ACQUIRED: 65955 d216-e_green252-site 2026-09-24T23:04:14Z
+2026-09-24T23:04:14Z d216-e_green252-site pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 576 files, 470.1MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.51s
+     Running tests/integration_cluster_snapshot.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/integration_cluster_snapshot-350a4148b9c71550)
+
+running 1 test
+test an_install_under_a_wal_pin_is_refused_and_names_the_pin ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.08s
+
+2026-09-24T23:04:23Z d216-e_green252-site rc=0
+2026-09-24T23:04:23Z d216-e_green252-site released (owner matched)
+rc=0

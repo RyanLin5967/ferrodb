@@ -1,0 +1,16 @@
+2026-09-24T23:04:40Z d216-e_green252-d252 acquiring (5s poll), pid 80227
+2026-09-24T23:04:40Z d216-e_green252-d252 ACQUIRED: 80227 d216-e_green252-d252 2026-09-24T23:04:40Z
+2026-09-24T23:04:40Z d216-e_green252-d252 pre-cleaned ferrodb artifacts in /Users/idide/wt/ferrodb-lane-target.noindex (Removed 536 files, 567.2MiB total)
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.67s
+     Running tests/d252_caught_up_subscription_lets_the_log_truncate.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d252_caught_up_subscription_lets_the_log_truncate-91fea13c2dc44a53)
+
+running 2 tests
+test a_subscription_passes_a_durable_rollback_after_the_last_commit ... ok
+test a_subscription_that_has_read_every_commit_lets_the_checkpoint_truncate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+2026-09-24T23:04:48Z d216-e_green252-d252 rc=0
+2026-09-24T23:04:48Z d216-e_green252-d252 released (owner matched)
+rc=0

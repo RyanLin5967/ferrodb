@@ -1,0 +1,29 @@
+2026-09-24T21:53:33Z d216-a_red216-d247 acquiring (5s poll), pid 38041
+2026-09-24T21:53:33Z d216-a_red216-d247 ACQUIRED: 38041 d216-a_red216-d247 2026-09-24T21:53:33Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d216-verify.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.63s
+     Running tests/d247_arena_page_write_back_flushes_no_log.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d247_arena_page_write_back_flushes_no_log-7a34255449999040)
+
+running 1 test
+test writing_back_a_dirty_arena_page_does_not_flush_the_log ... FAILED
+
+failures:
+
+---- writing_back_a_dirty_arena_page_does_not_flush_the_log stdout ----
+
+thread 'writing_back_a_dirty_arena_page_does_not_flush_the_log' (356181554) panicked at tests/d247_arena_page_write_back_flushes_no_log.rs:60:5:
+assertion `left == right` failed: writing back an arena page flushed the WAL: its header was read as a heap page's LSN
+  left: 34
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    writing_back_a_dirty_arena_page_does_not_flush_the_log
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--test d247_arena_page_write_back_flushes_no_log`
+2026-09-24T21:53:35Z d216-a_red216-d247 rc=101
+2026-09-24T21:53:35Z d216-a_red216-d247 released (owner matched)
+rc=101

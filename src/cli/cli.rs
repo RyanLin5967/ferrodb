@@ -1,13 +1,12 @@
-use std::{fs::OpenOptions, io, path::Path, sync::Arc};
+use std::{io, path::Path, sync::Arc};
 use std::io::Write;
 use crate::execution::executor::run;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
-use crate::wal::log::WalManager;
-use crate::wal::recovery::{rebuild_indexes, recover};
+use crate::wal::recovery::{open_recovered, OpenedDatabase};
 use crate::wal::txn::TxnManager;
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::column::Value, error::FerroError, execution::executor::Outcome};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::TableBranchCatalog;
@@ -17,7 +16,6 @@ use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
 use crate::storage::db_lock::DbLock;
 use crate::tel::DurableEffectLog;
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
 /// Placeholder root recorded for trunk before a real tree exists. `AgentRuntime::with_storage`
 /// replaces it with a page it allocates; `reopen_with_storage` refuses if the recorded root does
@@ -55,25 +53,15 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // is the only point at which the problem is detectable. Held for the whole session: `_lock`
     // lives to the end of this function and releases on the way out, including on `?`.
     let _lock = DbLock::acquire(Path::new(db_path))?;
-    let existed = Path::new(db_path).exists();
-    let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
-    let dm = Arc::new(DiskManager::new(file)?);
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    // D280: refuses a data file whose pages carry LSNs this log never issued (a restored backup, a
-    // replica's file, a lost `.wal`), before anything else is created beside it.
-    let wal = Arc::new(WalManager::open_for_database(Path::new(db_path), &bp.disk_manager)?);
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal.clone());
-    let recovered = recover(&txn)?;
-    let mut catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
-    } else {
-        Catalog::create(bp.clone())?
-    };
-    if recovered {
-        rebuild_indexes(&mut catalog, &bp)?;
-        txn.checkpoint()?;
-    }
+    // D204: recover, rebuild every index from the recovered heap when recovery replayed a data
+    // record or the stale-indexes marker asks (D216: a clean restart does not), then checkpoint
+    // after a rebuild or whenever the log holds records, in the one function every binary opens
+    // through. This sequence used to be written out here, and
+    // `examples/pgserver.rs` had its own copy that omitted the rebuild. D280's refusal of a data file
+    // whose pages carry LSNs its log never issued (a restored backup, a replica's file, a lost
+    // `.wal`) is inside it too: `open_recovered` opens the log through
+    // `WalManager::open_for_database`, before anything else is created beside the file.
+    let OpenedDatabase { bp, txn, catalog, .. } = open_recovered(Path::new(db_path), &_lock)?;
 
     // The agent runtime is built HERE, after the catalog, and that order is load-bearing: the
     // arena floor must sit at or above the disk manager's high-water mark, and `Catalog::create`

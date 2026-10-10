@@ -68,6 +68,24 @@ pub struct WalManager {
     pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
 }
 
+/// What [`WalManager::truncate`] did. D234.
+///
+/// A checkpoint re-appends the retained DDL and run declarations after a truncation, because the
+/// truncation discarded them. When a pin kept the log, nothing was discarded, and re-appending them
+/// grew the log by every declaration at every checkpoint. A kept checkpoint therefore re-declares
+/// no run, and the schema only once a pin has passed its last declaration, which needs the pins
+/// below. So the answer has to reach the caller, and it cannot be dropped without a warning.
+#[must_use = "a checkpoint re-declares in full only after a real truncation (D234), so it has to know whether there was one"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// The log was discarded and restarted at its end.
+    Truncated,
+    /// A pin below the end kept the whole log; nothing was discarded. `oldest_pin` and
+    /// `newest_pin` are the lowest and highest LSNs still pinned: every reader starts at or above
+    /// the oldest, and the newest decides whether any reader starts above a given record.
+    Kept { oldest_pin: u64, newest_pin: u64 },
+}
+
 /// A claim on the log from `lsn` onwards. Released on drop.
 ///
 /// This is a minimal **replication slot**. It exists because a base backup taken while the primary
@@ -191,8 +209,8 @@ pub enum RecKind {
     ///   appended immediately before the `Commit`, and [`crate::replication::logical`] documents
     ///   at length why anywhere else loses it.
     /// * `txn_id == 0` — a **declaration**: this run exists. Written by `TxnManager` after every
-    ///   checkpoint, because a checkpoint discards the log whole, exactly as `replay_schema` does
-    ///   for DDL. Transaction 0 never commits, so a declaration binds nothing.
+    ///   checkpoint that truncates, because a truncation discards the log whole, exactly as
+    ///   `replay_schema` does for DDL. Transaction 0 never commits, so a declaration binds nothing.
     RunIdentity { run: RunEntity },
 }
 
@@ -591,8 +609,9 @@ impl WalManager {
     }
 
     /// Open `<db>.wal` for the database at `db_path`. **It refuses when the data file's pages carry an
-    /// LSN this log never issued** (D280). `cli.rs` and `examples/pgserver.rs` both open through
-    /// here, so they cannot disagree about it.
+    /// LSN this log never issued** (D280). Its one production caller is `wal::recovery::open_recovered`
+    /// (D204), the open path `cli.rs`, `examples/pgserver.rs` and every other binary share, so they
+    /// cannot disagree about it.
     ///
     /// `WalManager::new` on a missing file starts the log at `INITIAL_LSN`, and it looks at no page.
     /// Three files arrive in exactly that state with pages stamped by some other log:
@@ -618,16 +637,17 @@ impl WalManager {
     /// **What it reads.** Every page the file physically holds, not `0..high_water`. A replica
     /// applies records to pages the primary allocated after the backup, and its copy of the bitmap
     /// never learns of them. A page only counts if it names itself in bytes 1..5, which is the rule
-    /// redo uses. Its LSN is then read by `buffer_pool::page_lsn_of`, the WAL gate's classifier.
-    /// The self-naming rule is what stops that classifier reading the bitmap page and COW arena
-    /// pages as heap pages with large LSNs.
+    /// redo uses. Its LSN is then read by `buffer_pool::page_lsn_of`, the classifier the WAL gate
+    /// used before D216/D247 (the gate now asks `buffer_pool::log_dependency`, which applies the same
+    /// self-naming rule). The self-naming rule is what stops `page_lsn_of` reading the bitmap page
+    /// and COW arena pages as heap pages with large LSNs.
     ///
     /// **Blind spots, stated so nobody takes this for more than it is:**
     /// - A log that has issued anything is trusted without reading a page. A restored file opened
     ///   by a binary from before this guard, which logged a write and checkpointed, now has a log
     ///   whose base is above 1. It is not rescanned, and its untouched pages stay exposed.
     /// - The existence check and the creation are two steps, so the caller must hold the
-    ///   database's `DbLock`, as both entry points do.
+    ///   database's `DbLock`, as `open_recovered` requires of its callers.
     /// - A database that has never logged anything (no DDL, no DML) is rescanned on every open. In
     ///   the CLI that includes the sparse gap below the arena floor. The first `CREATE TABLE` logs a
     ///   `Ddl` record and ends that for good.
@@ -818,18 +838,20 @@ impl WalManager {
         Ok(buf)
     }
 
-    /// Discard the log and restart it at the current end.
+    /// Discard the log and restart it at the current end, and say whether that happened.
     ///
     /// **A pin below that point cancels the truncation.** This log cannot be truncated part-way —
     /// it is thrown away whole and restarted — so honouring a pin means keeping everything. The
-    /// checkpoint still succeeds; it simply reclaims nothing this time.
+    /// checkpoint still succeeds; it simply reclaims nothing this time, and the answer is
+    /// [`Truncation::Kept`]. D234: a caller that re-appends anything after a truncation has to know
+    /// whether there was one, which is why the answer is `#[must_use]`.
     ///
     /// The cost is the same one PostgreSQL replication slots have: a pin nobody releases makes the
     /// WAL grow without bound. That is a real hazard and it is not guarded here beyond
     /// [`WalManager::min_pinned_lsn`] being available to look at. It is the right trade against the
     /// alternative, which is discarding records a replica has been promised and only finding out
     /// when the replica is refused.
-    pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
+    pub fn truncate(&self, next_txn_id: u64) -> Result<Truncation, FerroError> {
         self.flush()?;
         // Taken first and held across the decision, so a pin cannot be registered against a range
         // this call is in the middle of discarding. `pin_durable` reads the frontier under this
@@ -839,10 +861,10 @@ impl WalManager {
         let file = self.file.lock().unwrap();
         let next = self.next_lsn.load(Ordering::SeqCst);
 
-        if let Some(&oldest) = pins.values().min() {
+        if let (Some(&oldest), Some(&newest)) = (pins.values().min(), pins.values().max()) {
             if oldest < next {
                 // Something still needs records below the new base. Keep the log.
-                return Ok(());
+                return Ok(Truncation::Kept { oldest_pin: oldest, newest_pin: newest });
             }
         }
 
@@ -860,7 +882,7 @@ impl WalManager {
         buffer.bytes.clear();
         buffer.start_lsn = next;
         self.flushed_lsn.store(next, Ordering::SeqCst);
-        Ok(())
+        Ok(Truncation::Truncated)
 
     }
 
@@ -926,6 +948,18 @@ impl WalManager {
     /// whole frames), so `flushed_lsn > lsn` means the whole record is durable.
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
         if self.flushed_lsn.load(Ordering::SeqCst) > lsn {
+            return Ok(());
+        }
+        self.flush()
+    }
+
+    /// Make every byte of the log below `end` durable. `end` is a position the log's END reached,
+    /// not where a record starts. This is what the buffer pool asks for a page that carries no LSN
+    /// of its own, whose `Frame::wal_mark` records where the log's end was when the page last
+    /// changed. `>=` is right here and wrong in [`WalManager::flush_up_to`]: the two differ only in
+    /// which end of a record their argument names.
+    pub fn flush_through(&self, end: u64) -> Result<(), FerroError> {
+        if self.flushed_lsn.load(Ordering::SeqCst) >= end {
             return Ok(());
         }
         self.flush()
