@@ -641,17 +641,3 @@ impl Drop for ClusterScope {
 
 #[cfg(test)]
 mod tests;
-
-impl Grants {
-    #[allow(dead_code)]
-    fn coalesce_for_mutant(&mut self) {
-        let mut merged: Vec<Held> = Vec::new();
-        for h in self.held.iter().copied() {
-            match merged.last_mut() {
-                Some(p) if p.hi == h.lo => p.hi = h.hi,
-                _ => merged.push(h),
-            }
-        }
-        self.held = merged;
-    }
-}

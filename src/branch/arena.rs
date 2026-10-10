@@ -743,12 +743,18 @@ impl ArenaPageStore {
     fn revoke_stale_authority(&self) -> u64 {
         let epoch = crate::cluster::epoch();
         if self.authority_epoch.swap(epoch, Ordering::SeqCst) != epoch {
-            let mut st = self.state.lock().unwrap();
-            // Same rule and same reason as `load_state`'s `current.clear()`: never resume filling
-            // an extent whose provenance this process can no longer vouch for.
-            st.current.clear();
-            st.claim_epoch.clear();
-            st.recycled.clear();
+            // **One mechanism, not three.** Clearing `current` and `recycled` as well was the
+            // first version, and the mutation sweep showed both were dead weight: removing either
+            // failed no test, because dropping the stamp already makes `arena_for` skip its fast
+            // path and `alloc_in_arena` refuse before it pops a recycled page. Three overlapping
+            // guards where one is load-bearing means two of them are untested code that a later
+            // reader will trust.
+            //
+            // What is left behind is harmless and deliberate: `current` may still name a stale
+            // arena, which `arena_for` filters and then overwrites via `alloc_arena`; `recycled`
+            // may still hold its pages, which `alloc_in_arena` refuses and `free_arena` reclaims
+            // whole. Neither is reachable as a page.
+            self.state.lock().unwrap().claim_epoch.clear();
         }
         epoch
     }
@@ -1791,6 +1797,19 @@ impl ArenaPageStore {
 
     /// Replace the free-space map from a checkpoint. Refuses a truncated or corrupt image rather
     /// than loading a partial map — a free-space map that is half right hands out live pages.
+    /// # F4: the two counters are **raised**, never set
+    ///
+    /// This used to `store()` the image's values straight into the two atomics. It now calls
+    /// `GrantedCounter::raise_issued_through`, which takes the maximum. Every caller in the tree
+    /// passes a freshly assembled store whose watermark is still `base_page`, so on every real path
+    /// the two are identical — but this is a `pub` method, and on a store that has already issued,
+    /// the old behaviour would rewind the counter and re-hand-out pages it had already given away.
+    /// Raising cannot do that.
+    ///
+    /// The free-space map is still replaced wholesale, so on such a store the map and the watermark
+    /// can disagree. That disagreement is in the conservative direction — fresh extents start above
+    /// what the map suggests — and the alternative, lowering the watermark to match, is the
+    /// aliasing bug.
     pub fn load_state(&self, bytes: &[u8]) -> Result<(), FerroError> {
         let body = bytes
             .len()
