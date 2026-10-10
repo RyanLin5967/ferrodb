@@ -884,3 +884,210 @@ impl RuntimeLock for NoOpGate {
         body();
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// F1 — downtime is not charged to a lease. Chubby §2.9: while the authority is down the lease
+// timer is STOPPED, which is equivalent to extending every lease by the outage. §2.8: a deadline
+// may move later, never earlier.
+//
+// Source: `artie-research/frontier/research_reclaim-with-live-children.md` §5 F1. Before the fix a
+// server that restarted after an outage longer than a branch's remaining lease reaped that branch
+// on its first scan: the agent never had a chance to act, and the design could not tell
+// "abandoned before the outage" from "expired because of the outage".
+//
+// Both tests below use REAL downtime, measured on the wall clock the binaries anchor their lease
+// clock to, and change nothing but the one lease deadline — through the same offline catalog
+// operation `expire_lease` uses. Nothing here reaches for a mark or a clock the binaries do not
+// read themselves, so the tests compile, and mean the same thing, before and after the fix.
+// ------------------------------------------------------------------------------------------------
+
+/// How long the lease in [`a_lease_that_lapsed_only_while_the_server_was_down_survives_the_first_scan_after_restart`]
+/// had left when the database went down. It is also the margin the post-restart window runs
+/// inside: the branch must still be live for this long after the restart, so a test process that
+/// is descheduled for less than this cannot turn a correct server into a failure.
+const LEASE_LEFT_AT_SHUTDOWN_MILLIS: u64 = 5_000;
+
+/// How long past that deadline the database stays down. Any positive value makes the lease lapse
+/// during the outage; one second keeps it unambiguous at millisecond clock resolution.
+const DOWN_PAST_DEADLINE_MILLIS: u64 = 1_000;
+
+/// Slack for comparing the test's wall-clock readings with a binary's lease clock. Each binary
+/// anchors its lease clock to this same wall clock at its first reading and then advances it
+/// monotonically, so the two disagree only by clock-rate drift over a few seconds, or by a wall
+/// step during the test. A second is far above the first and states the second as a failure.
+const CLOCK_SLACK_MILLIS: u64 = 1_000;
+
+/// Milliseconds since the unix epoch on this machine's wall clock — the clock each binary anchors
+/// its lease clock to when it starts. Read here directly, rather than through `LeaseDeadline`, so
+/// that the test's notion of "now" is not the subject's.
+fn wall_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock before 1970")
+        .as_millis() as u64
+}
+
+/// Set a branch's lease deadline offline, to exactly `deadline`. The general form of
+/// [`expire_lease`], through the same narrow catalog operation.
+fn set_lease(db: &Path, id: u64, deadline: u64) {
+    let catalog = open_branchcat(db);
+    let rec = catalog.get_raw(id).expect("branch record");
+    catalog.renew_lease(rec.branch_id, LeaseDeadline(deadline)).expect("set the lease");
+}
+
+/// The downtime a restart measured, as the server itself printed it.
+///
+/// Read from the server's own line so that the assertion on the moved deadline compares two
+/// numbers the SERVER produced — the extension it applied and the downtime it measured — rather
+/// than a downtime the test estimated from outside and the server never saw.
+fn printed_downtime(stderr: &str) -> u64 {
+    const LEAD: &str = "lease: clock resumed after ";
+    let at = stderr.find(LEAD).unwrap_or_else(|| {
+        panic!(
+            "the server never said it resumed the lease clock, so no downtime was measured and \
+             nothing below can be about a restart grace. Its stderr:\n{stderr}"
+        )
+    });
+    let digits: String =
+        stderr[at + LEAD.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or_else(|e| {
+        panic!("the resume line carries no downtime in milliseconds ({e}). Its stderr:\n{stderr}")
+    })
+}
+
+#[test]
+fn a_lease_that_lapsed_only_while_the_server_was_down_survives_the_first_scan_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("grace.db");
+    let (baseline, populated) = abandoned_branch_fixture(&db);
+    let branch = populated.only_agent_branch().branch_id;
+
+    // The fixture's last binary has exited, so whatever it last knew about the lease clock is at
+    // or before this reading.
+    let shutdown = wall_millis();
+    // At shutdown the branch had `LEASE_LEFT_AT_SHUTDOWN_MILLIS` left...
+    let deadline = shutdown + LEASE_LEFT_AT_SHUTDOWN_MILLIS;
+    set_lease(&db, branch.id, deadline);
+    // ...and the database stays down until well past it. Real downtime, not a rewritten clock: the
+    // lease lapses while nothing is running, which is the whole of F1's scenario.
+    while wall_millis() < deadline + DOWN_PAST_DEADLINE_MILLIS {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The mark the server will measure its downtime from, read offline BEFORE it starts, through a
+    // read-only accessor (D198 adversary, C4). With the test's own clock readings either side of
+    // the server's resume, it bounds the downtime the server reports from outside the server.
+    let mark = open_branchcat(&db)
+        .last_alive_mark()
+        .expect("read the last-alive mark")
+        .expect("the fixture's binaries each resumed and marked, so the catalog must hold a mark");
+    let t_spawn = wall_millis();
+    let server = start_server(&db, BRISK_SCAN_MILLIS);
+    // Printed after `LeaseThread::start` returns, i.e. after the resume and after the scan thread
+    // has been spawned — so the window below is measured from a point at which scanning has begun.
+    server.wait_for_stderr("pgserver: lease scan every");
+    let t_seen = wall_millis();
+    // Ten scan intervals. Before the fix the first of them reaps the branch.
+    std::thread::sleep(Duration::from_millis(BRISK_SCAN_MILLIS * 10));
+    let early = server.stderr();
+    assert!(
+        !early.contains("lease: reaped"),
+        "a lease that lapsed only while the server was down was reaped on the first scan after \
+         the restart — F1. The branch had {LEASE_LEFT_AT_SHUTDOWN_MILLIS}ms left when the \
+         database stopped, and the agent never had a chance to act. Its stderr:\n{early}"
+    );
+    // D198 removed an assertion here, `early.contains("1 live lease(s) extended")`: it pinned a
+    // count of rewritten leases, and the O(1) restart rewrites none and counts none (a count would
+    // be an O(live branches) walk at open). Its purpose — that the survival above is a lease that
+    // was kept and not a scan that never ran — is carried by `printed_downtime`, which panics
+    // without the resume line, and by the exact-deadline assertion below, which is unchanged.
+    let downtime = printed_downtime(&early);
+    // Independent of the server's own report (C4): its resume read its clock after `t_spawn` and
+    // before `t_seen`, and measured from `mark`. A server that inflated the downtime it measured
+    // AND the shift it applied by the same amount passes the exact-deadline assertion below, and
+    // fails this.
+    assert!(
+        downtime + CLOCK_SLACK_MILLIS >= t_spawn - mark && downtime <= t_seen - mark + CLOCK_SLACK_MILLIS,
+        "the server measured {downtime}ms of downtime from mark {mark}, but it resumed between \
+         {t_spawn} and {t_seen} by the test's clock, so the downtime must lie in [{}, {}] (slack \
+         {CLOCK_SLACK_MILLIS}ms). Its stderr:\n{early}",
+        (t_spawn - mark).saturating_sub(CLOCK_SLACK_MILLIS),
+        t_seen - mark + CLOCK_SLACK_MILLIS
+    );
+    assert!(
+        downtime >= LEASE_LEFT_AT_SHUTDOWN_MILLIS + DOWN_PAST_DEADLINE_MILLIS,
+        "the server measured {downtime}ms of downtime, but it was down for at least \
+         {}ms by the wall clock — it is crediting less than the outage, so a lease that lapsed \
+         late in it would still be reaped. Its stderr:\n{early}",
+        LEASE_LEFT_AT_SHUTDOWN_MILLIS + DOWN_PAST_DEADLINE_MILLIS
+    );
+
+    // **A lease, not an exemption.** Once the remainder it had at shutdown runs out, the same
+    // scan reaps it with no client action — exit criterion 8 still holds for this branch.
+    server.wait_for_stderr("lease: reaped");
+    let stderr = server.kill_and_unlock();
+    assert!(
+        stderr.contains(&format!("{branch}")),
+        "the reap that ended the preserved lease did not name the branch:\n{stderr}"
+    );
+
+    let after = arena_state(&db);
+    let rec = after.branch(branch.id);
+    assert_eq!(rec.state, BranchState::Reaped, "the preserved lease was never enforced");
+    // `mark_reaped` does not touch the deadline, so the reaped record still carries the one the
+    // restart wrote.
+    assert_eq!(
+        rec.lease_deadline.0,
+        deadline + downtime,
+        "the restart moved the deadline by something other than the downtime it measured \
+         ({deadline} + {downtime}). Chubby's rule is exactly the outage: less charges downtime to \
+         the lease, more hands out time nobody was owed"
+    );
+    assert_eq!(
+        after.live, baseline.live,
+        "allocated page count did not return to baseline once the preserved lease ran out ({} at \
+         baseline, {} after the branch wrote, {} after the reap)",
+        baseline.live, populated.live, after.live
+    );
+    assert_eq!(after.reserved, baseline.reserved, "the extent did not go back");
+}
+
+#[test]
+fn a_lease_that_had_already_expired_before_the_server_went_down_is_still_reaped_after_restart() {
+    // The control for the test above, and the half of F1 that must NOT change: stopping the timer
+    // during an outage keeps what a lease had left, it does not hand a lease back to a branch that
+    // had already run out while the database was up. `the_server_reaps_an_abandoned_branch_without
+    // _one_socket_being_opened` pins the degenerate deadline 0; this pins a realistic one, an hour
+    // before the shutdown. A restart that gave every live branch a fresh window — the obvious lazy
+    // fix — passes the test above and fails this one.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("expired.db");
+    let (baseline, populated) = abandoned_branch_fixture(&db);
+    let branch = populated.only_agent_branch().branch_id;
+
+    let shutdown = wall_millis();
+    let deadline = shutdown - 3_600_000;
+    set_lease(&db, branch.id, deadline);
+
+    let server = start_server(&db, BRISK_SCAN_MILLIS);
+    server.wait_for_stderr("lease: reaped");
+    let stderr = server.kill_and_unlock();
+    assert!(
+        stderr.contains(&format!("{branch}")) && stderr.contains("with no client cooperation"),
+        "the server's own log does not name the branch it reaped:\n{stderr}"
+    );
+
+    let after = arena_state(&db);
+    assert_eq!(
+        after.branch(branch.id).state,
+        BranchState::Reaped,
+        "a lease that expired an hour before the shutdown survived the restart"
+    );
+    assert_eq!(
+        after.live, baseline.live,
+        "allocated page count did not return to baseline ({} at baseline, {} after the branch \
+         wrote, {} after the reap)",
+        baseline.live, populated.live, after.live
+    );
+    assert_eq!(after.reserved, baseline.reserved, "the extent did not go back");
+}

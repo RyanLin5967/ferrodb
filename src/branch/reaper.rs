@@ -23,12 +23,14 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::record::{CoreRecord, BranchRecord};
-use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState};
+use crate::branch::types::{
+    ArenaId, BranchError, BranchId, BranchState, LeaseDeadline, LeaseResume,
+};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::PageStore;
 use crate::error::FerroError;
@@ -96,6 +98,10 @@ pub enum ReapOutcome {
     /// Its lease is no longer expired: the deadline moved between the candidate query and the
     /// re-read inside the lock. Routine, and deliberately reported nowhere — the branch is
     /// healthy and there is nothing for an operator to do.
+    ///
+    /// Since C2b (D198) also the answer for a branch whose lease the reaper no longer ENFORCES by
+    /// the time of the re-read — quarantined in between, say: `enforced_lease` answers `None`, and
+    /// leaving the branch alone is just as routine.
     NotExpired,
     /// **The reaper declined to decide, and this is why.** Usually nothing was freed, so nothing is
     /// lost; the branch keeps its pages and the next sweep asks again. ⚠ Not always (found under
@@ -165,6 +171,14 @@ pub struct TwoTierReaper {
     /// sweep), `resumed reap of ...`, or `interrupted reap of slot N:`. `LeaseThread::start` words
     /// each by that prefix (`lease_thread::open_refusal_line`).
     open_slot_refusals: Mutex<Vec<String>>,
+    /// **F1.** Whether this reaper resumed a lease clock whose last-alive mark its catalog keeps,
+    /// and so owes that mark a heartbeat. Set by [`Self::resume_lease_clock`] and nothing else.
+    ///
+    /// A flag rather than a question put to the catalog on every scan, because the answer is only
+    /// meaningful after a resume: a reaper that never resumed — every caller of `scan_once` that is
+    /// not `LeaseThread`, and every test that drives a sweep by hand — must not start writing marks
+    /// that the next start would measure a downtime from.
+    lease_marks: AtomicBool,
 }
 
 impl TwoTierReaper {
@@ -182,7 +196,45 @@ impl TwoTierReaper {
             refused_reaps: AtomicU64::new(0),
             open_slots_reclaimed: AtomicU64::new(0),
             open_slot_refusals: Mutex::new(Vec::new()),
+            lease_marks: AtomicBool::new(false),
         }
+    }
+
+    /// **F1 — resume the lease clock before the first scan.** See [`LeaseResume`] for the rule.
+    ///
+    /// The other half of startup beside [`Self::resume_interrupted_reaps`], and called beside it
+    /// by `LeaseThread::start`, on the caller's thread and under the runtime lock: a restart that
+    /// scanned first would reap every branch whose lease lapsed while the process was down, which
+    /// is the defect this exists to remove.
+    ///
+    /// Not applied on a cluster member ([`LeaseResume::Clustered`]): lease time there is the
+    /// replicated tick, the same on every member, and extending deadlines on one node's restart is
+    /// the divergence exit criterion 9 forbids. A member does not arm the heartbeat either, so a
+    /// tick value never becomes a mark a later standalone start would measure from.
+    pub fn resume_lease_clock(&self) -> Result<LeaseResume, FerroError> {
+        if crate::cluster::is_clustered() {
+            return Ok(LeaseResume::Clustered);
+        }
+        // Standalone, so this cannot refuse; `?` rather than a fabricated reading if it ever does.
+        let now = LeaseDeadline::try_now_millis()?;
+        let resumed = self.catalog.resume_leases(now)?;
+        if resumed != LeaseResume::NoMark {
+            self.lease_marks.store(true, Ordering::SeqCst);
+        }
+        Ok(resumed)
+    }
+
+    /// **F1 — the heartbeat the next start measures downtime from.** Records `now_millis` as the
+    /// catalog's last-alive mark, if [`Self::resume_lease_clock`] armed this reaper; otherwise a
+    /// no-op, and deliberately silent, because an unarmed reaper already said why when it resumed.
+    ///
+    /// Skipped on a cluster member for the reason `resume_lease_clock` gives, re-checked here
+    /// because the authority is process-scoped and can change after startup.
+    pub fn record_lease_alive(&self, now_millis: u64) -> Result<(), FerroError> {
+        if !self.lease_marks.load(Ordering::SeqCst) || crate::cluster::is_clustered() {
+            return Ok(());
+        }
+        self.catalog.record_lease_alive(now_millis)
     }
 
     /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
@@ -1304,21 +1356,41 @@ impl TwoTierReaper {
     /// a lock the caller is holding. The old whole-sweep atomicity is not needed for that — only
     /// per-branch atomicity is, which is all this takes.
     ///
-    /// It adds no second opinion about anything [`Reaper::reap`] already decides. Generation,
-    /// trunk and already-reaped are `reap`'s to judge and are left to it; duplicating them here
-    /// would be a second predicate to drift, and the one that is easier to test would mask the one
-    /// that ships. The single new question is the deadline, and it is asked because the removed
-    /// lock is what used to answer it.
+    /// ⚠ **This used to say it "adds no second opinion" about anything [`Reaper::reap`] decides —
+    /// generation, trunk and already-reaped left to `reap`, because a second predicate drifts and
+    /// the easier-to-test one masks the one that ships. C2b (D198) made that false, on purpose.**
+    /// The re-check now asks `BranchCatalog::enforced_lease`, the refused predicate, and that call
+    /// runs `check_readable` (a stale generation or a `Reaping`/`Reaped` record is refused here) and
+    /// answers `None` for trunk and a quarantined branch. So on THIS path `reap`'s own generation
+    /// refusal is reached only by a record that changes between the two reads; the masking the old
+    /// sentence warned about is real, and it is accepted because the alternative — deciding expiry
+    /// from a read the catalog does not refuse — let an unresumed catalog reap on an uncredited
+    /// clock. `reap`'s `Branch` arm stays covered where the re-check passes: `lease_thread`'s D127
+    /// tests (a decorator that refuses inside `reap`) and `reap_is_idempotent_and_a_stale_handle_is_refused`,
+    /// which calls `reap` directly.
     pub(crate) fn reap_if_still_expired(
         &self,
         branch: BranchId,
         now_millis: u64,
     ) -> Result<ReapOutcome, FerroError> {
-        match self.catalog.get_raw(branch.id) {
-            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => {
+        // **C2b (D198) — the re-check asks the catalog's REFUSED predicate, not a raw read.** It
+        // read `get_raw(..).lease_deadline`, which answers on any catalog; `enforced_lease` is the
+        // reaper's own predicate (`Live`, non-trunk, on the lease clock) and is REFUSED by a catalog
+        // that holds a last-alive mark and has not resumed in this process (C2). Before this, both
+        // callers were protected only by having asked the refused `expired_candidates` first — the
+        // calling convention C2 removed one level up.
+        match self.catalog.enforced_lease(branch) {
+            // No longer a lease the reaper enforces — e.g. quarantined between the candidate query
+            // and this re-check. The raw read would have reaped it on its long-expired deadline;
+            // leaving it is the same answer as a lease that moved, and just as routine.
+            Ok(None) => return Ok(ReapOutcome::NotExpired),
+            Ok(Some(deadline)) if !deadline.is_expired_at(now_millis) => {
                 return Ok(ReapOutcome::NotExpired)
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            // **C2b: an unresumed marked catalog's refusal arrives here**, and is a D127 refusal
+            // like any other — counted, and printed with the catalog's reason.
+            //
             // **D124 — not "the slot is gone entirely".** Nothing removes a record, so the slot
             // did not vanish between the query and here; what this catches is any `Branch` error
             // from the read. ⚠ This used to add "including the momentary miss
@@ -2890,6 +2962,11 @@ mod tests {
         // ARM 4 — the record reads fine but `reap` itself refuses (`reap`'s `Branch` arm). This
         // is the site D124's `Corrupt` arrives at from `has_live_children`; a stale generation is
         // the same arm reached without a corrupt catalog.
+        // ⚠ Since C2b (D198) the stale handle is refused one step EARLIER, by the re-check's
+        // `enforced_lease` (`check_readable`), so this arm now exercises the re-check's `Branch`
+        // arm, as ARM 3 does, and no longer reaches `reap`'s. The outcome it asserts is unchanged.
+        // `reap`'s `Branch` arm is covered by `lease_thread`'s D127 tests and by
+        // `reap_is_idempotent_and_a_stale_handle_is_refused`.
         let live = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id;
         write_pages(&h, live, 2);
         let stale = live.bump();

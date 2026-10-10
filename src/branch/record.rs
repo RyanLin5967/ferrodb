@@ -145,6 +145,17 @@ impl CoreRecord {
     pub fn serialize_core(&self) -> Vec<u8> {
         self.0.serialize_core()
     }
+    /// The same core with its lease deadline replaced — used by `TableBranchCatalog`'s private
+    /// `stored::StoredCore::outward` to hand a core record out on the lease clock rather than in the
+    /// catalog's virtual time (D198), without hydrating a row it only needs the core of.
+    ///
+    /// **Safe by direction, like [`CoreRecord::narrow`]:** it changes one fixed-width core field and
+    /// yields a `CoreRecord`, so the result is exactly as incomplete as its input and still cannot
+    /// be mistaken for a whole record.
+    pub(crate) fn with_lease_deadline(mut self, deadline: LeaseDeadline) -> CoreRecord {
+        self.0.lease_deadline = deadline;
+        self
+    }
 }
 
 impl BranchRecord {
