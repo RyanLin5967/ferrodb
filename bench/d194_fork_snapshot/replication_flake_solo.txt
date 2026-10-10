@@ -1,0 +1,11 @@
+# 2026-09-24T02:51:04Z solo runs of the lib test binary built at 2eeed40, each under taskpolicy -b; load: 14.54 18.45 16.93
+assertion `left == right` failed: 18/200 waiters lost an acknowledgement to a concurrent forget -- the commit was satisfied and then reported unacknowledged because its replica disconnected
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 12.62s
+assertion `left == right` failed: 23/200 waiters lost an acknowledgement to a concurrent forget -- the commit was satisfied and then reported unacknowledged because its replica disconnected
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 14.70s
+assertion `left == right` failed: 17/200 waiters lost an acknowledgement to a concurrent forget -- the commit was satisfied and then reported unacknowledged because its replica disconnected
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 15.24s
+assertion `left == right` failed: 22/200 waiters lost an acknowledgement to a concurrent forget -- the commit was satisfied and then reported unacknowledged because its replica disconnected
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 14.98s
+assertion `left == right` failed: 17/200 waiters lost an acknowledgement to a concurrent forget -- the commit was satisfied and then reported unacknowledged because its replica disconnected
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1666 filtered out; finished in 14.07s

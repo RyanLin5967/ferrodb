@@ -605,6 +605,7 @@ fn describe_stmt(stmt: &Stmt, catalog: &Catalog) -> Result<Option<Vec<Field>>, F
         | Stmt::Diff { .. }
         | Stmt::Merge { .. }
         | Stmt::Abandon { .. }
+        | Stmt::Rebase { .. }
         | Stmt::RevertMerge { .. } => Ok(crate::agent_sql::dispatch::columns_for_stmt(stmt)
             .map(fields_of)),
         _ => Ok(None),

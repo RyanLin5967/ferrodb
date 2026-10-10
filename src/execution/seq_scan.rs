@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::wal::txn::ReadView;
-use crate::{error::FerroError, execution::executor::Executor, storage::heap_scanner::HeapScanner, wal::visibility::resolve_visibility};
+use crate::{error::FerroError, execution::executor::Executor, storage::heap_scanner::HeapScanner, wal::visibility::{resolve_visibility_counted, HopCount}};
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
@@ -43,6 +43,8 @@ pub struct SeqScan {
     /// D176 — tuples pulled, accumulated locally and flushed once in `Drop`. Not `pub`: a
     /// caller that could set it could forge the measurement.
     pulled: u64,
+    /// D194 — version-chain hops, flushed once when the scan drops. See `VISIBILITY_HOPS`.
+    hops: HopCount,
 }
 
 impl SeqScan {
@@ -53,7 +55,7 @@ impl SeqScan {
         view: Arc<ReadView>,
         tt_heap: HeapFileManager,
     ) -> Self {
-        Self { scanner, schema, view, tt_heap, pulled: 0 }
+        Self { scanner, schema, view, tt_heap, pulled: 0, hops: HopCount::default() }
     }
 }
 
@@ -75,7 +77,7 @@ impl Executor for SeqScan {
             // Counted where the heap yielded it, BEFORE visibility filtering — the engine paid
             // for this tuple whether or not the caller ever sees it. Plain field, no atomic.
             self.pulled += 1;
-            let vt = match resolve_visibility(&self.view, &self.tt_heap, tuple) {
+            let vt = match resolve_visibility_counted(&self.view, &self.tt_heap, tuple, &mut self.hops) {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e))

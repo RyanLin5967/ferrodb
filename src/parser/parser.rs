@@ -350,6 +350,11 @@ pub enum Stmt {
     Abandon {
         branch: Option<BranchRef>,
     },
+    /// `REBASE;` — D194 step 4: re-pin this session's branch to main as it stands now, if nothing
+    /// the branch depends on has moved since its fork. `REBASE` is matched by lexeme, not reserved.
+    Rebase {
+        branch: Option<BranchRef>,
+    },
     /// `REVERT MERGE m_44 CASCADE;` — causal rollback over retained read-sets. Without `CASCADE`
     /// the revert halts and reports the dependency tree (exit criterion 10).
     RevertMerge {
@@ -460,6 +465,14 @@ impl Parser {
             let branch = self.parse_optional_branch_arg()?;
             self.consume(TokenType::Semicolon, "expected ;")?;
             return Ok(Stmt::Abandon { branch })
+        } else if self.check(TokenType::Identifier) && self.peek().lexeme.eq_ignore_ascii_case("rebase") {
+            // Matched by lexeme rather than reserved, like `PROMPT` and `ALL`: at the start of a
+            // statement no other reading of an identifier exists, and `rebase` stays usable as a
+            // column name everywhere else.
+            self.advance();
+            let branch = self.parse_optional_branch_arg()?;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::Rebase { branch })
         } else if self.match_token(&[TokenType::Revert]) {
             return self.parse_revert()
         } else if self.match_token(&[TokenType::Simulate]) {
@@ -1135,7 +1148,7 @@ impl Parser {
         Ok(Stmt::Simulate { agent, run, model, candidates, assertions, admit })
     }
 
-    // optional `BRANCH b_1` argument on DIFF / MERGE / ABANDON; absent means "this session's branch"
+    // optional `BRANCH b_1` argument on DIFF / MERGE / ABANDON / REBASE; absent means "this session's branch"
     pub fn parse_optional_branch_arg(&mut self) -> Result<Option<BranchRef>, FerroError> {
         if self.match_token(&[TokenType::Branch]) {
             return Ok(Some(BranchRef::new(self.consume_name("expected a branch name")?)));
@@ -1714,6 +1727,18 @@ mod tests {
     fn test_begin_agent_session_requires_a_quoted_agent_id() {
         assert!(parse_sql("BEGIN AGENT SESSION AS pricing;").is_err());
         assert!(parse_sql("BEGIN AGENT AS 'a';").is_err());
+    }
+
+    #[test]
+    fn rebase_parses_with_and_without_a_branch_and_is_not_a_reserved_word() {
+        assert!(matches!(one("REBASE;"), Stmt::Rebase { branch: None }));
+        match one("rebase branch b_3;") {
+            Stmt::Rebase { branch: Some(b) } => assert_eq!(b.name, "b_3"),
+            other => panic!("expected Rebase, got {:?}", other),
+        }
+        // Matched by lexeme at the start of a statement only, so it is still an ordinary column name.
+        assert!(matches!(one("CREATE TABLE t (rebase INTEGER);"), Stmt::CreateTable { .. }));
+        assert!(parse_sql("REBASE BRANCH;").is_err());
     }
 
     #[test]

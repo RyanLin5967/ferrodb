@@ -16,7 +16,7 @@ use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::index_fulltext::{distinct_tokens, indexed_text, open_posting_tree, postings_for_token, tokenize};
 use crate::wal::txn::ReadView;
-use crate::wal::visibility::resolve_visibility;
+use crate::wal::visibility::{resolve_visibility_counted, HopCount};
 
 /// How many rows `SEARCH` returns when the statement does not say.
 ///
@@ -269,6 +269,8 @@ impl FullTextSearch {
         // primary key to `RecordId` to heap tuple to visible version — plus the recheck that a
         // posting is only a claim about *some* version of the row.
         let mut candidates: Vec<Candidate> = Vec::new();
+        // D194: this search's version-chain hops, flushed once when it returns (`VISIBILITY_HOPS`).
+        let mut hops = HopCount::default();
         let mut doc_freqs = vec![0usize; terms.len()];
         let mut total_len = 0usize;
         for pk in candidate_pks.keys() {
@@ -278,7 +280,7 @@ impl FullTextSearch {
                 None => continue,
             };
             let tuple = heap.read(rid)?;
-            let visible = match resolve_visibility(&view, &tt_heap, tuple)? {
+            let visible = match resolve_visibility_counted(&view, &tt_heap, tuple, &mut hops)? {
                 Some(v) => v,
                 // No version of this row is visible to this reader: a deleted row, or one written by
                 // a transaction this snapshot cannot see. This is what makes leaving a dead posting
