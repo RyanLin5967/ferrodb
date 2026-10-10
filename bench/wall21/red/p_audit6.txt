@@ -1,0 +1,92 @@
+step=p_audit6 sha=661afe31690834e85723fb22ea0b2c9355b59a26
+cmd=cargo test --lib --test d200_reap_releases_id_slots -- a_failed_read_on_the_slow_path_at_open_is_the_reaps_refusal branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch
+2026-09-24T23:02:23Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:800:13
+    |
+800 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2646:17
+     |
+2646 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2818 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2646:17
+     |
+2646 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2818 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:2646:17
+     |
+2646 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2819 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:2646:17
+     |
+2646 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+2819 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (lib test) generated 3 warnings (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.38s
+     Running unittests src/lib.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/ferrodb-d929e200b07daf14)
+
+running 3 tests
+test branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch ... FAILED
+test branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once ... FAILED
+test branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed ... FAILED
+
+failures:
+
+---- branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch stdout ----
+
+thread 'branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch' (363625706) panicked at src/branch/table_catalog.rs:4137:9:
+E6: a stale Quarantined key listed a Live branch as held: [1]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once stdout ----
+
+thread 'branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once' (363625704) panicked at src/branch/table_catalog.rs:4078:9:
+assertion `left == right` failed: E3: a torn renew left two DEADLINE keys, and L was named once per key
+  left: 2
+ right: 1
+
+---- branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed stdout ----
+
+thread 'branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed' (363625705) panicked at src/branch/table_catalog.rs:4110:9:
+E4: the failed move left a Live record with no DEADLINE key: it never expires
+
+
+failures:
+    branch::table_catalog::tests::a_live_record_re_deadlined_twice_appears_once
+    branch::table_catalog::tests::a_move_into_live_that_fails_never_leaves_a_live_record_unindexed
+    branch::table_catalog::tests::a_stale_quarantined_key_does_not_list_a_live_branch
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 1683 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`
+rc=101

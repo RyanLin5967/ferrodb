@@ -1,0 +1,94 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-reaped-subtree.noindex)
+warning: variable does not need to be mutable
+   --> tests/integration_branch_attestation.rs:548:9
+    |
+548 |     let mut run_sql = |sql: &str, s: &mut Session, catalog: &mut Catalog| {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_branch_attestation") generated 1 warning (run `cargo fix --test "integration_branch_attestation" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.21s
+     Running tests/adv_f5_probe.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/adv_f5_probe-68c5843e4ccb02b0)
+
+running 5 tests
+test p5_an_update_on_a_sealed_branch_now_reports_a_read_error ... ok
+test p1_non_agent_as_of_branch_reads_fine_and_retains_nothing ... ok
+test p2_agent_session_reads_another_live_branch_as_of ... ok
+test p3_supervisor_merge_by_name_leaves_the_agent_connection_inert ... ok
+test p4_a_read_on_a_branch_the_reaper_took_is_not_refused_and_pins_revert_forever ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/adv_f6_dropped_capture.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/adv_f6_dropped_capture-dab99c539ab9b0b9)
+
+running 3 tests
+test abandoning_a_parent_whose_child_published_its_write_loses_the_dependent ... ok
+test reaping_a_parent_whose_child_published_its_write_loses_the_dependent ... ok
+test control_merging_the_parent_keeps_the_same_dependent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/d124_owner_record_refusal.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d124_owner_record_refusal-5e2fdccc71358212)
+
+running 4 tests
+test log_catalog_drain_pending_refuses_an_unreadable_owner ... ok
+test log_catalog_free_page_refuses_an_unreadable_owner ... ok
+test table_catalog_free_page_refuses_an_unreadable_owner ... ok
+test table_catalog_drain_pending_refuses_an_unreadable_owner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/d126_atomic_upsert.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d126_atomic_upsert-afd33fa128f9476a)
+
+running 4 tests
+test insert_still_does_not_replace ... ok
+test a_growing_rewrite_that_splits_is_still_never_absent ... ok
+test a_rewritten_key_is_never_absent_to_a_concurrent_reader ... ok
+test the_primary_index_rewrite_is_never_absent_either ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+
+     Running tests/d15_concurrent_fork_and_reap.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d15_concurrent_fork_and_reap-f616b8a3d4946baa)
+
+running 2 tests
+test log_catalog_survives_a_concurrent_reaper ... ok
+test table_catalog_survives_a_concurrent_reaper ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.80s
+
+     Running tests/d16_transitive_visibility.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d16_transitive_visibility-1fb58af419bef1e7)
+
+running 2 tests
+test log_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+test table_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/d18_reaper_asks_the_catalog.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d18_reaper_asks_the_catalog-6471ae76bebde910)
+
+running 2 tests
+test log_catalog_reap_must_not_free_what_a_live_child_reads ... ok
+test table_catalog_reap_must_not_free_what_a_live_child_reads ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/d19_leak_is_a_race.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d19_leak_is_a_race-10fc0f339fa6471c)
+
+running 1 test
+test the_control_that_says_race_or_logic has been running for over 60 seconds
+test the_control_that_says_race_or_logic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 329.02s
+
+     Running tests/d33_add_arena_must_be_durable.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d33_add_arena_must_be_durable-41f3e506fff8c65a)
+error: test failed, to rerun pass `--test d33_add_arena_must_be_durable`
+
+Caused by:
+  could not execute process `/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d33_add_arena_must_be_durable-41f3e506fff8c65a` (never executed)
+
+Caused by:
+  No such file or directory (os error 2)
+rc=101

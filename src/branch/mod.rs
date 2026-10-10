@@ -256,6 +256,24 @@ pub trait BranchCatalog: Send + Sync {
     /// filtered out — the two callers disagree about whether they want it, so each says.
     fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError>;
 
+    /// The ids in `state`'s index, in branch-id order, **without decoding a record**.
+    ///
+    /// **W3 (wall21 review audit 3).** `in_state` decodes every record in the span, so one record
+    /// that cannot be decoded fails the whole question. The open's resume asks this instead and
+    /// reads each record itself, so that record costs a counted refusal and not the open (D127).
+    /// The default is `in_state`'s ids, which decodes; a catalog that indexes state by key should
+    /// answer from the index alone, as `TableBranchCatalog` does.
+    ///
+    /// ⚠ **Not always the ids of `in_state` (audit 4 A6; this line said it was).**
+    /// `TableBranchCatalog`'s answer is a SUPERSET of `in_state`'s ids: it includes an id whose
+    /// state key has no record, and an id whose stale state key names a record now in another
+    /// state (a torn move, D264). `in_state` skips both; since wall21 review audit 6 E6 it
+    /// re-checks each record's state. So a caller of this method re-reads each record and checks
+    /// its state, as the resume does (W3, A3).
+    fn ids_in_state(&self, state: BranchState) -> Result<Vec<u64>, FerroError> {
+        Ok(self.in_state(state)?.into_iter().map(|r| r.branch_id.id).collect())
+    }
+
     /// Every record the catalog holds, whatever its state, **streamed in branch-id order**.
     ///
     /// This one is genuinely O(N) and no index changes that: its callers are a full system view
@@ -348,6 +366,18 @@ pub trait BranchCatalog: Send + Sync {
     /// child still points at it makes the parent of those pages ambiguous. Trunk (`id == 0`) is
     /// never released.
     fn release_id(&self, id: u64);
+
+    /// **D200.** Id slots that may hold a `Reaped` record whose slot is not on the free list: the
+    /// candidates `TwoTierReaper`'s open-time sweep re-checks and, where nothing below them is
+    /// alive, releases.
+    ///
+    /// **Candidates, not answers.** A superset is correct, because the sweep re-reads each record
+    /// and `release_id` re-checks both of its conditions. The default is every `Reaped` record,
+    /// exact about state and blind to the free list; a catalog that keeps its free list as keys
+    /// should answer with a range query instead, as `TableBranchCatalog` does.
+    fn unreleased_reaped_candidates(&self) -> Result<Vec<u64>, FerroError> {
+        Ok(self.in_state(BranchState::Reaped)?.into_iter().map(|r| r.branch_id.id).collect())
+    }
 
     /// Add one child to `parent_id`'s live set.
     ///

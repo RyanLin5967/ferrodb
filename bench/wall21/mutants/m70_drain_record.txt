@@ -1,0 +1,36 @@
+mutant=m70_drain_record applied= drain_record base=30f247f713d5c5f3f41fcdd1ab1ee8ff316dee8f
+cmd=cargo test --test d200_reap_releases_id_slots -- a_persistent_fault_in_the_drain_read_fails_no_open --nocapture
+2026-09-24T23:02:58Z
+diff --git a/src/branch/reaper.rs b/src/branch/reaper.rs
+index b81fa25..6e7aee5 100644
+--- a/src/branch/reaper.rs
++++ b/src/branch/reaper.rs
+@@ -786,7 +786,7 @@ impl TwoTierReaper {
+                 // by a second exit. A mapped failure still refuses below, and the entries are put
+                 // back before the refusal, so the map in memory is the map on disk when it is taken.
+                 let owner = pf.owner.id;
+-                let pinned = match one_slot_read(owner, "the record", self.catalog.get_raw(owner)) {
++                let pinned = match self.catalog.get_raw(owner) {
+                     // **D18, second site.** This read `rec.live_children` too, and on the table
+                     // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
+                     // TRUE, so `pinned` was always false and EVERY parked page was released. The
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-wall21-mutants.noindex)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.52s
+     Running tests/d200_reap_releases_id_slots.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d200_reap_releases_id_slots-afa85a8f8f13df19)
+
+running 1 test
+
+thread 'a_persistent_fault_in_the_drain_read_fails_no_open' (363673633) panicked at tests/d200_reap_releases_id_slots.rs:1020:13:
+§8.22 (record): a persistent fault in the drain's read failed the first open: io error: injected persistent I/O error: get_raw of slot 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_persistent_fault_in_the_drain_read_fails_no_open ... FAILED
+
+failures:
+
+failures:
+    a_persistent_fault_in_the_drain_read_fails_no_open
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.22s
+
+error: test failed, to rerun pass `--test d200_reap_releases_id_slots`
+rc=101
