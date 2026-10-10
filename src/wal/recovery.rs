@@ -1,6 +1,6 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::OpenOptions, path::Path, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{db_lock::DbLock, disk_manager::DiskManager, heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, index_page::{entry_too_large, first_entry_over_bound, EntryOf, RECOVERY_REMEDY}, tuple::Tuple}, wal::{log::{RecKind, WalManager}, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -247,6 +247,9 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
     names.sort_unstable();
     refuse_rows_no_rebuilt_tree_admits(catalog, bp, &names)?;
+    // Every tree this rebuilds, with its fresh root: the shared cells are repointed from this at
+    // the end (D205), once the `&mut` borrow of each entry has ended.
+    let mut rebuilt: Vec<(String, Option<String>, u32)> = Vec::new();
     for name in names {
         let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
@@ -303,6 +306,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             fresh.insert(pk.clone(), *rid)?;
         }
         entry.primary_index_root = fresh.root_page_id.load(Ordering::SeqCst);
+        rebuilt.push((name.clone(), None, entry.primary_index_root));
 
         // secondary indexes
         for info in entry.indexes.iter_mut() {
@@ -314,6 +318,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
         }
 
         // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
@@ -340,14 +345,140 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
                 }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+            rebuilt.push((name.clone(), Some(info.column_name.clone()), info.root_page_id));
         }
     }
+    // **D205: the records above are the only copy that moved.** Every loop in this function
+    // writes the fresh root into the `TableEntry`, and the SHARED cells (`Catalog::roots`, D53)
+    // still hold the roots `Catalog::open` seeded before any of this ran: the trees `free_tree` has
+    // just released. `plan::open_table` and the optimizer prefer the cell to the record, so without
+    // this the rebuild is correct on disk and invisible. Every statement after recovery descended a
+    // freed tree, and the fresh-context adversary's schedule (a DROP below the table, then a crash)
+    // turned that into a committed row missing by key and a duplicate admitted.
+    //
+    // **Stored INTO the existing cell, not by re-creating the map.** `b9a0a75` (W4(c), never merged)
+    // closed the same hole with `reseed_root_cells`: clear every cell and re-create it. That is
+    // correct only while nothing holds a clone of a cell. A holder keeps an `Arc` nobody updates
+    // again, giving two root pointers for one tree, which is the D53 defect. Storing into the cell
+    // has no such precondition: every holder sees the new root, and there stays one cell per tree
+    // (`a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them`). `sync_root_cells` then
+    // creates a cell for any tree that has none, and it never overwrites the ones just repointed.
+    //
+    // ⚠ Pre-existing, and not changed here: a cell is keyed by `(table, column)` with no index kind,
+    // so a secondary index and a full-text index on ONE column share a cell, and the full-text root
+    // is stored last. See `frontier/lane_rollback_index_orphan.md` §14.
+    //
+    // Here, and not only in `open_recovered`, because this is the function that makes the cells
+    // wrong. A caller that rebuilds and then queries, as the full-text and recovery tests do, gets
+    // cells that match what it built.
+    for (table, column, root) in &rebuilt {
+        if let Some(cell) = catalog.root_cell(table, column.as_deref()) {
+            cell.store(*root, Ordering::SeqCst);
+        }
+    }
+    catalog.sync_root_cells();
     catalog.persist()
+}
+
+/// The page the table catalog starts on, in every database file. One constant for the one open
+/// path. The CLI and three examples each used to declare their own.
+pub const FIRST_CATALOG_PAGE_ID: u32 = 1;
+
+/// A database file, opened, recovered, and with every index rebuilt from the recovered heap.
+pub struct OpenedDatabase {
+    pub bp: Arc<BufferPoolManager>,
+    pub wal: Arc<WalManager>,
+    pub txn: Arc<TxnManager>,
+    pub catalog: Catalog,
+    /// Whether the log held anything to replay, which is also whether the trees were rebuilt.
+    pub recovered: bool,
+}
+
+/// **D204 — THE way to open a database file.** Every binary calls this; none spells the sequence
+/// out for itself (`tests/open_path_allowlist.rs` enforces that).
+///
+/// The order is the whole content:
+/// 1. open the file, the buffer pool, the WAL and the transaction manager, and attach the WAL;
+/// 2. [`recover`]: redo and undo the HEAP records, and nothing else;
+/// 3. open the catalog, or create it for a new file;
+/// 4. if recovery replayed anything, [`rebuild_indexes`] from the recovered heap, then checkpoint.
+///    The rebuild ends by repointing the shared root cells at the trees it built (D205). Without
+///    that, every statement after recovery descends the trees the rebuild freed. The checkpoint is
+///    there because the rebuilt trees and the catalog page are then on disk, so the log that
+///    produced them has nothing left to say; without it, the next open would replay the same
+///    records and rebuild every tree again (reasoning from `b9a0a75`). Step 4 also runs when a
+///    marker says an earlier rollback's index undo failed (`TxnManager::mark_indexes_stale`), even
+///    if the log is empty.
+///
+/// Step 4 is why this exists. Index pages are not logged, so after step 2 each tree is whatever
+/// the buffer pool last flushed. That tree can miss a committed row, which makes it invisible by
+/// key and lets a second row take its key; or it can name a row recovery just undid. The
+/// sequence used to be spelled out in each entry point. `cli::run_cli` had step 4 and
+/// `examples/pgserver.rs` never did, from D9 until D204. That is the drift this function ends:
+/// `tests/pgserver_crash_rebuilds_indexes.rs`.
+///
+/// **The caller holds the single-writer lock**, and proves it by passing it: a lock on another
+/// path is refused. It is taken by the caller rather than here because the callers differ in
+/// what they do BEFORE it. `pgserver` reads its environment first, because its refusal path is
+/// `process::exit`, which skips `Drop`, and `table_dump` refuses a missing file first.
+///
+/// Anything built on top, such as the agent runtime and its arena, comes AFTER this returns. The
+/// rebuild allocates pages, and the arena floor must sit above everything this has allocated
+/// (`cli::run_cli` explains the arena ordering).
+pub fn open_recovered(db_path: &Path, lock: &DbLock) -> Result<OpenedDatabase, FerroError> {
+    if !lock.guards(db_path) {
+        return Err(FerroError::Io(format!(
+            "refusing to open {}: the lock passed in is for a different database, so this open is \
+             not protected against a second writer",
+            db_path.display()
+        )));
+    }
+    let existed = db_path.exists();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(db_path)
+        .map_err(|e| FerroError::Io(format!("open {}: {e}", db_path.display())))?;
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file)?)));
+    // D280: refuses a data file whose pages carry LSNs this log never issued (a restored backup, a
+    // replica's file, a lost `<db>.wal`), before anything else is created beside it. Every binary
+    // opens through here, so the CLI and pgserver share the refusal as well as the sequence.
+    let wal = Arc::new(WalManager::open_for_database(db_path, &bp.disk_manager)?);
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    let recovered = recover(&txn)?;
+    let mut catalog = if existed {
+        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
+    } else {
+        Catalog::create(bp.clone())?
+    };
+    // D205 C1 correction: a rollback in an earlier process whose index undo failed left a marker
+    // (`TxnManager::mark_indexes_stale`), because its orphaned entries are on disk and an empty log
+    // would not trigger the rebuild below. The marker is removed only after the rebuilt trees are
+    // checkpointed. If removal fails, the next open simply rebuilds again, which is harmless.
+    let marker = crate::wal::txn::stale_indexes_marker(&wal.path);
+    let stale = marker.exists();
+    if recovered || stale {
+        rebuild_indexes(&mut catalog, &bp)?;
+        txn.checkpoint()?;
+        if stale {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ferrodb: rebuilt the indexes, but could not remove {} ({e}); the next open rebuilds again",
+                    marker.display()
+                );
+            }
+        }
+    }
+    Ok(OpenedDatabase { bp, wal, txn, catalog, recovered })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions, path::Path};
+    use std::{fs::OpenOptions, path::{Path, PathBuf}};
 
 use crate::{execution::session::Session, storage::disk_manager::DiskManager, wal::log::WalManager};
 
@@ -550,5 +681,273 @@ use super::*;
             "a heap page reached the disk while its own HeapInsert was still only in memory"
         );
         txn.abort(t).unwrap();
+    }
+
+    /// **D204 — `open_recovered` refuses a lock held for another database, and opens with its own.**
+    ///
+    /// The lock is the caller's proof that no second writer shares the file. Without the refusal, a
+    /// caller holding the lock on one database could open another unprotected, and nothing on the
+    /// SQL path could tell. The second half is the anti-vacuity: a guard that refused every lock would
+    /// pass the first half and open nothing.
+    #[test]
+    fn open_recovered_refuses_a_lock_for_another_database_and_opens_with_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.db"), dir.path().join("b.db"));
+        let lock_a = DbLock::acquire(&a).unwrap();
+
+        let refused = open_recovered(&b, &lock_a).err().expect("a lock on a.db opened b.db");
+        assert!(format!("{refused}").contains("different database"), "refused for the wrong reason: {refused}");
+        assert!(!b.exists(), "the refusal created b.db before refusing");
+
+        let opened = open_recovered(&a, &lock_a).expect("a.db did not open under its own lock");
+        assert!(!opened.recovered, "a brand-new database reported a recovery");
+        assert!(a.exists(), "a.db was not created");
+    }
+
+    /// **D205 — after a crash rebuild, every shared root cell names the tree the rebuild built.**
+    ///
+    /// `Catalog::open` seeds one shared cell per tree (D53) from the pre-crash roots on the catalog
+    /// page. `rebuild_indexes` frees each old tree and writes the fresh root into the `TableEntry`
+    /// only, and `sync_root_cells` never overwrites an existing cell. `plan::open_table` and the
+    /// optimizer prefer the cell, so unless the rebuild repoints the cells, every statement after recovery descends a
+    /// FREED tree (the fresh-context adversary, `frontier/d202_adversary.md` §2).
+    ///
+    /// The DROP is load-bearing. The fixture needs a free page BELOW `t`'s root, so that the
+    /// rebuild's lowest-free allocation cannot hand `t` its old root back and hide the defect. The
+    /// shipped pgserver test (one table, no holes) is exactly that coincidence. `t`'s first row is
+    /// inserted BEFORE the DROP, so its heap page exists and the post-DROP insert allocates nothing.
+    ///
+    /// Structural first: record == cell for every table, both read from the system and neither
+    /// written into this test. Then the user-visible consequence, a lookup by key and a refused
+    /// duplicate.
+    #[test]
+    fn a_crash_rebuild_points_every_shared_root_cell_at_its_new_tree() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        fn exec(sql: &str, o: &mut OpenedDatabase) -> Result<Outcome, FerroError> {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("crash.db");
+        let pre_crash_root;
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in [
+                "CREATE TABLE a (id INTEGER NOT NULL, v INTEGER);",
+                "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);",
+                // A secondary tree too, so the structural check covers more than primary cells
+                // (a gap the re-adversary named).
+                "CREATE INDEX iv ON t (v);",
+                "INSERT INTO t VALUES (0, 0);",
+                "DROP TABLE a;",
+                "INSERT INTO t VALUES (1, 10);",
+            ] {
+                exec(sql, &mut o).unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+            pre_crash_root = o.catalog.get_table("t").unwrap().primary_index_root;
+            // The crash: every handle is dropped with no checkpoint and no flush. `BufferPoolManager`
+            // has no `Drop`, so the last insert's pages die here and only its WAL records survive.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
+        let tables: Vec<String> = o.catalog.tables.keys().cloned().collect();
+        assert!(tables.contains(&"t".to_string()), "premise failed: table t did not survive: {tables:?}");
+        // The premise the re-adversary asked for: the rebuilt root really MOVED. If the rebuild handed
+        // back the pre-crash page, cell == record would hold whether or not the cells were repointed.
+        assert_ne!(
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            pre_crash_root,
+            "premise failed: t's rebuilt root is its pre-crash page, so the structural check cannot fail"
+        );
+        for name in &tables {
+            let entry = o.catalog.get_table(name).unwrap();
+            let mut trees: Vec<(Option<String>, u32)> = vec![(None, entry.primary_index_root)];
+            trees.extend(entry.indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
+            trees.extend(entry.fulltext_indexes.iter().map(|i| (Some(i.column_name.clone()), i.root_page_id)));
+            assert!(trees.len() >= 2 || name != "t", "premise failed: t lost its secondary index");
+            for (column, record) in trees {
+                let cell = o
+                    .catalog
+                    .root_cell(name, column.as_deref())
+                    .expect("Catalog::open seeds a cell for every tree it loads")
+                    .load(Ordering::SeqCst);
+                assert_eq!(
+                    cell, record,
+                    "table '{name}', tree {column:?}: the shared root cell names page {cell}, a tree the \
+                     rebuild FREED; the rebuilt tree is at page {record}"
+                );
+            }
+        }
+
+        match exec("SELECT id, v FROM t WHERE id = 1;", &mut o).unwrap() {
+            Outcome::Rows(rows) => assert_eq!(
+                rows,
+                vec![vec![Value::Integer(1), Value::Integer(10)]],
+                "after the crash, a committed row is missing by key"
+            ),
+            _ => panic!("a SELECT did not return rows"),
+        }
+        match exec("INSERT INTO t VALUES (1, 99);", &mut o) {
+            Err(FerroError::Constraint(m)) if m.contains("duplicate primary key") => {}
+            Err(e) => panic!("a second row 1 was refused, but not as a duplicate: {e}"),
+            Ok(_) => panic!("after the crash, a second row 1 was ADMITTED"),
+        }
+    }
+
+    /// **D205, the choice between the two copies: the rebuild REPOINTS the cells it finds, and
+    /// never replaces them.**
+    ///
+    /// `b9a0a75` closed the hole with `reseed_root_cells`: clear the map and re-create every cell.
+    /// That is correct only while no handle holds a clone of a cell, because a handle that does
+    /// keeps an `Arc` nobody updates any more: two root pointers for one tree, which is the D53
+    /// defect itself. Its doc stated that precondition; nothing enforced it. Storing the fresh root
+    /// into the EXISTING cell has no precondition. Every holder of the `Arc` sees the new root, and
+    /// D53's invariant (one cell per tree for the life of the process) is kept.
+    ///
+    /// So this holds a cell across `rebuild_indexes`, as a live handle would, and requires that it
+    /// is still THE cell afterwards and names the rebuilt tree. FAILS under the clear-and-resync
+    /// form (`d81f080`) at `ptr_eq`. Passes under store-in-place.
+    #[test]
+    fn a_rebuild_repoints_the_cells_it_finds_and_does_not_replace_them() {
+        use crate::execution::executor::run;
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("held.db");
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+        let held = o.catalog.root_cell("t", None).expect("CREATE TABLE seeds a cell");
+
+        rebuild_indexes(&mut o.catalog, &o.bp).unwrap();
+
+        let now = o.catalog.root_cell("t", None).expect("the rebuild left no cell for t");
+        assert!(
+            Arc::ptr_eq(&held, &now),
+            "the rebuild REPLACED t's cell, so a handle holding the old one now has a private root pointer (D53)"
+        );
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            o.catalog.get_table("t").unwrap().primary_index_root,
+            "the cell a handle holds does not name the tree the rebuild built"
+        );
+    }
+
+    /// **D205, the second route to the same drift: the shape of the rebuilt tree.** Ported from
+    /// `b9a0a75`'s `crash_rebuild_reseeds_the_shared_root_cells` (W4(c), never merged) and adapted
+    /// to this branch's `open_recovered`.
+    ///
+    /// The DROP test above puts a free page BELOW a one-leaf tree. This one needs no DROP. Two
+    /// tables of 400 rows each give multi-level trees, and a multi-level tree's final root is a page
+    /// allocated late in the refill, so it differs from the pre-crash root by construction. The
+    /// second table starts from an allocator the first has already churned. It passes at `d81f080`
+    /// and fails when the rebuild stops repointing the cells (mutant Q1).
+    #[test]
+    fn a_crash_rebuild_of_multi_level_trees_leaves_every_cell_on_its_new_root() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        fn exec(sql: &str, o: &mut OpenedDatabase) -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors in `{sql}`: {:?}", p.errors);
+            run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+
+        const ROWS: i64 = 400;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("shape.db");
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for t in ["t", "u"] {
+                exec(&format!("CREATE TABLE {t} (id INTEGER NOT NULL, name VARCHAR(16));"), &mut o);
+                for i in 0..ROWS {
+                    exec(&format!("INSERT INTO {t} VALUES ({i}, 'r{i}');"), &mut o);
+                }
+            }
+            // No checkpoint and no clean close: the reopen below takes the recovery path.
+        }
+
+        let lock = DbLock::acquire(&db).unwrap();
+        let mut o = open_recovered(&db, &lock).unwrap();
+        assert!(o.recovered, "premise failed: the reopen replayed nothing, so no rebuild ran");
+        for t in ["t", "u"] {
+            let record = o.catalog.get_table(t).unwrap().primary_index_root;
+            let cell = o.catalog.root_cell(t, None).expect("a cell per loaded table").load(Ordering::SeqCst);
+            assert_eq!(cell, record, "table '{t}': the cell names page {cell}, a freed tree; the rebuilt one is page {record}");
+        }
+        for t in ["t", "u"] {
+            match exec(&format!("SELECT name FROM {t} WHERE id = {};", ROWS - 1), &mut o) {
+                Outcome::Rows(rows) => assert_eq!(rows.len(), 1, "table '{t}': point lookup after crash recovery"),
+                _ => panic!("table '{t}': expected rows"),
+            }
+        }
+    }
+
+    /// **C1, made true: after an index undo fails, the NEXT OPEN rebuilds the indexes, even when
+    /// the log it opens is empty.**
+    ///
+    /// `open_recovered` rebuilds when `recover` replays something. `recover` returns `false` for an
+    /// empty log, and a clean restart can leave one: `schema_log` is filled only by `log_ddl` in the
+    /// running process, so a checkpoint in a process that ran no DDL re-declares nothing (the
+    /// re-adversary's C1 correction). So "the next open rebuilds every tree" was false exactly when
+    /// it was needed, and an entry that a failed index undo left on a freed slot would have outlived
+    /// the restart. The fix is a durable marker beside the log (`<db>.wal.stale-indexes`), which
+    /// `open_recovered` honours and then removes.
+    ///
+    /// FAILS at `d7891d5` at "left no marker". The failure is forced with a recorded write whose root
+    /// is past end-of-file, as in `txn.rs`'s C1 test.
+    #[test]
+    fn a_failed_index_undo_makes_the_next_open_rebuild_even_when_the_log_is_empty() {
+        use crate::execution::executor::run;
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("stale.db");
+        let marker = PathBuf::from(format!("{}.wal.stale-indexes", db.display()));
+        {
+            let lock = DbLock::acquire(&db).unwrap();
+            let mut o = open_recovered(&db, &lock).unwrap();
+            for sql in ["CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", "INSERT INTO t VALUES (1, 10);"] {
+                let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+                let mut p = Parser::new(tokens);
+                let mut stmts = p.parse();
+                run(stmts.remove(0), &mut o.catalog, o.bp.clone(), o.txn.clone(), &mut Session::new())
+                    .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+            }
+        }
+        {
+            // A second "process": it recovers and rebuilds, and its own checkpoint re-declares
+            // nothing, because it ran no DDL.
+            let lock = DbLock::acquire(&db).unwrap();
+            let o = open_recovered(&db, &lock).unwrap();
+            let t = o.txn.begin().unwrap();
+            o.txn.record_primary_write(t, Arc::new(std::sync::atomic::AtomicU32::new(1_000_000)), Value::Integer(5), None);
+            o.txn.abort(t).expect("the transaction ended, so its abort reports success");
+            assert!(marker.exists(), "a failed index undo left no marker, so a clean restart would not rebuild");
+            o.txn.checkpoint().unwrap();
+        }
+        let lock = DbLock::acquire(&db).unwrap();
+        let o = open_recovered(&db, &lock).unwrap();
+        assert!(!o.recovered, "premise failed: the log was not empty, so recovery alone would have rebuilt");
+        assert!(!marker.exists(), "the marker survived the open, so the rebuild it asks for did not run");
     }
 }

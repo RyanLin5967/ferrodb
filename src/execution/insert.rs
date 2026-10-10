@@ -187,6 +187,9 @@ impl Modify for Insert {
             reused = Some((existing, head));
         }
         let mut tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
+        // What the primary entry holds before this statement: nothing for a new key, the dead
+        // version's slot for a reuse. It is what a rollback must put back (D202).
+        let entry_before = reused.as_ref().map(|(dead_rid, _)| *dead_rid);
         let (rid, index_moved) = match reused {
             Some((dead_rid, dead)) => {
                 // Archived VERBATIM: its `end_ts` is its deleter's and must stay so. UPDATE
@@ -224,6 +227,13 @@ impl Modify for Insert {
         // window a relocated UPDATE already has: `HeapFileManager::update` frees the old slot
         // before this line repoints the entry.
         if index_moved {
+            // **D202 — recorded before the write, so a rollback can take it back.** Index pages are
+            // not logged, and before this a rolled-back INSERT left its key pointing at the slot
+            // `undo_insert` freed: the key then failed every lookup and every INSERT with
+            // `SlotDeleted`. See `TxnManager::record_primary_write`.
+            if let Some(txn) = &self.heap.txn {
+                txn.record_primary_write(self.heap.txn_id, self.primary_index.root_cell(), vals[0].clone(), entry_before);
+            }
             self.primary_index.upsert(vals[0].clone(), rid)?;
         }
         // **E66 — the same de-duplication UPDATE needs, on the path E63 opened.**

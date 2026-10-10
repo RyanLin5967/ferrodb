@@ -8,8 +8,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::TableBranchCatalog;
@@ -20,12 +18,7 @@ use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
-use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::wal::log::WalManager;
-use ferrodb::wal::recovery::recover;
-use ferrodb::wal::txn::TxnManager;
-
-const FIRST_CATALOG_PAGE_ID: u32 = 1;
+use ferrodb::wal::recovery::{open_recovered, OpenedDatabase};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -51,32 +44,26 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let existed = Path::new(&db).exists();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&db)
-        .expect("open db");
-    let dm = Arc::new(DiskManager::new(file).unwrap());
-    let bp = Arc::new(BufferPoolManager::new(dm));
-    // D280: the same refusal as the CLI's, through the same function. Released by hand because
-    // `process::exit` runs no destructors, and a lock left behind refuses the next open as stale.
-    let wal = match WalManager::open_for_database(Path::new(&db), &bp.disk_manager) {
-        Ok(w) => Arc::new(w),
+    // **D204: the one open path.** Recovery, then every index rebuilt from the recovered heap, then a
+    // checkpoint, through the same function the CLI calls. This file used to spell the sequence out
+    // itself, and from D9 until D202 its copy omitted the rebuild. Index pages are not logged, so a
+    // row committed after the last checkpoint came back in the heap but not in its primary index: a
+    // lookup by key missed it, and an INSERT of its key was admitted as a second live row
+    // (`tests/pgserver_crash_rebuilds_indexes.rs`). `tests/open_path_allowlist.rs` keeps it from
+    // drifting again. Before the arena below, for the reason given there: the rebuild allocates pages.
+    //
+    // D280: `open_recovered` opens the log through `WalManager::open_for_database`, so this server
+    // refuses a data file whose pages carry LSNs its log never issued, as the CLI does. The refusal
+    // is reported and exits 1 with the lock released by hand, because `process::exit` runs no
+    // destructors and a lock left behind refuses the next open as stale
+    // (`tests/d280_orphaned_wal_binaries.rs` checks both).
+    let OpenedDatabase { bp, txn, catalog, .. } = match open_recovered(Path::new(&db), &_lock) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("pgserver: {e}");
             drop(_lock);
             std::process::exit(1);
         }
-    };
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal);
-    recover(&txn).unwrap();
-    let catalog = if existed {
-        Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID).unwrap()
-    } else {
-        Catalog::create(bp.clone()).unwrap()
     };
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
