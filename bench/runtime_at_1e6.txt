@@ -1,0 +1,208 @@
+S15: the RUNTIME and SQL path at 10^6 branches. Measured, not extrapolated.
+
+CONTEXT. bench/curve_to_1e6.txt took the CATALOG to 10^6: space linear (266 B/branch constant
+over 100x), reopen O(1), fork throughput flat. It measured `TableBranchCatalog::fork` and nothing
+above it. The objective is the whole system, and before this run nobody had executed a statement,
+an agent session or a system view against a 10^6-branch database.
+
+Harness: examples/runtime_curve.rs. Durable `TableBranchCatalog::open_sidecar` on a real file --
+NOT the in-memory stand-in -- with a real Catalog, BufferPool, WAL and TxnManager, driven through
+`execution::executor::run`, the same scanner -> parser -> binder -> executor path the CLI and
+examples/pgserver.rs take. Four phases, each its own file:
+    runtime_at_1e6_query.txt      phase 1  user-facing paths at N branches
+    runtime_at_1e6_session.txt    phase 2  N agent sessions held open through the runtime
+    runtime_at_1e6_fork.txt       phase 3  where the per-statement BEGIN cost lives
+    runtime_at_1e6_firecheck.txt  phase 4  forcing the flat columns to fire
+
+=================================================================================================
+PHASE 1 -- a database that already holds N branches. What does a statement cost?
+=================================================================================================
+
+        N   BEGIN ms  INSERT ms  SELECT ms    ASOF ms   br_1row ms    br_all ms      runs ms  activity ms    quaran ms  live_cnt ms     RSS MB
+     9984    13.7489     0.0462     0.0322     0.0367       214.68       266.48       206.84       0.0144       0.0167        0.478       33.4
+    99968    12.9539     0.0725     0.0555     0.0358      2863.89      2726.52      2556.53       0.0320       0.0222        4.818      161.1
+  1000000    27.8387     0.0503     0.0191     0.0193     31535.43     25087.56     44124.12       0.1793       0.0346       57.626     1109.7
+
+  br_1row = SELECT generation, state FROM ferro_branches WHERE branch_id = 1;   -- returns ONE row
+  br_all  = SELECT * FROM ferro_branches;
+  runs    = SELECT * FROM ferro_runs;                                           -- returns ~1 row
+
+INSTRUMENT CALIBRATION. `live_cnt` is the control, and it is in this table for one reason: it is
+ALREADY KNOWN LINEAR (0.664 -> 59.234 ms, bench/curve_to_1e6.txt). This harness reproduces it at
+57.626 ms against that run's 59.234 ms -- 2.7% apart on a different day. The harness is wired to a
+real durable catalog and CAN see an O(N) cost. A flat row next to a flat control would prove
+nothing; a flat row next to a control that rose 120x is a result.
+
+=================================================================================================
+THE WALL. Three system views are O(total branches) and one takes the global lock per branch.
+=================================================================================================
+
+W1. src/catalog/system_views.rs:362 -- `branches_rows`
+        runtime.branches().scan()?.collect::<Result<Vec<_>, FerroError>>()?
+    31.5 SECONDS to answer `WHERE branch_id = 1` at 10^6. The WHERE is worth nothing: the plan at
+    src/catalog/system_views.rs:649 wraps `MaterialisedRows::new(view.materialise(...))` and only
+    THEN applies Filter, so every branch becomes a row before the predicate that keeps one of them
+    is looked at. br_1row and br_all cost the same because they ARE the same work.
+    Cost per branch is ~31 us, not the ~57 ns/branch `live_count` manages, because
+    `TableBranchCatalog::scan` (src/branch/table_catalog.rs:848) is documented HYDRATED: hydrate
+    (src/branch/table_catalog.rs:486) does a range_scan for the arena span plus a search for the
+    envelope PER RECORD, so a full view is 2 x 10^6 extra B-tree descents on top of the leaf walk,
+    and then 11 Values incl. two Strings are built per row.
+
+W2. src/catalog/system_views.rs:393 -- `runs_rows`
+    44.1 SECONDS at 10^6, to return roughly one row. Same full hydrated scan as W1, and then WORSE:
+    it calls `runtime.run_of(rec.branch_id)` per record, and `run_of`
+    (src/agent_sql/runtime.rs:788) takes `self.state.lock()` on every call. So `SELECT * FROM
+    ferro_runs` acquires the runtime's ONE global Mutex 10^6 times -- the same Mutex every INSERT,
+    every SELECT and every BEGIN AGENT SESSION must take. This is the only wall here that degrades
+    OTHER connections while it runs, and it is the slowest of the three.
+
+W3. src/catalog/system_views.rs:649 -- `run_select`
+    The structural cause of W1: materialise-then-filter. No predicate on any of the five views can
+    ever be pushed down, so `ferro_branches`, `ferro_runs` and `ferro_row_authors` each cost their
+    whole relation on every read however narrow the query.
+
+WHICH OF THESE RUN PER-STATEMENT: NONE. All three are system-view reads -- a user or an agent
+asking `SELECT ... FROM ferro_*`. That is the honest answer and it is the good news in this report.
+It is not the same as harmless: 31 s for a one-row lookup is past any client timeout, `ferro_runs`
+is the view an agent would poll to see its own run, and W2 stalls every other connection while it
+runs.
+
+=================================================================================================
+NOT A WALL -- the per-statement path is FLAT from 10^4 to 10^6
+=================================================================================================
+
+INSERT on a branch, SELECT on a branch, and SELECT ... AS OF BRANCH are flat across 100x N:
+0.046/0.032/0.037 ms at 10^4 against 0.050/0.019/0.019 ms at 10^6. They do not touch the branch
+collection at all -- `visible_rows` (src/agent_sql/runtime.rs:1029) reads the shared table and the
+one workspace, and `resolve_branch` (src/agent_sql/runtime.rs:3509) is a BTreeMap lookup.
+`ferro_quarantine` is flat too (0.0167 -> 0.0346 ms) because `quarantined_branches`
+(src/agent_sql/runtime.rs:2029) asks `in_state`, which is index-backed -- the one view of the five
+that already does the right thing, and the proof that W1/W2 are fixable rather than inherent.
+
+`live_count` IS linear (59 ms at 10^6) and IS ON NO RUNTIME PATH. Every call site outside the trait
+declaration and its three implementations is past a `#[cfg(test)]` boundary: src/branch/reaper.rs
+(cfg(test) at :384) lines 443/463/1297, src/branch/catalog.rs (cfg(test) at :530) lines 761/1010,
+src/branch/table_catalog.rs (cfg(test) at :1029) lines 1237 onward. Checked, because the brief
+asked whether anything on a runtime path calls it. Nothing does.
+
+BEGIN AGENT SESSION rose 13 -> 28 ms and the rise is NOT the runtime's. Phase 3 separates the three
+layers on one catalog at one N, single-threaded and interleaved:
+
+        N       raw ms        rt ms      stmt ms    rt-raw ms   stmt-rt ms   syncs/op
+     9984        7.038        7.273        7.250        0.236       -0.023       1.67
+    99968        5.011        5.151        5.306        0.139        0.155       1.67
+  1000000       10.488       10.735       11.760        0.247        1.025       1.67
+
+    raw  = TableBranchCatalog::fork          rt = AgentRuntime::begin_session_as
+    stmt = the whole BEGIN AGENT SESSION statement through the parser
+`rt - raw` -- everything the runtime adds over the catalog: interning the run, the Workspace, the
+name, the capture -- is FLAT at ~0.2 ms and does not move with N. fsyncs per op are 1.67 at every
+N. The rise sits in `raw`, i.e. the catalog and this device's fsync, single-threaded with no group
+commit partner to amortise it; the catalog curve already showed 3778 forks/sec at 10^6 when 64
+threads let group commit do its job. Nothing above the catalog scales with branch count.
+
+=================================================================================================
+PHASE 2 -- the OTHER axis: N agent sessions HELD OPEN. This is where the second wall is.
+=================================================================================================
+
+        N   seg sess/sec      stmt ms     RSS MB    B/session   resolve us    forget ms  activity ms
+     9984         2071.5        4.223       46.3         3518          8.9       288.27         6.78
+    99968         3263.0        7.010      285.1         2740         11.9      3401.73       105.53
+  1000000         2816.4       18.322     2682.9         2672          7.2     39330.80      1090.32
+
+Sessions/sec is flat (2071 -> 2816): opening agent tasks through the runtime does not degrade with
+how many are already open. `resolve` -- `AS OF BRANCH b_k`, a BTreeMap lookup on `State::names` --
+is flat at 7-12 us with 10^6 names in the map.
+
+W4. src/agent_sql/runtime.rs:3244 -- `forget_reaped_branches`
+    39.3 SECONDS at 10^6 open sessions. Exactly linear (288 ms -> 3402 ms -> 39331 ms for
+    10x -> 100x). It walks `State::workspaces` building a String per workspace, then does one
+    catalog `get` -- a B-tree descent against the durable file -- per candidate.
+    ** THIS IS THE WORST FINDING IN THIS REPORT, because nobody asks for it. ** It is called from
+    the lease thread on a timer (src/branch/lease_thread.rs:421), and `scan_once`
+    (src/branch/lease_thread.rs:390) runs its whole body inside `with_lock(lock, ...)`. That lock
+    is `ServerContext::catalog()` (src/branch/lease_thread.rs:167) -- the pgserver's per-statement
+    mutex -- or `CatalogLock` for the CLI (:197). So on every tick that reaps at least one branch
+    (the sweep is skipped when `reaped.is_empty()`, src/branch/lease_thread.rs:417), a 10^6-session
+    server holds the lock that serialises EVERY statement for 39 seconds. Non-cooperative 15-minute
+    lease expiry means steady state is mostly such ticks, by design.
+
+W5. src/agent_sql/runtime.rs:861 -- `run_activity`, feeding `ferro_run_activity`
+    1090 ms at 10^6 open sessions, linear in open sessions, and it holds `self.state.lock()` for
+    the whole walk. Reading this view stalls every writer for ~1 s.
+    Note the cross-check: this same column is FLAT in phase 1 (0.0144 -> 0.179 ms) where the
+    workspace map holds ~1 entry, and linear in phase 2 where it holds N. One timer, flat on one
+    knob and linear on the other, is the instrument disproving its own blindness.
+
+W6. MEMORY -- ~2.4 KB of runtime bookkeeping per OPEN session, never dropped while it is open.
+    2682.9 MB RSS at 10^6 (2672 B/session marginal, of which 266 B is the catalog's own, per
+    bench/curve_to_1e6.txt). 10^6 open sessions survive on this machine; they cost ~2.4 GB above
+    the catalog. Four structures grow per session and none is bounded: `State::workspaces`,
+    `State::names`, `State::captures` (src/agent_sql/runtime.rs:240-267) and
+    `MemProvenanceStore::runs` (src/provenance/store.rs:101), which grows per distinct
+    (agent_id, run_id) and is what a real one-run-per-task workload produces.
+
+=================================================================================================
+PHASE 4 -- FIRE-CHECK. Proving the flat columns are not a broken instrument.
+=================================================================================================
+
+Phase 1 reports INSERT / SELECT / ASOF flat. A dead timer reports flat too. `live_count` calibrates
+the harness but not THOSE THREE timers, which are separate code. So: branch count held FIXED at
+10^4, and the TABLE grown instead -- a knob `visible_rows` is known to be sensitive to.
+
+     rows    INSERT ms    SELECT ms      ASOF ms   sel rows
+       20       0.0346       0.0179       0.0185          1
+      200       0.0559       0.0424       0.0425          1
+     2000       0.3381       0.2826       0.2846          1
+    20000       3.4017       3.7349       3.4622          1
+
+They move 100-200x. The timers are live; their flatness against branch count is a measurement and
+not a silence.
+(Incidental, outside this brief's scope: `WHERE id = 7` costs 3.7 ms against a 20k-row table to
+return one row. `visible_rows` -> `scan_table` is a full heap scan with no index use. That is an
+O(table) cost on every in-session SELECT, and it is not a branch-count wall.)
+
+=================================================================================================
+VERDICT
+=================================================================================================
+
+The per-statement path SURVIVES 10^6 branches. INSERT, SELECT, AS OF BRANCH, branch-name
+resolution and the runtime's own share of BEGIN AGENT SESSION are all flat across 100x, on a real
+durable catalog, with the instrument proven able to see an O(N) cost on the same run.
+
+Six walls, none of them per-statement, in two groups:
+  - O(total branches), paid per system-view read:  W1 ferro_branches 31.5 s · W2 ferro_runs 44.1 s
+    (and 10^6 global-Mutex acquisitions) · W3 the materialise-then-filter plan that makes a WHERE
+    worthless on all five views.
+  - O(open sessions), paid by the background sweep and by memory:  W4 forget_reaped_branches
+    39.3 s HOLDING THE SERVER'S STATEMENT LOCK · W5 ferro_run_activity 1.09 s holding the state
+    Mutex · W6 ~2.4 KB/session of unbounded runtime bookkeeping.
+
+W4 is the one to fix first. W1/W2 are a user waiting for a query they asked for; W4 is the whole
+database stopping for 39 seconds because a timer went off.
+=================================================================================================
+ERRATA (append-only; the lines above stand as written). Added 2026-10-08, when this artifact
+reached main through the merge of S15-runtime-at-1e6 (0ac1931, measured on parent 9986d4c).
+=================================================================================================
+
+E1. The PHASE 3 `syncs/op` column is NOT per op. It is catalog fsyncs across the whole rep block
+    divided by reps*3, while the block performs five catalog-mutating operations per rep
+    (cat.fork, begin_session, runtime.abandon, the BEGIN AGENT SESSION statement, ABANDON BRANCH).
+    Found and fixed in examples/runtime_curve.rs by 5bb234b, whose header says "Any previously
+    recorded `syncs/op` figure is that inflated quantity". So 1.67 means about 5.0 fsyncs per rep
+    block (1.67 x 3; derived, not re-measured), and this artifact never measured a per-op figure.
+    5bb234b measured 1.00 per timed op and 7.00 per block on its own tree (N=20, reps=2).
+    "fsyncs per op are 1.67 at every N" is withdrawn as a per-op claim; constant across N stands.
+
+E2. The three phase 3 arms run in a FIXED within-rep order (raw, rt, stmt) and `raw` never
+    abandons what it forked, so `rt-raw` and `stmt-rt` carry a same-sign position effect in every
+    rep (disclosed, deliberately not changed, in 5bb234b). Read those two columns as upper bounds
+    on the layer cost, not as the layer cost.
+
+E3. Line numbers above are at the measured tree, not at main. Since this run: W1 and W2 were
+    fixed by D28 (0e51bdf, which reproduced both with this harness first,
+    bench/d28_view_pushdown.txt), and W3 by the same commit for ferro_branches and
+    ferro_row_authors (ferro_quarantine and ferro_run_activity decline the hint by design);
+    W4's lease-sweep hold of the statement lock was closed by D98 (bench/w4/DECISION.md,
+    Addendum 5). W5 and W6 were not re-checked for this note.

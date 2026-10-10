@@ -669,7 +669,7 @@ fn scan_once(
             // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
             // O(reaped). A larger figure for the same walk is reported on branch
             // S15-runtime-at-1e6 (commit 0ac1931, `bench/runtime_at_1e6.txt`, W4); that file is
-            // not in this worktree and the number is NOT reproduced here, so it is motivation
+            // in tree since the S15 merge; the number is NOT reproduced here, so it is motivation
             // rather than evidence.
             forgotten_all += runtime.forget_branches(&reaped);
         });

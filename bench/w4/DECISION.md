@@ -721,3 +721,22 @@ that `seal` never clears it, so a reaped quarantined branch leaves its reason fo
 occupant to read. That is a wrong sentence in a diagnostic, not a cross-agent answer about data — a
 correctness fix with no failing test behind it is how the item above got mis-filed in the first
 place, so it is recorded at the field instead of bundled here.
+## Addendum 7 — `bench/runtime_at_1e6.txt` is in tree now (2026-10-08)
+
+Appended, not edited in place: the paragraphs above that say `bench/runtime_at_1e6.txt` "is not in
+this worktree" (the blockquote under Addendum 1, the corrections section, Addendum 5) were true
+when written. The file reached main through the merge of `S15-runtime-at-1e6` (`0ac1931`), so a
+reader can now open it. Three things do NOT change:
+
+- **The number is still not reproduced here.** Addendum 5's `bench/d98_outer_runtime_lock.txt`
+  stays the evidence for the outer lock; the S15 row is motivation.
+- **Which of the three versions of the row it holds is now checkable, and it is S15's own:** the
+  phase 2 table (N agent sessions held open) has `forget ms` 39330.80 at N = 1000000, and its W4
+  paragraph reads "39.3 SECONDS at 10^6 open sessions". That is "at 10⁶ open sessions", not the
+  ledger's "at 10⁶ branches". The artifact's line numbers are at its own tree (parent `9986d4c`).
+- **Its phase 3 `syncs/op` column is block fsyncs over reps×3, not per op** (fixed in the harness by
+  `5bb234b`); the errata appended to the artifact say so.
+
+The two code comments that cited the file (`src/agent_sql/runtime.rs`, `src/branch/lease_thread.rs`)
+were changed in the same commit from "not in this worktree" to "in tree since the S15 merge", and
+both still say the number is not reproduced here.
