@@ -119,7 +119,39 @@ impl Modify for Insert {
         self.author = Some((prov, id));
     }
 
-    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
+    /// Write the row, then record every root it moved **on every exit, not only on success** — D230.
+    ///
+    /// A root split is published into the shared cell the moment it happens and is not logged, so it
+    /// is permanent whatever this statement returns. The primary `upsert` can split and a later
+    /// secondary `insert` or `post_tokens` can still fail (the allocator refusing at the arena floor,
+    /// an I/O error), and that exit used to skip `sync_roots`. The in-memory record then lagged the
+    /// tree, every later `persist` of any table wrote the lagging value, and an open that does not
+    /// rebuild — a clean restart after a process that ran no DDL leaves an empty log, so `recover`
+    /// returns false — seeded the cell from a root that is now only the left part of the tree
+    /// (`tests/d230_root_sync_on_every_exit.rs`).
+    ///
+    /// When both fail, the write's error is the one returned: it is why the statement failed.
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
+        let written = self.write_row();
+        let primary = sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog);
+        let fulltext = sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog);
+        let count = written?;
+        primary?;
+        fulltext?;
+        // D69 — record that this table changed, on the SAME path as the write that
+        // changed it. The merge staleness check reads this counter instead of
+        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
+        // be bumped here and not only on the agent-merge path: the hash it replaces was
+        // computed by scanning the real table, so it saw ordinary DML too.
+        catalog.bump_table_version(&self.table);
+        Ok(count)
+    }
+}
+
+impl Insert {
+    /// Everything [`Modify::execute`] does except record the roots, which `execute` does on every
+    /// exit from here.
+    fn write_row(&mut self) -> Result<usize, FerroError>{
         let mut vals = Vec::with_capacity(self.values.len());
         for expr in &self.values {
             vals.push(evaluate(expr, &[])?);
@@ -260,15 +292,6 @@ impl Modify for Insert {
                 post_tokens(&ft.tree, text, &vals[0])?;
             }
         }
-        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
-        sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog)?;
-        // D69 — record that this table changed, on the SAME path as the write that
-        // changed it. The merge staleness check reads this counter instead of
-        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
-        // be bumped here and not only on the agent-merge path: the hash it replaces was
-        // computed by scanning the real table, so it saw ordinary DML too.
-        catalog.bump_table_version(&self.table);
-
         Ok(1)
     }
 }

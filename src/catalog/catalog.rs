@@ -112,6 +112,11 @@ pub struct Catalog {
     /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
     /// write statement no longer invalidates every reader's cache.
     epoch: u64,
+    /// D230 review 3, F2: the transaction manager's catalog persist debt, when attached
+    /// (`owe_persists_to`; `open_recovered` does it). `persist` sets it on failure and clears it on
+    /// success, and every checkpoint keeps the log while it is set. `None` for a catalog built
+    /// outside `open_recovered` (tests), which then behaves as before.
+    persist_debt: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Which list of its table a [`BuiltIndex`] joins when it is attached (D271).
@@ -148,11 +153,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0, persist_debt: None};
         catalog.load()?;
         Ok(catalog)
     }
@@ -886,12 +891,40 @@ impl Catalog {
             Ok(()) => Ok(()),
             Err(e) => {
                 undo(self);
+                // D230 review 7, F-D: write the restored records back. The refused persist may have
+                // rewritten some catalog pages in the pool before it failed, and it left a persist
+                // owed (F2), which keeps every later log until some persist succeeds. This one
+                // usually does, since the entry that could not be written is gone; if it fails too,
+                // the debt stays set and the log stays kept, which is the safe direction.
+                let _ = self.persist();
                 Err(e)
             }
         }
     }
 
+    /// Share the transaction manager's catalog persist debt with this catalog (D230 review 3, F2).
+    /// From here on a failed `persist` marks a persist as owed and a successful one clears it, and
+    /// `TxnManager::checkpoint_or_keep_held` keeps the log while one is owed.
+    pub fn owe_persists_to(&mut self, debt: Arc<std::sync::atomic::AtomicBool>) {
+        self.persist_debt = Some(debt);
+    }
+
+    /// Write every table's record to the catalog pages, and settle the persist debt either way (D230
+    /// review 3, F2): owed after a failure, cleared after a success. A successful persist rewrites
+    /// every catalog page from the in-memory records, so the page it leaves in the pool is current.
     pub fn persist(&self) -> Result<(), FerroError> {
+        let written = self.write_pages();
+        if let Some(debt) = &self.persist_debt {
+            debt.store(written.is_err(), Ordering::SeqCst);
+        }
+        written
+    }
+
+    /// The catalog write itself, under [`Catalog::persist`]'s debt bookkeeping (D230). Its body is
+    /// main's D270 phases: everything that can refuse happens before the first catalog write, and no
+    /// `?` sits between a fetch and its unpin, which is the pin leak D230's reviews 8/9 fixed with a
+    /// `PageHandle` in the loop D270 replaced (merge resolve-recovery-16).
+    fn write_pages(&self) -> Result<(), FerroError> {
         // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
         // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
         // same two tables produced a different on-disk layout on every run. Nothing can rely on the
@@ -1038,27 +1071,43 @@ impl Catalog {
 
     // traverses catalog pages and loads into hashmap
     pub fn load(&mut self) -> Result<(), FerroError> {
-        let mut curr_page_id = self.first_catalog_page_id;
-        loop{
-            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
-            let cat_page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-                CatalogPage::deserialize(frame.data)?
-            };
-            self.buffer_pool.unpin_page(curr_page_id, false);
-            for entry in cat_page.entries {
-                self.tables.insert(entry.name.clone(), entry);
-            }
-            if cat_page.next_catalog_page == 0 {
-                break;
-            }
-            curr_page_id = cat_page.next_catalog_page;
+        let pool = self.buffer_pool.clone();
+        let entries = Self::read_entries(self.first_catalog_page_id, |page_id| {
+            let frame_i = pool.fetch_page(page_id)?;
+            let data = pool.frames[frame_i].read().unwrap().data;
+            pool.unpin_page(page_id, false);
+            Ok(data)
+        })?;
+        for entry in entries {
+            self.tables.insert(entry.name.clone(), entry);
         }
         // Seed the shared root cells from the records just loaded.
         self.sync_root_cells();
         // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.
         self.epoch += 1;
         Ok(())
+    }
+
+    /// The table entries of the catalog page chain that starts at `first`, each page read with
+    /// `read_page`. **It constructs no `Catalog`, seeds no root cell, and opens nothing**: it only
+    /// decodes. `load` reads the chain through the buffer pool. The clean exit's error message reads
+    /// it from the `DiskManager` (`clean_exit::unpersisted_roots`), which is what the next open will
+    /// see (D230 review 3, F1 and F5). A read-back that went through `Catalog::open` instead would
+    /// be a second way to open a database, which `open_path_allowlist` refuses.
+    pub fn read_entries(
+        first: u32,
+        mut read_page: impl FnMut(u32) -> Result<[u8; crate::storage::disk_manager::PAGE_SIZE], FerroError>,
+    ) -> Result<Vec<TableEntry>, FerroError> {
+        let mut entries = Vec::new();
+        let mut curr_page_id = first;
+        loop {
+            let cat_page = CatalogPage::deserialize(read_page(curr_page_id)?)?;
+            entries.extend(cat_page.entries);
+            if cat_page.next_catalog_page == 0 {
+                return Ok(entries);
+            }
+            curr_page_id = cat_page.next_catalog_page;
+        }
     }
 
     pub fn analyze(&mut self, table: &str) -> Result<(), FerroError> {

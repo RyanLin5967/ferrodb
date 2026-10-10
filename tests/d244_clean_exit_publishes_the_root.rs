@@ -146,7 +146,9 @@ fn a_clean_exit_after_a_failed_publish_leaves_a_catalog_that_opens() {
     let wal = Arc::new(WalManager::new(dir.path().join("f7.wal")).unwrap());
     let txn = TxnManager::new(wal.clone(), bp.clone());
     bp.attach_wal(wal);
-    let _catalog = Catalog::create(bp.clone()).expect("create the database catalog");
+    // Named, not `_catalog`: the joined `exit_sequence` persists it (D230's step; merge
+    // resolve-recovery-16, a call-site port, no assertion changed).
+    let catalog = Catalog::create(bp.clone()).expect("create the database catalog");
 
     // The branch catalog, in a file whose page-1 reads can be failed.
     let storage = PageOneFault::new(Vec::new());
@@ -191,7 +193,7 @@ fn a_clean_exit_after_a_failed_publish_leaves_a_catalog_that_opens() {
 
     // 3. The clean exit, through the function `run_cli` calls, then the arena and the branch
     //    catalog dropped. Nothing else holds the branch catalog's pool.
-    exit_sequence(&branches, &txn, &store, &dir.path().join("f7.arena")).expect("the clean exit");
+    exit_sequence(&branches, &catalog, &txn, &store, &dir.path().join("f7.arena")).expect("the clean exit");
     drop(store);
     drop(branches);
 

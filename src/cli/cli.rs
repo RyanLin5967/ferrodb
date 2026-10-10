@@ -209,13 +209,17 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     {
         println!("ferrodb: lease scan {stats:?}");
     }
-    exit_sequence(&branches, &txn, &store, Path::new(&arena_path))?;
+    // The catalog guard lives for the whole call, the arena checkpoint included. That is the
+    // existing order (the catalog before the arena, as the lease thread takes them), and the lease
+    // thread has stopped, so nothing waits on it.
+    exit_sequence(&branches, &catalog.lock(), &txn, &store, Path::new(&arena_path))?;
     println!("bye bye");
     Ok(())
 }
 
 /// The clean exit's durable steps, in order, once the REPL has ended and the lease scan has
-/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs.
+/// stopped. `run_cli` calls this, and so do the tests, so a test runs the code the binary runs
+/// (D230 review 3, F3(b)).
 ///
 /// 1. **D244 review F7.** The branch catalog publishes its root and syncs. A publish that failed on
 ///    a mutation's exit is otherwise retried only by the next mutation or the next sync
@@ -223,28 +227,42 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 ///    If split pages have already reached the disk through an eviction, the header would still name
 ///    the old root, and the next open would refuse. That eviction case is what this call still
 ///    buys over `durable()`'s own publish.
-/// 2. The database's checkpoint.
+/// 2. **D230:** persist the catalog from its in-memory records, then checkpoint the log
+///    (`catalog::clean_exit::checkpoint_for_exit`). A `sync_roots` whose persist failed this session
+///    left the catalog page behind the trees, and a checkpoint alone would flush that page and
+///    truncate the log, so the next open would not rebuild and would read it. On failure the log is
+///    kept for the next open to rebuild from, and the error names the roots. (On this tree the
+///    catalog `open_recovered` returns also carries the persist debt, so no checkpoint truncates
+///    after a failed persist until one succeeds: D230 review 3, F2. This step then writes the
+///    records the debt is waiting for.)
 /// 3. Persist where the arena starts and what it has allocated. Without this the next open finds no
 ///    checkpoint, refuses to reattach, and the branch tree written this session is unreachable. It
-///    runs after the branch catalog's sync, so the map it writes is taken after the catalog's last
-///    durable write.
+///    runs after the branch catalog's sync and the database catalog's persist, so the map it writes
+///    is taken after both catalogs' last durable writes.
 ///
 /// Every step runs whatever the ones before it returned, and the errors come back in step order,
 /// the first returned and any later one printed. A failed publish must not also cost the database
-/// and the arena their checkpoints (D244 review 3, R3-F2), which is the shape
-/// `rollback-index-orphan` already gives its two checkpoints (its review 2, C2).
+/// and the arena their checkpoints (D244 review 3, R3-F2), and a refused catalog persist must not
+/// cost the arena its checkpoint (D230 review 3, F4). That is the shape `rollback-index-orphan`
+/// gives its two checkpoints (its review 2, C2): it holds the WAL checkpoint's result because it
+/// refuses while a release is owed, and returning then skipped the arena checkpoint, leaving the
+/// session's branch tree unreachable. (D244 and D230 each wrote this function; the merge
+/// resolve-recovery-16 joined them, and both source-shape tests, `d244_exits_run_the_publish` and
+/// `d230_exit_runs_the_catalog_persist`, read this one body.)
 pub fn exit_sequence(
     branches: &TableBranchCatalog,
+    // In full: `rollback-index-orphan` narrows this file's `catalog` import to `column::Value`, and
+    // a merge that keeps that line must still compile (D230 review 7, F-A).
+    catalog: &crate::catalog::catalog::Catalog,
     txn: &TxnManager,
     store: &ArenaPageStore,
     arena_path: &Path,
 ) -> Result<(), FerroError> {
     let published = branches.publish_root_durably();
-    let wal_checkpoint = txn.checkpoint();
+    let wal_checkpoint = crate::catalog::clean_exit::checkpoint_for_exit(catalog, txn);
     let arena_checkpoint = store.checkpoint(arena_path);
-    // `rollback-index-orphan`'s review 2 and review 3 caveat 4: the transaction manager's failure
-    // counters are printed at exit, after both checkpoints and whatever they returned, so a failed
-    // checkpoint does not also cost the counters their only reader outside tests.
+    // #16 (rollback-index-orphan): the failure counters are printed after both checkpoints, whatever
+    // they returned (its review 2, and its review 3's caveat 4: a failure must not skip them).
     if let Some(line) = crate::wal::txn::failure_counters_line() {
         eprintln!("{line}");
     }
