@@ -1,0 +1,100 @@
+worktree /Users/idide/projects/ferrodb
+HEAD 38f5df17593d123be5be8374753759d551432883
+branch refs/heads/main
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-consensus-phasef.noindex
+HEAD 33e31399bb259442ba3a39f9544b4e7246857b46
+branch refs/heads/resolve-consensus-phasef
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-index-catalog-2.noindex
+HEAD bd11f0a7346dbf0279221edd1ee25877f4518eac
+branch refs/heads/resolve-index-catalog-2
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-index-catalog-3.noindex
+HEAD 65cb69186e3723d01dbad3041891c0b18104264a
+branch refs/heads/resolve-index-catalog-3
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-index-catalog.noindex
+HEAD c58d72af88b30247fee2c2e13b05342b2c67d77e
+branch refs/heads/resolve-index-catalog
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-recovery-16-r2.noindex
+HEAD 804de0938203b7b5613b2a0436e9001d8a643e9a
+branch refs/heads/resolve-recovery-16-r2
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-recovery-16-r3.noindex
+HEAD c3cbe398760adb3b6756bd7932e9fbb8ccb7feac
+branch refs/heads/resolve-recovery-16-r3
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-recovery-16.noindex
+HEAD 474bf6b7c6248295d8878112ebd48ce53b51220c
+branch refs/heads/resolve-recovery-16
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-recovery-clean-restart.noindex
+HEAD 38f5df17593d123be5be8374753759d551432883
+branch refs/heads/resolve-recovery-clean-restart
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-recovery-sweep.noindex
+HEAD cf9f51f434f510a7971404b810ca0998e320477f
+branch refs/heads/resolve-recovery-sweep
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-runtime-tel-r3.noindex
+HEAD 8ca194ad26785f0f20d1d8605f55121906342fb5
+branch refs/heads/resolve-runtime-tel-r3
+
+worktree /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/resolve/ferrodb-runtime-tel.noindex
+HEAD 173f99c48ab9b1121afd8e721a6c69de7294b694
+branch refs/heads/resolve-runtime-tel
+
+worktree /Users/idide/wt/ferrodb-agent-a019de2e7a5c8afb1
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a019de2e7a5c8afb1
+
+worktree /Users/idide/wt/ferrodb-agent-a1cb7f2d090fddc87
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a1cb7f2d090fddc87
+
+worktree /Users/idide/wt/ferrodb-agent-a3ba77b24fedec712
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a3ba77b24fedec712
+
+worktree /Users/idide/wt/ferrodb-agent-a4bb2002542da961f
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a4bb2002542da961f
+
+worktree /Users/idide/wt/ferrodb-agent-a60b10c55c30d6808
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a60b10c55c30d6808
+
+worktree /Users/idide/wt/ferrodb-agent-a62cb6787a94349cc
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a62cb6787a94349cc
+
+worktree /Users/idide/wt/ferrodb-agent-a81f9c05a4db679aa
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a81f9c05a4db679aa
+
+worktree /Users/idide/wt/ferrodb-agent-a8ebd1800ee586c3b
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-a8ebd1800ee586c3b
+
+worktree /Users/idide/wt/ferrodb-agent-ad52894a42bef10b2
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-ad52894a42bef10b2
+
+worktree /Users/idide/wt/ferrodb-agent-ad9b74fc2a75885ab
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-ad9b74fc2a75885ab
+
+worktree /Users/idide/wt/ferrodb-agent-ae91b089c0a9ab367
+HEAD 6bd2d690c41636d427d5c31eb6b023c0e9e29626
+branch refs/heads/agent-ae91b089c0a9ab367
+
+worktree /Users/idide/wt/ferrodb-d224-f1-accept.noindex
+HEAD e347342e220e3718b0bf4213da97859536b4da09
+branch refs/heads/d224-f1-accept.noindex
+
+worktree /Users/idide/wt/ferrodb-r11-dist.noindex
+HEAD 4dbf846d2a9fab45ee1412c0a5945838919f92a1
+branch refs/heads/r11-dist.noindex
+
