@@ -22,81 +22,144 @@
 /// Tag byte, and therefore the sort group. Ordering between groups is the tag's own order, so each
 /// group occupies one contiguous span and `[tag] .. [tag + 1]` is exactly that span.
 pub mod tag {
-    /// `[0x00][branch id]` → the serialized `BranchRecord`. The only copy of the truth.
-    pub const RECORD: u8 = 0x00;
-    /// `[0x01][lease deadline][branch id]` → empty. **`Live`, non-trunk branches only.**
+    /// **Every tag this tree uses, as ONE enum: a new tag is a new VARIANT, never a literal.**
     ///
-    /// The restriction is not tidiness. A quarantined branch holds its record for as long as an
-    /// operator wants to look at it, and its lease expired long ago — left in this index it would
-    /// sit at the head of the range for ever, and *every* 30-second reap scan would walk over it
-    /// before reaching anything real. That is an unbounded walk in the hot path reintroduced
-    /// through the back door, which is the one thing D2 exists to prevent.
-    pub const DEADLINE: u8 = 0x01;
-    /// `[0x02][state][branch id]` → empty. Every branch, including trunk.
-    pub const STATE: u8 = 0x02;
-    /// `[0x03][parent id][fork epoch]` → empty. **Live children only.**
+    /// The discriminants are explicit, so two tags with the same byte are compile error E0081. They
+    /// were `pub const`s, and D198's `ALIVE` and wall21's `UNRELEASED` both took `0x08` on separate
+    /// branches, which `tree_keys.rs` merged with no conflict. The merged build would then have
+    /// read one key as the other, and bricked at the first lease start (D244 review 2, R2-3). The
+    /// `pub const`s below are derived from this enum, so every caller is unchanged.
     ///
-    /// Replaces the `live_children` array that used to live inside the parent's record and forced
-    /// `fork` to rewrite the parent. The reclamation rule was already a range-emptiness question
-    /// over that array; here it is a range-emptiness question over the tree, which is the same
-    /// question asked of a structure that can answer it without holding every parent resident.
-    pub const CHILD: u8 = 0x03;
-    /// `[0x05][branch id]` → the serialized `CapabilityEnvelope`. **Sparse**: only governed
-    /// branches have one.
-    ///
-    /// Out of the record because it is variable-length and because `envelope_of` is already a
-    /// separate trait method — it exists so the write funnel, which asks on every statement, does
-    /// not clone the rest of the record. Splitting the storage the same way the query is already
-    /// split costs nothing and keeps the core record fixed-size.
-    pub const ENVELOPE: u8 = 0x05;
-    /// `[0x06][branch id][arena id]` → empty. The arenas a branch allocates novel pages from.
-    ///
-    /// **Not optional.** A leaf page holds about 2 KB of entries in total, and a branch that has
-    /// written ~230 MB owns ~900 arena ids — around 3.6 KB on its own. A record that can outgrow a
-    /// page is a wall with no error message, so the unbounded field becomes a key span, where the
-    /// only question anyone asks of it ("which arenas does this branch own?") is a range scan.
-    pub const ARENA: u8 = 0x06;
-    /// `[0x07]` → the catalog header: `next_id` and the epoch counter.
-    ///
-    /// Inside the tree rather than on a page of its own, so that `open` is one descent and so that
-    /// a fork's id allocation commits in the same structure as the record it allocated. The only
-    /// value that must live outside the tree is the tree's own root page id, which the caller
-    /// persists — that is the irreducible bootstrap, and it is one `u32`.
-    pub const HEADER: u8 = 0x07;
-    /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
-    ///
-    /// In the tree rather than in the header on purpose: a free-id *list* in a fixed header is
-    /// unbounded in the one direction that matters — a workload that creates and reaps 10⁶
-    /// branches would need every released id in the header, and the header must stay O(1) or
-    /// `open` is O(N) again by another route. "Lowest free id" is the first key in this span.
-    pub const FREE_ID: u8 = 0x04;
-    /// `[0x08][branch id]` → empty. **D200.** Every slot that may be RELEASABLE and is not yet
-    /// released:
-    /// - put here by `set_state` on the way into `Reaping`;
-    /// - kept by the `Reaped` flip only if nothing is alive below it, and taken off by the flip
-    ///   if something is (a PINNED interior is not releasable);
-    /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
-    ///   frees it runs for an originator whose own key covers it until that originator's release);
-    /// - taken off by `release_id`, and only once the slot IS on the free list;
-    /// - put here by `release_id` on each error it swallows, whatever the slot held before (C1,
-    ///   W1 and W2 of the wall21 review audits): a record read that fails (any slot); a liveness
-    ///   read that fails, on a `Reaped` slot only; a FREE_ID write that fails, on a releasable
-    ///   one. (Audit 4 A6: this said "every error", which overstated the liveness arm.) A key
-    ///   frees nothing: the sweep and `release_id` re-read before acting, and since audit 4 A1 an
-    ///   error on that re-read is the slot's refusal, not a failed open;
-    /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read,
-    ///   whatever the error (W3, A1).
-    ///
-    /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
-    /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
-    /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
-    /// interiors number up to live branches × chain depth under MCTS pruning; neither is here,
-    /// except a pinned slot a failed liveness read keyed (W7). On a catalog only ever reaped by a
-    /// reaper, with no failed read or write, the span is empty; after reaper-less use it holds
-    /// every branch sealed without one until the first open with a reaper releases them (F6 of the
-    /// wall21 review audit). The one-byte key `[0x08]` alone is not a slot: it
-    /// marks the span as complete for this catalog (see `unreleased_index_built`).
-    pub const UNRELEASED: u8 = 0x08;
+    /// **`0x08` is wall21's `UNRELEASED`** (the lead's registry), a variant since the merge of
+    /// wall21 and lease-grace, so E0081 now refuses any second use of the byte;
+    /// `tests::the_lease_tags_leave_0x08_to_wall21s_unreleased_span` still pins the registry's
+    /// numbers.
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Tag {
+        /// `[0x00][branch id]` → the serialized `BranchRecord`. The only copy of the truth.
+        Record = 0x00,
+        /// `[0x01][lease deadline][branch id]` → empty. **`Live`, non-trunk branches only.**
+        ///
+        /// The restriction is not tidiness. A quarantined branch holds its record for as long as an
+        /// operator wants to look at it, and its lease expired long ago — left in this index it would
+        /// sit at the head of the range for ever, and *every* 30-second reap scan would walk over it
+        /// before reaching anything real. That is an unbounded walk in the hot path reintroduced
+        /// through the back door, which is the one thing D2 exists to prevent.
+        Deadline = 0x01,
+        /// `[0x02][state][branch id]` → empty. Every branch, including trunk.
+        State = 0x02,
+        /// `[0x03][parent id][fork epoch]` → empty. **Live children only.**
+        ///
+        /// Replaces the `live_children` array that used to live inside the parent's record and forced
+        /// `fork` to rewrite the parent. The reclamation rule was already a range-emptiness question
+        /// over that array; here it is a range-emptiness question over the tree, which is the same
+        /// question asked of a structure that can answer it without holding every parent resident.
+        Child = 0x03,
+        /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
+        ///
+        /// In the tree rather than in the header on purpose: a free-id *list* in a fixed header is
+        /// unbounded in the one direction that matters — a workload that creates and reaps 10⁶
+        /// branches would need every released id in the header, and the header must stay O(1) or
+        /// `open` is O(N) again by another route. "Lowest free id" is the first key in this span.
+        FreeId = 0x04,
+        /// `[0x05][branch id]` → the serialized `CapabilityEnvelope`. **Sparse**: only governed
+        /// branches have one.
+        ///
+        /// Out of the record because it is variable-length and because `envelope_of` is already a
+        /// separate trait method — it exists so the write funnel, which asks on every statement, does
+        /// not clone the rest of the record. Splitting the storage the same way the query is already
+        /// split costs nothing and keeps the core record fixed-size.
+        Envelope = 0x05,
+        /// `[0x06][branch id][arena id]` → empty. The arenas a branch allocates novel pages from.
+        ///
+        /// **Not optional.** A leaf page holds about 2 KB of entries in total, and a branch that has
+        /// written ~230 MB owns ~900 arena ids — around 3.6 KB on its own. A record that can outgrow a
+        /// page is a wall with no error message, so the unbounded field becomes a key span, where the
+        /// only question anyone asks of it ("which arenas does this branch own?") is a range scan.
+        Arena = 0x06,
+        /// `[0x07]` → the catalog header: `next_id` and the epoch counter.
+        ///
+        /// Inside the tree rather than on a page of its own, so that `open` is one descent and so that
+        /// a fork's id allocation commits in the same structure as the record it allocated. The only
+        /// value that must live outside the tree is the tree's own root page id, which the caller
+        /// persists — that is the irreducible bootstrap, and it is one `u32`.
+        Header = 0x07,
+        /// `[0x08][branch id]` → empty. **D200.** Every slot that may be RELEASABLE and is not yet
+        /// released:
+        /// - put here by `set_state` on the way into `Reaping`;
+        /// - kept by the `Reaped` flip only if nothing is alive below it, and taken off by the flip
+        ///   if something is (a PINNED interior is not releasable);
+        /// - (a pinned interior whose last pin later goes needs no key of its own: the cascade that
+        ///   frees it runs for an originator whose own key covers it until that originator's release);
+        /// - taken off by `release_id`, and only once the slot IS on the free list;
+        /// - put here by `release_id` on each error it swallows, whatever the slot held before (C1,
+        ///   W1 and W2 of the wall21 review audits): a record read that fails (any slot); a liveness
+        ///   read that fails, on a `Reaped` slot only; a FREE_ID write that fails, on a releasable
+        ///   one. (Audit 4 A6: this said "every error", which overstated the liveness arm.) A key
+        ///   frees nothing: the sweep and `release_id` re-read before acting, and since audit 4 A1 an
+        ///   error on that re-read is the slot's refusal, not a failed open;
+        /// - put here by the one-time build for a `Reaped`-indexed slot whose record cannot be read,
+        ///   whatever the error (W3, A1).
+        ///
+        /// It exists so the open-time sweep for leaked slots — run under the statement lock at start —
+        /// reads only what it could release now. A released slot stays a `Reaped` record until a fork
+        /// recycles it, so the `Reaped` STATE span grows with branches ever reaped, and pinned
+        /// interiors number up to live branches × chain depth under MCTS pruning; neither is here,
+        /// except a pinned slot a failed liveness read keyed (W7). On a catalog only ever reaped by a
+        /// reaper, with no failed read or write, the span is empty; after reaper-less use it holds
+        /// every branch sealed without one until the first open with a reaper releases them (F6 of the
+        /// wall21 review audit). The one-byte key `[0x08]` alone is not a slot: it
+        /// marks the span as complete for this catalog (see `unreleased_index_built`).
+        Unreleased = 0x08,
+        /// `[0x09]` → the **virtual lease clock's state**, 16 bytes, both big-endian `u64`: the
+        /// last-alive mark (the lease clock reading at which this database last had its leases
+        /// enforced) and the offset `D` (cumulative downtime credited, which every stored deadline is
+        /// read back with). F1's restart grace, D198; see [`crate::branch::types::LeaseResume`] and
+        /// `TableBranchCatalog::to_lease_clock`.
+        ///
+        /// A key of its own rather than more bytes in `HEADER`, for two reasons. `HEADER` is rewritten
+        /// on every fork (`write_header`), and this key has two writers, the lease scan and the startup
+        /// resume — sharing a value would make every fork a write of the mark too. And a catalog
+        /// written before this key existed simply lacks it, which reads as "never recorded, `D = 0`"
+        /// with no length check to relax, where a wider header would need the two-lengths tolerant read
+        /// `deserialize_core` already carries for D60.
+        Alive = 0x09,
+        /// `[0x0A]` → **the soft mark**, 16 bytes, both big-endian `u64`: the writer's lease-clock
+        /// reading at its commit, and the downtime already owed when it opened the catalog. Written by
+        /// EVERY commit of a catalog with no `ALIVE` record — an embedder with no lease thread, a
+        /// first start before its resume — and by a legacy migration, whose `accrued` is the source's
+        /// age. The next first start credits `accrued + (now − mark)` the way it would credit a mark,
+        /// which is right however far the writer's lease clock lagged the wall (D198 review 3, E1 and
+        /// C4). Read and written only while `ALIVE` is absent; once a mark exists it is never read.
+        ///
+        /// A key of its own for `ALIVE`'s reasons, and absent from every catalog no D198 build wrote,
+        /// whose first start then falls back to the file's time.
+        FirstStart = 0x0A,
+    }
+
+    /// [`Tag::Record`] as its byte.
+    pub const RECORD: u8 = Tag::Record as u8;
+    /// [`Tag::Deadline`] as its byte.
+    pub const DEADLINE: u8 = Tag::Deadline as u8;
+    /// [`Tag::State`] as its byte.
+    pub const STATE: u8 = Tag::State as u8;
+    /// [`Tag::Child`] as its byte.
+    pub const CHILD: u8 = Tag::Child as u8;
+    /// [`Tag::Envelope`] as its byte.
+    pub const ENVELOPE: u8 = Tag::Envelope as u8;
+    /// [`Tag::Arena`] as its byte.
+    pub const ARENA: u8 = Tag::Arena as u8;
+    /// [`Tag::Header`] as its byte.
+    pub const HEADER: u8 = Tag::Header as u8;
+    /// [`Tag::Alive`] as its byte.
+    pub const ALIVE: u8 = Tag::Alive as u8;
+    /// [`Tag::FirstStart`] as its byte.
+    pub const FIRST_START: u8 = Tag::FirstStart as u8;
+    /// [`Tag::FreeId`] as its byte.
+    pub const FREE_ID: u8 = Tag::FreeId as u8;
+    /// [`Tag::Unreleased`] as its byte.
+    pub const UNRELEASED: u8 = Tag::Unreleased as u8;
 }
 
 /// `[0x00][id]`
@@ -212,6 +275,16 @@ pub fn free_id_from_key(key: &[u8]) -> Option<u64> {
 /// `[0x07]` — the single header key.
 pub fn header() -> Vec<u8> {
     vec![tag::HEADER]
+}
+
+/// `[0x09]` — the single last-alive key.
+pub fn alive() -> Vec<u8> {
+    vec![tag::ALIVE]
+}
+
+/// `[0x0A]` — the single first-start key.
+pub fn first_start() -> Vec<u8> {
+    vec![tag::FIRST_START]
 }
 
 /// The half-open span `[lo, hi)` covering an entire tag group.
@@ -528,5 +601,86 @@ mod tests {
         assert!(child(5, 0) >= lo && child(5, 0) <= hi, "epoch 0 must be inside [0, 3)");
         assert!(child(5, 2) >= lo && child(5, 2) <= hi);
         assert!(!(child(5, 3) >= lo), "epoch 3 is outside [0, 3)");
+    }
+
+    /// The mark is one key in a group of its own; every existing span must stay blind to it, and
+    /// its own group must hold nothing else.
+    #[test]
+    fn the_alive_key_is_its_own_group_and_no_other_span_reaches_it() {
+        let (lo, hi) = whole_group(tag::ALIVE);
+        assert!(alive() >= lo && alive() < hi);
+        for (name, k) in [
+            ("record", record(u64::MAX)),
+            ("deadline", deadline(u64::MAX, u64::MAX)),
+            ("state", state(0xFF, u64::MAX)),
+            ("child", child(u64::MAX, u64::MAX)),
+            ("free_id", free_id(0)),
+            ("envelope", envelope(u64::MAX)),
+            ("arena", arena(u64::MAX, u32::MAX)),
+            ("header", header()),
+        ] {
+            assert!(!(k >= lo && k < hi), "a {name} key fell inside the ALIVE group");
+        }
+        for t in [
+            tag::RECORD, tag::DEADLINE, tag::STATE, tag::CHILD, tag::FREE_ID, tag::ENVELOPE,
+            tag::ARENA, tag::HEADER,
+        ] {
+            let (lo, hi) = whole_group(t);
+            assert!(!(alive() >= lo && alive() < hi), "the ALIVE key fell inside tag {t:#04x}");
+        }
+        let (lo, hi) = expired_at_or_before(u64::MAX);
+        assert!(!(alive() >= lo && alive() < hi), "the expiry span reached the ALIVE key");
+    }
+
+    /// The same for `[0x0A]`, with `ALIVE` among the neighbours it must not share a span with.
+    #[test]
+    fn the_first_start_key_is_its_own_group_and_no_other_span_reaches_it() {
+        let (lo, hi) = whole_group(tag::FIRST_START);
+        assert!(first_start() >= lo && first_start() < hi);
+        for (name, k) in [
+            ("record", record(u64::MAX)),
+            ("deadline", deadline(u64::MAX, u64::MAX)),
+            ("state", state(0xFF, u64::MAX)),
+            ("child", child(u64::MAX, u64::MAX)),
+            ("free_id", free_id(0)),
+            ("envelope", envelope(u64::MAX)),
+            ("arena", arena(u64::MAX, u32::MAX)),
+            ("header", header()),
+            ("alive", alive()),
+        ] {
+            assert!(!(k >= lo && k < hi), "a {name} key fell inside the FIRST_START group");
+        }
+        for t in [
+            tag::RECORD, tag::DEADLINE, tag::STATE, tag::CHILD, tag::FREE_ID, tag::ENVELOPE,
+            tag::ARENA, tag::HEADER, tag::ALIVE,
+        ] {
+            let (lo, hi) = whole_group(t);
+            assert!(
+                !(first_start() >= lo && first_start() < hi),
+                "the FIRST_START key fell inside tag {t:#04x}"
+            );
+        }
+        let (lo, hi) = expired_at_or_before(u64::MAX);
+        assert!(
+            !(first_start() >= lo && first_start() < hi),
+            "the expiry span reached the FIRST_START key"
+        );
+    }
+
+    /// **The lead's registry (D244 review 2, R2-3): `0x08` is wall21's `UNRELEASED`.** This branch's
+    /// lease tags took `0x08` and `0x09` first, and wall21's took `0x08` on a branch of its own; the
+    /// two files merged with no conflict into a build that reads one key as the other. Once
+    /// `UNRELEASED` is a `Tag` variant (wall21's merge), E0081 makes a clash a compile error; until
+    /// then this pins the renumbering. The literal is the registry's, not read from the subject.
+    #[test]
+    fn the_lease_tags_leave_0x08_to_wall21s_unreleased_span() {
+        const UNRELEASED_PER_REGISTRY: u8 = 0x08;
+        assert_ne!(tag::ALIVE, UNRELEASED_PER_REGISTRY, "ALIVE sits on wall21's UNRELEASED byte");
+        assert_ne!(
+            tag::FIRST_START,
+            UNRELEASED_PER_REGISTRY,
+            "FIRST_START sits on wall21's UNRELEASED byte"
+        );
+        assert_eq!((tag::ALIVE, tag::FIRST_START), (0x09, 0x0A), "the registry's assignments");
     }
 }

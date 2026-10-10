@@ -101,13 +101,28 @@
 //! [`LeaseStats::refused_branches`], and their reasons are printed by [`refusal_report`]. The
 //! sweep still continues past one — that is what the absorption is FOR — it just no longer
 //! continues *quietly*.
+//!
+//! **5 — F1. Downtime is not charged to a lease.** Chubby §2.9: while the authority is down, the
+//! lease timer is stopped. Before this, [`LeaseThread::start`] resumed interrupted reaps and then
+//! spawned a loop whose first act was a scan — so a restart after an outage longer than a branch's
+//! remaining lease reaped that branch before its agent could do anything, and nothing could tell
+//! "abandoned before the outage" from "expired because of it". Now `start` also resumes the lease
+//! clock ([`TwoTierReaper::resume_lease_clock`]): every lease is extended by exactly the measured
+//! downtime, in the same acquisition as the reap resume and before the first scan — as ONE write to
+//! the catalog's virtual lease clock (D198, `TableBranchCatalog::to_lease_clock`), not a rewrite of
+//! each deadline. Every scan then records the mark it
+//! read the clock at, and [`LeaseThread::stop`] records one more, so the next start measures the
+//! outage from the last moment leases were actually enforced. A lease that had run out before the
+//! mark is still expired after the shift and is reaped exactly as before — `tests/integration_server_reaps.rs` pins
+//! both halves through `pgserver`. What `start` did is always printed ([`lease_resume_report`]),
+//! including when it did nothing and why.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::agent_sql::runtime::AgentRuntime;
-use crate::branch::types::{BranchId, LeaseDeadline};
+use crate::branch::types::{BranchId, LeaseDeadline, LeaseResume};
 // `Reaper` is deliberately NOT imported: since D98 this module reaches the reaper only through its
 // inherent methods (`resume_interrupted_reaps`, `expired_candidates`, `reap_if_still_expired`,
 // `collect_orphans_if_due`), because the trait's `reap_expired` is the whole-sweep shape whose
@@ -387,6 +402,10 @@ pub struct LeaseThread {
     halt: Arc<Halt>,
     handle: Option<std::thread::JoinHandle<()>>,
     resumed: Vec<BranchId>,
+    /// What resuming the lease clock did at start. Rule 5.
+    lease_resume: LeaseResume,
+    /// Kept for the last-alive mark [`LeaseThread::shutdown`] records once the thread is joined.
+    reaper: Arc<TwoTierReaper>,
 }
 
 impl LeaseThread {
@@ -414,7 +433,23 @@ impl LeaseThread {
         lock: Arc<dyn RuntimeLock>,
         interval: Duration,
     ) -> Result<LeaseThread, FerroError> {
-        let resumed = with_lock(&*lock, || reaper.resume_interrupted_reaps())?;
+        // Rules 1 and 5, in ONE acquisition: both are "before the first scan", and a second
+        // acquisition would be a second chance for a statement to run between them — against a
+        // catalog whose leases still carry the outage.
+        //
+        // The lease clock is resumed AFTER the interrupted reaps are finished. The order does not
+        // change either answer — a `Reaping` record is not in the deadline index, so the grace
+        // cannot see it — but it keeps the destructive half of startup first, as rule 1 states it.
+        //
+        // A failure to resume refuses to start, the same as a failed reap resume. Starting anyway
+        // would run the first scan against deadlines that still carry the outage, and reap exactly
+        // the branches rule 5 exists to keep.
+        let (resumed, lease_resume) = with_lock(&*lock, || -> Result<_, FerroError> {
+            let resumed = reaper.resume_interrupted_reaps()?;
+            let lease_resume = reaper.resume_lease_clock()?;
+            Ok((resumed, lease_resume))
+        })?;
+        report(lease_resume_report(lease_resume));
         if !resumed.is_empty() {
             // The reaper reclaimed pages without any client asking, so the runtime still holds
             // those branches' workspaces; nothing else will ever tell it.
@@ -443,6 +478,7 @@ impl LeaseThread {
 
         let counters = Arc::new(Counters::default());
         let halt = Arc::new(Halt { stopping: Mutex::new(false), wake: Condvar::new() });
+        let kept = Arc::clone(&reaper);
         let handle = {
             let counters = Arc::clone(&counters);
             let halt = Arc::clone(&halt);
@@ -466,12 +502,17 @@ impl LeaseThread {
                 })?
         };
 
-        Ok(LeaseThread { counters, halt, handle: Some(handle), resumed })
+        Ok(LeaseThread { counters, halt, handle: Some(handle), resumed, lease_resume, reaper: kept })
     }
 
     /// Branches whose interrupted reap [`LeaseThread::start`] finished.
     pub fn resumed(&self) -> &[BranchId] {
         &self.resumed
+    }
+
+    /// What resuming the lease clock did at [`LeaseThread::start`] — rule 5.
+    pub fn lease_resume(&self) -> LeaseResume {
+        self.lease_resume
     }
 
     /// What the thread has done so far. Safe to read while it runs.
@@ -496,6 +537,27 @@ impl LeaseThread {
             // and panicking there during an unwind aborts the process.
             if h.join().is_err() {
                 report("lease: the scan thread panicked; no further leases will be reaped in this process".to_string());
+            }
+            // **Rule 5 — the last moment leases were enforced is NOW, not the last scan.** Without
+            // this the next start would count everything since the last scan — up to a whole
+            // interval, thirty seconds at the default — as downtime, and hand every live lease that
+            // much extra. After the join, so no scan can record an earlier mark over this one.
+            //
+            // Inside the `if`, so a second `shutdown` (`stop` followed by `Drop`) records nothing:
+            // the first one's mark is the true one. Reported, never propagated, for the reason the
+            // panic report above gives; a missing mark errs towards keeping leases, not reaping.
+            //
+            // No reading at all is a cluster member with no tick, which `record_lease_alive` would
+            // skip anyway: the mark is a standalone node's.
+            if let Ok(now) = LeaseDeadline::try_now_millis() {
+                if let Err(e) = self.reaper.record_lease_alive(now) {
+                    report(format!(
+                        "lease: could not record the shutdown as the last-alive mark ({e}). The \
+                         next start measures downtime from the last scan's mark instead, which \
+                         extends live leases by up to one scan interval more than the outage; \
+                         nothing is reaped early"
+                    ));
+                }
             }
         }
     }
@@ -633,6 +695,22 @@ fn scan_once(
             return;
         }
     };
+
+    // **Rule 5 — the heartbeat.** Recorded before this pass reaps anything, with the reading it
+    // reaps against: the mark says "leases were enforced up to here", and a crash in the middle of
+    // the reaps below leaves a mark every expired branch is already on the far side of, so the next
+    // start reaps them rather than crediting them the outage. Outside the runtime lock — it writes
+    // one key to the BRANCH catalog, which has its own lock. A no-op unless `start` armed it.
+    //
+    // A failure is reported and the scan goes on: a stale mark makes the next start OVER-measure
+    // the outage, which keeps leases longer than owed and never reaps one early.
+    if let Err(e) = reaper.record_lease_alive(now) {
+        out(format!(
+            "lease: could not record lease clock {now} as the last-alive mark: {e}. This scan \
+             still runs; if the process stops before a later mark lands, the next start credits the \
+             time since the last one as downtime — longer leases, never an early reap."
+        ));
+    }
 
     // **Outside the lock.** An index descent on the branch catalog, which has its own lock.
     let candidates = match reaper.expired_candidates(now) {
@@ -909,6 +987,62 @@ fn refusal_report(refused: &[(BranchId, FerroError)]) -> String {
         ));
     }
     msg
+}
+
+/// **Rule 5 — what resuming the lease clock did, for whoever reads the server's stderr.**
+///
+/// Printed on EVERY start, including the two outcomes where no grace was applied, because those are
+/// the ones an operator needs: a restart whose downtime was charged to every lease looks, from the
+/// outside, exactly like one that measured nothing to credit. A free function over the outcome for
+/// `refusal_report`'s reason — the operator-facing text is what a test can pin.
+///
+/// ⚠ `tests/integration_server_reaps.rs` parses the `Resumed` line (`clock resumed after <n>ms`)
+/// and several tests there assert the ABSENCE of `lease: reaped` in startup output, so no line
+/// here may contain that phrase.
+fn lease_resume_report(r: LeaseResume) -> String {
+    match r {
+        LeaseResume::Resumed { last_alive, now_millis, downtime_millis, offset_millis } => format!(
+            "lease: clock resumed after {downtime_millis}ms down (last alive at {last_alive}, now \
+             {now_millis}); every lease now reads {downtime_millis}ms later ({offset_millis}ms of \
+             downtime credited in total, no record rewritten), so a lease that lapsed only while \
+             nothing was running is kept for what it had left (Chubby §2.9)"
+        ),
+        LeaseResume::FirstStartFromFileTime {
+            now_millis,
+            file_mtime,
+            writer_mark,
+            recorded_millis,
+            credited_millis,
+        } => format!(
+            "lease: no last-alive mark in this catalog yet, but it holds live leases; crediting \
+             {credited_millis}ms as downtime (now {now_millis}): {recorded_millis}ms owed before \
+             the last writer that never resumed it, plus the longer of the time since {} and \
+             since {}. So a lease that lapsed only while nothing was running is kept for what it \
+             had left. Over a catalog no D198 build wrote, the file time is the only evidence, and \
+             the credit falls short if something else wrote the file later; it is never below zero",
+            match writer_mark {
+                Some(m) => format!("that writer's last commit at {m} on its lease clock"),
+                None => "a writer's soft mark (none here)".to_string(),
+            },
+            match file_mtime {
+                Some(m) => format!("the file's last write at {m}"),
+                None => "a file time (none is evidence here)".to_string(),
+            }
+        ),
+        LeaseResume::FirstStart { now_millis } => format!(
+            "lease: no last-alive mark in this catalog yet, so the downtime before this start \
+             cannot be measured and no lease was extended; marking {now_millis}, and every later \
+             start is measured from marks"
+        ),
+        LeaseResume::NoMark => "lease: NO restart grace — this branch catalog keeps no last-alive \
+             mark, so downtime cannot be measured, and a lease that lapsed while the process was \
+             down is reaped on the first scan"
+            .to_string(),
+        LeaseResume::Clustered => "lease: no restart grace on a cluster member — lease time is the \
+             replicated LeaseTick, the same on every member, and extending deadlines on one node's \
+             restart would make members disagree about which branches are live"
+            .to_string(),
+    }
 }
 
 /// Say something on stderr, tolerating a closed one.

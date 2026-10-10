@@ -1204,3 +1204,227 @@ fn each_open_refusal_is_worded_for_its_source() {
         assert!(line.ends_with(why), "the line lost the refusal it reports: {line}");
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// F1 — downtime is not charged to a lease (Chubby §2.9: the timer is stopped while the authority
+// is down). `artie-research/frontier/research_reclaim-with-live-children.md` §5.
+// -------------------------------------------------------------------------------------------
+
+/// [`fixture`] over the catalog that SHIPS. `fixture` uses the log catalog (`Harness::new`), which
+/// is the reference oracle rather than what either binary opens; a restart grace is a property of
+/// the durable catalog a restart actually reads.
+fn table_fixture() -> Fixture {
+    let h = Harness::new_with(true);
+    let runtime = Arc::new(
+        AgentRuntime::with_storage(
+            Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            Arc::clone(&h.store) as Arc<dyn PageStore>,
+        )
+        .unwrap(),
+    );
+    let reaper = Arc::new(TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store)));
+    Fixture { h, reaper, runtime }
+}
+
+/// **F1 at the scan's own granularity.** `tests/integration_server_reaps.rs` pins the same claim
+/// through `pgserver`, which cannot say how many scans ran; this can, so "it survived the first
+/// scan" is a counted fact here rather than an inference from elapsed time.
+///
+/// A restart is modelled as what the lease logic sees of one: the scan thread stops, real time
+/// passes with nothing scanning, and a new thread starts over the same durable catalog. Nothing
+/// here writes a clock or a mark — only the one lease deadline, through `renew_lease` — so this
+/// compiles against, and means the same thing on, the tree before the fix.
+#[test]
+fn f1_a_lease_that_lapsed_while_nothing_was_scanning_survives_the_scans_after_a_restart() {
+    let f = table_fixture();
+    let branch = branch_with_pages(&f, FAR_FUTURE, 3);
+    let with_pages = f.h.store.live_page_count().unwrap();
+
+    // The first life: the thread starts, scans, and is stopped.
+    let first = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("the first life to scan", || first.stats().scans >= 2);
+    let first_stats = first.stop();
+    assert_eq!(first_stats.reaped, 0, "the first life reaped a far-future lease: {first_stats:?}");
+
+    // At shutdown the lease had two seconds left, and nothing scans for three.
+    let shutdown = LeaseDeadline::now_millis();
+    let deadline = shutdown + 2_000;
+    f.h.catalog.renew_lease(branch, LeaseDeadline(deadline)).unwrap();
+    while LeaseDeadline::now_millis() < deadline + 1_000 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        LeaseDeadline(deadline).is_expired_at(LeaseDeadline::now_millis()),
+        "premise: the lease must have lapsed during the downtime, or nothing below is about F1"
+    );
+
+    // The second life.
+    let second = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        BRISK,
+    )
+    .unwrap();
+    wait_for("four scans after the restart", || second.stats().scans >= 4);
+    let after_restart = second.stats();
+    assert_eq!(
+        after_restart.reaped, 0,
+        "a lease that lapsed only while nothing was scanning was reaped by the first scans after \
+         the restart — F1. It had 2000ms left when the thread stopped: {after_restart:?}"
+    );
+    assert_eq!(state_of(&f, branch), BranchState::Live);
+    assert_eq!(f.h.store.live_page_count().unwrap(), with_pages, "a page went back early");
+    let moved = f.h.catalog.get_raw(branch.id).unwrap().lease_deadline.0;
+    assert!(
+        moved > deadline,
+        "the branch survived but its deadline did not move ({moved} <= {deadline}), so the survival \
+         is not the grace this test is about"
+    );
+
+    // A lease, not an exemption: once the remainder it had at shutdown runs out, it is reaped.
+    wait_for("the preserved remainder to run out and the scan to reap the branch", || {
+        second.stats().reaped >= 1
+    });
+    second.stop();
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    assert!(f.h.store.live_page_count().unwrap() < with_pages, "the reap freed nothing");
+}
+
+/// **Rule 5's crash path — the Turso lane's R2 lesson.** A mark written only on a clean close
+/// loses the whole of the last run's open time after a crash, and the next start then credits it
+/// as downtime. Here the thread is never stopped: one scan runs on an armed reaper and the
+/// "process" ends there, with no `stop` and no `Drop` of any `LeaseThread`. The mark the next
+/// start measures from must be that scan's, not the one written at start.
+#[test]
+fn f1_every_scan_records_the_mark_so_a_crash_does_not_lose_the_time_since_start() {
+    let f = table_fixture();
+    let marked_at_start = match f.reaper.resume_lease_clock().unwrap() {
+        LeaseResume::FirstStart { now_millis } => now_millis,
+        other => panic!("a fresh table catalog must report a first start, got {other:?}"),
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let before_scan = LeaseDeadline::now_millis();
+    assert!(before_scan > marked_at_start, "premise: the scan must read a later clock than start");
+
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &|_| {});
+    assert_eq!(counters.snapshot().scans, 1, "premise: the scan must have completed");
+
+    // The crash is here. The next start asks the catalog what it last recorded.
+    match f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap() {
+        LeaseResume::Resumed { last_alive, .. } => assert!(
+            last_alive >= before_scan,
+            "the next start measures from {last_alive}, the mark written at START \
+             ({marked_at_start}), not the scan's (>= {before_scan}): the scan recorded nothing, so \
+             after a crash every lease would be handed all the time since the process started"
+        ),
+        other => panic!("the catalog lost its mark: {other:?}"),
+    }
+}
+
+/// The other side of arming: a reaper that never resumed the lease clock writes no mark, however
+/// many scans run through it. Every `scan_once` a test drives by hand is such a reaper, and so is
+/// any caller that is not `LeaseThread` — a mark from one of them would be a "last alive" that no
+/// enforcing process ever wrote, and the next real start would measure its downtime from it.
+#[test]
+fn f1_a_reaper_that_never_resumed_the_clock_writes_no_mark() {
+    let f = table_fixture();
+    let counters = Counters::default();
+    for _ in 0..3 {
+        scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &|_| {});
+    }
+    assert_eq!(counters.snapshot().scans, 3, "premise: the scans must have completed");
+    let now = LeaseDeadline::now_millis();
+    assert_eq!(
+        f.h.catalog.resume_leases(now).unwrap(),
+        LeaseResume::FirstStart { now_millis: now },
+        "an unarmed reaper recorded a last-alive mark"
+    );
+}
+
+/// **The shutdown mark, pinned (D198 adversary, C4).** `LeaseThread::shutdown` records the moment
+/// the thread stopped as the last-alive mark; without it the next start measures the outage from
+/// the last SCAN and hands every live lease up to one scan interval extra. No test failed when it
+/// was removed. Here the interval is `NEVER`, so the one scan runs at start and nothing else marks
+/// until `stop`: the mark the next resume measures from must be at or after a reading taken just
+/// before `stop` was called. Its red is mutant M26: delete the `record_lease_alive` in `shutdown`.
+#[test]
+fn f1_a_clean_stop_records_the_moment_it_stopped_as_the_last_alive_mark() {
+    let f = table_fixture();
+    let lease = LeaseThread::start(
+        Arc::clone(&f.reaper),
+        Arc::clone(&f.runtime),
+        Arc::clone(&TestGate::new()) as Arc<dyn RuntimeLock>,
+        NEVER,
+    )
+    .unwrap();
+    wait_for("the one scan a NEVER interval runs", || lease.stats().scans >= 1);
+    std::thread::sleep(Duration::from_millis(50));
+    let before_stop = LeaseDeadline::now_millis();
+    lease.stop();
+
+    match f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap() {
+        LeaseResume::Resumed { last_alive, .. } => assert!(
+            last_alive >= before_stop,
+            "the last-alive mark is {last_alive}, before the stop at >= {before_stop}: a clean stop \
+             recorded nothing, so the next start would credit the time since the last scan as \
+             downtime"
+        ),
+        other => panic!("the catalog lost its mark across a clean stop: {other:?}"),
+    }
+}
+
+/// **C2b (lead, after the D198 adversary): the reap's own re-check must not decide expiry on a
+/// catalog that refuses the question.**
+///
+/// C2 made a marked catalog refuse `expired_before` and `enforced_lease` until it resumes, but
+/// `TwoTierReaper::reap_if_still_expired` re-decided expiry from `get_raw`, which is not refused.
+/// Both production callers reach it only after the refused candidate query, which is the same
+/// calling-convention protection C2 removed one level up. Called directly here, on a lapsed branch
+/// of a marked, unresumed catalog, it must decline — as a D127 refusal, counted and carrying the
+/// catalog's reason — and free nothing. Once the catalog resumes, the same call reaps.
+#[test]
+fn f1_an_unresumed_marked_catalog_is_not_reaped_by_the_recheck_either() {
+    let f = table_fixture();
+    let branch = branch_with_pages(&f, EXPIRED, 2);
+    let with_pages = f.h.store.live_page_count().unwrap();
+    // A lease authority ran here and stopped at 1000; this instance has not resumed.
+    f.h.catalog.record_lease_alive(1_000).unwrap();
+    assert!(
+        f.h.catalog.expired_before(LeaseDeadline::now_millis()).is_err(),
+        "premise: C2 must already refuse the candidate query on this catalog"
+    );
+
+    let before = f.reaper.refused_reaps();
+    match f.reaper.reap_if_still_expired(branch, LeaseDeadline::now_millis()).unwrap() {
+        ReapOutcome::Refused(why) => {
+            assert!(why.to_string().contains("has not resumed its lease clock"), "{why}")
+        }
+        other => panic!(
+            "the re-check answered {other:?} on a catalog that refuses expiry questions: it decided \
+             expiry from a raw read the catalog would not have answered (C2b)"
+        ),
+    }
+    assert_eq!(f.reaper.refused_reaps(), before + 1, "the refusal was not counted (D127)");
+    assert_eq!(state_of(&f, branch), BranchState::Live, "the refusal reaped the branch");
+    assert_eq!(f.h.store.live_page_count().unwrap(), with_pages, "the refusal freed a page");
+
+    // Resumed, the question is answered: deadline 0 plus the credited downtime is still long past.
+    f.h.catalog.resume_leases(LeaseDeadline::now_millis()).unwrap();
+    assert!(
+        matches!(
+            f.reaper.reap_if_still_expired(branch, LeaseDeadline::now_millis()).unwrap(),
+            ReapOutcome::Reaped
+        ),
+        "a resumed catalog must let the re-check reap an expired branch"
+    );
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+}
