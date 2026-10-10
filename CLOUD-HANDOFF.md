@@ -13,6 +13,7 @@ says where. The same file is at the root of all three repos.
    `~/.claude/CLAUDE.md`). `lead-context/memory/` holds the lead's 229 memory notes, and `MEMORY.md` is the index.
    These are lessons paid for in failures, so grep them before you repeat a mistake.
 5. `artie-research/frontier/RESUME.md`: the top banners give per-lane state.
+6. **Workflow progress:** `artie-research/frontier/lead-context/workflows/README.md` lists the unfinished runs and where each stopped. `runs/<id>/journal.jsonl` has every finished agent's full result, and `INDEX.tsv` lists all 227 runs. Continue from those rather than redoing steps.
 
 ## 1. The repos (all Ryan's, all on GitHub)
 | repo | what | main |
