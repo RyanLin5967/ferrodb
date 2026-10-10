@@ -1,0 +1,5102 @@
+{
+  "title": "FerroDB · The core, connected",
+  "revision": "fc9556a742f61884a3011ccc28e78f160a8d57fe",
+  "date": "2026-09-23",
+  "intro": "An implementation map, from SQL to bytes and back. Read the numbered views in order; select a box for its mechanism and evidence. Solid arrows show the labeled dependency or data flow. Dashed arrows mark a separate path, optional component, or later action as labeled.",
+  "legend": [
+    {
+      "key": "sql",
+      "label": "Ordinary SQL / shared data"
+    },
+    {
+      "key": "branch",
+      "label": "Private branch / COW"
+    },
+    {
+      "key": "wal",
+      "label": "Log / durability"
+    },
+    {
+      "key": "check",
+      "label": "Validation / boundary"
+    },
+    {
+      "key": "lifecycle",
+      "label": "Ownership / cleanup"
+    },
+    {
+      "key": "neutral",
+      "label": "Entry point / separate component"
+    }
+  ],
+  "sections": [
+    {
+      "id": "system",
+      "number": "01",
+      "title": "The system, in one view",
+      "subtitle": "Start here. Follow the blue SQL path or the purple agent path; they meet when a merge publishes rows.",
+      "diagram": {
+        "width": 1200,
+        "height": 895,
+        "nodes": [
+          {
+            "id": "entry",
+            "x": 440,
+            "y": 30,
+            "w": 320,
+            "h": 90,
+            "title": "CLI or PostgreSQL client",
+            "lines": [
+              "SQL text enters a session",
+              "Current transaction / agent"
+            ],
+            "tone": "neutral",
+            "detail": [
+              "The CLI and PostgreSQL-wire example share execution components. A session separately tracks an ordinary transaction and an agent branch. PostgreSQL wire compatibility is a protocol surface, not the PostgreSQL storage engine."
+            ],
+            "sources": []
+          },
+          {
+            "id": "route",
+            "x": 440,
+            "y": 165,
+            "w": 320,
+            "h": 85,
+            "title": "Parse and route",
+            "lines": [
+              "Ordinary SQL or agent command"
+            ],
+            "tone": "neutral",
+            "detail": [
+              "The scanner/parser creates statements. Execution dispatch routes agent commands and branch-session DML to AgentRuntime. Ordinary SELECT is bound and planned; ordinary DML uses dedicated operators."
+            ],
+            "sources": []
+          },
+          {
+            "id": "sql",
+            "x": 70,
+            "y": 325,
+            "w": 300,
+            "h": 110,
+            "title": "Ordinary SQL execution",
+            "lines": [
+              "Plans, operators, transactions",
+              "Heap rows + index lookups"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The ordinary path reads and writes heap rows with MVCC visibility. Its primary and secondary B+ trees locate row versions; they are separate from the branch COW tree."
+            ],
+            "sources": []
+          },
+          {
+            "id": "agent",
+            "x": 830,
+            "y": 325,
+            "w": 300,
+            "h": 110,
+            "title": "AgentRuntime",
+            "lines": [
+              "Fork, private reads and edits",
+              "Evaluate / publish merge"
+            ],
+            "tone": "branch",
+            "detail": [
+              "An agent session lives across statements. It stages changes in a private workspace, captures typed effects, and mirrors row state to its branch COW pages."
+            ],
+            "sources": []
+          },
+          {
+            "id": "heap",
+            "x": 70,
+            "y": 535,
+            "w": 300,
+            "h": 110,
+            "title": "Shared SQL heap",
+            "lines": [
+              "Authoritative committed rows",
+              "Current + older row versions"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Normal SQL rows remain in the ordinary heap. The trunk COW tree is not an alternative authoritative copy of those tables."
+            ],
+            "sources": []
+          },
+          {
+            "id": "merge",
+            "x": 450,
+            "y": 535,
+            "w": 300,
+            "h": 110,
+            "title": "Merge admission",
+            "lines": [
+              "Resolve effects; check premises",
+              "Publish accepted rows"
+            ],
+            "tone": "check",
+            "detail": [
+              "SQL MERGE reads the workspace and its in-memory effect frame, evaluates against the current heap, then applies accepted rows in one ordinary WAL transaction. It does not replace the trunk COW root."
+            ],
+            "sources": []
+          },
+          {
+            "id": "workspace",
+            "x": 830,
+            "y": 535,
+            "w": 300,
+            "h": 110,
+            "title": "Private workspace — RAM",
+            "lines": [
+              "Rows / tombstones / before-images",
+              "Typed effects / read captures"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Persistent maps preserve inherited private state. Actual SQL reads combine current committed heap rows with these maps. Live merge input comes from Workspace.frame; the durable TEL is not replayed into this workspace on reopen."
+            ],
+            "sources": []
+          },
+          {
+            "id": "data",
+            "x": 70,
+            "y": 735,
+            "w": 300,
+            "h": 100,
+            "title": "Main database pages",
+            "lines": [
+              "Buffer pool → disk manager",
+              "Heap, indexes, COW arenas"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Heap/index allocation is below the persisted arena floor; branch arena allocation is above it. Both use the main database buffer pool and file. The branch catalog uses a different file and pool."
+            ],
+            "sources": []
+          },
+          {
+            "id": "logs",
+            "x": 450,
+            "y": 735,
+            "w": 300,
+            "h": 100,
+            "title": "Logs and metadata",
+            "lines": [
+              "WAL ≠ TEL ≠ branch catalog",
+              "Different jobs and guarantees"
+            ],
+            "tone": "wal",
+            "detail": [
+              "WAL supports ordinary row recovery. TEL stores typed intent when a durable implementation is configured. Branch records identify roots, ownership, generations and leases. Their separate durability boundaries matter."
+            ],
+            "sources": []
+          },
+          {
+            "id": "cow",
+            "x": 830,
+            "y": 735,
+            "w": 300,
+            "h": 100,
+            "title": "Branch COW pages",
+            "lines": [
+              "Mirror staged row state",
+              "Shared pages + private copies"
+            ],
+            "tone": "branch",
+            "detail": [
+              "These are real page-backed trees with their own roots. They support COW isolation, diff and reclamation, but normal branch SQL reads still use the workspace overlay."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "route",
+            "points": [
+              [
+                600,
+                120
+              ],
+              [
+                600,
+                165
+              ]
+            ],
+            "label": "statement",
+            "tone": "neutral",
+            "dashed": false,
+            "from": "entry",
+            "label_x": 650,
+            "label_y": 147
+          },
+          {
+            "to": "sql",
+            "points": [
+              [
+                440,
+                210
+              ],
+              [
+                220,
+                210
+              ],
+              [
+                220,
+                325
+              ]
+            ],
+            "label": "ordinary SQL",
+            "tone": "sql",
+            "dashed": false,
+            "from": "route",
+            "label_x": 290,
+            "label_y": 197
+          },
+          {
+            "to": "agent",
+            "points": [
+              [
+                760,
+                210
+              ],
+              [
+                980,
+                210
+              ],
+              [
+                980,
+                325
+              ]
+            ],
+            "label": "agent path",
+            "tone": "branch",
+            "dashed": false,
+            "from": "route",
+            "label_x": 860,
+            "label_y": 197
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                220,
+                435
+              ],
+              [
+                220,
+                535
+              ]
+            ],
+            "label": "read / write",
+            "tone": "sql",
+            "dashed": false,
+            "from": "sql",
+            "label_x": 220,
+            "label_y": 487
+          },
+          {
+            "to": "workspace",
+            "points": [
+              [
+                980,
+                435
+              ],
+              [
+                980,
+                535
+              ]
+            ],
+            "label": "private state",
+            "tone": "branch",
+            "dashed": false,
+            "from": "agent",
+            "label_x": 980,
+            "label_y": 487
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                830,
+                380
+              ],
+              [
+                790,
+                380
+              ],
+              [
+                790,
+                475
+              ],
+              [
+                330,
+                475
+              ],
+              [
+                330,
+                535
+              ]
+            ],
+            "label": "read committed base",
+            "tone": "sql",
+            "dashed": true,
+            "from": "agent",
+            "label_x": 540,
+            "label_y": 463
+          },
+          {
+            "to": "merge",
+            "points": [
+              [
+                830,
+                590
+              ],
+              [
+                750,
+                590
+              ]
+            ],
+            "label": "submit",
+            "tone": "branch",
+            "dashed": false,
+            "from": "workspace",
+            "label_x": 790,
+            "label_y": 577
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                450,
+                590
+              ],
+              [
+                370,
+                590
+              ]
+            ],
+            "label": "publish",
+            "tone": "check",
+            "dashed": false,
+            "from": "merge",
+            "label_x": 410,
+            "label_y": 577
+          },
+          {
+            "to": "data",
+            "points": [
+              [
+                220,
+                645
+              ],
+              [
+                220,
+                735
+              ]
+            ],
+            "label": "page I/O",
+            "tone": "sql",
+            "dashed": false,
+            "from": "heap",
+            "label_x": 220,
+            "label_y": 696
+          },
+          {
+            "to": "logs",
+            "points": [
+              [
+                600,
+                645
+              ],
+              [
+                600,
+                735
+              ]
+            ],
+            "label": "row WAL",
+            "tone": "wal",
+            "dashed": false,
+            "from": "merge",
+            "label_x": 600,
+            "label_y": 696
+          },
+          {
+            "to": "cow",
+            "points": [
+              [
+                980,
+                645
+              ],
+              [
+                980,
+                735
+              ]
+            ],
+            "label": "mirror edits",
+            "tone": "branch",
+            "dashed": false,
+            "from": "workspace",
+            "label_x": 980,
+            "label_y": 696
+          }
+        ],
+        "lanes": [],
+        "texts": [
+          {
+            "x": 70,
+            "y": 860,
+            "text": "Ordinary DML and accepted merge rows both use WAL; private COW staging has separate durability.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          }
+        ]
+      },
+      "cards": [
+        {
+          "title": "The decisive distinction",
+          "text": "SQL row versions, private workspace state, and COW page versions are different structures. The detailed views below follow each separately.",
+          "tone": "sql"
+        },
+        {
+          "title": "Actual server concurrency",
+          "text": "Eligible reads can run together. Current pgwire statements that write take an exclusive catalog gate and drain readers; multiple agents do not imply simultaneously executing SQL writers.",
+          "tone": "check"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/execution/session.rs",
+          "line": 6,
+          "label": "Transaction and agent session are separate"
+        },
+        {
+          "file": "src/execution/executor.rs",
+          "line": 173,
+          "label": "Statement routing"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 2152,
+          "label": "Heap + workspace read path"
+        },
+        {
+          "file": "src/pgwire/mod.rs",
+          "line": 143,
+          "label": "Exclusive statement gate"
+        },
+        {
+          "file": "tests/integration_trunk_tree_authority.rs",
+          "line": 170,
+          "label": "Trunk SQL rows live in heap"
+        }
+      ]
+    },
+    {
+      "id": "sql",
+      "number": "02",
+      "title": "From SQL to a physical row",
+      "subtitle": "This is the ordinary SQL path. Primary and secondary indexes lead to heap row locations, not branch roots.",
+      "diagram": {
+        "width": 1200,
+        "height": 700,
+        "nodes": [
+          {
+            "id": "parse",
+            "x": 40,
+            "y": 65,
+            "w": 240,
+            "h": 90,
+            "title": "Scanner → parser",
+            "lines": [
+              "SQL text → statement"
+            ],
+            "tone": "neutral",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "bind",
+            "x": 340,
+            "y": 65,
+            "w": 240,
+            "h": 110,
+            "title": "Bind SELECT",
+            "lines": [
+              "Resolve tables / columns",
+              "Construct logical plan"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Name/type binding builds expressions with column positions and a logical SELECT plan. DDL and ordinary DML are not all passed through this same logical-plan pipeline."
+            ],
+            "sources": []
+          },
+          {
+            "id": "plan",
+            "x": 640,
+            "y": 65,
+            "w": 240,
+            "h": 110,
+            "title": "Optimize → lower",
+            "lines": [
+              "Push filters; choose scans",
+              "Choose joins; build operators"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The optimizer can choose table or index scans and hash or nested-loop joins. Inner joins can be reordered; supported left joins preserve their semantics. Lowering produces executor operators."
+            ],
+            "sources": []
+          },
+          {
+            "id": "next",
+            "x": 940,
+            "y": 65,
+            "w": 240,
+            "h": 110,
+            "title": "Execute with ReadView",
+            "lines": [
+              "Pull rows through operators",
+              "Filter / join / project"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Operators share one read view for the statement. An ordinary explicit transaction supplies its retained snapshot; autocommit statements obtain a current snapshot."
+            ],
+            "sources": []
+          },
+          {
+            "id": "secondary",
+            "x": 40,
+            "y": 300,
+            "w": 240,
+            "h": 110,
+            "title": "Secondary B+ tree",
+            "lines": [
+              "(column value, PK) → entry",
+              "Use PK to find row"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The secondary index stores pairs so duplicate column values remain distinguishable. It resolves the primary key through the primary index before fetching the heap row."
+            ],
+            "sources": []
+          },
+          {
+            "id": "primary",
+            "x": 340,
+            "y": 300,
+            "w": 240,
+            "h": 110,
+            "title": "Primary B+ tree",
+            "lines": [
+              "PK → RecordId",
+              "RecordId = page + slot"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The index root cell is shared by handles so a root split is visible to later lookups. Internal pages route by separator keys; linked leaf pages support ordered scans."
+            ],
+            "sources": []
+          },
+          {
+            "id": "heap",
+            "x": 640,
+            "y": 300,
+            "w": 240,
+            "h": 110,
+            "title": "Heap page and slot",
+            "lines": [
+              "Read current tuple header",
+              "Follow older versions if needed"
+            ],
+            "tone": "sql",
+            "detail": [
+              "A physical RecordId identifies a slot in a heap page. The current version may not be visible to this reader; its previous-version pointer leads into the time-travel heap. Index candidates are rechecked against visible row values."
+            ],
+            "sources": []
+          },
+          {
+            "id": "scan",
+            "x": 940,
+            "y": 300,
+            "w": 240,
+            "h": 110,
+            "title": "Sequential scan",
+            "lines": [
+              "Directory → heap pages",
+              "Visit row slots"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Without a useful index, the heap scanner walks table page directories and row slots. MVCC visibility still applies; a scan is not permission to expose uncommitted rows."
+            ],
+            "sources": []
+          },
+          {
+            "id": "pool",
+            "x": 340,
+            "y": 550,
+            "w": 240,
+            "h": 110,
+            "title": "Buffer pool — RAM",
+            "lines": [
+              "Hit: pin cached frame",
+              "Miss: load a disk page"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Pinning prevents eviction while a caller uses a frame. Dirty pages need writeback. ARC replacement tracks recency/frequency; staged touch batching and optimistic read shadows are cache/concurrency techniques, not branch COW."
+            ],
+            "sources": []
+          },
+          {
+            "id": "disk",
+            "x": 640,
+            "y": 550,
+            "w": 240,
+            "h": 110,
+            "title": "Disk manager",
+            "lines": [
+              "Page ID → 4 KB block",
+              "Allocate / read / write / sync"
+            ],
+            "tone": "sql",
+            "detail": [
+              "DiskManager maps page IDs to blocks and manages allocation bitmaps. The main database reserves disjoint heap/index and branch arena regions. WAL must be durable through a dirty heap page's LSN before that page is written."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "bind",
+            "points": [
+              [
+                280,
+                110
+              ],
+              [
+                340,
+                110
+              ]
+            ],
+            "label": "SELECT",
+            "tone": "sql",
+            "dashed": false,
+            "from": "parse",
+            "label_x": 310,
+            "label_y": 98
+          },
+          {
+            "to": "plan",
+            "points": [
+              [
+                580,
+                120
+              ],
+              [
+                640,
+                120
+              ]
+            ],
+            "label": "plan",
+            "tone": "sql",
+            "dashed": false,
+            "from": "bind",
+            "label_x": 610,
+            "label_y": 108
+          },
+          {
+            "to": "next",
+            "points": [
+              [
+                880,
+                120
+              ],
+              [
+                940,
+                120
+              ]
+            ],
+            "label": "operators",
+            "tone": "sql",
+            "dashed": false,
+            "from": "plan",
+            "label_x": 910,
+            "label_y": 108
+          },
+          {
+            "to": "secondary",
+            "points": [
+              [
+                1060,
+                175
+              ],
+              [
+                1060,
+                240
+              ],
+              [
+                160,
+                240
+              ],
+              [
+                160,
+                300
+              ]
+            ],
+            "label": "secondary-index lookup",
+            "tone": "sql",
+            "dashed": false,
+            "from": "next",
+            "label_x": 600,
+            "label_y": 226
+          },
+          {
+            "to": "primary",
+            "points": [
+              [
+                1035,
+                175
+              ],
+              [
+                1035,
+                270
+              ],
+              [
+                460,
+                270
+              ],
+              [
+                460,
+                300
+              ]
+            ],
+            "label": "primary-key lookup",
+            "tone": "sql",
+            "dashed": false,
+            "from": "next",
+            "label_x": 640,
+            "label_y": 258
+          },
+          {
+            "to": "scan",
+            "points": [
+              [
+                1100,
+                175
+              ],
+              [
+                1100,
+                300
+              ]
+            ],
+            "label": "scan",
+            "tone": "sql",
+            "dashed": false,
+            "from": "next",
+            "label_x": 1138,
+            "label_y": 252
+          },
+          {
+            "to": "primary",
+            "points": [
+              [
+                280,
+                355
+              ],
+              [
+                340,
+                355
+              ]
+            ],
+            "label": "PK",
+            "tone": "sql",
+            "dashed": false,
+            "from": "secondary",
+            "label_x": 310,
+            "label_y": 343
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                580,
+                355
+              ],
+              [
+                640,
+                355
+              ]
+            ],
+            "label": "RID",
+            "tone": "sql",
+            "dashed": false,
+            "from": "primary",
+            "label_x": 610,
+            "label_y": 343
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                940,
+                355
+              ],
+              [
+                880,
+                355
+              ]
+            ],
+            "label": "tuple",
+            "tone": "sql",
+            "dashed": false,
+            "from": "scan",
+            "label_x": 910,
+            "label_y": 343
+          },
+          {
+            "to": "pool",
+            "points": [
+              [
+                760,
+                410
+              ],
+              [
+                760,
+                475
+              ],
+              [
+                460,
+                475
+              ],
+              [
+                460,
+                550
+              ]
+            ],
+            "label": "fetch / pin referenced pages",
+            "tone": "sql",
+            "dashed": false,
+            "from": "heap",
+            "label_x": 602,
+            "label_y": 461
+          },
+          {
+            "to": "disk",
+            "points": [
+              [
+                580,
+                605
+              ],
+              [
+                640,
+                605
+              ]
+            ],
+            "label": "I/O",
+            "tone": "sql",
+            "dashed": false,
+            "from": "pool",
+            "label_x": 610,
+            "label_y": 593
+          }
+        ],
+        "lanes": [],
+        "texts": [
+          {
+            "x": 40,
+            "y": 205,
+            "text": "INSERT / UPDATE / DELETE use dedicated operators; UPDATE / DELETE can plan their row selection.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          },
+          {
+            "x": 45,
+            "y": 495,
+            "text": "Index traversal also fetches pages through the buffer pool.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          }
+        ]
+      },
+      "cards": [
+        {
+          "title": "Two kinds of synchronization",
+          "text": "MVCC decides logical visibility. Page latches protect physical tree structure during traversal/splits. Buffer pinning protects residency. None of these substitutes for the others.",
+          "tone": "neutral"
+        },
+        {
+          "title": "Index maintenance is distinct",
+          "text": "Ordinary indexes mutate in place. Deletes retain entries and scans filter stale candidates. Heap recovery is followed by index rebuilding in the CLI; this is not per-index-operation WAL redo.",
+          "tone": "check"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/execution/executor.rs",
+          "line": 115,
+          "label": "Read snapshots"
+        },
+        {
+          "file": "src/optimizer/optimizer.rs",
+          "line": 7,
+          "label": "Optimization and lowering"
+        },
+        {
+          "file": "src/storage/index.rs",
+          "line": 347,
+          "label": "Optimistic index descent"
+        },
+        {
+          "file": "src/storage/index_page.rs",
+          "line": 4,
+          "label": "Ordinary index page layouts"
+        },
+        {
+          "file": "src/buffer/buffer_pool.rs",
+          "line": 747,
+          "label": "Page fetch"
+        },
+        {
+          "file": "src/wal/recovery.rs",
+          "line": 177,
+          "label": "Index rebuilding"
+        }
+      ]
+    },
+    {
+      "id": "mvcc",
+      "number": "03",
+      "title": "MVCC: time belongs to the reader",
+      "subtitle": "A snapshot is a visibility rule over transaction IDs. It is not a copied database and not a change log.",
+      "diagram": {
+        "width": 1200,
+        "height": 590,
+        "nodes": [
+          {
+            "id": "snap",
+            "x": 40,
+            "y": 70,
+            "w": 300,
+            "h": 110,
+            "title": "Reader snapshot",
+            "lines": [
+              "high_water + active IDs",
+              "Own writes are visible"
+            ],
+            "tone": "sql",
+            "detail": [
+              "A snapshot includes a creator transaction when its ID is below high_water and it was not active at capture. ReadView also treats its own transaction ID as visible. The begin_ts/end_ts field names contain transaction IDs, not wall-clock times."
+            ],
+            "sources": []
+          },
+          {
+            "id": "head",
+            "x": 440,
+            "y": 70,
+            "w": 300,
+            "h": 110,
+            "title": "Current row: value 15",
+            "lines": [
+              "begin = B; end = 0",
+              "prev → older row location"
+            ],
+            "tone": "sql",
+            "detail": [
+              "An UPDATE puts the prior row version into the time-travel heap and makes the new row the head. A larger tuple can move to a new physical location; indexes are updated accordingly."
+            ],
+            "sources": []
+          },
+          {
+            "id": "old",
+            "x": 840,
+            "y": 70,
+            "w": 300,
+            "h": 110,
+            "title": "Older row: value 10",
+            "lines": [
+              "begin = A; end = B",
+              "May point to another version"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The old copy's end transaction is the updating transaction B. A reader whose snapshot excludes B can still see the old copy if it includes A. Versions live as tuples, not full snapshots of every page."
+            ],
+            "sources": []
+          },
+          {
+            "id": "oldreader",
+            "x": 40,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Reader started before B",
+            "lines": [
+              "B was not visible at capture",
+              "Reject head; follow prev"
+            ],
+            "tone": "sql",
+            "detail": [
+              "For a transaction started before B, the new head is invisible. Following prev reaches the version created by A; B does not count as a visible ending transaction, so value 10 remains visible."
+            ],
+            "sources": []
+          },
+          {
+            "id": "rule",
+            "x": 440,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Version visibility test",
+            "lines": [
+              "Creator visible to reader?",
+              "No visible ending transaction?"
+            ],
+            "tone": "check",
+            "detail": [
+              "ReadView first checks creation visibility, then whether a nonzero end_ts is visible. If a head fails, resolve_visibility follows the previous-version chain. A transaction also sees its own changes."
+            ],
+            "sources": []
+          },
+          {
+            "id": "newreader",
+            "x": 840,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Reader started after B",
+            "lines": [
+              "After B committed",
+              "Head is visible → value 15"
+            ],
+            "tone": "sql",
+            "detail": [
+              "After commit, a new snapshot includes B. The head is visible; the old version is ended by a transaction this reader includes. An already open ordinary transaction keeps its original snapshot."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "old",
+            "points": [
+              [
+                740,
+                125
+              ],
+              [
+                840,
+                125
+              ]
+            ],
+            "label": "prev pointer",
+            "tone": "sql",
+            "dashed": false,
+            "from": "head",
+            "label_x": 790,
+            "label_y": 111
+          },
+          {
+            "to": "rule",
+            "points": [
+              [
+                190,
+                180
+              ],
+              [
+                190,
+                250
+              ],
+              [
+                590,
+                250
+              ],
+              [
+                590,
+                335
+              ]
+            ],
+            "label": "visibility metadata",
+            "tone": "sql",
+            "dashed": false,
+            "from": "snap",
+            "label_x": 395,
+            "label_y": 237
+          },
+          {
+            "to": "rule",
+            "points": [
+              [
+                590,
+                180
+              ],
+              [
+                590,
+                220
+              ],
+              [
+                780,
+                220
+              ],
+              [
+                780,
+                285
+              ],
+              [
+                640,
+                285
+              ],
+              [
+                640,
+                335
+              ]
+            ],
+            "label": "test version",
+            "tone": "check",
+            "dashed": false,
+            "from": "head",
+            "label_x": 775,
+            "label_y": 266
+          },
+          {
+            "to": "oldreader",
+            "points": [
+              [
+                440,
+                390
+              ],
+              [
+                340,
+                390
+              ]
+            ],
+            "label": "older view",
+            "tone": "sql",
+            "dashed": false,
+            "from": "rule",
+            "label_x": 390,
+            "label_y": 378
+          },
+          {
+            "to": "newreader",
+            "points": [
+              [
+                740,
+                390
+              ],
+              [
+                840,
+                390
+              ]
+            ],
+            "label": "newer view",
+            "tone": "sql",
+            "dashed": false,
+            "from": "rule",
+            "label_x": 790,
+            "label_y": 378
+          }
+        ],
+        "lanes": [],
+        "texts": [
+          {
+            "x": 40,
+            "y": 510,
+            "text": "UPDATE: preserve old tuple → write new head.    DELETE: mark end transaction; keep history.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          },
+          {
+            "x": 40,
+            "y": 546,
+            "text": "Overlapping writes can raise a write conflict. MVCC visibility alone does not prove serializable execution.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          }
+        ]
+      },
+      "cards": [
+        {
+          "title": "A snapshot does not lock in agent SQL",
+          "text": "This diagram describes ordinary transaction snapshots. Agent SQL obtains fresh committed base rows for each read and overlays private state; it does not retain this full view from branch fork.",
+          "tone": "branch"
+        },
+        {
+          "title": "History has a separate lifetime",
+          "text": "The branch reaper frees branch COW pages. It is not a vacuum for old heap row versions; no general MVCC vacuum is represented here.",
+          "tone": "lifecycle"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/wal/txn.rs",
+          "line": 121,
+          "label": "Snapshot representation"
+        },
+        {
+          "file": "src/wal/txn.rs",
+          "line": 1113,
+          "label": "Visibility predicate"
+        },
+        {
+          "file": "src/wal/visibility.rs",
+          "line": 3,
+          "label": "Following previous versions"
+        },
+        {
+          "file": "src/execution/update.rs",
+          "line": 73,
+          "label": "Creating a new version"
+        },
+        {
+          "file": "src/execution/delete.rs",
+          "line": 47,
+          "label": "Ending a version"
+        },
+        {
+          "file": "src/storage/tuple.rs",
+          "line": 11,
+          "label": "Version header"
+        }
+      ],
+      "table": {
+        "headers": [
+          "Ordinary operation",
+          "Row/version action",
+          "Index action"
+        ],
+        "rows": [
+          [
+            "INSERT",
+            "Create tuple with begin=my transaction",
+            "Primary upsert; secondary entries"
+          ],
+          [
+            "UPDATE",
+            "Preserve old copy; new head points to it",
+            "Maintain mapping if location/indexed value changes"
+          ],
+          [
+            "DELETE",
+            "Set ending transaction; retain historical row",
+            "Entries can remain; reads check visibility"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "fork",
+      "number": "04",
+      "title": "Fork and shadow paging, with real pointer roles",
+      "subtitle": "Illustrative IDs. This is the branch COW tree, not a frozen copy of every ordinary SQL table.",
+      "diagram": {
+        "width": 1200,
+        "height": 650,
+        "nodes": [
+          {
+            "id": "before_rec",
+            "x": 65,
+            "y": 70,
+            "w": 290,
+            "h": 100,
+            "title": "Two branch records",
+            "lines": [
+              "Parent.root = 7",
+              "Child.root = 7"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Fork creates child metadata with a new identity/generation/lease and the parent's root ID. Sharing this number makes the existing COW tree reachable without copying all data."
+            ],
+            "sources": []
+          },
+          {
+            "id": "before_root",
+            "x": 125,
+            "y": 245,
+            "w": 170,
+            "h": 100,
+            "title": "Page 7: root",
+            "lines": [
+              "Internal node",
+              "child IDs: 12, 19"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "before_left",
+            "x": 45,
+            "y": 465,
+            "w": 150,
+            "h": 90,
+            "title": "Page 12",
+            "lines": [
+              "Leaf values"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "before_right",
+            "x": 235,
+            "y": 465,
+            "w": 150,
+            "h": 90,
+            "title": "Page 19",
+            "lines": [
+              "Leaf values"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "parent_rec",
+            "x": 480,
+            "y": 70,
+            "w": 260,
+            "h": 100,
+            "title": "Parent record",
+            "lines": [
+              "root_page_id = 7"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "child_rec",
+            "x": 900,
+            "y": 70,
+            "w": 260,
+            "h": 100,
+            "title": "Child record",
+            "lines": [
+              "root_page_id = 30"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Only this child's record receives the new COW root. The branch catalog also has its own B+ tree root; that is a different ID in a different tree."
+            ],
+            "sources": []
+          },
+          {
+            "id": "original_root",
+            "x": 555,
+            "y": 245,
+            "w": 180,
+            "h": 100,
+            "title": "Page 7: original",
+            "lines": [
+              "IDs still 12, 19"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "copied_root",
+            "x": 935,
+            "y": 245,
+            "w": 220,
+            "h": 100,
+            "title": "Page 30: copy",
+            "lines": [
+              "IDs now 12, 31"
+            ],
+            "tone": "branch",
+            "detail": [
+              "The root needs a copy because its child pointer changes. A deeper tree may need affected shared ancestors copied along the path; unchanged subtrees remain shared."
+            ],
+            "sources": []
+          },
+          {
+            "id": "original_leaf",
+            "x": 745,
+            "y": 465,
+            "w": 175,
+            "h": 90,
+            "title": "Page 19",
+            "lines": [
+              "Original values"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "shared_leaf",
+            "x": 465,
+            "y": 465,
+            "w": 175,
+            "h": 90,
+            "title": "Page 12",
+            "lines": [
+              "Still shared"
+            ],
+            "tone": "sql",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "changed_leaf",
+            "x": 985,
+            "y": 465,
+            "w": 175,
+            "h": 90,
+            "title": "Page 31",
+            "lines": [
+              "Modified copy of 19"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "before_root",
+            "points": [
+              [
+                210,
+                170
+              ],
+              [
+                210,
+                245
+              ]
+            ],
+            "label": "root ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "before_rec",
+            "label_x": 210,
+            "label_y": 212
+          },
+          {
+            "to": "before_left",
+            "points": [
+              [
+                175,
+                345
+              ],
+              [
+                120,
+                465
+              ]
+            ],
+            "label": "12",
+            "tone": "branch",
+            "dashed": false,
+            "from": "before_root",
+            "label_x": 135,
+            "label_y": 400
+          },
+          {
+            "to": "before_right",
+            "points": [
+              [
+                245,
+                345
+              ],
+              [
+                310,
+                465
+              ]
+            ],
+            "label": "19",
+            "tone": "branch",
+            "dashed": false,
+            "from": "before_root",
+            "label_x": 290,
+            "label_y": 400
+          },
+          {
+            "to": "original_root",
+            "points": [
+              [
+                610,
+                170
+              ],
+              [
+                645,
+                245
+              ]
+            ],
+            "label": "unchanged",
+            "tone": "branch",
+            "dashed": false,
+            "from": "parent_rec",
+            "label_x": 610,
+            "label_y": 211
+          },
+          {
+            "to": "copied_root",
+            "points": [
+              [
+                1030,
+                170
+              ],
+              [
+                1045,
+                245
+              ]
+            ],
+            "label": "new root ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "child_rec",
+            "label_x": 1050,
+            "label_y": 211
+          },
+          {
+            "to": "original_leaf",
+            "points": [
+              [
+                690,
+                345
+              ],
+              [
+                832,
+                465
+              ]
+            ],
+            "label": "19",
+            "tone": "branch",
+            "dashed": false,
+            "from": "original_root",
+            "label_x": 770,
+            "label_y": 400
+          },
+          {
+            "to": "shared_leaf",
+            "points": [
+              [
+                615,
+                345
+              ],
+              [
+                552,
+                465
+              ]
+            ],
+            "label": "12",
+            "tone": "sql",
+            "dashed": false,
+            "from": "original_root",
+            "label_x": 560,
+            "label_y": 400
+          },
+          {
+            "to": "shared_leaf",
+            "points": [
+              [
+                980,
+                345
+              ],
+              [
+                945,
+                390
+              ],
+              [
+                945,
+                590
+              ],
+              [
+                552,
+                590
+              ],
+              [
+                552,
+                555
+              ]
+            ],
+            "label": "shared page 12",
+            "tone": "sql",
+            "dashed": false,
+            "from": "copied_root",
+            "label_x": 750,
+            "label_y": 578
+          },
+          {
+            "to": "changed_leaf",
+            "points": [
+              [
+                1080,
+                345
+              ],
+              [
+                1072,
+                465
+              ]
+            ],
+            "label": "31",
+            "tone": "branch",
+            "dashed": false,
+            "from": "copied_root",
+            "label_x": 1110,
+            "label_y": 400
+          }
+        ],
+        "lanes": [
+          {
+            "x": 25,
+            "y": 15,
+            "w": 380,
+            "h": 580,
+            "label": "1 / AFTER FORK",
+            "tone": "branch"
+          },
+          {
+            "x": 435,
+            "y": 15,
+            "w": 745,
+            "h": 580,
+            "label": "2 / AFTER CHILD EDITS RIGHT LEAF",
+            "tone": "branch"
+          }
+        ],
+        "texts": [
+          {
+            "x": 40,
+            "y": 630,
+            "text": "Assume shared starting pages; no split or boundary repair. Copy 19 and the route to it; keep 12 shared.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          }
+        ]
+      },
+      "cards": [
+        {
+          "title": "RAM shares a second structure",
+          "text": "Fork also clones roots of immutable workspace maps. These are balanced binary trees in RAM, not disk B+ tree pages. Map edits copy their path; later parent-private edits stay isolated.",
+          "tone": "branch"
+        },
+        {
+          "title": "Exclusively owned pages can change in place",
+          "text": "The writer must own the page and its birth epoch must meet the privacy barrier, which includes the latest live child fork. Splits or boundary repairs can allocate extra pages.",
+          "tone": "branch"
+        },
+        {
+          "title": "Avoiding a full data copy is not zero cost",
+          "text": "Fork still performs catalog, synchronization and durability work. Branches also add effect capture, workspace and page-management costs; no cheaper-than-transactions claim is made.",
+          "tone": "check"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/branch/record.rs",
+          "line": 244,
+          "label": "Child inherits page root"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 1737,
+          "label": "Share workspace roots"
+        },
+        {
+          "file": "src/agent_sql/persistent_map.rs",
+          "line": 190,
+          "label": "Immutable map clone"
+        },
+        {
+          "file": "src/branch/arena.rs",
+          "line": 2008,
+          "label": "COW decision"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 942,
+          "label": "Relink ancestors"
+        },
+        {
+          "file": "src/branch/table_catalog.rs",
+          "line": 1124,
+          "label": "Record new root"
+        }
+      ]
+    },
+    {
+      "id": "cow-engine",
+      "number": "05",
+      "title": "The COW engine: lookup, ownership, edit, relink",
+      "subtitle": "The tree algorithm operates on page IDs. Arena ownership decides whether a page can change in place.",
+      "diagram": {
+        "width": 1200,
+        "height": 835,
+        "nodes": [
+          {
+            "id": "root",
+            "x": 40,
+            "y": 65,
+            "w": 250,
+            "h": 105,
+            "title": "Start from branch root",
+            "lines": [
+              "BranchRecord.root_page_id",
+              "No ancestor-branch lookup"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "descent",
+            "x": 350,
+            "y": 65,
+            "w": 250,
+            "h": 105,
+            "title": "Descend internal nodes",
+            "lines": [
+              "Compare key to separators",
+              "Fetch / pin selected child"
+            ],
+            "tone": "branch",
+            "detail": [
+              "CowTree::get receives a root ID and key, not a branch ancestry chain. ArenaPageStore fetches the page through the main buffer pool and verifies its COW checksum."
+            ],
+            "sources": []
+          },
+          {
+            "id": "leaf",
+            "x": 660,
+            "y": 65,
+            "w": 250,
+            "h": 105,
+            "title": "Reach leaf",
+            "lines": [
+              "Search sorted key slots",
+              "Read encoded value if present"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "read",
+            "x": 970,
+            "y": 65,
+            "w": 190,
+            "h": 105,
+            "title": "Read result",
+            "lines": [
+              "Value or absent",
+              "Unpin after use"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Pins keep a buffer frame resident during access. A cache miss loads the page; a cache hit reuses the existing frame. The branch tree read is separate from SQL's heap-plus-workspace overlay."
+            ],
+            "sources": []
+          },
+          {
+            "id": "ownership",
+            "x": 40,
+            "y": 365,
+            "w": 250,
+            "h": 110,
+            "title": "Need a writable page",
+            "lines": [
+              "Writer owns the arena?",
+              "birth epoch >= privacy barrier?"
+            ],
+            "tone": "check",
+            "detail": [
+              "Private iff the writer owns the page's arena and birth_epoch >= max(branch fork epoch, latest live child fork epoch). The stored private flag is not a substitute for these checks."
+            ],
+            "sources": []
+          },
+          {
+            "id": "inplace",
+            "x": 355,
+            "y": 285,
+            "w": 260,
+            "h": 110,
+            "title": "Private: reuse page",
+            "lines": [
+              "Keep same page ID",
+              "Save before-image for rollback"
+            ],
+            "tone": "branch",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "copy",
+            "x": 355,
+            "y": 510,
+            "w": 260,
+            "h": 110,
+            "title": "Shared: shadow page",
+            "lines": [
+              "Allocate in writer arena",
+              "Copy payload; stamp new header"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Inherited pages are not the child's property to retire. Replaced pages owned by this writer are retired only when the operation commits, and descendant pins may still defer reuse."
+            ],
+            "sources": []
+          },
+          {
+            "id": "edit",
+            "x": 690,
+            "y": 395,
+            "w": 240,
+            "h": 120,
+            "title": "Edit / split leaf",
+            "lines": [
+              "Change cell and slot layout",
+              "Split / repair boundaries if needed"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Leaf boundaries use key hashes and entry sizes with page-capacity bounds. Some updates/deletes repair chunk boundaries, so the simple two-page copy example intentionally excludes splits and boundary repair."
+            ],
+            "sources": []
+          },
+          {
+            "id": "relink",
+            "x": 980,
+            "y": 395,
+            "w": 180,
+            "h": 120,
+            "title": "Relink ancestors",
+            "lines": [
+              "Changed child IDs",
+              "Propagate any splits"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Ancestors need edits when child pointers or separator keys change. Shared ancestors copy; private ones can update in place. Relinking can stop when nothing above changes, or create a new root after a split."
+            ],
+            "sources": []
+          },
+          {
+            "id": "journal",
+            "x": 40,
+            "y": 685,
+            "w": 350,
+            "h": 110,
+            "title": "Operation rollback journal",
+            "lines": [
+              "Restore in-place before-images",
+              "Delay retirement until success"
+            ],
+            "tone": "wal",
+            "detail": [
+              "On a tree error, restore the pages mutated in place. Some newly allocated unreachable pages may remain until branch reclamation. This journal handles one tree operation, not disk power loss or a multi-store SQL transaction."
+            ],
+            "sources": []
+          },
+          {
+            "id": "publish",
+            "x": 840,
+            "y": 685,
+            "w": 320,
+            "h": 110,
+            "title": "Return / record resulting root",
+            "lines": [
+              "If changed: set branch root ID",
+              "Root unchanged for some edits"
+            ],
+            "tone": "branch",
+            "detail": [
+              "AgentRuntime::put_row records a new root only if CowTree returned a different ID. TableBranchCatalog persists its own metadata separately; root publication alone does not imply atomic persistence of all COW data pages."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "descent",
+            "points": [
+              [
+                290,
+                117
+              ],
+              [
+                350,
+                117
+              ]
+            ],
+            "label": "root ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "root",
+            "label_x": 320,
+            "label_y": 104
+          },
+          {
+            "to": "leaf",
+            "points": [
+              [
+                600,
+                117
+              ],
+              [
+                660,
+                117
+              ]
+            ],
+            "label": "child ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "descent",
+            "label_x": 630,
+            "label_y": 104
+          },
+          {
+            "to": "read",
+            "points": [
+              [
+                910,
+                117
+              ],
+              [
+                970,
+                117
+              ]
+            ],
+            "label": "lookup",
+            "tone": "branch",
+            "dashed": false,
+            "from": "leaf",
+            "label_x": 940,
+            "label_y": 104
+          },
+          {
+            "to": "ownership",
+            "points": [
+              [
+                785,
+                170
+              ],
+              [
+                785,
+                230
+              ],
+              [
+                165,
+                230
+              ],
+              [
+                165,
+                365
+              ]
+            ],
+            "label": "WRITE: obtain a writable version of the selected page",
+            "tone": "check",
+            "dashed": false,
+            "from": "leaf",
+            "label_x": 475,
+            "label_y": 216
+          },
+          {
+            "to": "inplace",
+            "points": [
+              [
+                290,
+                400
+              ],
+              [
+                320,
+                400
+              ],
+              [
+                320,
+                340
+              ],
+              [
+                355,
+                340
+              ]
+            ],
+            "label": "yes",
+            "tone": "branch",
+            "dashed": false,
+            "from": "ownership",
+            "label_x": 322,
+            "label_y": 326
+          },
+          {
+            "to": "copy",
+            "points": [
+              [
+                290,
+                440
+              ],
+              [
+                320,
+                440
+              ],
+              [
+                320,
+                565
+              ],
+              [
+                355,
+                565
+              ]
+            ],
+            "label": "no",
+            "tone": "branch",
+            "dashed": false,
+            "from": "ownership",
+            "label_x": 322,
+            "label_y": 552
+          },
+          {
+            "to": "edit",
+            "points": [
+              [
+                615,
+                340
+              ],
+              [
+                655,
+                340
+              ],
+              [
+                655,
+                435
+              ],
+              [
+                690,
+                435
+              ]
+            ],
+            "label": "same ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "inplace",
+            "label_x": 657,
+            "label_y": 328
+          },
+          {
+            "to": "edit",
+            "points": [
+              [
+                615,
+                565
+              ],
+              [
+                655,
+                565
+              ],
+              [
+                655,
+                475
+              ],
+              [
+                690,
+                475
+              ]
+            ],
+            "label": "new ID",
+            "tone": "branch",
+            "dashed": false,
+            "from": "copy",
+            "label_x": 653,
+            "label_y": 591
+          },
+          {
+            "to": "relink",
+            "points": [
+              [
+                930,
+                455
+              ],
+              [
+                980,
+                455
+              ]
+            ],
+            "label": "upward",
+            "tone": "branch",
+            "dashed": false,
+            "from": "edit",
+            "label_x": 955,
+            "label_y": 442
+          },
+          {
+            "to": "publish",
+            "points": [
+              [
+                1070,
+                515
+              ],
+              [
+                1070,
+                685
+              ]
+            ],
+            "label": "tree success",
+            "tone": "branch",
+            "dashed": false,
+            "from": "relink",
+            "label_x": 1080,
+            "label_y": 608
+          },
+          {
+            "to": "journal",
+            "points": [
+              [
+                165,
+                475
+              ],
+              [
+                165,
+                685
+              ]
+            ],
+            "label": "journal spans tree edit",
+            "tone": "wal",
+            "dashed": true,
+            "from": "ownership",
+            "label_x": 165,
+            "label_y": 652
+          }
+        ],
+        "lanes": [],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Bounded copying is the benefit",
+          "text": "Unchanged subtrees remain shared. Read cost follows tree height, not branch ancestry depth. Actual write cost also includes allocations, splits, boundary repair and metadata/durability work.",
+          "tone": "branch"
+        },
+        {
+          "title": "Read and write structures are still distinct",
+          "text": "This is the COW page engine. Ordinary SQL indexes have their own traversal/latching implementation; branch SQL reads still use current heap rows overlaid with a private RAM workspace.",
+          "tone": "sql"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/cow/btree.rs",
+          "line": 214,
+          "label": "Tree lookup"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 466,
+          "label": "Tree insertion"
+        },
+        {
+          "file": "src/branch/arena.rs",
+          "line": 2008,
+          "label": "Ownership/privacy decision"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 787,
+          "label": "Leaf boundary/split logic"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 942,
+          "label": "Ancestor relinking"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 147,
+          "label": "Operation journal"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 1486,
+          "label": "Publish changed root"
+        }
+      ]
+    },
+    {
+      "id": "pages",
+      "number": "06",
+      "title": "Inside the pages: three layouts, three purposes",
+      "subtitle": "Page IDs locate blocks. Root IDs choose starting blocks. Child IDs route through trees. Row locations select heap slots.",
+      "diagram": {
+        "width": 1200,
+        "height": 680,
+        "nodes": [
+          {
+            "id": "cow_header",
+            "x": 50,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "COW header — 24 bytes",
+            "lines": [
+              "birth epoch / arena ID / CRC",
+              "page type / flags / reserved"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Offsets: birth epoch 0–7; arena ID 8–11; checksum 12–15; type 16; flags 17; reserved 18–23. No branch root ID or list of child IDs lives here."
+            ],
+            "sources": []
+          },
+          {
+            "id": "cow_payload",
+            "x": 50,
+            "y": 265,
+            "w": 320,
+            "h": 110,
+            "title": "COW internal payload",
+            "lines": [
+              "Count / offsets / leftmost child",
+              "Separator keys + child page IDs"
+            ],
+            "tone": "branch",
+            "detail": [
+              "A slotted node holds variable-size cells. Leftmost child has its own payload field; other child IDs accompany separator keys. Root is a role: a small tree can have a leaf as its root."
+            ],
+            "sources": []
+          },
+          {
+            "id": "cow_leaf",
+            "x": 50,
+            "y": 455,
+            "w": 320,
+            "h": 110,
+            "title": "COW leaf payload",
+            "lines": [
+              "(table ID, row ID) → row value",
+              "No leaf next / prev links"
+            ],
+            "tone": "branch",
+            "detail": [
+              "PagedRows keys concatenate table_id:u32 and row_id:u64 in big-endian order. Values encode typed row values. Ordered scans use an ancestor stack rather than leaf sibling links."
+            ],
+            "sources": []
+          },
+          {
+            "id": "index_header",
+            "x": 440,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "Ordinary index header",
+            "lines": [
+              "Type / own page ID / LSN",
+              "Checksum field / key count"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Ordinary internal header: 19 bytes. Ordinary leaf header: 27 bytes, including next/prev leaf IDs. The ordinary checksum field is serialized but is not verified COW-style CRC protection. This differs from the COW format."
+            ],
+            "sources": []
+          },
+          {
+            "id": "index_payload",
+            "x": 440,
+            "y": 265,
+            "w": 320,
+            "h": 110,
+            "title": "Ordinary internal payload",
+            "lines": [
+              "Sorted separator keys",
+              "Child page IDs"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Another B+ tree, with pages updated in place under physical synchronization. Shared root cells make splits visible to other index handles."
+            ],
+            "sources": []
+          },
+          {
+            "id": "index_leaf",
+            "x": 440,
+            "y": 455,
+            "w": 320,
+            "h": 110,
+            "title": "Ordinary index leaf",
+            "lines": [
+              "Primary: PK → (page, slot)",
+              "Secondary: (value, PK)"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Ordinary leaves have sibling links for ordered scans. They locate heap rows rather than hold branch-private encoded rows."
+            ],
+            "sources": []
+          },
+          {
+            "id": "heap_header",
+            "x": 830,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "Heap page header",
+            "lines": [
+              "Page metadata / LSN / checksum",
+              "Slot counts and free space"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Heap pages use a 23-byte header and 4-byte slot entries. The ordinary checksum field does not imply verified COW-style CRC protection. This is neither the COW node nor the ordinary index node format."
+            ],
+            "sources": []
+          },
+          {
+            "id": "heap_slot",
+            "x": 830,
+            "y": 265,
+            "w": 320,
+            "h": 110,
+            "title": "Slot directory",
+            "lines": [
+              "slot number → offset + length",
+              "Variable-size tuple bytes"
+            ],
+            "tone": "sql",
+            "detail": [
+              "RecordId is physical (page_id, slot_num). Slot offsets locate tuple bytes. It is distinct from the logical row ID used in agent merging."
+            ],
+            "sources": []
+          },
+          {
+            "id": "tuple",
+            "x": 830,
+            "y": 455,
+            "w": 320,
+            "h": 110,
+            "title": "Tuple / version header",
+            "lines": [
+              "begin / end transaction IDs",
+              "Previous version: page + slot"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Fixed 24-byte version prefix: begin 8, end 8, previous page 4, previous slot 2, reserved 2. Null bitmap and typed values follow. Current agent row identity is derived from the primary key, not an independent immutable surrogate."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "cow_payload",
+            "points": [
+              [
+                210,
+                190
+              ],
+              [
+                210,
+                265
+              ]
+            ],
+            "label": "within page",
+            "tone": "branch",
+            "dashed": false,
+            "from": "cow_header",
+            "label_x": 210,
+            "label_y": 232
+          },
+          {
+            "to": "cow_leaf",
+            "points": [
+              [
+                210,
+                375
+              ],
+              [
+                210,
+                455
+              ]
+            ],
+            "label": "child page link",
+            "tone": "branch",
+            "dashed": false,
+            "from": "cow_payload",
+            "label_x": 210,
+            "label_y": 416
+          },
+          {
+            "to": "index_payload",
+            "points": [
+              [
+                600,
+                190
+              ],
+              [
+                600,
+                265
+              ]
+            ],
+            "label": "within page",
+            "tone": "sql",
+            "dashed": false,
+            "from": "index_header",
+            "label_x": 600,
+            "label_y": 232
+          },
+          {
+            "to": "index_leaf",
+            "points": [
+              [
+                600,
+                375
+              ],
+              [
+                600,
+                455
+              ]
+            ],
+            "label": "child page link",
+            "tone": "sql",
+            "dashed": false,
+            "from": "index_payload",
+            "label_x": 600,
+            "label_y": 416
+          },
+          {
+            "to": "heap_slot",
+            "points": [
+              [
+                990,
+                190
+              ],
+              [
+                990,
+                265
+              ]
+            ],
+            "label": "then slots",
+            "tone": "sql",
+            "dashed": false,
+            "from": "heap_header",
+            "label_x": 990,
+            "label_y": 232
+          },
+          {
+            "to": "tuple",
+            "points": [
+              [
+                990,
+                375
+              ],
+              [
+                990,
+                455
+              ]
+            ],
+            "label": "slot locates",
+            "tone": "sql",
+            "dashed": false,
+            "from": "heap_slot",
+            "label_x": 990,
+            "label_y": 416
+          }
+        ],
+        "lanes": [
+          {
+            "x": 30,
+            "y": 20,
+            "w": 360,
+            "h": 590,
+            "label": "BRANCH COW TREE",
+            "tone": "branch"
+          },
+          {
+            "x": 420,
+            "y": 20,
+            "w": 360,
+            "h": 590,
+            "label": "ORDINARY SQL INDEX",
+            "tone": "sql"
+          },
+          {
+            "x": 810,
+            "y": 20,
+            "w": 360,
+            "h": 590,
+            "label": "ORDINARY HEAP ROWS",
+            "tone": "sql"
+          }
+        ],
+        "texts": [
+          {
+            "x": 45,
+            "y": 650,
+            "text": "A child link reaches a different page with its own header. Internal and leaf payloads are different node types.",
+            "size": 14,
+            "tone": "neutral",
+            "anchor": "start"
+          }
+        ]
+      },
+      "cards": [
+        {
+          "title": "Where is the root ID?",
+          "text": "A branch record stores its COW root ID in the branch catalog. The catalog has its own separate tree root. Every page does not store the root of its tree.",
+          "tone": "branch"
+        },
+        {
+          "title": "Where is the page itself?",
+          "text": "A buffer-pool hit reuses a RAM frame; a miss reads the requested page from disk. Fork does not load the whole tree. A page must be in memory before it can be edited.",
+          "tone": "sql"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/cow/page_header.rs",
+          "line": 9,
+          "label": "COW header bytes"
+        },
+        {
+          "file": "src/cow/node.rs",
+          "line": 19,
+          "label": "COW payload"
+        },
+        {
+          "file": "src/agent_sql/paged_rows.rs",
+          "line": 36,
+          "label": "Encoded row key"
+        },
+        {
+          "file": "src/storage/index_page.rs",
+          "line": 35,
+          "label": "Ordinary index headers"
+        },
+        {
+          "file": "src/storage/heap_page.rs",
+          "line": 19,
+          "label": "Heap layout"
+        },
+        {
+          "file": "src/storage/tuple.rs",
+          "line": 11,
+          "label": "Version prefix"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 299,
+          "label": "Logical row identity"
+        }
+      ]
+    },
+    {
+      "id": "agent",
+      "number": "07",
+      "title": "What an agent actually reads and writes",
+      "subtitle": "Workspace state drives branch SQL. Its frame drives live SQL merge; the appended effect log is a separate representation.",
+      "diagram": {
+        "width": 1200,
+        "height": 710,
+        "nodes": [
+          {
+            "id": "base",
+            "x": 40,
+            "y": 80,
+            "w": 280,
+            "h": 110,
+            "title": "Current committed heap",
+            "lines": [
+              "Fresh ordinary ReadView",
+              "Index / table scan"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The base scan uses read_snapshot_cached with txn_id 0 for each call. A branch does not freeze committed tables at fork."
+            ],
+            "sources": []
+          },
+          {
+            "id": "overlay",
+            "x": 450,
+            "y": 80,
+            "w": 300,
+            "h": 110,
+            "title": "Combine by logical key",
+            "lines": [
+              "Private row replaces base row",
+              "Deleted marker removes row"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Private inserts add rows. Predicates apply to private after-images too, allowing an edited row to enter or leave the result."
+            ],
+            "sources": []
+          },
+          {
+            "id": "result",
+            "x": 860,
+            "y": 80,
+            "w": 300,
+            "h": 110,
+            "title": "Agent-visible result",
+            "lines": [
+              "Projection + read capture",
+              "Supported single-table reads"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Explicit reads capture point-version references or predicate summaries. This AgentRuntime SELECT path refuses general joins."
+            ],
+            "sources": []
+          },
+          {
+            "id": "write",
+            "x": 40,
+            "y": 330,
+            "w": 280,
+            "h": 110,
+            "title": "Compute proposed edit",
+            "lines": [
+              "Read visible row; evaluate RHS",
+              "Capture operation + WHERE guard"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Recognized same-column + literal or - literal becomes Add(delta). Other expressions can become Assign(evaluated value), including some mathematically equivalent forms."
+            ],
+            "sources": []
+          },
+          {
+            "id": "checks",
+            "x": 450,
+            "y": 330,
+            "w": 300,
+            "h": 110,
+            "title": "Validate whole statement",
+            "lines": [
+              "Capability envelope / escrow",
+              "Charge applicable budgets"
+            ],
+            "tone": "check",
+            "detail": [
+              "Policy/escrow preflight occurs before row staging. Ordinary SQL outside the agent path bypasses these branch controls."
+            ],
+            "sources": []
+          },
+          {
+            "id": "state",
+            "x": 860,
+            "y": 330,
+            "w": 300,
+            "h": 110,
+            "title": "Stage private workspace",
+            "lines": [
+              "After-image + first-touch before",
+              "Extend cumulative task frame"
+            ],
+            "tone": "branch",
+            "detail": [
+              "base_rows retains the row's first-touch witness, rows retains latest private state, and frame collects typed effects/guards. fork_seq helps find intervening published operations."
+            ],
+            "sources": []
+          },
+          {
+            "id": "merge_input",
+            "x": 860,
+            "y": 560,
+            "w": 300,
+            "h": 110,
+            "title": "Input to SQL MERGE",
+            "lines": [
+              "Workspace + frame + read set",
+              "Not a replay from .tel"
+            ],
+            "tone": "check",
+            "detail": [
+              "Live merge reads runtime state. Reopening the durable effect log does not rebuild the SQL workspaces or admission history."
+            ],
+            "sources": []
+          },
+          {
+            "id": "tel",
+            "x": 450,
+            "y": 560,
+            "w": 300,
+            "h": 110,
+            "title": "Append / extend TEL",
+            "lines": [
+              "Task identity + typed effects",
+              "CLI: append and sync .tel"
+            ],
+            "tone": "wal",
+            "detail": [
+              "Durable TEL extends frames and deduplicates identical retries. The pgserver example instead uses a memory effect log. This is not physical recovery WAL."
+            ],
+            "sources": []
+          },
+          {
+            "id": "mirror",
+            "x": 40,
+            "y": 560,
+            "w": 280,
+            "h": 110,
+            "title": "Mirror row to COW pages",
+            "lines": [
+              "Encode row; put / delete",
+              "Record changed root"
+            ],
+            "tone": "branch",
+            "detail": [
+              "The order is workspace staging, TEL append, then page mirroring. A later I/O failure is not rolled back as one transaction across all stores."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "overlay",
+            "points": [
+              [
+                320,
+                135
+              ],
+              [
+                450,
+                135
+              ]
+            ],
+            "label": "base rows",
+            "tone": "sql",
+            "dashed": false,
+            "from": "base",
+            "label_x": 385,
+            "label_y": 123
+          },
+          {
+            "to": "result",
+            "points": [
+              [
+                750,
+                135
+              ],
+              [
+                860,
+                135
+              ]
+            ],
+            "label": "visible rows",
+            "tone": "branch",
+            "dashed": false,
+            "from": "overlay",
+            "label_x": 805,
+            "label_y": 123
+          },
+          {
+            "to": "overlay",
+            "points": [
+              [
+                1010,
+                330
+              ],
+              [
+                1010,
+                250
+              ],
+              [
+                600,
+                250
+              ],
+              [
+                600,
+                190
+              ]
+            ],
+            "label": "private overrides / deletions",
+            "tone": "branch",
+            "dashed": false,
+            "from": "state",
+            "label_x": 780,
+            "label_y": 238
+          },
+          {
+            "to": "checks",
+            "points": [
+              [
+                320,
+                385
+              ],
+              [
+                450,
+                385
+              ]
+            ],
+            "label": "proposed rows",
+            "tone": "branch",
+            "dashed": false,
+            "from": "write",
+            "label_x": 385,
+            "label_y": 373
+          },
+          {
+            "to": "state",
+            "points": [
+              [
+                750,
+                385
+              ],
+              [
+                860,
+                385
+              ]
+            ],
+            "label": "1. stage",
+            "tone": "check",
+            "dashed": false,
+            "from": "checks",
+            "label_x": 805,
+            "label_y": 373
+          },
+          {
+            "to": "merge_input",
+            "points": [
+              [
+                1070,
+                440
+              ],
+              [
+                1070,
+                560
+              ]
+            ],
+            "label": "live state",
+            "tone": "branch",
+            "dashed": false,
+            "from": "state",
+            "label_x": 1070,
+            "label_y": 503
+          },
+          {
+            "to": "tel",
+            "points": [
+              [
+                910,
+                440
+              ],
+              [
+                910,
+                500
+              ],
+              [
+                600,
+                500
+              ],
+              [
+                600,
+                560
+              ]
+            ],
+            "label": "2. append frame",
+            "tone": "wal",
+            "dashed": false,
+            "from": "state",
+            "label_x": 745,
+            "label_y": 488
+          },
+          {
+            "to": "mirror",
+            "points": [
+              [
+                450,
+                615
+              ],
+              [
+                320,
+                615
+              ]
+            ],
+            "label": "3. mirror",
+            "tone": "branch",
+            "dashed": false,
+            "from": "tel",
+            "label_x": 385,
+            "label_y": 603
+          }
+        ],
+        "lanes": [],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "A branch spans statements",
+          "text": "A branch retains private proposals until merge or abandonment. Ordinary transaction IDs, effect-frame IDs, branch IDs and generations have different meanings.",
+          "tone": "neutral"
+        },
+        {
+          "title": "Read validation is partial",
+          "text": "Exact point reads can detect later agent-published versions. Predicate summaries do not supply complete phantom validation; ordinary writes do not all update this same version map.",
+          "tone": "check"
+        },
+        {
+          "title": "Three representations are not one commit",
+          "text": "Workspace, TEL and COW mirror are staged in sequence. The per-tree rollback journal does not make the full sequence atomic or restore unfinished sessions after restart.",
+          "tone": "wal"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 2152,
+          "label": "Read overlay"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 2250,
+          "label": "Agent SELECT scope"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 2990,
+          "label": "Staging sequence"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 6856,
+          "label": "Operation capture"
+        },
+        {
+          "file": "src/tel/log.rs",
+          "line": 1625,
+          "label": "Frame extension"
+        },
+        {
+          "file": "tests/integration_durable_tel.rs",
+          "line": 8,
+          "label": "Live merge versus durable log"
+        }
+      ]
+    },
+    {
+      "id": "merge",
+      "number": "08",
+      "title": "Merge means reconciliation, then publication",
+      "subtitle": "The live SQL merge uses operation intent, current target rows and checks. It does not replace the trunk COW root.",
+      "diagram": {
+        "width": 1200,
+        "height": 735,
+        "nodes": [
+          {
+            "id": "frame",
+            "x": 35,
+            "y": 80,
+            "w": 280,
+            "h": 110,
+            "title": "Branch proposal — RAM",
+            "lines": [
+              "Private images + effect frame",
+              "Before-images / fork sequence"
+            ],
+            "tone": "branch",
+            "detail": [
+              "Workspace.frame supplies branch intent. First-touch witnesses and recorded target operations since fork_seq provide context. An ordinary SQL change without an agent operation can be treated as an opaque Assign based on its changed value."
+            ],
+            "sources": []
+          },
+          {
+            "id": "target",
+            "x": 35,
+            "y": 300,
+            "w": 280,
+            "h": 110,
+            "title": "Current target state",
+            "lines": [
+              "Rows + recorded applied effects",
+              "Read versions / table counters"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The evaluator reads target rows and applied-operation history. It records a fingerprint so publication can refuse an evaluation whose involved tables or tracked premises moved afterward."
+            ],
+            "sources": []
+          },
+          {
+            "id": "resolve",
+            "x": 365,
+            "y": 80,
+            "w": 280,
+            "h": 110,
+            "title": "Resolve changed cells",
+            "lines": [
+              "Compose compatible operations",
+              "Reject or report explicit loss"
+            ],
+            "tone": "branch",
+            "detail": [
+              "No conflicting target effect: clean. Compatible Add/Add, Min/Min or Max/Max: compose. Equal Assign values converge. Different assignments default to Conflict; explicit LWW is incoming-merge-wins and reports discarded effects."
+            ],
+            "sources": []
+          },
+          {
+            "id": "gate",
+            "x": 695,
+            "y": 80,
+            "w": 280,
+            "h": 110,
+            "title": "Check admission",
+            "lines": [
+              "WHERE guards on pre-state",
+              "Read premises; supplied assertions"
+            ],
+            "tone": "check",
+            "detail": [
+              "Guards check the target before this branch's effects. Assertions check proposed results, but ordinary MERGE supplies none; SIMULATE supplies declared assertions. Exact read checking is limited to tracked runtime versions; predicate-only reads are not automatically quarantined."
+            ],
+            "sources": []
+          },
+          {
+            "id": "decision",
+            "x": 1020,
+            "y": 80,
+            "w": 150,
+            "h": 110,
+            "title": "Decision",
+            "lines": [
+              "Conflict?",
+              "Gate passes?"
+            ],
+            "tone": "check",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "held",
+            "x": 1020,
+            "y": 300,
+            "w": 150,
+            "h": 110,
+            "title": "No publish",
+            "lines": [
+              "Conflict: retain",
+              "Gate: quarantine"
+            ],
+            "tone": "check",
+            "detail": [
+              "Conflict leaves the branch available for correction. A failing admission gate in production MERGE quarantines the branch. Neither path applies the proposed row batch."
+            ],
+            "sources": []
+          },
+          {
+            "id": "preflight",
+            "x": 695,
+            "y": 300,
+            "w": 280,
+            "h": 110,
+            "title": "Recheck and preflight",
+            "lines": [
+              "Refuse stale fingerprint",
+              "Validate all row / schema plans"
+            ],
+            "tone": "check",
+            "detail": [
+              "Table counters catch changes between evaluation and publication. This check is different from validating every read made throughout the branch lifetime. Whole-plan preflight prevents known shape/constraint refusals from partially applying schema plans."
+            ],
+            "sources": []
+          },
+          {
+            "id": "ddl",
+            "x": 365,
+            "y": 300,
+            "w": 280,
+            "h": 110,
+            "title": "Apply schema edits first",
+            "lines": [
+              "Outside the row transaction",
+              "May remain after later failure"
+            ],
+            "tone": "check",
+            "detail": [
+              "Schema work runs before the row transaction. An unexpected I/O failure can leave schema effects even when row publication does not complete; the lifecycle is not a single crash-atomic operation."
+            ],
+            "sources": []
+          },
+          {
+            "id": "txn",
+            "x": 365,
+            "y": 540,
+            "w": 280,
+            "h": 120,
+            "title": "One ordinary transaction",
+            "lines": [
+              "BEGIN → every accepted row",
+              "COMMIT once; abort on error"
+            ],
+            "tone": "wal",
+            "detail": [
+              "All accepted row writes share one TxnManager transaction. This is the tested atomic row batch. Row publication uses ordinary heap/MVCC/WAL rather than making a branch root the shared table root."
+            ],
+            "sources": []
+          },
+          {
+            "id": "record",
+            "x": 695,
+            "y": 540,
+            "w": 280,
+            "h": 120,
+            "title": "Record published history",
+            "lines": [
+              "Operations / versions / authors",
+              "Attest merge; then seal branch"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "Applied-operation history and logical row authorship are recorded after commit; physical version-author stamps can be written during row application. These separate provenance writes are not covered by the row WAL atomicity. Sealing then reclaims or retires branch state. A later failure cannot retroactively undo a committed row transaction."
+            ],
+            "sources": []
+          },
+          {
+            "id": "heap",
+            "x": 35,
+            "y": 540,
+            "w": 280,
+            "h": 120,
+            "title": "Shared SQL heap",
+            "lines": [
+              "Accepted rows become visible",
+              "Subject to reader snapshot"
+            ],
+            "tone": "sql",
+            "detail": [],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "resolve",
+            "points": [
+              [
+                315,
+                135
+              ],
+              [
+                365,
+                135
+              ]
+            ],
+            "label": "intent",
+            "tone": "branch",
+            "dashed": false,
+            "from": "frame",
+            "label_x": 340,
+            "label_y": 121
+          },
+          {
+            "to": "resolve",
+            "points": [
+              [
+                175,
+                300
+              ],
+              [
+                175,
+                235
+              ],
+              [
+                505,
+                235
+              ],
+              [
+                505,
+                190
+              ]
+            ],
+            "label": "target + witnesses",
+            "tone": "sql",
+            "dashed": false,
+            "from": "target",
+            "label_x": 350,
+            "label_y": 221
+          },
+          {
+            "to": "gate",
+            "points": [
+              [
+                645,
+                135
+              ],
+              [
+                695,
+                135
+              ]
+            ],
+            "label": "result",
+            "tone": "branch",
+            "dashed": false,
+            "from": "resolve",
+            "label_x": 670,
+            "label_y": 121
+          },
+          {
+            "to": "decision",
+            "points": [
+              [
+                975,
+                135
+              ],
+              [
+                1020,
+                135
+              ]
+            ],
+            "label": "checks",
+            "tone": "check",
+            "dashed": false,
+            "from": "gate",
+            "label_x": 998,
+            "label_y": 121
+          },
+          {
+            "to": "held",
+            "points": [
+              [
+                1135,
+                190
+              ],
+              [
+                1135,
+                300
+              ]
+            ],
+            "label": "refuse",
+            "tone": "check",
+            "dashed": false,
+            "from": "decision",
+            "label_x": 1140,
+            "label_y": 245
+          },
+          {
+            "to": "preflight",
+            "points": [
+              [
+                1060,
+                190
+              ],
+              [
+                1060,
+                255
+              ],
+              [
+                835,
+                255
+              ],
+              [
+                835,
+                300
+              ]
+            ],
+            "label": "eligible",
+            "tone": "check",
+            "dashed": false,
+            "from": "decision",
+            "label_x": 940,
+            "label_y": 241
+          },
+          {
+            "to": "ddl",
+            "points": [
+              [
+                695,
+                355
+              ],
+              [
+                645,
+                355
+              ]
+            ],
+            "label": "valid",
+            "tone": "check",
+            "dashed": false,
+            "from": "preflight",
+            "label_x": 670,
+            "label_y": 342
+          },
+          {
+            "to": "txn",
+            "points": [
+              [
+                505,
+                410
+              ],
+              [
+                505,
+                540
+              ]
+            ],
+            "label": "then rows",
+            "tone": "wal",
+            "dashed": false,
+            "from": "ddl",
+            "label_x": 505,
+            "label_y": 480
+          },
+          {
+            "to": "heap",
+            "points": [
+              [
+                365,
+                600
+              ],
+              [
+                315,
+                600
+              ]
+            ],
+            "label": "rows",
+            "tone": "sql",
+            "dashed": false,
+            "from": "txn",
+            "label_x": 340,
+            "label_y": 586
+          },
+          {
+            "to": "record",
+            "points": [
+              [
+                645,
+                600
+              ],
+              [
+                695,
+                600
+              ]
+            ],
+            "label": "then",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "txn",
+            "label_x": 670,
+            "label_y": 586
+          }
+        ],
+        "lanes": [
+          {
+            "x": 345,
+            "y": 490,
+            "w": 320,
+            "h": 205,
+            "label": "ATOMIC BOUNDARY: ROW TRANSACTION",
+            "tone": "wal"
+          }
+        ],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Arithmetic example",
+          "text": "Start at qty 20. A captures Add(−5); B captures Add(−3). Merge A → 15; merge B applies −3 to current 15 → 12. Use point UPDATEs without a prior stale explicit SELECT; additional checks can still refuse a merge.",
+          "tone": "branch"
+        },
+        {
+          "title": "Precondition versus postcondition",
+          "text": "Two −12 withdrawals from 20: WHERE qty >= 12 rejects the second at current qty 8. WHERE qty >= 0 allows it and can produce −4. An explicit postcondition would test the proposed final value.",
+          "tone": "check"
+        },
+        {
+          "title": "What is not atomic together",
+          "text": "DDL, the row transaction, provenance/history recording and branch sealing are distinct stages. Frame retry deduplication does not establish exactly-once whole-merge retries after a crash.",
+          "tone": "wal"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/agent_sql/merge_engine.rs",
+          "line": 199,
+          "label": "Operation resolution"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 4269,
+          "label": "Evaluation"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 4562,
+          "label": "Guard pre-state"
+        },
+        {
+          "file": "src/agent_sql/gate.rs",
+          "line": 278,
+          "label": "Read-premise finding"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 4894,
+          "label": "Publication stages"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 5168,
+          "label": "Atomic row transaction"
+        },
+        {
+          "file": "tests/guard_precondition_probe.rs",
+          "line": 288,
+          "label": "Weak guard can allow negative result"
+        }
+      ],
+      "table": {
+        "headers": [
+          "Cell outcome",
+          "Meaning",
+          "Publication"
+        ],
+        "rows": [
+          [
+            "Clean",
+            "No incompatible concurrent operation, or equal assignments",
+            "Eligible if checks pass"
+          ],
+          [
+            "Commuting",
+            "Supported operations compose",
+            "Eligible if checks pass"
+          ],
+          [
+            "Conflict",
+            "Incompatible operations / row conflict",
+            "No rows published"
+          ],
+          [
+            "ResolvedWithLoss",
+            "Explicit incoming-wins policy discards a competing effect",
+            "Loss reported; checks still apply"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "wal",
+      "number": "09",
+      "title": "WAL, commit, crash recovery",
+      "subtitle": "For ordinary heap transactions, durable log records permit table pages to be written later. Log order matters.",
+      "diagram": {
+        "width": 1200,
+        "height": 560,
+        "nodes": [
+          {
+            "id": "change",
+            "x": 45,
+            "y": 90,
+            "w": 250,
+            "h": 110,
+            "title": "Ordinary row change",
+            "lines": [
+              "Append physical WAL record",
+              "Modify RAM page; set page LSN"
+            ],
+            "tone": "sql",
+            "detail": [
+              "Heap insert/delete/update routines append records and update pages with the corresponding log position. This flow does not mean every schema, index, allocator or COW page mutation is journaled identically."
+            ],
+            "sources": []
+          },
+          {
+            "id": "commit",
+            "x": 345,
+            "y": 90,
+            "w": 250,
+            "h": 110,
+            "title": "COMMIT",
+            "lines": [
+              "Append Commit record",
+              "Flush WAL through its LSN"
+            ],
+            "tone": "wal",
+            "detail": [
+              "TxnManager flushes through the commit LSN before reporting success. It then records transaction end and removes the transaction from the active set. Committing does not require every dirty table page to have reached disk."
+            ],
+            "sources": []
+          },
+          {
+            "id": "logdisk",
+            "x": 645,
+            "y": 90,
+            "w": 250,
+            "h": 110,
+            "title": "Durable WAL bytes",
+            "lines": [
+              "write + sync_data",
+              "Commit can now be acknowledged"
+            ],
+            "tone": "wal",
+            "detail": [
+              "WAL uses ordered records with lengths/checksums and a flushed position. The flush path keeps ordering under synchronization; a higher durable watermark must not skip earlier unsynced records."
+            ],
+            "sources": []
+          },
+          {
+            "id": "flush",
+            "x": 945,
+            "y": 90,
+            "w": 210,
+            "h": 110,
+            "title": "Later page write",
+            "lines": [
+              "Flush WAL through page LSN",
+              "Then write dirty heap page"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The buffer pool's WAL gate runs before dirty-page flush/eviction. It recognizes ordinary page LSN formats; it is not a universal journal for separate branch metadata and COW pages."
+            ],
+            "sources": []
+          },
+          {
+            "id": "scan",
+            "x": 45,
+            "y": 370,
+            "w": 250,
+            "h": 110,
+            "title": "On restart: scan WAL",
+            "lines": [
+              "Read complete valid records",
+              "Find committed / unfinished txns"
+            ],
+            "tone": "wal",
+            "detail": [
+              "Recovery scans valid records, initializes transaction ID state, and reconstructs which transactions committed or ended. A torn tail is different from complete transaction recovery."
+            ],
+            "sources": []
+          },
+          {
+            "id": "redo",
+            "x": 345,
+            "y": 370,
+            "w": 250,
+            "h": 110,
+            "title": "Redo heap changes",
+            "lines": [
+              "Replay row records and CLRs",
+              "Skip already-covered page LSNs"
+            ],
+            "tone": "wal",
+            "detail": [
+              "The page LSN makes physical redo repeatable. Redo reconstructs logged history, including work that may later be undone if its transaction did not commit."
+            ],
+            "sources": []
+          },
+          {
+            "id": "undo",
+            "x": 645,
+            "y": 370,
+            "w": 250,
+            "h": 110,
+            "title": "Undo unfinished work",
+            "lines": [
+              "Walk transaction log chains",
+              "Write compensation records"
+            ],
+            "tone": "wal",
+            "detail": [
+              "Abort/recovery writes CLRs with undo-next pointers so a second crash can continue undo rather than blindly applying the same inverse twice."
+            ],
+            "sources": []
+          },
+          {
+            "id": "finish",
+            "x": 945,
+            "y": 370,
+            "w": 210,
+            "h": 110,
+            "title": "Repair and reopen",
+            "lines": [
+              "Repair heap directories",
+              "CLI: rebuild indexes, checkpoint"
+            ],
+            "tone": "sql",
+            "detail": [
+              "CLI calls rebuild_indexes and checkpoint after recovery. The pgserver example opens after recover but does not run that same rebuilding block. This entrypoint difference is explicit in the next view."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "commit",
+            "points": [
+              [
+                295,
+                145
+              ],
+              [
+                345,
+                145
+              ]
+            ],
+            "label": "commit",
+            "tone": "wal",
+            "dashed": false,
+            "from": "change",
+            "label_x": 320,
+            "label_y": 131
+          },
+          {
+            "to": "logdisk",
+            "points": [
+              [
+                595,
+                145
+              ],
+              [
+                645,
+                145
+              ]
+            ],
+            "label": "fsync",
+            "tone": "wal",
+            "dashed": false,
+            "from": "commit",
+            "label_x": 620,
+            "label_y": 131
+          },
+          {
+            "to": "flush",
+            "points": [
+              [
+                895,
+                145
+              ],
+              [
+                945,
+                145
+              ]
+            ],
+            "label": "later",
+            "tone": "sql",
+            "dashed": true,
+            "from": "logdisk",
+            "label_x": 920,
+            "label_y": 131
+          },
+          {
+            "to": "scan",
+            "points": [
+              [
+                770,
+                200
+              ],
+              [
+                770,
+                285
+              ],
+              [
+                170,
+                285
+              ],
+              [
+                170,
+                370
+              ]
+            ],
+            "label": "after crash: recover from log",
+            "tone": "wal",
+            "dashed": false,
+            "from": "logdisk",
+            "label_x": 460,
+            "label_y": 271
+          },
+          {
+            "to": "redo",
+            "points": [
+              [
+                295,
+                425
+              ],
+              [
+                345,
+                425
+              ]
+            ],
+            "label": "analyze",
+            "tone": "wal",
+            "dashed": false,
+            "from": "scan",
+            "label_x": 320,
+            "label_y": 411
+          },
+          {
+            "to": "undo",
+            "points": [
+              [
+                595,
+                425
+              ],
+              [
+                645,
+                425
+              ]
+            ],
+            "label": "then",
+            "tone": "wal",
+            "dashed": false,
+            "from": "redo",
+            "label_x": 620,
+            "label_y": 411
+          },
+          {
+            "to": "finish",
+            "points": [
+              [
+                895,
+                425
+              ],
+              [
+                945,
+                425
+              ]
+            ],
+            "label": "repair",
+            "tone": "sql",
+            "dashed": false,
+            "from": "undo",
+            "label_x": 920,
+            "label_y": 411
+          }
+        ],
+        "lanes": [
+          {
+            "x": 25,
+            "y": 30,
+            "w": 1150,
+            "h": 205,
+            "label": "RUNNING: ORDINARY HEAP TRANSACTION",
+            "tone": "wal"
+          },
+          {
+            "x": 25,
+            "y": 310,
+            "w": 1150,
+            "h": 210,
+            "label": "RESTART: REPEATABLE REDO, THEN LOSER UNDO",
+            "tone": "wal"
+          }
+        ],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Checkpoint shortens recovery",
+          "text": "With no active transactions, checkpoint flushes WAL, flushes pages, syncs the database, then truncates eligible WAL and redeclares schema/run state. Retention pins can prevent discarding consumer-needed history.",
+          "tone": "wal"
+        },
+        {
+          "title": "What the crash test proves",
+          "text": "The focused merge test kills a process mid-row-publication and checks all-before or all-after rows. It does not simulate loss of the operating system page cache during machine power failure.",
+          "tone": "check"
+        },
+        {
+          "title": "COW has a different local rollback tool",
+          "text": "CowTree WriteJournal restores in-place pages after one tree-operation error and delays retirement. It is not this WAL transaction and does not make all branch sidecars crash-atomic.",
+          "tone": "branch"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/wal/txn.rs",
+          "line": 608,
+          "label": "Commit flush ordering"
+        },
+        {
+          "file": "src/buffer/buffer_pool.rs",
+          "line": 1425,
+          "label": "WAL-before-page gate"
+        },
+        {
+          "file": "src/wal/recovery.rs",
+          "line": 5,
+          "label": "Redo and undo"
+        },
+        {
+          "file": "src/wal/txn.rs",
+          "line": 651,
+          "label": "Compensation-based abort"
+        },
+        {
+          "file": "src/wal/txn.rs",
+          "line": 802,
+          "label": "Checkpoint"
+        },
+        {
+          "file": "src/cow/btree.rs",
+          "line": 147,
+          "label": "Tree write journal"
+        },
+        {
+          "file": "tests/integration_crash_safety.rs",
+          "line": 12,
+          "label": "Process-crash test scope"
+        }
+      ]
+    },
+    {
+      "id": "persistence",
+      "number": "10",
+      "title": "What is on disk, and what reopening restores",
+      "subtitle": "Different files and buffer pools create different durability boundaries. Persisted components do not imply a restored agent session.",
+      "diagram": {
+        "width": 1200,
+        "height": 680,
+        "nodes": [
+          {
+            "id": "main",
+            "x": 45,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "Main database file: <db>",
+            "lines": [
+              "Ordinary catalog / heap / indexes",
+              "Branch COW arena pages"
+            ],
+            "tone": "sql",
+            "detail": [
+              "The main buffer pool caches both regions. Ordinary allocation is below a persisted arena floor; ArenaPageStore owns extents above it. The default new-database headroom is 32,736 ordinary pages, a real growth bound."
+            ],
+            "sources": []
+          },
+          {
+            "id": "wal",
+            "x": 440,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "<db>.wal",
+            "lines": [
+              "Ordinary row recovery log",
+              "Transaction and control records"
+            ],
+            "tone": "wal",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "catalog",
+            "x": 835,
+            "y": 80,
+            "w": 320,
+            "h": 110,
+            "title": "<db>.branchcat",
+            "lines": [
+              "Branch records / roots / indexes",
+              "Separate file and buffer pool"
+            ],
+            "tone": "branch",
+            "detail": [
+              "TableBranchCatalog stages indexed record changes and group-commits its own pool/file. Its catalog root and each stored branch root are separate concepts. Catalog fsync does not itself flush the main pool's COW data pages."
+            ],
+            "sources": []
+          },
+          {
+            "id": "arena",
+            "x": 45,
+            "y": 295,
+            "w": 320,
+            "h": 110,
+            "title": "<db>.arena",
+            "lines": [
+              "Allocation and ownership state",
+              "Not the private row payloads"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "This allocator checkpoint/tail records the arena floor, extents, ownership and pending frees. COW row bytes remain in the main database file. Reopen avoids reissuing already-owned extents."
+            ],
+            "sources": []
+          },
+          {
+            "id": "tel",
+            "x": 440,
+            "y": 295,
+            "w": 320,
+            "h": 110,
+            "title": "<db>.tel — CLI",
+            "lines": [
+              "Typed effect frames and guards",
+              "Appended; replayable as frames"
+            ],
+            "tone": "wal",
+            "detail": [
+              "The CLI constructs DurableEffectLog. The PostgreSQL-wire example constructs MemEffectLog. Replayed frames can feed a separate effect merger; they do not reconstruct the live SQL Workspace."
+            ],
+            "sources": []
+          },
+          {
+            "id": "prov",
+            "x": 835,
+            "y": 295,
+            "w": 320,
+            "h": 110,
+            "title": "<db>.provenance — CLI",
+            "lines": [
+              "Run dictionary / version stamps",
+              "Logical row authorship"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "The CLI attaches DurableProvenanceStore. The server example leaves the runtime's default memory store. Provenance append durability is separate from row WAL commit."
+            ],
+            "sources": []
+          },
+          {
+            "id": "boot",
+            "x": 45,
+            "y": 530,
+            "w": 320,
+            "h": 110,
+            "title": "Startup order",
+            "lines": [
+              "DbLock → recovery → catalog",
+              "Open branch catalog and allocator"
+            ],
+            "tone": "neutral",
+            "detail": [
+              "DbLock excludes a second process writing the same database. Ordinary catalog allocation must precede choosing the arena floor. Reopen uses the stored floor; it does not guess a new boundary over existing extents. CLI additionally rebuilds ordinary indexes after recovery."
+            ],
+            "sources": []
+          },
+          {
+            "id": "attach",
+            "x": 440,
+            "y": 530,
+            "w": 320,
+            "h": 110,
+            "title": "Reattach storage",
+            "lines": [
+              "Validate existing COW root",
+              "Start reaper; replay CLI sidecars"
+            ],
+            "tone": "branch",
+            "detail": [
+              "A missing or invalid recorded root is refused rather than silently replaced. LeaseThread resumes interrupted reaps. CLI effect/provenance replay restores those stores, not all runtime maps."
+            ],
+            "sources": []
+          },
+          {
+            "id": "ram",
+            "x": 835,
+            "y": 530,
+            "w": 320,
+            "h": 110,
+            "title": "Fresh runtime memory",
+            "lines": [
+              "No recovered private Workspace",
+              "No restored escrow / read history"
+            ],
+            "tone": "check",
+            "detail": [
+              "reopen_with_storage constructs State::default. Branch names, workspaces, applied-operation history, merge records, read dependencies and escrow are not rehydrated into an unfinished SQL session. Durable roots alone cannot make it resumable."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "arena",
+            "points": [
+              [
+                205,
+                190
+              ],
+              [
+                205,
+                295
+              ]
+            ],
+            "label": "allocation sidecar",
+            "tone": "lifecycle",
+            "dashed": true,
+            "from": "main",
+            "label_x": 205,
+            "label_y": 248
+          },
+          {
+            "to": "main",
+            "points": [
+              [
+                995,
+                80
+              ],
+              [
+                995,
+                30
+              ],
+              [
+                205,
+                30
+              ],
+              [
+                205,
+                80
+              ]
+            ],
+            "label": "branch root IDs address main-file pages",
+            "tone": "branch",
+            "dashed": false,
+            "from": "catalog",
+            "label_x": 600,
+            "label_y": 22
+          },
+          {
+            "to": "attach",
+            "points": [
+              [
+                365,
+                585
+              ],
+              [
+                440,
+                585
+              ]
+            ],
+            "label": "reopen",
+            "tone": "branch",
+            "dashed": false,
+            "from": "boot",
+            "label_x": 402,
+            "label_y": 571
+          },
+          {
+            "to": "ram",
+            "points": [
+              [
+                760,
+                585
+              ],
+              [
+                835,
+                585
+              ]
+            ],
+            "label": "fresh RAM",
+            "tone": "check",
+            "dashed": false,
+            "from": "attach",
+            "label_x": 797,
+            "label_y": 571
+          }
+        ],
+        "lanes": [],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Root publication is a separate boundary",
+          "text": "set_root writes branch metadata in the catalog pool. It is not an atomic commit across COW data, allocator state, effect log, provenance and shared heap.",
+          "tone": "check"
+        },
+        {
+          "title": "Two shipped entrypoints differ",
+          "text": "The CLI wires durable TEL/provenance and index rebuilding after recovery. examples/pgserver.rs uses memory TEL/provenance and lacks the CLI index-rebuild block. The map describes both, not an idealized common configuration.",
+          "tone": "check"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/cli/cli.rs",
+          "line": 46,
+          "label": "CLI construction"
+        },
+        {
+          "file": "examples/pgserver.rs",
+          "line": 61,
+          "label": "Server construction"
+        },
+        {
+          "file": "examples/pgserver.rs",
+          "line": 112,
+          "label": "Memory effect log wiring"
+        },
+        {
+          "file": "src/branch/table_catalog.rs",
+          "line": 176,
+          "label": "Separate catalog pool"
+        },
+        {
+          "file": "src/branch/arena.rs",
+          "line": 1466,
+          "label": "Allocator persistence"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 1381,
+          "label": "Reopen creates fresh runtime state"
+        },
+        {
+          "file": "src/provenance/durable.rs",
+          "line": 38,
+          "label": "Provenance file contents"
+        }
+      ],
+      "table": {
+        "headers": [
+          "Component",
+          "CLI",
+          "pgserver example"
+        ],
+        "rows": [
+          [
+            "Main heap / WAL / arena / branch catalog",
+            "Page/file-backed",
+            "Page/file-backed"
+          ],
+          [
+            "Effect log (TEL)",
+            "DurableEffectLog → .tel",
+            "MemEffectLog"
+          ],
+          [
+            "Provenance",
+            "DurableProvenanceStore → .provenance",
+            "Memory store"
+          ],
+          [
+            "Index rebuild after WAL recovery",
+            "Explicitly called",
+            "No corresponding call"
+          ],
+          [
+            "Unfinished agent Workspace restored",
+            "No",
+            "No"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "lifetime",
+      "number": "11",
+      "title": "Who owns a page, and when it can be freed",
+      "subtitle": "The cleanup rule preserves descendants that might still reach old pages. Epoch, lease and generation are different clocks/identities.",
+      "diagram": {
+        "width": 1200,
+        "height": 695,
+        "nodes": [
+          {
+            "id": "trigger",
+            "x": 45,
+            "y": 80,
+            "w": 300,
+            "h": 110,
+            "title": "Branch is finished",
+            "lines": [
+              "Merge / abandon / lease expiry",
+              "Validate handle generation"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "The default agent lease is 15 minutes; the default background scan is every 30 seconds. Expiry makes cleanup eligible rather than implying exact-deadline deletion. The trunk cannot be reaped."
+            ],
+            "sources": []
+          },
+          {
+            "id": "reaping",
+            "x": 450,
+            "y": 80,
+            "w": 300,
+            "h": 110,
+            "title": "Persist Reaping state",
+            "lines": [
+              "Refuse further branch reads",
+              "Choose logical free epoch"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "Persisting an intermediate lifecycle state allows a later startup to resume cleanup after interruption. A stale handle cannot act on a different branch occupying the same recycled ID slot."
+            ],
+            "sources": []
+          },
+          {
+            "id": "children",
+            "x": 855,
+            "y": 80,
+            "w": 300,
+            "h": 110,
+            "title": "Any live children?",
+            "lines": [
+              "Consult authoritative catalog",
+              "Keep descendant visibility pins"
+            ],
+            "tone": "check",
+            "detail": [
+              "The catalog indexes parent/child relationships and child fork epochs. A reaped intermediate ancestor with a live descendant retains its lineage link, preserving protection for grandparent pages."
+            ],
+            "sources": []
+          },
+          {
+            "id": "bulk",
+            "x": 450,
+            "y": 300,
+            "w": 300,
+            "h": 110,
+            "title": "Childless branch",
+            "lines": [
+              "Free its owned arenas in bulk",
+              "Do not free inherited pages"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "An arena is a contiguous extent owned by one branch; extents grow geometrically from 1 to 256 pages, then stay capped. A branch can own several arenas. Bulk reclaim is safe when no descendant needs those private pages."
+            ],
+            "sources": []
+          },
+          {
+            "id": "interval",
+            "x": 855,
+            "y": 300,
+            "w": 300,
+            "h": 110,
+            "title": "Shared history remains",
+            "lines": [
+              "Check birth / free interval",
+              "Park protected pages as pending"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "A page cannot be reused while a live child fork epoch falls in [page birth, logical free). Protection is conservative and indexed by lineage, not a count stored on every page."
+            ],
+            "sources": []
+          },
+          {
+            "id": "epoch",
+            "x": 45,
+            "y": 300,
+            "w": 300,
+            "h": 110,
+            "title": "Example: page lifetime",
+            "lines": [
+              "Birth 3 → free requested at 9",
+              "Child fork at 5 still protects it"
+            ],
+            "tone": "branch",
+            "detail": [
+              "5 lies in [3,9), so the child may still reach the old page even though its parent no longer uses it. These numbers are logical ordering epochs, not seconds or transaction IDs."
+            ],
+            "sources": []
+          },
+          {
+            "id": "fence",
+            "x": 450,
+            "y": 540,
+            "w": 300,
+            "h": 110,
+            "title": "Persist Reaped state",
+            "lines": [
+              "Bump generation; reuse if safe",
+              "Retain needed ancestor links"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "Reaped slots remain unavailable while live descendants still require them. Generation fencing prevents an old BranchId handle from accidentally reading/writing a new branch after ID reuse. Parent links detach only when descendant pins can be released safely."
+            ],
+            "sources": []
+          },
+          {
+            "id": "retry",
+            "x": 855,
+            "y": 540,
+            "w": 300,
+            "h": 110,
+            "title": "Drain pending frees",
+            "lines": [
+              "After last protecting child ends",
+              "Reuse newly safe pages / extents"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "When the last relevant child disappears, cleanup revisits deferred frees and can cascade upward through reaped ancestors. Startup also resumes interrupted reaps and sweeps orphaned extents."
+            ],
+            "sources": []
+          },
+          {
+            "id": "allocator",
+            "x": 45,
+            "y": 540,
+            "w": 300,
+            "h": 110,
+            "title": "Arena allocator state",
+            "lines": [
+              "Main-file page extents",
+              "Checkpoint / tail in .arena"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "Page payloads are in the main database; ownership/allocation metadata is in the allocator sidecar. Persisted allocation avoids giving a page already owned by one branch to another after reopen."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "reaping",
+            "points": [
+              [
+                345,
+                135
+              ],
+              [
+                450,
+                135
+              ]
+            ],
+            "label": "retire",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "trigger",
+            "label_x": 397,
+            "label_y": 123
+          },
+          {
+            "to": "children",
+            "points": [
+              [
+                750,
+                135
+              ],
+              [
+                855,
+                135
+              ]
+            ],
+            "label": "inspect",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "reaping",
+            "label_x": 802,
+            "label_y": 123
+          },
+          {
+            "to": "bulk",
+            "points": [
+              [
+                900,
+                190
+              ],
+              [
+                900,
+                240
+              ],
+              [
+                600,
+                240
+              ],
+              [
+                600,
+                300
+              ]
+            ],
+            "label": "no live child",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "children",
+            "label_x": 750,
+            "label_y": 227
+          },
+          {
+            "to": "interval",
+            "points": [
+              [
+                1050,
+                190
+              ],
+              [
+                1050,
+                300
+              ]
+            ],
+            "label": "yes",
+            "tone": "check",
+            "dashed": false,
+            "from": "children",
+            "label_x": 1080,
+            "label_y": 245
+          },
+          {
+            "to": "interval",
+            "points": [
+              [
+                195,
+                410
+              ],
+              [
+                195,
+                455
+              ],
+              [
+                1005,
+                455
+              ],
+              [
+                1005,
+                410
+              ]
+            ],
+            "label": "fork 5 lies inside [3, 9): defer",
+            "tone": "branch",
+            "dashed": true,
+            "from": "epoch",
+            "label_x": 610,
+            "label_y": 442
+          },
+          {
+            "to": "fence",
+            "points": [
+              [
+                600,
+                410
+              ],
+              [
+                600,
+                540
+              ]
+            ],
+            "label": "finish record",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "bulk",
+            "label_x": 600,
+            "label_y": 510
+          },
+          {
+            "to": "retry",
+            "points": [
+              [
+                1100,
+                410
+              ],
+              [
+                1100,
+                540
+              ]
+            ],
+            "label": "later release",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "interval",
+            "label_x": 1100,
+            "label_y": 510
+          },
+          {
+            "to": "fence",
+            "points": [
+              [
+                900,
+                410
+              ],
+              [
+                900,
+                490
+              ],
+              [
+                700,
+                490
+              ],
+              [
+                700,
+                540
+              ]
+            ],
+            "label": "mark reaped",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "interval",
+            "label_x": 810,
+            "label_y": 479
+          },
+          {
+            "to": "allocator",
+            "points": [
+              [
+                450,
+                595
+              ],
+              [
+                345,
+                595
+              ]
+            ],
+            "label": "safe frees",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "fence",
+            "label_x": 397,
+            "label_y": 583
+          },
+          {
+            "to": "retry",
+            "points": [
+              [
+                750,
+                595
+              ],
+              [
+                855,
+                595
+              ]
+            ],
+            "label": "recheck",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "fence",
+            "label_x": 802,
+            "label_y": 583
+          }
+        ],
+        "lanes": [],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Epoch",
+          "text": "Logical ordering of page births, forks and frees. Also participates in deciding whether a branch-owned page is private enough to edit in place.",
+          "tone": "branch"
+        },
+        {
+          "title": "Lease",
+          "text": "Standalone: wall-clock deadline for abandoned work; clustered components use replicated time. A background scan and cleanup do the actual reclaim; this is separate from MVCC snapshot visibility.",
+          "tone": "lifecycle"
+        },
+        {
+          "title": "Generation",
+          "text": "Identity fence for recycled branch IDs. Same numeric slot with a different generation means a different branch. Branch GC does not vacuum ordinary heap row versions.",
+          "tone": "check"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/branch/reaper.rs",
+          "line": 619,
+          "label": "Reap stages"
+        },
+        {
+          "file": "src/branch/reaper.rs",
+          "line": 242,
+          "label": "Preserve descendant links"
+        },
+        {
+          "file": "src/branch/record.rs",
+          "line": 1267,
+          "label": "Half-open lifetime interval"
+        },
+        {
+          "file": "src/branch/arena.rs",
+          "line": 2132,
+          "label": "Pending versus immediate free"
+        },
+        {
+          "file": "src/branch/types.rs",
+          "line": 271,
+          "label": "Arena growth"
+        },
+        {
+          "file": "src/branch/lease_thread.rs",
+          "line": 120,
+          "label": "Background interval"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 96,
+          "label": "Default lease"
+        }
+      ]
+    },
+    {
+      "id": "boundaries",
+      "number": "12",
+      "title": "Extensions connect to the core at specific points",
+      "subtitle": "These are attachments, not a second explanation of the database. Dashed arrows mean a separate/optional component connection.",
+      "diagram": {
+        "width": 1200,
+        "height": 790,
+        "nodes": [
+          {
+            "id": "simulate",
+            "x": 45,
+            "y": 75,
+            "w": 300,
+            "h": 110,
+            "title": "SIMULATE / selected effects",
+            "lines": [
+              "Try candidate workspaces",
+              "Inspect, select, recheck admission"
+            ],
+            "tone": "branch",
+            "detail": [
+              "SIMULATE forks candidates and runs the same evaluator. Assertions determine legality; equally legal candidates tie and declaration order wins. Cherry-pick selects recorded effects into a workspace. Neither is a second storage engine."
+            ],
+            "sources": []
+          },
+          {
+            "id": "core",
+            "x": 450,
+            "y": 75,
+            "w": 300,
+            "h": 110,
+            "title": "Agent staging and merge",
+            "lines": [
+              "Private staging → checked merge",
+              "Shared heap is the target"
+            ],
+            "tone": "check",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "provenance",
+            "x": 855,
+            "y": 75,
+            "w": 300,
+            "h": 110,
+            "title": "Provenance / revert",
+            "lines": [
+              "Who wrote and what was read",
+              "Dependency-aware inverse changes"
+            ],
+            "tone": "lifecycle",
+            "detail": [
+              "Provenance captures run/model/prompt identity and read/write relationships. Revert can halt on downstream dependencies or explicitly cascade inverse operations. It is not a tree-root rewind or one all-cascade atomic transaction."
+            ],
+            "sources": []
+          },
+          {
+            "id": "physical",
+            "x": 45,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Physical WAL shipping",
+            "lines": [
+              "Durable log bytes → heap redo",
+              "Base backup needed for bootstrap"
+            ],
+            "tone": "wal",
+            "detail": [
+              "The source stops at flushed_lsn. Log shipping alone is not leader election or safe automatic failover. Bare redo does not reproduce the full ordinary catalog; an existing integration test explicitly records that limitation."
+            ],
+            "sources": []
+          },
+          {
+            "id": "wal",
+            "x": 450,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Ordinary WAL",
+            "lines": [
+              "Row records + transaction markers",
+              "Source for replication / decoding"
+            ],
+            "tone": "wal",
+            "detail": [],
+            "sources": []
+          },
+          {
+            "id": "cdc",
+            "x": 855,
+            "y": 335,
+            "w": 300,
+            "h": 110,
+            "title": "Logical CDC feed",
+            "lines": [
+              "Decode committed row changes",
+              "Snapshot + resumable WAL handoff"
+            ],
+            "tone": "wal",
+            "detail": [
+              "An initial MVCC snapshot captures existing rows; pinned WAL and a resume boundary bridge later committed changes. Publication filtering controls emitted rows. CDC is not the branch TEL and does not perform branch merging."
+            ],
+            "sources": []
+          },
+          {
+            "id": "raft",
+            "x": 45,
+            "y": 610,
+            "w": 300,
+            "h": 110,
+            "title": "Separate consensus components",
+            "lines": [
+              "Raft-style terms / quorums",
+              "Ordered rounds + durable log"
+            ],
+            "tone": "neutral",
+            "detail": [
+              "The consensus state machine and driver coordinate replicated commands and membership. Normal CLI/pgserver do not construct this coordinator. Consensus log round numbers are not local WAL byte offsets."
+            ],
+            "sources": []
+          },
+          {
+            "id": "cluster",
+            "x": 450,
+            "y": 610,
+            "w": 300,
+            "h": 110,
+            "title": "ClusterAgents coordinator",
+            "lines": [
+              "Replicated metadata decisions",
+              "Speculative contents stay local"
+            ],
+            "tone": "neutral",
+            "detail": [
+              "A merge proposal is based on an applied round, may require re-evaluation if the base moved, and publishes locally after its metadata decision applies. This is a library/test path, not the normal SQL server path."
+            ],
+            "sources": []
+          },
+          {
+            "id": "gap",
+            "x": 855,
+            "y": 610,
+            "w": 300,
+            "h": 110,
+            "title": "Distribution boundary",
+            "lines": [
+              "Merge metadata and row WAL",
+              "Arrive in separate rounds"
+            ],
+            "tone": "check",
+            "detail": [
+              "The documented failure window can leave metadata saying merged while row WAL has not arrived. There is no transparent failover for an unfinished node-local branch. No end-to-end distributed SQL atomicity is claimed here."
+            ],
+            "sources": []
+          }
+        ],
+        "edges": [
+          {
+            "to": "core",
+            "points": [
+              [
+                345,
+                130
+              ],
+              [
+                450,
+                130
+              ]
+            ],
+            "label": "reuse core paths",
+            "tone": "branch",
+            "dashed": false,
+            "from": "simulate",
+            "label_x": 397,
+            "label_y": 118
+          },
+          {
+            "to": "provenance",
+            "points": [
+              [
+                750,
+                130
+              ],
+              [
+                855,
+                130
+              ]
+            ],
+            "label": "capture / record",
+            "tone": "lifecycle",
+            "dashed": false,
+            "from": "core",
+            "label_x": 802,
+            "label_y": 118
+          },
+          {
+            "to": "wal",
+            "points": [
+              [
+                600,
+                185
+              ],
+              [
+                600,
+                335
+              ]
+            ],
+            "label": "published row transaction",
+            "tone": "wal",
+            "dashed": false,
+            "from": "core",
+            "label_x": 600,
+            "label_y": 268
+          },
+          {
+            "to": "physical",
+            "points": [
+              [
+                450,
+                390
+              ],
+              [
+                345,
+                390
+              ]
+            ],
+            "label": "ship bytes",
+            "tone": "wal",
+            "dashed": true,
+            "from": "wal",
+            "label_x": 397,
+            "label_y": 378
+          },
+          {
+            "to": "cdc",
+            "points": [
+              [
+                750,
+                390
+              ],
+              [
+                855,
+                390
+              ]
+            ],
+            "label": "decode rows",
+            "tone": "wal",
+            "dashed": true,
+            "from": "wal",
+            "label_x": 802,
+            "label_y": 378
+          },
+          {
+            "to": "cluster",
+            "points": [
+              [
+                345,
+                665
+              ],
+              [
+                450,
+                665
+              ]
+            ],
+            "label": "commands",
+            "tone": "neutral",
+            "dashed": true,
+            "from": "raft",
+            "label_x": 397,
+            "label_y": 653
+          },
+          {
+            "to": "gap",
+            "points": [
+              [
+                750,
+                665
+              ],
+              [
+                855,
+                665
+              ]
+            ],
+            "label": "known gap",
+            "tone": "check",
+            "dashed": true,
+            "from": "cluster",
+            "label_x": 802,
+            "label_y": 653
+          }
+        ],
+        "lanes": [
+          {
+            "x": 25,
+            "y": 550,
+            "w": 1150,
+            "h": 205,
+            "label": "IMPLEMENTED SEPARATELY — NOT IN THE NORMAL CLI / PGWIRE EXECUTION PATH",
+            "tone": "neutral"
+          }
+        ],
+        "texts": []
+      },
+      "cards": [
+        {
+          "title": "Tree utilities are distinct",
+          "text": "Page diff skips shared page IDs during paired descent. cow::merge3 is a structural base/ours/theirs merger; SQL MERGE uses operation semantics. Auxiliary content hashes do not define production page identity.",
+          "tone": "branch"
+        },
+        {
+          "title": "Deliberately outside the core map",
+          "text": "Benchmark harnesses, full-text retrieval, wire-format conveniences, unwired dedup and page-delta compression utilities are not expanded. Their omission does not imply they are core execution dependencies.",
+          "tone": "neutral"
+        }
+      ],
+      "sources": [
+        {
+          "file": "src/agent_sql/simulate.rs",
+          "line": 367,
+          "label": "Candidate workflow"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 5791,
+          "label": "Dependency-aware revert"
+        },
+        {
+          "file": "src/agent_sql/runtime.rs",
+          "line": 2094,
+          "label": "Runtime page diff"
+        },
+        {
+          "file": "src/cow/merge3.rs",
+          "line": 303,
+          "label": "Structural merge library"
+        },
+        {
+          "file": "src/replication/mod.rs",
+          "line": 1,
+          "label": "Replication and CDC components"
+        },
+        {
+          "file": "src/agent_sql/cluster.rs",
+          "line": 67,
+          "label": "Cluster atomicity boundary"
+        },
+        {
+          "file": "tests/integration_replication_e2e.rs",
+          "line": 255,
+          "label": "Catalog replication boundary"
+        }
+      ]
+    }
+  ],
+  "glossary": [
+    {
+      "term": "Page",
+      "meaning": "A 4 KB block addressed by a page ID. Its format depends on what it stores."
+    },
+    {
+      "term": "Page ID",
+      "meaning": "A numeric block address, not a memory pointer or a content hash."
+    },
+    {
+      "term": "Root page ID",
+      "meaning": "The starting page for a tree. A branch stores this in its branch record."
+    },
+    {
+      "term": "Internal / leaf",
+      "meaning": "An internal tree node routes to children; a leaf holds the tree's key/value entries."
+    },
+    {
+      "term": "Separator key",
+      "meaning": "A boundary used to choose which child subtree can contain a search key."
+    },
+    {
+      "term": "Header / payload",
+      "meaning": "The format's metadata prefix versus the node or tuple data following it."
+    },
+    {
+      "term": "RecordId",
+      "meaning": "Physical ordinary row location: page ID plus slot number."
+    },
+    {
+      "term": "Logical row ID",
+      "meaning": "Identity used to match agent changes; currently derived from primary-key values."
+    },
+    {
+      "term": "Heap",
+      "meaning": "Pages containing ordinary table tuples, organized through page directories."
+    },
+    {
+      "term": "Buffer pool",
+      "meaning": "RAM cache of disk pages. Pins prevent eviction; locks protect accesses to bytes."
+    },
+    {
+      "term": "Latch",
+      "meaning": "Short-lived physical synchronization for page/tree operations; distinct from transaction visibility."
+    },
+    {
+      "term": "MVCC",
+      "meaning": "Multiple row versions plus a rule choosing which version a reader sees."
+    },
+    {
+      "term": "Snapshot",
+      "meaning": "Transaction-ID boundary and active set defining visibility, not a complete copied database."
+    },
+    {
+      "term": "Version chain",
+      "meaning": "Previous-version pointers linking a current tuple to older tuples."
+    },
+    {
+      "term": "COW / shadow paging",
+      "meaning": "Share existing pages; copy pages when an edit would otherwise change shared state."
+    },
+    {
+      "term": "Workspace",
+      "meaning": "RAM maps of private row state, before-images, effects, schema edits and related task state."
+    },
+    {
+      "term": "Persistent map",
+      "meaning": "Immutable, structurally shared map in RAM. Persistent here does not mean saved to disk."
+    },
+    {
+      "term": "Arena",
+      "meaning": "A contiguous page extent owned by a branch; a branch can own multiple extents."
+    },
+    {
+      "term": "Epoch",
+      "meaning": "Logical order used for sharing and reclamation. Not elapsed time or MVCC transaction identity."
+    },
+    {
+      "term": "Lease",
+      "meaning": "Deadline after which background cleanup can retire abandoned branch work."
+    },
+    {
+      "term": "Generation",
+      "meaning": "Version of a recycled branch identity slot, used to reject stale handles."
+    },
+    {
+      "term": "TEL / effect frame",
+      "meaning": "Typed operation intent and guards for a task. Separate from physical recovery WAL."
+    },
+    {
+      "term": "WAL",
+      "meaning": "Write-ahead log: recovery information is made durable before associated dirty heap pages are written."
+    },
+    {
+      "term": "LSN",
+      "meaning": "WAL position; page LSNs help avoid replaying the same physical update twice."
+    },
+    {
+      "term": "CLR",
+      "meaning": "Compensation log record describing undo progress so recovery can continue after another crash."
+    },
+    {
+      "term": "Guard / assertion",
+      "meaning": "Guard: precondition on the target before effects. Assertion: condition on proposed results."
+    },
+    {
+      "term": "Commuting effects",
+      "meaning": "Supported operations whose combination can preserve both intents; checks can still reject the result."
+    },
+    {
+      "term": "Fingerprint",
+      "meaning": "Evidence of the evaluated base, checked again before publishing; not a full serializability proof."
+    },
+    {
+      "term": "Quarantine",
+      "meaning": "Hold an agent branch for inspection after an admission gate refuses publication."
+    },
+    {
+      "term": "Checkpoint",
+      "meaning": "Coordinate durable state to reduce replay history; retention rules may prevent log truncation."
+    },
+    {
+      "term": "CDC",
+      "meaning": "Committed row-change feed decoded from WAL, optionally bootstrapped with a snapshot."
+    },
+    {
+      "term": "Consensus round",
+      "meaning": "Position in the replicated command order, distinct from the local WAL byte LSN."
+    }
+  ],
+  "scope": [
+    "Mapped to the source revision above. Four independent source reviews were reconciled; see review/ and verification.json for evidence and final checks.",
+    "The atlas explains implemented mechanisms. It does not certify every combination of isolation, schema change, rollback, index access, allocation and machine power loss.",
+    "Agent branch semantics, costs, server concurrency and restart boundaries are stated explicitly. No general branch-versus-transaction performance advantage is claimed.",
+    "The application source was not changed. Focused existing tests support specific claims; they are not a full test-suite or exhaustive correctness proof."
+  ]
+}

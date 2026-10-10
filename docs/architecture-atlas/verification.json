@@ -1,0 +1,88 @@
+{
+  "status": "complete",
+  "verified_at_utc": "2026-09-24T00:50:12.631436+00:00",
+  "source_revision": "fc9556a742f61884a3011ccc28e78f160a8d57fe",
+  "application_source_modified": false,
+  "diagrams": 12,
+  "nodes": 112,
+  "labeled_or_routed_edges": 99,
+  "source_references": 78,
+  "unique_cited_source_files": 41,
+  "artifacts": {
+    "index.html": {
+      "sha256": "bb41128f526243018875615d2b89816b0888ecaafeb12ff0d1eecc2e0dab22fc",
+      "bytes": 302897
+    },
+    "ferrodb-core-atlas.pdf": {
+      "sha256": "efa733b763f20ebee75798661b0ab8a017bde0bd6c9a7128cce4ca8be196ae7f",
+      "bytes": 2091817
+    },
+    "atlas.json": {
+      "sha256": "7e1b5368cb0703b02e2a2960de23f41e45bb723998a29582ecfe077cd59106a6",
+      "bytes": 145772
+    }
+  },
+  "source_review": {
+    "status": "accepted after corrections",
+    "reports": [
+      "review/final-sql-review.md",
+      "review/final-branch-review.md",
+      "review/final-merge-review.md",
+      "review/final-durability-review.md"
+    ],
+    "resolutions": "review/resolutions.md"
+  },
+  "tests": {
+    "passed": 66,
+    "failed": 0,
+    "targets": 16,
+    "record": "review/core-tests.json",
+    "log": "review/core-tests.log",
+    "full_repository_suite_run": false
+  },
+  "model_validation": {
+    "status": "passed",
+    "record": "review/model-audit.json",
+    "source_hashes_unchanged": true
+  },
+  "render_validation": {
+    "status": "passed",
+    "record": "review/browser-audit.json",
+    "pdf_pages": 14,
+    "offline": true,
+    "external_requests": 0,
+    "browser_errors": 0,
+    "responsive_modes": [
+      "desktop",
+      "tablet",
+      "mobile",
+      "print"
+    ],
+    "root_visual_review": [
+      "fork",
+      "cow-engine",
+      "lifetime",
+      "persistence print"
+    ],
+    "all_diagrams_visually_reviewed_by_renderer": true
+  },
+  "coverage": {
+    "system": "The system, in one view",
+    "sql": "From SQL to a physical row",
+    "mvcc": "MVCC: time belongs to the reader",
+    "fork": "Fork and shadow paging, with real pointer roles",
+    "cow-engine": "The COW engine: lookup, ownership, edit, relink",
+    "pages": "Inside the pages: three layouts, three purposes",
+    "agent": "What an agent actually reads and writes",
+    "merge": "Merge means reconciliation, then publication",
+    "wal": "WAL, commit, crash recovery",
+    "persistence": "What is on disk, and what reopening restores",
+    "lifetime": "Who owns a page, and when it can be freed",
+    "boundaries": "Extensions connect to the core at specific points"
+  },
+  "limits": [
+    "Mechanism map and scoped checks, not a proof of all database correctness or power-loss behavior.",
+    "Source revision is fixed; revalidate implementation and anchors after code changes.",
+    "Optional/unwired features are located at the boundary rather than expanded as core paths."
+  ]
+}

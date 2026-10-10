@@ -1,0 +1,164 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/projects/ferrodb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.57s
+     Running tests/d16_transitive_visibility.rs (target/debug/deps/d16_transitive_visibility-1fb58af419bef1e7)
+
+running 2 tests
+test log_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+test table_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/d27_fork_shares_without_leaking.rs (target/debug/deps/d27_fork_shares_without_leaking-93a27c747d4c9c8d)
+
+running 5 tests
+test a_parent_schema_edit_after_the_fork_stays_invisible_to_the_child ... ok
+test the_instrument_goes_blind_when_the_workspace_it_reads_is_gone ... ok
+test siblings_forked_from_one_parent_cannot_see_each_other ... ok
+test a_read_on_a_deep_child_does_not_consult_its_ancestors ... ok
+test a_parent_write_after_the_fork_stays_invisible_to_the_child ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+
+     Running tests/d59_snapshot_cache.rs (target/debug/deps/d59_snapshot_cache-a750662366179024)
+
+running 9 tests
+test an_abort_also_moves_the_version ... ok
+test a_transaction_that_begins_is_in_the_next_cached_snapshot ... ok
+test a_transaction_that_commits_leaves_the_next_cached_snapshot ... ok
+test raising_the_id_watermark_invalidates_a_cached_snapshot ... ok
+test a_cached_snapshot_matches_the_locked_one_in_high_water_too ... ok
+test recovery_moves_the_version_for_a_thread_that_already_cached_a_snapshot ... ok
+test two_managers_on_one_thread_do_not_share_a_cached_snapshot ... ok
+test a_watermark_raise_waits_for_the_table_lock ... ok
+test a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.06s
+
+     Running tests/guard_precondition_probe.rs (target/debug/deps/guard_precondition_probe-4ef9bb6f64891efb)
+
+running 5 tests
+test both_engines_conflict_on_post_state_so_correctness_lives_in_the_caller ... ok
+test a_guarded_delete_merges_solo ... ok
+test a_genuinely_violated_precondition_is_still_rejected ... ok
+test a_solo_merge_that_lands_on_the_bound_is_not_a_conflict ... ok
+test a_floor_guard_does_not_protect_the_floor_and_the_counter_goes_negative ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/integration_cow_branch.rs (target/debug/deps/integration_cow_branch-17aeb4828b31d3e8)
+
+running 1 test
+test the_cow_btree_runs_on_the_arena_store_and_a_child_sees_the_parents_data_without_a_copy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/integration_crash_safety.rs (target/debug/deps/integration_crash_safety-47f0679b34602969)
+
+running 4 tests
+test a_crash_does_not_lose_the_table_or_its_rows ... ok
+test a_merge_that_is_not_interrupted_lands_completely ... ok
+test reopening_repeatedly_after_a_crash_keeps_giving_the_same_answer ... ok
+test a_merge_killed_mid_publish_leaves_no_torn_state ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+
+     Running tests/integration_durable_tel.rs (target/debug/deps/integration_durable_tel-20b67d219c0e8ca6)
+
+running 3 tests
+test wide_typed_values_survive_the_restart_with_their_bytes_intact ... ok
+test the_durable_store_captures_exactly_what_the_in_memory_one_captures ... ok
+test an_agent_tasks_frames_and_its_merge_survive_a_process_restart ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/integration_fork_kill9.rs (target/debug/deps/integration_fork_kill9-31ddab80011db9f6)
+
+running 1 test
+test an_acknowledged_fork_survives_sigkill ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.14s
+
+     Running tests/integration_merge_agreement.rs (target/debug/deps/integration_merge_agreement-43e4b7e3ce4f1adc)
+
+running 6 tests
+test both_engines_agree_that_a_one_sided_write_is_clean ... ok
+test both_engines_agree_that_an_unannotated_column_forbids_concurrent_writes ... ok
+test both_engines_agree_that_two_decrements_commute ... ok
+test both_engines_agree_that_a_discarding_lww_never_reads_as_clean ... ok
+test both_engines_deduplicate_a_replayed_add_by_txn_id ... ok
+test both_engines_agree_that_a_guard_failing_against_merged_state_is_a_conflict ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/integration_merge_ddl_atomicity.rs (target/debug/deps/integration_merge_ddl_atomicity-81b4e1b7467e1784)
+
+running 9 tests
+test a_row_the_merge_would_publish_with_a_null_in_a_not_null_column_refuses_the_whole_merge ... ok
+test a_merge_publishes_its_rows_into_the_shape_its_own_edits_produced ... ok
+test a_rename_follows_its_column_into_the_fulltext_index_too ... ok
+test an_index_follows_its_column_across_the_renames_a_merge_applies ... ok
+test a_chain_refused_at_its_first_edit_names_that_edit_and_not_the_last ... ok
+test narrowing_a_row_and_retyping_behind_it_takes_two_merges_and_the_refusal_says_so ... ok
+test a_row_the_merge_would_publish_too_wide_for_the_shape_it_lands_in_refuses_the_whole_merge ... ok
+test planning_a_refused_merge_does_not_even_append_an_empty_page ... ok
+test a_merge_refused_at_its_third_edit_leaves_neither_of_the_first_two_applied ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.33s
+
+     Running tests/integration_read_premise.rs (target/debug/deps/integration_read_premise-5c7b7e6036a74c42)
+
+running 3 tests
+test two_branches_reading_different_rows_both_merge ... ok
+test a_read_of_an_unpublished_row_is_recorded_as_version_zero ... ok
+test a_branch_that_read_a_row_another_branch_then_changed_is_held ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/integration_runtime_reattach.rs (target/debug/deps/integration_runtime_reattach-72c494a20a8177da)
+
+running 4 tests
+test reopening_a_database_with_no_trunk_tree_is_refused_by_name ... ok
+test creating_over_an_existing_trunk_tree_is_refused ... ok
+test a_reopened_runtime_reads_the_rows_the_first_one_wrote ... ok
+test a_root_pointing_at_a_page_this_engine_did_not_write_is_refused ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/integration_sql_on_durable_branches.rs (target/debug/deps/integration_sql_on_durable_branches-1573d64d39185f4f)
+
+running 4 tests
+test abandon_marks_the_branch_reaped_in_the_durable_record_log ... ok
+test branch_writes_stay_invisible_to_main_on_the_durable_catalog ... ok
+test a_guard_violation_is_rejected_with_its_predicate_on_the_durable_catalog ... ok
+test two_branches_decrementing_compose_arithmetically_on_the_durable_catalog ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/integration_statement_atomicity.rs (target/debug/deps/integration_statement_atomicity-7a89d477e1710752)
+
+running 3 tests
+test a_refused_statement_does_not_consume_the_budget_it_never_used ... ok
+test a_multi_row_update_within_budget_still_applies_to_every_row ... ok
+test a_refused_multi_row_update_leaves_no_row_rewritten ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/integration_trunk_tree_authority.rs (target/debug/deps/integration_trunk_tree_authority-069e9ab3d7327f95)
+
+running 3 tests
+test trunks_root_is_a_real_arena_page_named_by_the_branch_catalog ... ok
+test trunk_rows_live_in_the_heap_not_in_trunks_page_tree ... ok
+test an_agent_write_lives_on_branch_pages_and_reaches_the_heap_only_on_merge ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/integration_txn_concurrency.rs (target/debug/deps/integration_txn_concurrency-321b53de585b05de)
+
+running 4 tests
+test concurrent_commits_and_aborts_do_not_panic ... ok
+test a_running_transaction_is_never_missing_from_a_snapshot ... ok
+test committed_transactions_leave_the_active_set ... ok
+test concurrent_begins_get_distinct_transaction_ids ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.05s
+

@@ -1,0 +1,185 @@
+{
+  "status": "final browser audit",
+  "timestamp": "2026-09-24T00:48:09.337Z",
+  "modelSha256": "7e1b5368cb0703b02e2a2960de23f41e45bb723998a29582ecfe077cd59106a6",
+  "desktop": {
+    "ok": true,
+    "issues": [],
+    "diagrams": 12,
+    "nodes": 112,
+    "bodyOverflow": false
+  },
+  "mobile": {
+    "ok": true,
+    "issues": [],
+    "diagrams": 12,
+    "nodes": 112,
+    "bodyOverflow": false
+  },
+  "tablet": {
+    "ok": true,
+    "issues": [],
+    "diagrams": 12,
+    "nodes": 112,
+    "bodyOverflow": false
+  },
+  "print": {
+    "ok": true,
+    "issues": [],
+    "diagrams": 12,
+    "nodes": 112,
+    "bodyOverflow": false
+  },
+  "clickDetail": true,
+  "keyboardDetail": true,
+  "selectedTitle": "Page 7: root",
+  "navigationHash": "#merge",
+  "sourcePopupURL": "file:///Users/idide/projects/ferrodb/src/execution/session.rs#L6",
+  "sourceStats": {
+    "renderedLinks": 156,
+    "uniqueSources": 73,
+    "invalid": []
+  },
+  "exportCheck": {
+    "name": "ferrodb-merge-v0.svg",
+    "hasSvg": true,
+    "hasMarkers": true,
+    "hasInlineStyle": true,
+    "bytes": 15098
+  },
+  "printFullSelection": true,
+  "mobileScroll": {
+    "clientWidth": 356,
+    "scrollWidth": 1006,
+    "scrollable": true,
+    "panWorks": true
+  },
+  "errors": [],
+  "networkRequests": [],
+  "screenshots": [
+    "screenshots/system-desktop.png",
+    "screenshots/sql-desktop.png",
+    "screenshots/mvcc-desktop.png",
+    "screenshots/fork-desktop.png",
+    "screenshots/cow-engine-desktop.png",
+    "screenshots/pages-desktop.png",
+    "screenshots/agent-desktop.png",
+    "screenshots/merge-desktop.png",
+    "screenshots/wal-desktop.png",
+    "screenshots/persistence-desktop.png",
+    "screenshots/lifetime-desktop.png",
+    "screenshots/boundaries-desktop.png"
+  ],
+  "pdf": "../ferrodb-core-atlas.pdf",
+  "pdfAudit": {
+    "pages": 14,
+    "format": "A3 landscape",
+    "structure": "Cover + one complete page per section + glossary",
+    "orphanPages": false,
+    "pagination": [
+      {
+        "page": 1,
+        "characters": 517,
+        "sectionTitles": []
+      },
+      {
+        "page": 2,
+        "characters": 5117,
+        "sectionTitles": [
+          "The system, in one view"
+        ]
+      },
+      {
+        "page": 3,
+        "characters": 4121,
+        "sectionTitles": [
+          "From SQL to a physical row"
+        ]
+      },
+      {
+        "page": 4,
+        "characters": 3903,
+        "sectionTitles": [
+          "MVCC: time belongs to the reader"
+        ]
+      },
+      {
+        "page": 5,
+        "characters": 4145,
+        "sectionTitles": [
+          "Fork and shadow paging, with real pointer roles"
+        ]
+      },
+      {
+        "page": 6,
+        "characters": 5200,
+        "sectionTitles": [
+          "The COW engine: lookup, ownership, edit, relink"
+        ]
+      },
+      {
+        "page": 7,
+        "characters": 4193,
+        "sectionTitles": [
+          "Inside the pages: three layouts, three purposes"
+        ]
+      },
+      {
+        "page": 8,
+        "characters": 4118,
+        "sectionTitles": [
+          "What an agent actually reads and writes"
+        ]
+      },
+      {
+        "page": 9,
+        "characters": 5893,
+        "sectionTitles": [
+          "Merge means reconciliation, then publication"
+        ]
+      },
+      {
+        "page": 10,
+        "characters": 3637,
+        "sectionTitles": [
+          "WAL, commit, crash recovery"
+        ]
+      },
+      {
+        "page": 11,
+        "characters": 5155,
+        "sectionTitles": [
+          "What is on disk, and what reopening restores"
+        ]
+      },
+      {
+        "page": 12,
+        "characters": 4792,
+        "sectionTitles": [
+          "Who owns a page, and when it can be freed"
+        ]
+      },
+      {
+        "page": 13,
+        "characters": 3657,
+        "sectionTitles": [
+          "Extensions connect to the core at specific points"
+        ]
+      },
+      {
+        "page": 14,
+        "characters": 6757,
+        "sectionTitles": []
+      }
+    ]
+  },
+  "visualReview": {
+    "inspectedAll12DesktopDiagrams": true,
+    "inspectedMobileScreenshots": true,
+    "inspectedPrintPages": [
+      "merge",
+      "persistence"
+    ],
+    "findings": "No clipping, node overlaps, label/node collisions, or edges crossing unrelated nodes after geometry corrections."
+  }
+}
