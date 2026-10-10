@@ -81,9 +81,13 @@
 //! # The ordering discipline callers must keep
 //!
 //! Latches are acquired **down** the tree (parent before child) and **rightward** along the leaf
-//! chain (a leaf before its `next`). Never upward, never leftward. The wait-for graph is then
-//! ordered by depth and then by key, so it has no cycle. `src/storage/index.rs` is the only
-//! caller and states where each latch is taken.
+//! chain (a leaf before its `next`). Never upward. **Leftward in exactly one place**:
+//! `BPlusTreeManager::remove_and_unlink` (D233) write-latches an emptied leaf's `prev` while
+//! holding the whole path. Its doc argues why that cannot close a cycle: every other holder of a
+//! leaf latch waits on no page latch, and every writer that could wait on one needs the root latch
+//! the unlinker holds. Apart from that one edge the wait-for graph is ordered by depth and then by
+//! key, so it has no cycle. `src/storage/index.rs` is the only caller and states where each latch
+//! is taken.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

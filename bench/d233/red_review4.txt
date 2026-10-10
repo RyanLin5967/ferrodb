@@ -1,0 +1,3 @@
+2026-09-24T22:45:22Z wall19 acquiring (5s poll), pid 22953
+Terminated: 15
+2026-09-24T22:54:07Z wall19 ABORTED by signal (every descendant ran its own exit)

@@ -72,12 +72,12 @@ pub struct Catalog {
 impl Catalog {
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let page_id = buffer_pool.new_page()?; // = 1 on a fresh DB
-        let frame_i = buffer_pool.fetch_page(page_id)?;
-        let mut frame = buffer_pool.frame_write(frame_i);
+        let pin = buffer_pool.pin(page_id)?;
+        let mut frame = pin.write();
         let page = CatalogPage::new(page_id);
         frame.data = page.serialize()?;
         drop(frame);
-        buffer_pool.unpin_page(page_id, true);
+        pin.unpin(true);
         Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
     }
 
@@ -458,6 +458,12 @@ impl Catalog {
     ///
     /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
     /// where those pages are.
+    ///
+    /// **D237: all of the table's pages, or none.** Every page of every tree is collected first,
+    /// then freed in one [`BufferPoolManager::free_pages`] call, which refuses whole before it frees
+    /// anything and keeps pinners out for the duration. A refusal therefore leaves the table in the
+    /// catalog with every page still its own. This used to free one structure after another with
+    /// `?`, so a pin leaked on the primary tree refused after the heap was already free.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
         let (heap_dir, tt_root, primary_root, sec_roots) = {
             let entry = self.require_table(name)?;
@@ -473,12 +479,23 @@ impl Catalog {
                     .collect::<Vec<_>>(),
             )
         };
-        HeapFileManager::open(heap_dir, self.buffer_pool.clone()).free_all()?;
-        HeapFileManager::open(tt_root, self.buffer_pool.clone()).free_all()?;
-        BPlusTreeManager::<Value, RecordId>::open(primary_root, self.buffer_pool.clone()).free_all()?;
+        // **Every page of every tree is collected before any is freed** (D237), and the batch free
+        // refuses whole if one of them is pinned. This freed each structure in turn with `?`, so a
+        // pin leaked on the primary tree came back as a refusal after the heap was already free,
+        // with `t` still in the catalog naming those pages. The next allocation handed them to
+        // another table, and a retried DROP freed them from under it. D229's design (under review)
+        // moves the free after a durable unlink; this is its collect-then-free half.
+        let mut pages = HeapFileManager::open(heap_dir, self.buffer_pool.clone()).page_ids()?;
+        pages.extend(HeapFileManager::open(tt_root, self.buffer_pool.clone()).page_ids()?);
+        pages.extend(BPlusTreeManager::<Value, RecordId>::open(primary_root, self.buffer_pool.clone()).page_ids()?);
         for root in sec_roots {
-            BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).free_all()?;
+            pages.extend(BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).page_ids()?);
         }
+        // A page reached twice (two trees sharing one, which a sound catalog never has) is freed
+        // once. Order kept, so the frees still run leaves and data pages first.
+        let mut seen = std::collections::HashSet::with_capacity(pages.len());
+        pages.retain(|p| seen.insert(*p));
+        self.buffer_pool.free_pages(&pages)?;
         self.tables.remove(name);
         self.stats.remove(name);
         self.persist()?;
@@ -638,12 +655,12 @@ impl Catalog {
                 )));
             }
             chain.push(id);
-            let frame_i = self.buffer_pool.fetch_page(id)?;
+            let pin = self.buffer_pool.pin(id)?;
             let page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                let frame = pin.read();
                 CatalogPage::deserialize(frame.data)
             };
-            self.buffer_pool.unpin_page(id, false);
+            pin.unpin(false);
             id = page?.next_catalog_page;
         }
 
@@ -678,8 +695,7 @@ impl Catalog {
         //    failure here comes after the new image is complete: the error is returned, and the pages
         //    hold the image while the caller's undo rolls memory back.
         for &surplus in chain.iter().skip(layout.len()) {
-            self.buffer_pool.fetch_page(surplus)?;
-            self.buffer_pool.unpin_page(surplus, false);
+            self.buffer_pool.pin(surplus)?.unpin(false);
             self.buffer_pool.delete_page(surplus)?;
         }
         Ok(())
@@ -693,12 +709,12 @@ impl Catalog {
     /// allowlist to accept all-zeroes, which would let a genuinely corrupt page through (B8).
     fn stamped_catalog_page(&self) -> Result<u32, FerroError> {
         let new_id = self.buffer_pool.new_page()?;
-        let stamped = self.buffer_pool.fetch_page(new_id).and_then(|frame_i| {
+        let stamped = self.buffer_pool.pin(new_id).and_then(|pin| {
             let image = CatalogPage::new(new_id).serialize();
             if let Ok(bytes) = &image {
-                self.buffer_pool.frame_write(frame_i).data = *bytes;
+                pin.write().data = *bytes;
             }
-            self.buffer_pool.unpin_page(new_id, true);
+            pin.unpin(true);
             image.map(|_| ())
         });
         match stamped {
@@ -722,9 +738,9 @@ impl Catalog {
 
     /// Copy one serialized image into its page.
     fn write_catalog_page(&self, page_id: u32, image: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
-        let frame_i = self.buffer_pool.fetch_page(page_id)?;
-        self.buffer_pool.frame_write(frame_i).data = *image;
-        self.buffer_pool.unpin_page(page_id, true);
+        let pin = self.buffer_pool.pin(page_id)?;
+        pin.write().data = *image;
+        pin.unpin(true);
         Ok(())
     }
 
@@ -732,12 +748,12 @@ impl Catalog {
     pub fn load(&mut self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
         loop{
-            let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
+            let pin = self.buffer_pool.pin(curr_page_id)?;
             let cat_page = {
-                let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                let frame = pin.read();
                 CatalogPage::deserialize(frame.data)?
             };
-            self.buffer_pool.unpin_page(curr_page_id, false);
+            pin.unpin(false);
             for entry in cat_page.entries {
                 self.tables.insert(entry.name.clone(), entry);
             }

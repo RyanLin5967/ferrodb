@@ -924,6 +924,9 @@ impl ArenaPageStore {
         drop(pt);
         {
             let mut frame = self.pool.frame_write(frame_i);
+            // `page_table` write was held until the entry was removed, so no `free_pages` call held
+            // it, and none can mark this frame now (`Frame::freeing`'s invariant, D237 review 3 R2).
+            debug_assert!(!frame.freeing, "arena evict: frame {frame_i} is being freed");
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
