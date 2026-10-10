@@ -70,15 +70,18 @@ impl Checks {
 fn agent_history(branches: u64, per_branch: u64) -> AttestedHistory {
     let mut h = AttestedHistory::new();
     let mut epoch = 1u64;
-    h.append(BranchId::TRUNK, Epoch(epoch), BranchOp::Commit, ContentId::of(b"trunk"));
+    h.append(BranchId::TRUNK, Epoch(epoch), BranchOp::Commit, ContentId::of(b"trunk"))
+        .expect("a legitimate append must not be refused");
     epoch += 1;
     for b in 1..=branches {
         let child = BranchId::new(b, 0);
-        h.append_fork(child, BranchId::TRUNK, Epoch(epoch), ContentId::of(&epoch.to_be_bytes()));
+        h.append_fork(child, BranchId::TRUNK, Epoch(epoch), ContentId::of(&epoch.to_be_bytes()))
+            .expect("a legitimate append must not be refused");
         epoch += 1;
         for r in 0..per_branch {
             let cid = ContentId::of(&[b.to_be_bytes(), r.to_be_bytes()].concat());
-            h.append(child, Epoch(epoch), BranchOp::RowVersion, cid);
+            h.append(child, Epoch(epoch), BranchOp::RowVersion, cid)
+                .expect("a legitimate append must not be refused");
             epoch += 1;
         }
     }
@@ -226,16 +229,32 @@ fn main() {
 
     println!("-- 1c-ter. A RECYCLED ID SLOT MUST NOT INHERIT A REAPED BRANCH'S CHAIN -----");
     let mut recycled = AttestedHistory::new();
-    recycled.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, ContentId::of(b"t"));
-    recycled.append_fork(BranchId::new(7, 0), BranchId::TRUNK, Epoch(2), ContentId::of(b"f"));
+    recycled.append(BranchId::TRUNK, Epoch(1), BranchOp::Commit, ContentId::of(b"t"))
+        .expect("a legitimate append must not be refused");
+    recycled.append_fork(BranchId::new(7, 0), BranchId::TRUNK, Epoch(2), ContentId::of(b"f"))
+        .expect("a legitimate append must not be refused");
     let reap_att =
-        recycled.append(BranchId::new(7, 0), Epoch(3), BranchOp::Reap, ContentId::of(b"r"));
-    recycled.append(BranchId::new(7, 1), Epoch(4), BranchOp::Commit, ContentId::of(b"g1"));
-    let g1 = *recycled.entries().last().unwrap();
-    c.expect("generation 1 does not chain onto generation 0's reap", g1.prev != reap_att);
+        recycled.append(BranchId::new(7, 0), Epoch(3), BranchOp::Reap, ContentId::of(b"r"))
+            .expect("a legitimate append must not be refused");
+    // Wall #19: generation 1 has no live head, so the writer refuses it rather than link it to
+    // anything; the verifier still reports the shape when it is forged.
+    let refused =
+        recycled.append(BranchId::new(7, 1), Epoch(4), BranchOp::Commit, ContentId::of(b"g1"));
     c.expect(
-        "and a generation-1 branch with no Fork of its own is reported",
-        recycled.verify_chain().is_err(),
+        "generation 1 cannot write without a Fork of its own, so nothing chains onto the reap",
+        refused.is_err() && recycled.len() == 3,
+    );
+    let mut forged = recycled.entries().to_vec();
+    forged.push(HistoryEntry {
+        prev: reap_att,
+        branch: BranchId::new(7, 1),
+        content_cid: ContentId::of(b"g1"),
+        epoch: Epoch(4),
+        op: BranchOp::Commit,
+    });
+    c.expect(
+        "and a forged generation-1 entry chained onto generation 0's reap is reported",
+        AttestedHistory::load_untrusted(forged).verify_chain().is_err(),
     );
     println!();
 
@@ -302,7 +321,8 @@ fn main() {
             Epoch(10_000 + k),
             BranchOp::RowVersion,
             ContentId::of(&k.to_be_bytes()),
-        );
+        )
+        .expect("a legitimate append must not be refused");
     }
     let cp2 = growing.consistency_proof(100).expect("proof exists");
     c.expect(

@@ -483,15 +483,14 @@ impl CowTree {
         self.finish(outcome, journal, epoch)
     }
 
-    fn insert_within(
-        &self,
-        root: PageId,
-        branch: BranchId,
-        epoch: Epoch,
-        key: &[u8],
-        value: &[u8],
-        journal: &mut WriteJournal,
-    ) -> Result<PageId, FerroError> {
+    /// Would [`CowTree::insert`] refuse an entry of this shape, whatever tree it landed in?
+    ///
+    /// The size half of `insert`'s refusals, and the only half that does not depend on the tree:
+    /// every other way an insert fails is the store refusing a page. `insert_within` calls this, so
+    /// the limits are stated once. D258: a caller that has to decide a whole batch before writing
+    /// any of it (`AgentRuntime::stage_all`) calls it first, because a refusal discovered at the
+    /// write arrives after the batch has already been half applied.
+    pub fn check_entry(key: &[u8], value: &[u8]) -> Result<(), FerroError> {
         if node::leaf_entry_bytes(key, value) > node::MAX_ENTRY_BYTES {
             return Err(FerroError::Cow(format!(
                 "entry of {} bytes exceeds the {}-byte limit for a 4KB page",
@@ -519,6 +518,20 @@ impl CowTree {
                 node::MAX_ENTRY_BYTES
             )));
         }
+        Ok(())
+    }
+
+    fn insert_within(
+        &self,
+        root: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+        key: &[u8],
+        value: &[u8],
+        journal: &mut WriteJournal,
+    ) -> Result<PageId, FerroError> {
+        // Before anything is shadowed, so a refused entry spends no page.
+        Self::check_entry(key, value)?;
         let (path, leaf_id) = self.descend(root, key)?;
         let cp = self.shadow(leaf_id, branch, epoch, journal)?;
         let new_leaf = cp.page_id;

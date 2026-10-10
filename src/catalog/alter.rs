@@ -74,7 +74,7 @@ use crate::catalog::schema::Schema;
 use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::parser::parser::AlterAction;
-use crate::provenance::ProvenanceStore;
+use crate::provenance::{ProvId, ProvenanceStore};
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
 use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
@@ -650,6 +650,24 @@ impl Catalog {
 
         let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov, &widened)?;
 
+        // **D219 (PREREG A1) — a rewrite that may re-stamp attributed rows is refused HERE when the
+        // provenance store is refusing writes, before the first heap byte moves.** The rows it
+        // moves are re-stamped after `finish` (see `apply_plan`); a store poisoned by an earlier
+        // failed append refuses that, and the ALTER was then installed and returning `Err`, which
+        // both callers answer by NOT logging its DDL record — a schema change the log never hears
+        // of. Asked here, the refusal is E82's: made while nothing has changed.
+        //
+        // Conditioned on an attributed row, because a rewrite that will stamp nothing has no
+        // business failing on the store's state (`an_alter_that_stamps_nothing_is_not_refused_by_
+        // a_poisoned_provenance_store`). Every attributed row, not only the ones that will move,
+        // because which rows move is decided while writing; refusing a rewrite that would have moved
+        // none of them is the conservative direction on a store refusing every write anyway.
+        if let Some(store) = prov {
+            if prepared.iter().any(|p| p.prov.is_some()) {
+                store.check_writable()?;
+            }
+        }
+
         Ok(AlterPlan {
             table: table.to_string(),
             shapes,
@@ -778,8 +796,8 @@ impl Catalog {
             HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
         }
 
-        let primary_root_now =
-            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
+        let (primary_root_now, moved) =
+            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared)?;
 
         // An index records the column it covers by NAME (`IndexInfo.column_name`) and the planner
         // re-resolves it to an ordinal with `position()` on every statement. Miss this and the
@@ -802,6 +820,56 @@ impl Catalog {
         // ALTER changed the schema, so every cached reader snapshot is stale. Root moves do NOT
         // bump this (D53 made the root cell shared); a column change must.
         self.epoch_bump();
+        // **D219 — the moved rows' stamps, written and made durable before this returns.**
+        //
+        // **After `finish`, deliberately.** The rewrite used to stamp each moved row inside its
+        // loop, and a stamp is fallible (a provenance store poisoned by an earlier failed append
+        // refuses every write), so a refusal there left every tuple converted under the old
+        // catalog — the I19 state `finish` exists to rule out. Here a refusal, or a failed sync,
+        // returns with the catalog and the heap agreeing on the new shape. What it does NOT
+        // restore is the caller's DDL record: both callers log it only after this returns `Ok`,
+        // so the change feed never hears of this ALTER — which is why a store already refusing
+        // writes is refused in `plan_alters` instead (below).
+        //
+        // **One sync for all of them, before any later table is touched.** They are queued with
+        // `stamp_pending` and made durable with one `flush`: this table's rewritten pages, and the
+        // catalog page `finish` just persisted, can reach the database file at any eviction, and a
+        // merge altering a second table keeps allocating while it rewrites that one. The same one
+        // sync serves a plain `ALTER TABLE`, which used to pay one per moved row.
+        //
+        // **Only if this rewrite moved an attributed row.** `flush` writes whatever the store has
+        // pending, and a store poisoned by another statement's failed append refuses every
+        // non-empty flush; a rewrite that stamped nothing has no business failing on that.
+        //
+        // **After `epoch_bump` too, and that is load-bearing.** A failure here must not leave the
+        // catalog changed with the epoch unmoved: cached reader snapshots would keep decoding this
+        // table with its old shape (`a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered`
+        // checks the epoch moved).
+        //
+        // What moved to buy this, stated rather than left to be found: a plain `ALTER TABLE`'s
+        // stamps used to be durable row by row DURING the rewrite, and are now durable once, after
+        // the install — the same windows `provenance::deferred`'s header lists for a MERGE's
+        // rewrite. And a `persist` failure inside `finish` (itself the I19 state) now returns
+        // before any moved row is re-stamped.
+        //
+        // A store ALREADY refusing writes never gets here with attributed rows: `plan_alters`
+        // refused the ALTER before the heap moved (`check_writable`, PREREG A1). What can still
+        // fail here returns with the ALTER applied and its DDL record unlogged (both callers log
+        // only on `Ok`), and there are two such cases (PREREG A2, F2):
+        // * a store that was healthy when planned and whose sync fails NOW: an I/O failure, the
+        //   environmental class of the heap flush that follows;
+        // * a restamp refused by a page's provenance dictionary at `MAX_PAGE_DICT_ENTRIES`. The
+        //   dictionary grows over the page's whole history (a re-stamped slot keeps its old run's
+        //   entry, slots are never reused, a freed page id keeps its dictionary), so a page a moved
+        //   row lands on can already be full even though it holds far fewer live rows than that.
+        if let Some(store) = &prov {
+            if !moved.is_empty() {
+                for (rid, who) in &moved {
+                    store.stamp_pending(*rid, *who)?;
+                }
+                store.flush()?;
+            }
+        }
         Ok(shapes[1..].iter().map(shape_of).collect())
     }
 
@@ -1035,11 +1103,11 @@ fn rewrites_rows(shapes: &[Schema]) -> bool {
 ///
 /// [`commit_rewrite`] is not infallible; it is free of every failure the *data* can cause. What is
 /// left is environmental — a buffer pool with no evictable frame, a disk write that fails, a
-/// B+tree page that cannot be read — and one data-dependent case that is unreachable rather than
-/// handled: the per-page provenance dictionary is capped at `MAX_PAGE_DICT_ENTRIES` (255) distinct
-/// runs, while the page it belongs to has room for on the order of 135 tuples, so re-stamping the
-/// rows that moved cannot fill it. `attribute` is read-only and is therefore done here, for the
-/// same reason. If any of those does fire, the outcome is the half-rewritten heap described above;
+/// B+tree page that cannot be read. Provenance adds no failure here: `attribute` is read-only, and
+/// the moved rows are re-stamped only after `finish` installs the new schema (`apply_plan`). There
+/// the per-page dictionary cap (`MAX_PAGE_DICT_ENTRIES`, 255 distinct runs) CAN refuse: an earlier
+/// version of this note argued it could not, from the ~135 tuples a page holds, but the dictionary
+/// grows over the page's history rather than its live rows (PREREG A2, F2). If any of those does fire, the outcome is the half-rewritten heap described above;
 /// the answer to that is to log the rewrite, which is a larger change than this one.
 ///
 /// # Two things about the order of operations are load-bearing
@@ -1241,10 +1309,12 @@ fn commit_rewrite(
     dir_root: u32,
     primary_root: u32,
     prepared: Vec<Prepared>,
-    prov: Option<&Arc<dyn ProvenanceStore>>,
-) -> Result<u32, FerroError> {
+) -> Result<(u32, Vec<(RecordId, ProvId)>), FerroError> {
     let heap = HeapFileManager::open(dir_root, bp.clone());
     let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
+    // The stamps the rows this rewrite moves must carry, returned rather than written here: the
+    // caller writes them after `finish` (D219; see `apply_plan`).
+    let mut moved: Vec<(RecordId, ProvId)> = Vec::new();
     for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
@@ -1273,8 +1343,8 @@ fn commit_rewrite(
             // Provenance is keyed by `RecordId` too (a page-local dictionary slot). Without this
             // the answer to "which agent wrote this row" silently becomes "nobody" for every row
             // the rewrite happened to move.
-            if let (Some(store), Some(who)) = (prov, attribution) {
-                store.stamp(new_rid, who)?;
+            if let Some(who) = attribution {
+                moved.push((new_rid, who));
             }
         }
     }
@@ -1295,5 +1365,327 @@ fn commit_rewrite(
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
     // inventing a rule for it.
-    Ok(primary.root_page_id.load(Ordering::Relaxed))
+    Ok((primary.root_page_id.load(Ordering::Relaxed), moved))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    use crate::branch::types::BranchId;
+    use crate::execution::executor::{run, Outcome};
+    use crate::execution::session::Session;
+    use crate::parser::parser::{Parser, Stmt};
+    use crate::parser::scanner::Scanner;
+    use crate::provenance::{DurableProvenanceStore, ProvId, ProvenanceFlush, RunEntity};
+    use crate::storage::disk_manager::DiskManager;
+    use crate::wal::log::WalManager;
+
+    fn parse(sql: &str) -> Stmt {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// A table of 41 rows that fill exactly one heap page, so ADD COLUMN relocates them (the
+    /// packing `tests/integration_alter_refusal_safety.rs` uses), and a durable provenance store.
+    struct Fixture {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<TxnManager>,
+        durable: Arc<DurableProvenanceStore>,
+        run: ProvId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn packed() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("alter.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join("alter.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let mut session = Session::new();
+        let pad = "y".repeat(60);
+        let mut sql = vec!["CREATE TABLE p (id INTEGER NOT NULL, v VARCHAR(120));".to_string()];
+        sql.extend((1..=41).map(|i| format!("INSERT INTO p VALUES ({i}, '{pad}');")));
+        for s in &sql {
+            run(parse(s), &mut catalog, bp.clone(), txn.clone(), &mut session).unwrap();
+        }
+        let dir_root = catalog.require_table("p").unwrap().first_directory_page_id;
+        let pages: std::collections::BTreeSet<u32> = HeapFileManager::open(dir_root, bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid.page_id))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the fixture must pack exactly one heap page, or ADD COLUMN need not relocate a row: {pages:?}"
+        );
+        let durable =
+            Arc::new(DurableProvenanceStore::open(dir.path().join("alter.provenance")).unwrap());
+        let run_id = durable
+            .intern(&RunEntity::new(ProvId::NONE, "a", "r", "m", "v", [0u8; 32], 1, BranchId::new(1, 0)))
+            .unwrap();
+        Fixture { catalog, bp, txn, durable, run: run_id, _dir: dir }
+    }
+
+    fn add_column(f: &mut Fixture, prov: &Arc<dyn ProvenanceStore>) -> Result<Vec<ColumnShape>, FerroError> {
+        let Stmt::AlterTable { table, action } = parse("ALTER TABLE p ADD COLUMN w VARCHAR(10);") else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        f.catalog.alter_table(&table, &action, &f.txn, Some(prov))
+    }
+
+    /// **D219: a rewrite that stamped nothing does not answer for records another statement left
+    /// pending.** A store poisoned by a failed append, with a stamp still queued — what a MERGE
+    /// whose final sync failed leaves behind — refuses every non-empty flush. A plain ALTER of an
+    /// UNATTRIBUTED table writes no stamp, so it must not flush, and must not fail: before D219 it
+    /// never touched the provenance store at all. Found by the fourth D219 review (F1).
+    #[test]
+    fn an_alter_that_stamps_nothing_is_not_refused_by_a_poisoned_provenance_store() {
+        let mut f = packed();
+        f.durable.stamp_pending(RecordId { page_id: 9999, slot_num: 0 }, f.run).unwrap();
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
+        assert!(
+            f.durable.flush().is_err(),
+            "the fixture did not leave a poisoned store with a stamp pending, so it proves nothing"
+        );
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+
+        add_column(&mut f, &prov)
+            .expect("an ALTER that stamped nothing was refused for records another statement left");
+        assert_eq!(f.catalog.require_table("p").unwrap().schema.columns.len(), 3);
+    }
+
+    /// **D219: a flush that fails after a rewrite leaves the table consistently ALTERED, not the
+    /// I19 state.** The rewrite's stamps are queued through a MERGE's stamper and flushed after
+    /// `finish`, so an append failure there returns the error with the new schema installed and
+    /// every row readable in it. Flushed before `finish`, the same failure would leave every tuple
+    /// converted under the old catalog.
+    #[test]
+    fn a_failed_flush_after_a_rewrite_leaves_the_table_consistently_altered() {
+        let mut f = packed();
+        let dir_root = f.catalog.require_table("p").unwrap().first_directory_page_id;
+        let rids: Vec<RecordId> = HeapFileManager::open(dir_root, f.bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rids.len(), 41);
+        for rid in &rids {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        let guard = ProvenanceFlush::new(f.durable.clone());
+        let stamper = Arc::clone(guard.stamper());
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        let epoch_before = f.catalog.epoch();
+
+        let err = add_column(&mut f, &stamper).expect_err(
+            "the ALTER succeeded: either the injected flush failure was swallowed, or the rewrite \
+             moved no attributed row and so never flushed (the fixture's premise)",
+        );
+        assert!(format!("{err}").contains("injected"), "it failed, but not at the flush: {err}");
+        assert_eq!(
+            f.catalog.require_table("p").unwrap().schema.columns.len(),
+            3,
+            "a failed flush left the rewritten rows under the OLD catalog: the I19 state"
+        );
+        let mut session = Session::new();
+        match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
+            .unwrap()
+        {
+            Outcome::Rows(rows) => {
+                assert_eq!(rows.len(), 41, "rows were lost");
+                assert!(rows.iter().all(|r| r.len() == 3), "a row did not read in the new shape");
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+        let after = rids_of(&f);
+        assert!(
+            after.iter().any(|r| !rids.contains(r)),
+            "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
+        assert!(
+            f.catalog.epoch() > epoch_before,
+            "a failed flush skipped the epoch bump, so cached reader snapshots keep decoding the \
+             altered table with its OLD shape"
+        );
+    }
+
+    fn rids_of(f: &Fixture) -> Vec<RecordId> {
+        let dir_root = f.catalog.require_table("p").unwrap().first_directory_page_id;
+        HeapFileManager::open(dir_root, f.bp.clone())
+            .scan()
+            .map(|r| r.map(|(rid, _)| rid))
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// **D219 (review 5 F1, PREREG A1): an ALTER whose rewrite would re-stamp attributed rows is
+    /// REFUSED on a store that is refusing writes, before the heap moves.** A store poisoned by an
+    /// earlier failed append refuses every stamp. The rewrite used to stamp each moved row inside
+    /// its loop, before `finish`, so such an ALTER failed with every tuple converted under the old
+    /// catalog (I19). Moving the stamps after `finish` (`7999830`) left it installed but returning
+    /// `Err`, so its DDL record was never logged. `plan_alters` now asks the store first, and the
+    /// ALTER changes nothing at all: `bench/d219/PREREG.md` A1 quotes the expectation this replaced.
+    #[test]
+    fn a_poisoned_store_refusing_the_rewrites_stamps_leaves_the_table_consistently_altered() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        for rid in &before {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+
+        let err = add_column(&mut f, &prov)
+            .expect_err("an ALTER of attributed rows was accepted by a store refusing writes");
+        // The probe and a post-install stamp refuse with the same text; the column count and the
+        // rids below are what tell them apart.
+        assert!(format!("{err}").contains("refusing further writes"), "it failed, but not by the poisoned store: {err}");
+        assert_eq!(
+            f.catalog.require_table("p").unwrap().schema.columns.len(),
+            2,
+            "the refused ALTER installed its schema anyway: a DDL change with no record in the log"
+        );
+        assert_eq!(rids_of(&f), before, "the refused ALTER moved rows: the heap was touched before it refused");
+        // No WAL assertion here (PREREG A2, F3): `plan_alters` and `apply_plan` never write the log;
+        // the DDL record is the callers', written only on `Ok`, so no refusal can make it appear.
+        let mut session = Session::new();
+        match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
+            .unwrap()
+        {
+            Outcome::Rows(rows) => {
+                assert_eq!(rows.len(), 41, "rows were lost");
+                assert!(rows.iter().all(|r| r.len() == 2), "a row does not read in the OLD shape");
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+    }
+
+    /// **D219: a plain ALTER makes its rewrite's stamps durable with ONE sync, and each moved row
+    /// is attributed at its NEW rid.** The rewrite used to sync once per moved row. Every row is
+    /// attributed here, so every row must still be attributed after the ALTER, wherever it moved.
+    #[test]
+    fn a_plain_alter_stamps_every_moved_row_at_its_new_rid_with_one_sync() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        for rid in &before {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        let syncs_before = f.durable.sync_counts();
+        add_column(&mut f, &prov).expect("a healthy ALTER was refused");
+        let syncs = f.durable.sync_counts().total() - syncs_before.total();
+        let after = rids_of(&f);
+        let moved = after.iter().filter(|r| !before.contains(r)).count();
+        assert!(
+            moved >= 2,
+            "premise: the rewrite moved {moved} attributed row(s); below two, one sync per ALTER and \
+             one per moved row are the same count (PREREG A2, F4)"
+        );
+        assert_eq!(syncs, 1, "a plain ALTER that moved {moved} rows synced provenance {syncs} times");
+        for rid in &after {
+            assert_eq!(
+                f.durable.attribute(*rid).unwrap(),
+                f.run,
+                "row at {rid:?} lost its author across the ALTER: a moved row was stamped at the \
+                 wrong rid, or not at all"
+            );
+        }
+    }
+
+    /// **A rewrite that moves exactly ONE attributed row still stamps it.** The boundary of the
+    /// "only if this rewrite moved an attributed row" condition: one is enough.
+    #[test]
+    fn a_rewrite_that_moves_one_attributed_row_still_stamps_it() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        let attributed = before[0];
+        f.durable.stamp(attributed, f.run).unwrap();
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        add_column(&mut f, &prov).expect("a healthy ALTER was refused");
+        let after = rids_of(&f);
+        assert!(!after.contains(&attributed), "premise: the attributed row did not move");
+        let authored: Vec<RecordId> =
+            after.iter().copied().filter(|r| f.durable.attribute(*r).unwrap() == f.run).collect();
+        assert_eq!(
+            authored.len(),
+            1,
+            "exactly the one attributed row must carry its author at its new rid: {authored:?}"
+        );
+    }
+
+    /// **D219 review 7 F1 (PREREG A2): a restamp refused AFTER a healthy probe leaves the table
+    /// consistently ALTERED and returns the refusal.** A store can start refusing between
+    /// `plan_alters` and `apply_plan`: both are `pub`, and another writer can poison it in between.
+    /// The probe then said yes, the rewrite installs, and the restamp is refused. The ALTER must
+    /// report that refusal (a swallowed one returns `Ok` with every moved row unattributed at its new
+    /// rid) and must leave the table in the NEW shape, not the I19 state.
+    ///
+    /// Since A1 this is the only test that reaches `apply_plan`'s restamp with a refusing store:
+    /// test 3's store is refused by the probe first.
+    #[test]
+    fn a_store_poisoned_between_plan_and_apply_leaves_the_table_consistently_altered() {
+        let mut f = packed();
+        let before = rids_of(&f);
+        for rid in &before {
+            f.durable.stamp(*rid, f.run).unwrap();
+        }
+        let prov: Arc<dyn ProvenanceStore> = f.durable.clone();
+        let Stmt::AlterTable { table, action } = parse("ALTER TABLE p ADD COLUMN w VARCHAR(10);") else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        let plan = f
+            .catalog
+            .plan_alters(&table, std::slice::from_ref(&action), &f.txn, Some(&prov))
+            .expect("a healthy store refused the plan");
+        f.durable.fail_next_append.store(true, Ordering::SeqCst);
+        assert!(f.durable.stamp_row(1, 1, f.run).is_err(), "the injected failure was swallowed");
+        let epoch_before = f.catalog.epoch();
+
+        let err = f.catalog.apply_plan(plan, &f.txn).expect_err(
+            "a restamp refused by a store poisoned after the plan was reported as success: every \
+             moved row is unattributed at its new rid",
+        );
+        assert!(format!("{err}").contains("refusing further writes"), "it failed, but not by the poisoned store: {err}");
+        assert_eq!(
+            f.catalog.require_table("p").unwrap().schema.columns.len(),
+            3,
+            "a refused restamp left the rewritten rows under the OLD catalog: the I19 state"
+        );
+        let mut session = Session::new();
+        match run(parse("SELECT * FROM p;"), &mut f.catalog, f.bp.clone(), f.txn.clone(), &mut session)
+            .unwrap()
+        {
+            Outcome::Rows(rows) => {
+                assert_eq!(rows.len(), 41, "rows were lost");
+                assert!(rows.iter().all(|r| r.len() == 3), "a row did not read in the new shape");
+            }
+            _ => panic!("SELECT did not return rows"),
+        }
+        assert!(
+            rids_of(&f).iter().any(|r| !before.contains(r)),
+            "premise: the rewrite moved no row, so it stamped nothing and this test proves nothing"
+        );
+        assert!(
+            f.catalog.epoch() > epoch_before,
+            "a refused restamp skipped the epoch bump, so cached reader snapshots keep decoding the \
+             altered table with its OLD shape"
+        );
+    }
 }

@@ -97,6 +97,27 @@ pub static POSITION_SCAN: AtomicU64 = AtomicU64::new(0);
 /// track the statement's own op count and NOT the session's.
 pub static EXTEND_TAIL_OPS: AtomicU64 = AtomicU64::new(0);
 
+/// Records [`STAGE_NS`] and [`STAGE_CALLS`] when dropped, so the span covers every exit of the
+/// function holding it, each `?` and each refusal included, with no timer to close by hand.
+///
+/// This is how `AgentRuntime::stage_all` is timed. It used to be a wrapper around a separate
+/// `stage_all_measured` body, which moved the funnel out of the function named `stage_all` that
+/// `tests/integration_capability_envelope.rs` reads as the one enforcement point.
+pub struct StageSpan(std::time::Instant);
+
+impl StageSpan {
+    pub fn start() -> Self {
+        StageSpan(std::time::Instant::now())
+    }
+}
+
+impl Drop for StageSpan {
+    fn drop(&mut self) {
+        bump(&STAGE_NS, self.0.elapsed().as_nanos() as u64);
+        bump(&STAGE_CALLS, 1);
+    }
+}
+
 /// Add `n` to a counter. Relaxed: these are diagnostics, never a happens-before edge.
 #[inline]
 pub fn bump(c: &AtomicU64, n: u64) {

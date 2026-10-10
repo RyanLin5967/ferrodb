@@ -50,7 +50,8 @@ use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId};
 use crate::branch::attest::{
-    AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry, InclusionProof, TreeHead,
+    AppendRefused, AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry,
+    InclusionProof, TreeHead,
 };
 use crate::branch::cherry::{
     cherry_pick as cherry_pick_ops, CherryLog, CherryResult, CherryTarget, CherryWrite, OpSelector,
@@ -75,12 +76,13 @@ use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, predicate_to_bounds, Plan};
 use crate::optimizer::optimizer::split_and;
 use crate::catalog::column::DataType;
-use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
+use crate::provenance::capture::{TxnCapture, WriteRecord};
+use crate::provenance::capture_set::CaptureSet;
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
-use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
+use crate::provenance::revert::{RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::sha256::prompt_digest;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceFlush, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::storage::index_page::entries_an_update_writes;
 use crate::tel::frame::TxnFrame;
@@ -231,6 +233,59 @@ pub fn diff_scan_counters() -> (u64, u64, u64) {
         DIFF_ROWS.load(AtomicOrdering::Relaxed),
         DIFF_FRAME_VISITED.load(AtomicOrdering::Relaxed),
     )
+}
+
+/// **Wall #18 instrument — how many `applied` entries `REVERT` TOUCHED to find one transaction's
+/// ops, and how many it KEPT.** The `OURS_SCAN_*` pair's shape, aimed at `undo_txn`.
+///
+/// `undo_txn` asks a KEYED question — `a.txn == txn` — of `State::applied`, a Vec that is never
+/// pruned and gains one entry per cell that any `MERGE` ever published. `EXAMINED` counts what the
+/// lookup walked; `MATCHED` counts what it returned, which the undo loop must then apply and which
+/// no index can remove. `EXAMINED` growing with merge history while `MATCHED` stays put is the
+/// rescan; both growing together would be a bigger revert, not a defect.
+///
+/// ⚠ Counted per reverted TRANSACTION, not per op: one relaxed add of a local count per call, so
+/// the instrument cannot create the slope it measures.
+pub static REVERT_APPLIED_EXAMINED: AtomicU64 = AtomicU64::new(0);
+pub static REVERT_APPLIED_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `(examined, matched)` since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_applied_counters() -> (u64, u64) {
+    (
+        REVERT_APPLIED_EXAMINED.load(AtomicOrdering::Relaxed),
+        REVERT_APPLIED_MATCHED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// **Wall #18 instrument — how many retained captures one `REVERT`'s planner consulted.**
+///
+/// `captures` keeps every PUBLISHED transaction for the life of the process
+/// (`forget_captures_unless_published` is the only remover, and it drops only the unpublished).
+/// The full-graph planner folded ALL of them into one graph on every call, so this counted
+/// merged-branch history. Since wall #18's walk (`CaptureSet::plan_revert`) it counts the captures
+/// the walk VISITED: the target and each dependent reached, which is the size of the answer. The
+/// debug-build oracle that re-runs the full graph beside it is not counted.
+pub static REVERT_GRAPH_CAPTURES: AtomicU64 = AtomicU64::new(0);
+
+/// Captures consulted since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_captures() -> u64 {
+    REVERT_GRAPH_CAPTURES.load(AtomicOrdering::Relaxed)
+}
+
+/// **Wall #18 instrument — how many retained reads a demand-driven `REVERT` planner examined as
+/// candidates**, one per (write, candidate read) pair it looked at. That is the walk's analogue of
+/// `GRAPH_BUILD_PAIRS`.
+///
+/// It exists so that a planner which walks out from the target cannot hide a linear scan: counting
+/// only the captures it visits would read 1 for a walk that then compares the target's writes
+/// against every read in the table. Counted by `revert_merge` from `CaptureSet::plan_revert`'s
+/// `WalkCost`. (The full-graph planner that came before examined no candidates; it compared pairs,
+/// counted by `GRAPH_BUILD_PAIRS`.)
+pub static REVERT_GRAPH_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+/// Candidates examined since process start. Read twice and subtract to scope it to a phase.
+pub fn revert_graph_candidates() -> u64 {
+    REVERT_GRAPH_CANDIDATES.load(AtomicOrdering::Relaxed)
 }
 
 /// **The `ours` side of one cell's three-way comparison:** this branch's own recorded ops on that
@@ -627,6 +682,52 @@ struct Staged {
     guard: Option<Guard>,
 }
 
+/// One table's share of a batch that [`AgentRuntime::stage_all`] applies as one unit.
+///
+/// D258: `merge_into` composes rows for several tables at once and used to stage them one
+/// `stage_all` per table, so a refusal on the second table left the first staged on the target.
+/// A batch of these is decided and applied whole.
+struct StagedTable {
+    tbl: TableId,
+    table: String,
+    pk_type: DataType,
+    items: Vec<Staged>,
+}
+
+impl StagedTable {
+    /// A one-table batch: the shape every caller of `stage_all` but `merge_into` stages.
+    fn batch(tbl: TableId, table: &str, pk_type: &DataType, items: Vec<Staged>) -> Vec<StagedTable> {
+        vec![StagedTable { tbl, table: table.to_string(), pk_type: pk_type.clone(), items }]
+    }
+}
+
+/// What it takes to put one row of a branch's page tree back as it was before a staging batch
+/// wrote it. `prior: None` means the key was absent, so putting it back is a delete.
+struct MirrorUndo {
+    table: String,
+    row: u64,
+    prior: Option<Vec<Value>>,
+}
+
+/// Does the page tree already hold exactly `prior` for a row — the same bytes, not merely an equal
+/// value?
+///
+/// **Bytes, because `Value`'s `==` is numeric** (`Decimal("1.50") == Decimal("1.5")`,
+/// `Integer(1) == Float(1.0)`). A write that landed a respelled value would compare equal to its
+/// prior under `==`, skip its restore, and leave the tree holding a value the workspace does not.
+/// The tree stores [`encode_row`]'s bytes, so comparing those is comparing what is on the page.
+/// An encoding that fails is not a match: the restore then runs, which is the safe direction.
+fn same_image(now: &Option<Vec<Value>>, prior: &Option<Vec<Value>>) -> bool {
+    match (now, prior) {
+        (None, None) => true,
+        (Some(a), Some(b)) => match (encode_row(a), encode_row(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// One published op, as an agent choosing a cherry-pick sees it.
 ///
 /// `seq` is what [`AgentRuntime::cherry_pick`] takes, and it names ONE write: a txn may write a
@@ -733,10 +834,11 @@ impl CherryLog for RuntimeCherryLog {
 /// A live agent branch as the thing a pick lands on.
 ///
 /// **`commit_all` is one [`AgentRuntime::stage_all`] call**, which is the all-or-nothing door
-/// `cherry.rs` says the runtime owes: it decides every refusal — the capability envelope, then the
-/// escrow check over the whole batch — before it applies anything. That is why
-/// [`AgentRuntime::cherry_pick`] refuses a selection spanning more than one table: the guarantee
-/// is per-table, so across tables there would be nothing to hold it.
+/// `cherry.rs` says the runtime owes: it decides every refusal — the capability envelope, the
+/// escrow check over the whole batch, and since D258 the effect log's and the page tree's — before
+/// it applies anything. `commit_all` stages ONE table, which is why [`AgentRuntime::cherry_pick`]
+/// refuses a selection spanning more than one. `stage_all` could now hold the guarantee across
+/// tables; moving `commit_all` onto it is a behaviour change left to its own row.
 struct BranchCherryTarget<'a> {
     runtime: &'a AgentRuntime,
     branch: BranchId,
@@ -840,7 +942,7 @@ impl CherryTarget for BranchCherryTarget<'_> {
             FerroError::Internal(format!("no schema resolved for table id {}", tbl.0))
         })?;
         let items: Vec<Staged> = staged.into_values().collect();
-        self.runtime.stage_all(self.branch, tbl, &name, &pk_type, items)?;
+        self.runtime.stage_all(self.branch, StagedTable::batch(tbl, &name, &pk_type, items))?;
         self.committed = true;
         Ok(())
     }
@@ -1190,14 +1292,16 @@ struct State {
     /// comparison a shared box cannot fake. Merge k cost O(k x delta); merging N branches was
     /// O(N^2).
     ///
-    /// ⚠ The Vec STAYS. This is an index beside the log, not a replacement for it, so the two must
-    /// be pushed together, and `push_applied` is the only place that does either. Its readers that
-    /// this key does not serve, enumerated by symbol:
-    /// * `undo_txn`'s `txn` filter (REVERT): one full pass per reverted txn.
+    /// ⚠ The Vec STAYS. This is an index beside the log, not a replacement for it, so they must
+    /// all be pushed together, and `push_applied` is the only place that does any of it. Its
+    /// readers that this key does not serve, enumerated by symbol:
     /// * `highest_applied_seq`: one full pass per merge, kept on purpose as an ordering guard
     ///   (D182; do not replace it with `last()`).
     /// * `RuntimeCherryLog::project`'s `at_seq` map: one full pass per cherry-pick.
     /// * `pickable_ops`: returns the whole log, so it is output-sized.
+    ///
+    /// `undo_txn`'s `txn` filter (REVERT), one full pass per reverted txn, was the first entry on
+    /// this list; since wall #18 it reads its own index, [`State::applied_by_txn`] below.
     ///
     /// ⚠ That list used to say "two" and name only the first two. `AgentRuntime::diff` was a third,
     /// scanning the whole log once per changed row, and nothing listed it (D191, branch-count wall
@@ -1262,6 +1366,20 @@ struct State {
     /// Precision locking (Jordan et al., SIGMOD 1981) is the predicate generalisation. It is not
     /// needed here, because `diff` asks about a row KEY, not a predicate.
     applied_row_high: std::collections::HashMap<(u32, u64), u64>,
+    /// **Wall #18.** `txn` -> positions in `applied`, so `REVERT` stops rescanning the whole log
+    /// for every transaction it undoes.
+    ///
+    /// `undo_txn` asked a KEYED question — `a.txn == txn` — of a Vec that is never pruned, once per
+    /// reverted transaction, under the lock every statement takes: O(every op any merge ever
+    /// published) to find the handful one merge did. It is D86's defect on one of the two readers
+    /// D86's index said it did not serve, and it gets D86's answer: an index beside the log,
+    /// pushed by the same door. This is the materialised form of ARIES's per-transaction
+    /// `PrevLSN` chain — a rollback walks its own transaction's records, never the log.
+    ///
+    /// Each list is increasing, because `push_applied` appends, so a transaction's positions come
+    /// back in log order — the order the scan it replaces produced — and `undo_txn`'s stable sort
+    /// sees the same input it always did.
+    applied_by_txn: std::collections::HashMap<u64, Vec<u32>>,
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id SLOT.
     ///
@@ -1330,7 +1448,24 @@ struct State {
     /// Keyed by txn, and never dropped by `seal`: the dependency graph has to outlive the workspace
     /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
     /// become visible to everyone else, which is the moment they can start being read.
-    captures: BTreeMap<u64, TxnCapture>,
+    ///
+    /// **Wall #18: a `CaptureSet`, not a bare map, so REVERT can walk instead of join.** The set
+    /// indexes every READ as it is retained, and `revert_merge` walks out from the reverted merge
+    /// through that index instead of folding every capture into one graph per call — Θ(N²)
+    /// comparisons under this lock after N merged tasks. It owns the captures privately, so the two
+    /// retention sites below go through `CaptureSet::entry` and cannot retain without indexing.
+    /// The sites and the invariant each keeps:
+    ///
+    /// * fork (`insert`): a new, empty capture, keyed by its own txn — `insert` refuses otherwise;
+    /// * `record_read` (`entry` → `on_read` / `on_write_targeting_read`): what the capture now
+    ///   holds exactly, and every predicate read it appended, is indexed;
+    /// * `record_applied` (`entry` → `on_write`): nothing to index — the walk reads a txn's writes
+    ///   from its own capture;
+    /// * `forget_captures_unless_published` (`remove`), the only remover: every index entry of the
+    ///   capture goes with it;
+    /// * `revert_merge`: reads only — the walk, and in debug builds the full-graph oracle and an
+    ///   index audit beside it.
+    captures: CaptureSet,
     /// Txns whose staged writes reached the shared tables -- by their own `MERGE`, or by a
     /// DESCENDANT's merge publishing writes the descendant inherited at fork time.
     ///
@@ -1362,14 +1497,16 @@ struct State {
 }
 
 impl State {
-    /// **D86.** The one place that appends to `applied`, so the log and its index cannot drift.
+    /// **D86.** The one place that appends to `applied`, so the log and its indexes cannot drift.
     ///
     /// A second source of truth rots when someone adds a write and does not know about the index.
     /// Making the append the only operation removes the ordering to get wrong — the same reason
-    /// `CatalogState::install` exists for the live-branch counter.
+    /// `CatalogState::install` exists for the live-branch counter. Wall #18's `applied_by_txn` is
+    /// pushed here for the same reason, and for EVERY op: a whole-row create or delete has no
+    /// cell, but it is still one of its transaction's ops and `REVERT` still has to undo it.
     fn push_applied(&mut self, op: AppliedOp) {
+        let at = self.applied.len() as u32;
         if let Some(col) = op.col {
-            let at = self.applied.len() as u32;
             self.applied_by_cell
                 .entry((op.tbl.0, op.row.0, col.0))
                 .or_default()
@@ -1379,7 +1516,14 @@ impl State {
         // `State::applied_row_high` for why each of those is load-bearing.
         let high = self.applied_row_high.entry((op.tbl.0, op.row.0)).or_insert(op.seq);
         *high = (*high).max(op.seq);
+        self.applied_by_txn.entry(op.txn.0).or_default().push(at);
         self.applied.push(op);
+    }
+
+    /// Positions in `applied` of one transaction's published ops, in log order. Empty for a
+    /// transaction that published nothing — a cascade can name a live task that never merged.
+    fn applied_of_txn(&self, txn: TxnId) -> &[u32] {
+        self.applied_by_txn.get(&txn.0).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Positions in `applied` for one cell, newest last. Empty when the cell has never been
@@ -2025,7 +2169,18 @@ pub struct AgentRuntime {
     /// does NOT prove"). Across a restart this answers nothing; within one process an operator who
     /// records [`AgentRuntime::attestation_head`] can later prove the log was only appended to.
     /// Persisting it is a separate decision about where roots are published, not a wiring detail.
+    ///
+    /// **Scope (wall #19): the branches this log saw forked, plus trunk.** The log refuses to write
+    /// an entry for any other branch rather than root it at genesis: a fork from such a parent
+    /// fails its `BEGIN AGENT SESSION`, and a merge into, or reap of, such a branch commits with
+    /// no entry and is counted by [`AgentRuntime::attestation_refusals`]. A lease-expiry reap is
+    /// attested from the forget paths once it has landed (D199,
+    /// [`AgentRuntime::attest_landed_reaps`]).
     attested: Mutex<AttestedHistory>,
+    /// **D258.** Rows whose page-tree restore failed after a staging step failed: each is a row
+    /// whose page mirror may now disagree with its branch's workspace. See
+    /// [`AgentRuntime::page_mirror_divergences`].
+    page_mirror_divergences: AtomicU64,
 }
 
 impl Default for AgentRuntime {
@@ -2064,6 +2219,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         }
     }
 
@@ -2123,6 +2279,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         })
     }
 
@@ -2163,6 +2320,7 @@ impl AgentRuntime {
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
             attested: Mutex::new(AttestedHistory::new()),
+            page_mirror_divergences: AtomicU64::new(0),
         })
     }
 
@@ -2472,6 +2630,12 @@ impl AgentRuntime {
         // hash, which is not `prompt_digest("")` and must never become it: "no prompt was declared"
         // and "the prompt was empty" are different facts about a run.
         let prompt_hash = prompt.map(prompt_digest).unwrap_or([0u8; 32]);
+        //
+        // **Wall #19: a refusal ends the session here, with a plain `?`.** The log refuses a fork
+        // from a non-trunk parent with no live attested head (never forked in this log, or
+        // reaped), because the child's first link would have to be invented. Nothing an agent can
+        // see exists yet: the fork is only staged, and `durability` discharges it on this `?`
+        // exactly as it does for the `intern` refusal below.
         self.attest_fork(
             branch,
             parent,
@@ -2480,7 +2644,7 @@ impl AgentRuntime {
             &run,
             (model_name, model_version),
             &prompt_hash,
-        );
+        )?;
 
         let mut state = self.state.lock().unwrap();
         state.next_txn += 1;
@@ -2493,7 +2657,8 @@ impl AgentRuntime {
         // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
         // A plain `?` again, deliberately. `intern` refusing a re-intern whose actor tuple
-        // disagrees is the one reachable failure after the fork has been staged, and it used to
+        // disagrees is one of the two reachable failures after the fork has been staged (the
+        // other is the attestation refusal above, since wall #19), and it used to
         // need a hand-written recovery arm here. It does not any more: `durability` was built on
         // the line after `fork_staged`, so this `?` drops it and `Drop` discharges the sync. That
         // is the difference between an invariant maintained at every call site and one maintained
@@ -3433,10 +3598,7 @@ impl AgentRuntime {
         // no error anywhere. There is one workspace-creation site and it opens a capture, so this
         // arm should be unreachable; it is written this way so that a second site cannot make
         // retention optional by forgetting.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, prov, reader));
+        let mut capture = state.captures.entry(txn, prov, reader);
         match purpose {
             ReadPurpose::Inspection => capture.on_read(shape, versions, Some(summary), observed_at),
             ReadPurpose::RowTargeting => capture.on_write_targeting_read(summary, observed_at),
@@ -3769,7 +3931,10 @@ impl AgentRuntime {
             seen_through,
         )?;
         let touched = staged.len();
-        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
+        self.stage_all(
+            branch,
+            StagedTable::batch(tbl, table, &schema.columns[0].data_type, staged),
+        )?;
         Ok(touched)
     }
 
@@ -3941,7 +4106,10 @@ impl AgentRuntime {
             seen_through,
         )?;
         let n = staged.len();
-        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
+        self.stage_all(
+            branch,
+            StagedTable::batch(tbl, table, &schema.columns[0].data_type, staged),
+        )?;
         Ok(n)
     }
 
@@ -3962,7 +4130,10 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        self.stage_all(branch, tbl, table, pk_type, vec![Staged { row, before, after, ops, guard }])
+        self.stage_all(
+            branch,
+            StagedTable::batch(tbl, table, pk_type, vec![Staged { row, before, after, ops, guard }]),
+        )
     }
 
     // ---- the capability envelope ------------------------------------------------------------
@@ -4036,35 +4207,74 @@ impl AgentRuntime {
     /// then is anything charged or recorded. Summing per cell matters: one statement can lower the same
     /// cell twice, and checking each half against the full remaining balance would admit a batch that
     /// overdraws in aggregate.
-    /// **D115 instrument.** The body is [`Self::stage_all_measured`]; this wrapper exists only so
-    /// that `STAGE_NS` covers every early return, including the refusals, without a timer having
-    /// to be closed on each `?`. A missed refusal would understate the phase that refused, which
-    /// is the one direction of error that reads as a clean result.
-    fn stage_all(
-        &self,
-        branch: BranchId,
-        tbl: TableId,
-        table: &str,
-        pk_type: &DataType,
-        items: Vec<Staged>,
-    ) -> Result<(), FerroError> {
-        let t = Instant::now();
-        let out = self.stage_all_measured(branch, tbl, table, pk_type, items);
-        stage_probe::bump(&stage_probe::STAGE_NS, t.elapsed().as_nanos() as u64);
-        stage_probe::bump(&stage_probe::STAGE_CALLS, 1);
-        out
-    }
-
-    fn stage_all_measured(
-        &self,
-        branch: BranchId,
-        tbl: TableId,
-        table: &str,
-        pk_type: &DataType,
-        items: Vec<Staged>,
-    ) -> Result<(), FerroError> {
+    ///
+    /// A batch may span several tables — every row of every table, or none. Every caller but
+    /// `merge_into` passes one ([`StagedTable::batch`]).
+    ///
+    /// # D258 — every refusal is decided before the first mutation
+    ///
+    /// ⚠ "Decide, then apply" above was true of the envelope and the escrow and false of the rest.
+    /// This used to decide those two, then charge, spend, rewrite the workspace's
+    /// rows and frame, and only THEN append the frame to the effect log and mirror the rows onto the
+    /// branch's page tree — two steps that refuse on their own: the durable log a string past its
+    /// u16 length prefix, a guard nested past 256 or a record too large to replicate, and the tree an
+    /// entry over 1015 bytes (a row value of 992 or more). All of that sat under a comment reading
+    /// "past this point nothing may fail", and no caller undid anything. So the client got an error
+    /// while `MERGE`, which reads the workspace, published the row; a retry applied it twice; the
+    /// refused statement kept its budget; and on the durable log the refused op stayed in `ws.frame`,
+    /// where every later statement re-encoded it and was refused too — the branch was wedged.
+    ///
+    /// The order is now:
+    ///
+    /// 1. **Decide, mutating nothing.** The envelope over every table; the escrow's batch check;
+    ///    the candidate frame (`ws.frame` plus this batch) against [`EffectLog::check_append`];
+    ///    every row against [`PagedRows::check_put`], the tree's own size rule.
+    /// 2. **Charge the row-write budget.** The first mutation. A budget refusal leaves everything
+    ///    untouched; an I/O failure in the charge's own durability step can leave the charge spent
+    ///    (`TableBranchCatalog` makes it visible before its fsync), with nothing else mutated.
+    /// 3. **Spend the escrow** — check and charge in one call, [`EscrowLedger::spend_all`], under one
+    ///    lock hold. Every later failure refunds it.
+    /// 4. **Write the page tree**, each row's prior image recorded before its write; a failure on
+    ///    row k puts rows k..0 back — row k included when its prior read succeeded, because its
+    ///    write may have landed before it reported failure — skipping any row the tree already
+    ///    holds unchanged ([`AgentRuntime::mirror_rows`]). Besides I/O and a starved allocator,
+    ///    `cow_page` also refuses a branch reaped mid-statement or an arena claimed under an older
+    ///    authority; all of them take the same undo.
+    /// 5. **Append the frame.** After step 1 this fails only on I/O; the tree is put back.
+    /// 6. **Install** the rows and the frame into the workspace — nothing in it can fail.
+    ///
+    /// **The tree goes before the log because only the tree can be undone.** The log is append-only:
+    /// log first and tree second would leave, on a tree failure, a logged frame the workspace does
+    /// not have, and the next statement's frame would then fail `extends` for ever. And the tree is
+    /// undone by writing the prior image back rather than by discarding a scratch root, because
+    /// `cow_page` mutates a page the branch already owns IN PLACE: once a `put` succeeds, the old
+    /// root no longer describes the old tree.
+    ///
+    /// **What is left, stated.** An I/O failure in step 2's durability step, or any failure in step
+    /// 4 or 5, leaves the row-write budget spent — the same fail-closed direction the charge below
+    /// has always taken. A double fault, where putting the tree back fails too, still reports the
+    /// error that failed the statement, in its own class, and counts the row in
+    /// [`AgentRuntime::page_mirror_divergences`]; the workspace, the frame and the log's index are
+    /// untouched then, and only the page mirror may disagree with them until that row is next
+    /// written. "Nothing staged" is about ROWS, not pages: a failed
+    /// statement can leave the branch holding private copies of pages it shared with its parent,
+    /// and pages the failed tree operation allocated stay in the branch's arena until `free_arena`
+    /// or the reaper takes them back (`cow::btree`'s `WriteJournal` says why they are not freed on
+    /// the error path). And a log write whose `pwrite` landed but whose `sync_data` failed leaves a
+    /// complete record in the file that the index never took; `DurableEffectLog::append` writes the
+    /// next record over it, but a reopen before that replays it — a property of the store that
+    /// predates D258.
+    ///
+    /// **D115 instrument.** `STAGE_NS` covers every exit, including the refusals, through
+    /// [`stage_probe::StageSpan`], which records when it drops, so no timer has to be closed on
+    /// each `?`. A missed refusal would understate the phase that refused, which is the one
+    /// direction of error that reads as a clean result. (D115 first did this with a wrapper around
+    /// a separate body function; the guard keeps the body in `stage_all`, which the capability
+    /// envelope's funnel test reads.)
+    fn stage_all(&self, branch: BranchId, mut batch: Vec<StagedTable>) -> Result<(), FerroError> {
+        let _stage = stage_probe::StageSpan::start();
         let t_decide = Instant::now();
-        // ---- decide -------------------------------------------------------------------------
+        // ---- 1. decide ------------------------------------------------------------------------
         //
         // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying off
         // `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so it walked
@@ -4091,10 +4301,16 @@ impl AgentRuntime {
         // the op is walked around by any other shape with the same effect. An INSERT is the live
         // example — its `Op` carries `col: None`, so a column check reading the ops would see it
         // write no column while it writes every one of them.
-        let charge = match self.branches.envelope_of(branch)? {
-            None => 0,
-            Some(envelope) => {
-                let images: Vec<RowImage> = items
+        //
+        // Summed over the tables of the batch. `admit` bounds each table's share by what remains;
+        // the sum is bounded by `charge_row_writes` in step 2, which re-checks under the catalog's
+        // own lock and is the first mutation, so a batch that fits table by table and not in total
+        // is still refused with nothing applied.
+        let mut charge: u64 = 0;
+        if let Some(envelope) = self.branches.envelope_of(branch)? {
+            for t in &batch {
+                let images: Vec<RowImage> = t
+                    .items
                     .iter()
                     .map(|i| RowImage {
                         row: i.row.0,
@@ -4108,36 +4324,105 @@ impl AgentRuntime {
                 // The whole statement, before a single row is recorded — the same batch rule the
                 // escrow check follows just below, and for the same reason. Nothing is charged
                 // here: `admit` only answers how much this statement would cost.
-                envelope.admit(tbl.0, table, &images)?
+                charge += envelope.admit(t.tbl.0, &t.table, &images)?;
             }
-        };
+        }
 
         let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
         {
             let state = self.state.lock().unwrap();
-            for item in &items {
-                if let (Some(before_row), RowState::Present(after_row)) = (&item.before, &item.after) {
-                    for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
-                        let cell = (tbl, item.row, ColId(idx as u32));
-                        if !state.escrow.is_bounded(&cell) {
-                            continue;
-                        }
-                        if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
-                            // Only a decrease consumes headroom; raising the value gives it back and
-                            // is always safe, so it is not charged.
-                            let drop = b - a;
-                            if drop > 0 {
-                                spends.push((cell, drop));
+            for t in &batch {
+                for item in &t.items {
+                    if let (Some(before_row), RowState::Present(after_row)) =
+                        (&item.before, &item.after)
+                    {
+                        for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
+                            let cell = (t.tbl, item.row, ColId(idx as u32));
+                            if !state.escrow.is_bounded(&cell) {
+                                continue;
+                            }
+                            if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
+                                // Only a decrease consumes headroom; raising the value gives it
+                                // back and is always safe, so it is not charged.
+                                let drop = b - a;
+                                if drop > 0 {
+                                    spends.push((cell, drop));
+                                }
                             }
                         }
                     }
                 }
             }
-            // The whole statement, before a single unit is charged. This is the line that makes the
-            // refusal atomic.
+            // The whole batch, before a single unit is charged. Step 3 charges it with the same
+            // check repeated under the same lock hold as the charge.
             state.escrow.check_all(branch, &spends)?;
         }
 
+        // **The frame this batch would leave, checked against the log before anything moves.**
+        //
+        // A clone of the workspace's frame, grown by this batch's ops and guards. It is what step 5
+        // appends and step 6 installs, so the log is asked about exactly the frame it will be
+        // handed. Re-appending the task's frame replaces it rather than adding a second copy: `Add`
+        // is not idempotent and two copies of one frame would double-count. Appended ONCE for the
+        // whole batch.
+        let (mut candidate, base_len, clone_ns) = {
+            let state = self.state.lock().unwrap();
+            let ws = state.workspaces.get(&branch).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {}", branch))
+            })?;
+            let base_len = (ws.frame.ops.len(), ws.frame.guards.len(), ws.frame.claims.len());
+            // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Times THIS clone alone and pairs it
+            // with the integer `ops.len()` at the same moment, so the timer never travels without
+            // its counter.
+            //
+            // D115 reads the SAME span: one clone, one timer, reported to both instruments, so
+            // neither the clone nor its timing is paid twice. Since D258 the clone is taken here, in
+            // the decide step and BEFORE this batch's ops are pushed onto it, so `ops.len()` and
+            // `CLONE_OPS` count the frame as it stood before the statement — what is cloned.
+            let n = ws.frame.ops.len() as u64;
+            let t0 = Instant::now();
+            let f = ws.frame.clone();
+            let clone_ns = t0.elapsed().as_nanos() as u64;
+            D172_CLONE_NS.fetch_add(clone_ns, std::sync::atomic::Ordering::Relaxed);
+            D172_CLONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            D172_OPS_LEN_SUM.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            D172_OPS_LEN_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+            stage_probe::bump(&stage_probe::CLONE_OPS, f.ops.len() as u64);
+            stage_probe::bump(&stage_probe::CLONE_GUARDS, f.guards.len() as u64);
+            (f, base_len, clone_ns)
+        };
+        for t in &mut batch {
+            for item in &mut t.items {
+                for op in std::mem::take(&mut item.ops) {
+                    candidate.push_op(op);
+                }
+                if let Some(g) = item.guard.take() {
+                    candidate.push_guard(g);
+                }
+            }
+        }
+        self.log.check_append(&candidate)?;
+
+        // **Every row against the page tree's own size rule**, when there is a tree. The tree
+        // refused an over-long row only at the write, after the statement had been staged.
+        if self.storage.is_some() {
+            for t in &batch {
+                debug_assert_eq!(
+                    table_id(&t.table),
+                    t.tbl,
+                    "the caller's TableId disagrees with the table name it passed, so the tree and \
+                     the workspace map would key the same row differently"
+                );
+                for item in &t.items {
+                    if let RowState::Present(vals) = &item.after {
+                        PagedRows::check_put(table_id(&t.table).0, item.row.0, vals)?;
+                    }
+                }
+            }
+        }
+
+        // ---- 2. charge ------------------------------------------------------------------------
+        //
         // **Every refusal has now been decided, so the budget can be charged.**
         //
         // The order is load-bearing and was wrong once: charging before `check_all` meant an
@@ -4147,136 +4432,235 @@ impl AgentRuntime {
         //
         // `charge_row_writes` is atomic against every other mutation of the record and re-checks
         // the budget under the catalog's own lock, so it is the charge — not `admit` above — that
-        // decides. The window it leaves is an I/O failure further down (appending the frame,
-        // mirroring to pages) with the budget already spent. That direction is deliberate:
+        // decides. The window it leaves is an I/O failure further down (mirroring to pages,
+        // appending the frame), or in this charge's own durability step (`TableBranchCatalog`
+        // makes the charge visible before its fsync), with the budget already spent. That
+        // direction is deliberate:
         // charging afterwards would mean a failed record write leaves a row written and
         // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
         // admits one.
         if charge > 0 {
             self.branches.charge_row_writes(branch, charge)?;
         }
-        stage_probe::bump(&stage_probe::DECIDE_NS, t_decide.elapsed().as_nanos() as u64);
-
-        // ---- apply --------------------------------------------------------------------------
-        //
-        // Past this point nothing may fail on a per-row basis: `check_all` has already established that
-        // every spend fits, so `spend` cannot refuse.
-        let t_apply = Instant::now();
-        for (cell, amount) in spends {
-            self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
-        }
-
-        let mut mirrored: Vec<(RowId, RowState)> = Vec::with_capacity(items.len());
-        #[allow(unused_assignments)]
-        let mut clone_ns = 0u64;
-        let frame = {
-            let mut state = self.state.lock().unwrap();
-            let ws = state.workspaces.get_mut(&branch).ok_or_else(|| {
-                FerroError::Branch(format!("no agent session on branch {}", branch))
-            })?;
-            ws.tables.insert(tbl.0, table.to_string());
-            for item in items {
-                let key = Workspace::key(tbl, item.row);
-                ws.base_rows.insert_if_absent(key, item.before);
-                if let RowState::Present(v) = &item.after {
-                    let probeable = row_id_of(v) == item.row
-                        && v.first().is_some_and(|c0| literal_matches(c0, pk_type));
-                    if !probeable {
-                        ws.unprobeable_rows += 1;
-                    }
-                }
-                ws.rows.insert(key, item.after.clone());
-                for op in item.ops {
-                    ws.frame.push_op(op);
-                }
-                if let Some(g) = item.guard {
-                    ws.frame.push_guard(g);
-                }
-                mirrored.push((item.row, item.after));
-            }
-            // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. Times THIS clone alone and pairs it
-            // with the integer `ops.len()` at the same moment, so the timer never travels without
-            // its counter.
-            //
-            // D115 reads the SAME span: one clone, one timer, reported to both instruments, so
-            // neither the clone nor its timing is paid twice.
-            {
-                let n = ws.frame.ops.len() as u64;
-                let t0 = Instant::now();
-                let f = ws.frame.clone();
-                clone_ns = t0.elapsed().as_nanos() as u64;
-                D172_CLONE_NS.fetch_add(clone_ns, std::sync::atomic::Ordering::Relaxed);
-                D172_CLONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                D172_OPS_LEN_SUM.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                D172_OPS_LEN_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
-                stage_probe::bump(&stage_probe::CLONE_OPS, f.ops.len() as u64);
-                stage_probe::bump(&stage_probe::CLONE_GUARDS, f.guards.len() as u64);
-                f
-            }
-        };
-        // The clone is charged to its own counter and SUBTRACTED from the apply phase, so the two
-        // do not both contain it. `saturating_sub` because the two clocks are read at different
-        // depths and a coarse tick can order them the wrong way at the smallest point.
+        // The clone is charged to its own counter and SUBTRACTED from the phase that contains it,
+        // so the two do not both contain it. Since D258 that phase is decide (it was apply).
+        // `saturating_sub` because the two clocks are read at different depths and a coarse tick
+        // can order them the wrong way at the smallest point.
         stage_probe::bump(&stage_probe::CLONE_NS, clone_ns);
         stage_probe::bump(
-            &stage_probe::APPLY_NS,
-            (t_apply.elapsed().as_nanos() as u64).saturating_sub(clone_ns),
+            &stage_probe::DECIDE_NS,
+            (t_decide.elapsed().as_nanos() as u64).saturating_sub(clone_ns),
         );
-        // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
-        // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
-        // statement, which is also why the frame is cloned after every row is folded in.
+
+        // ---- 3. escrow ------------------------------------------------------------------------
+        //
+        // D115's `APPLY_NS` is this step plus step 6, the two that apply the batch to `State`.
+        let t_spend = Instant::now();
+        self.state.lock().unwrap().escrow.spend_all(branch, &spends)?;
+        let spend_ns = t_spend.elapsed().as_nanos() as u64;
+
+        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING, and D115's `DROP_NS`: the third Theta(S)
+        // site. Freeing a frame runs `Op`'s destructor once per element, the same O(ops) walk that
+        // cloning it was, so it is dropped explicitly and timed on every path below rather than
+        // left to land outside every span as an unattributed remainder.
+        let timed_drop = |frame: TxnFrame| {
+            let t_drop = Instant::now();
+            drop(frame);
+            let drop_ns = t_drop.elapsed().as_nanos() as u64;
+            D172_DROP_NS.fetch_add(drop_ns, std::sync::atomic::Ordering::Relaxed);
+            stage_probe::bump(&stage_probe::DROP_NS, drop_ns);
+        };
+
+        // ---- 4. the page tree -----------------------------------------------------------------
+        //
+        // The workspace map is still what `DIFF` and `MERGE` read; this is the step that makes the
+        // branch's state exist as pages, so the isolation between branches is a property of the
+        // page graph rather than of a map that happens not to be shared.
+        //
+        // Done outside the state lock deliberately: `put_row` takes the catalog lock to publish
+        // the branch's new root, and taking the two in the opposite order elsewhere would deadlock.
+        let t_mirror = Instant::now();
+        let mirrored = match self.mirror_rows(branch, &batch) {
+            Ok(undo) => undo,
+            Err(e) => {
+                self.state.lock().unwrap().escrow.refund_all(branch, &spends);
+                timed_drop(candidate);
+                return Err(e);
+            }
+        };
+        if self.storage.is_some() {
+            stage_probe::bump(&stage_probe::MIRROR_NS, t_mirror.elapsed().as_nanos() as u64);
+            stage_probe::bump(&stage_probe::MIRROR_ROWS, mirrored.len() as u64);
+        }
+
+        // ---- 5. the log -----------------------------------------------------------------------
+        //
         // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The second Theta(S) site: classify's
         // frame_eq + extends compare op-by-op over the stored frame.
         // D115 reads the same span into `APPEND_NS`: one timer, two instruments.
         let t_append = Instant::now();
-        let appended = self.log.append(&frame);
+        let appended = self.log.append(&candidate);
         let append_ns = t_append.elapsed().as_nanos() as u64;
         D172_APPEND_NS.fetch_add(append_ns, std::sync::atomic::Ordering::Relaxed);
         stage_probe::bump(&stage_probe::APPEND_NS, append_ns);
-        // D172 ADVERSARY INSTRUMENT -- NOT FOR LANDING. The third Theta(S) site: dropping the
-        // clone deallocates S `Op`s and their witnesses, outside both timers above.
-        //
-        // **The clone's other half** (D115). `drop` runs `Op`'s destructor once per element, so
-        // freeing the copy is the same O(ops) walk that making it was. Dropped HERE, explicitly,
-        // rather than at the end of the scope — left implicit it lands outside every span and
-        // shows up only as an unattributed remainder. Dropped BEFORE the append's error is
-        // propagated (D115's order), so a failed append's drop is timed too.
-        let t_drop = Instant::now();
-        drop(frame);
-        let drop_ns = t_drop.elapsed().as_nanos() as u64;
-        D172_DROP_NS.fetch_add(drop_ns, std::sync::atomic::Ordering::Relaxed);
-        stage_probe::bump(&stage_probe::DROP_NS, drop_ns);
-        appended?;
+        if let Err(e) = appended {
+            self.unmirror_rows(branch, &mirrored);
+            self.state.lock().unwrap().escrow.refund_all(branch, &spends);
+            // A failed append's frame is freed and timed too (D115's order).
+            timed_drop(candidate);
+            return Err(e);
+        }
 
-        // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
-        // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
-        // step that makes the branch's state exist as pages, so the isolation between branches is
-        // a property of the page graph rather than of a map that happens not to be shared.
+        // ---- 6. install -----------------------------------------------------------------------
         //
-        // Done outside the state lock deliberately: `put_row` takes the catalog lock to publish
-        // the branch's new root, and taking the two in the opposite order elsewhere would deadlock.
-        //
-        // Guarded on `storage`, because `AgentRuntime::new()` is still map-backed and has no tree
-        // to write to. A runtime without a page store keeps exactly its old behaviour.
-        if self.storage.is_some() {
-            debug_assert_eq!(
-                table_id(table),
-                tbl,
-                "the caller's TableId disagrees with the table name it passed, so the tree and the \
-                 workspace map would key the same row differently"
-            );
-            let t_mirror = Instant::now();
-            let n = mirrored.len() as u64;
-            for (row, state) in mirrored {
-                match state {
-                    RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
-                    RowState::Deleted => self.delete_row(branch, table, row.0)?,
+        // Nothing below can fail on a well-formed call. The two refusals guard states no caller
+        // reaches today: every caller holds `&mut Catalog` through `ExecCtx` for the whole
+        // statement, so no other staging and no `seal` of this branch can land between step 1 and
+        // here. They are refusals rather than assumptions because installing over a moved frame
+        // would silently drop another statement's ops from the frame the log already holds.
+        let t_install = Instant::now();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let Some(ws) = state.workspaces.get_mut(&branch) else {
+            state.escrow.refund_all(branch, &spends);
+            return Err(FerroError::Branch(format!(
+                "branch {branch} was retired while a statement was being staged on it; its frame \
+                 reached the effect log and its rows the page tree, and neither will be merged"
+            )));
+        };
+        if (ws.frame.ops.len(), ws.frame.guards.len(), ws.frame.claims.len()) != base_len {
+            state.escrow.refund_all(branch, &spends);
+            return Err(FerroError::Internal(format!(
+                "branch {branch}'s frame moved while a statement was being staged on it: two \
+                 statements staged on one branch at once, which every caller's `&mut Catalog` is \
+                 supposed to rule out"
+            )));
+        }
+        for t in batch {
+            ws.tables.insert(t.tbl.0, t.table);
+            for item in t.items {
+                let key = Workspace::key(t.tbl, item.row);
+                ws.base_rows.insert_if_absent(key, item.before);
+                if let RowState::Present(v) = &item.after {
+                    let probeable = row_id_of(v) == item.row
+                        && v.first().is_some_and(|c0| literal_matches(c0, &t.pk_type));
+                    if !probeable {
+                        ws.unprobeable_rows += 1;
+                    }
+                }
+                ws.rows.insert(key, item.after);
+            }
+        }
+        // The batch's frame REPLACES the workspace's; the frame it replaces — the one the clone
+        // was taken from, this statement's ops shorter — is freed after the lock is released,
+        // through `timed_drop`. Before D258 it was the clone that was freed, after the append.
+        let replaced = std::mem::replace(&mut ws.frame, candidate);
+        drop(guard);
+        stage_probe::bump(&stage_probe::APPLY_NS, spend_ns + t_install.elapsed().as_nanos() as u64);
+        timed_drop(replaced);
+        Ok(())
+    }
+
+    /// Step 4 of [`AgentRuntime::stage_all`]: write a batch's rows onto the branch's own
+    /// copy-on-write tree — all of them, or none.
+    ///
+    /// Returns, per row, what it takes to put that row back. A failure part-way puts back every
+    /// row it recorded — the failing one included, when its prior read succeeded — before it
+    /// returns the failure's own error, so an `Err` here means the tree is as it was, unless a
+    /// restore failed too, which [`AgentRuntime::unmirror_rows`] counts.
+    ///
+    /// **Each row's prior image is recorded BEFORE its write, not after it (D258 review 1, F1).**
+    /// A write can land and still return an error: `put_row` commits the tree operation and then
+    /// calls `set_root`, and both production catalogs move the root before their durability step
+    /// can fail (`LogBranchCatalog` in memory, then its fsync'd append; `TableBranchCatalog` with
+    /// `write_record`, then `durable`). Recording the undo only once the write returned `Ok` left
+    /// exactly that row in the tree. Putting back a write that never landed is harmless: it rewrites
+    /// the prior image, or deletes a key that is absent, and a delete that hits nothing shadows
+    /// nothing.
+    ///
+    /// The read costs one descent per staged row. It is the price of the undo: the tree mutates the
+    /// branch's own pages in place, so nothing else remembers what was there.
+    ///
+    /// Guarded on `storage`, because `AgentRuntime::new()` is still map-backed and has no tree to
+    /// write to. A runtime without a page store keeps exactly its old behaviour.
+    fn mirror_rows(
+        &self,
+        branch: BranchId,
+        batch: &[StagedTable],
+    ) -> Result<Vec<MirrorUndo>, FerroError> {
+        let mut undo: Vec<MirrorUndo> = Vec::new();
+        if self.storage.is_none() {
+            return Ok(undo);
+        }
+        for t in batch {
+            for item in &t.items {
+                let row = item.row.0;
+                let written = self.get_row(branch, &t.table, row).and_then(|prior| {
+                    undo.push(MirrorUndo { table: t.table.clone(), row, prior });
+                    match &item.after {
+                        RowState::Present(vals) => self.put_row(branch, &t.table, row, vals),
+                        RowState::Deleted => self.delete_row(branch, &t.table, row),
+                    }
+                });
+                if let Err(e) = written {
+                    self.unmirror_rows(branch, &undo);
+                    return Err(e);
                 }
             }
-            stage_probe::bump(&stage_probe::MIRROR_NS, t_mirror.elapsed().as_nanos() as u64);
-            stage_probe::bump(&stage_probe::MIRROR_ROWS, n);
         }
-        Ok(())
+        Ok(undo)
+    }
+
+    /// Put back every row [`AgentRuntime::mirror_rows`] recorded, newest first — the failing row
+    /// included, whose write may or may not have landed.
+    ///
+    /// **A row whose tree image is already its prior, byte for byte, is skipped** (D258 review 2,
+    /// R2-1). That is every row whose write never landed. Rewriting it would ask the store for a
+    /// page again — a shared leaf is copied, not written in place — so on the exhausted or failing
+    /// store that just refused the write, the rewrite failed too, and an ordinary storage error was
+    /// reported as a failure to put the tree back. It also copied pages the statement never
+    /// changed. If the current image cannot be read, the row is put back anyway: skipping it could
+    /// leave a landed write in place, and a needless restore costs only a page.
+    ///
+    /// Every row is attempted even when one fails: they are independent keys, and stopping at the
+    /// first failure would leave the rest wrong for no gain. **A failed restore does not change the
+    /// error the statement reports** — the client is owed the error that failed its statement, in
+    /// that error's own class — and is counted instead in
+    /// [`AgentRuntime::page_mirror_divergences`]: each is a row whose page mirror may now disagree
+    /// with the workspace. "May", because a restore can itself land and then report failure,
+    /// exactly as the write it was undoing could.
+    fn unmirror_rows(&self, branch: BranchId, undo: &[MirrorUndo]) {
+        let mut failed = 0u64;
+        for u in undo.iter().rev() {
+            if let Ok(now) = self.get_row(branch, &u.table, u.row)
+                && same_image(&now, &u.prior)
+            {
+                continue;
+            }
+            let restored = match &u.prior {
+                Some(vals) => self.put_row(branch, &u.table, u.row, vals),
+                None => self.delete_row(branch, &u.table, u.row),
+            };
+            if restored.is_err() {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            self.page_mirror_divergences.fetch_add(failed, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// **D258.** How many rows, over this runtime's life, a failed staging step could not put back
+    /// on a branch's page tree.
+    ///
+    /// Each is a row whose page mirror may disagree with its branch's workspace until the next
+    /// write of that row: `SELECT`, `DIFF` and `MERGE` read the workspace and are unaffected, while
+    /// [`AgentRuntime::get_row`], [`AgentRuntime::scan_rows`], the page-derived changeset and a
+    /// child forked from the branch read the tree. Zero on a runtime whose storage never failed
+    /// twice in one statement. In memory, so a restart resets it — the mirror it counts does not
+    /// survive a restart as a branch's staged state either.
+    pub fn page_mirror_divergences(&self) -> u64 {
+        self.page_mirror_divergences.load(AtomicOrdering::Relaxed)
     }
 
     // ---- DIFF ------------------------------------------------------------------------------
@@ -5051,7 +5435,10 @@ impl AgentRuntime {
         h.entries().iter().filter(|e| e.branch == branch).copied().collect()
     }
 
-    /// The branch's current chain head, or `None` if nothing has been attested for it.
+    /// The branch's current chain head, or `None` if nothing has been attested for it **or its
+    /// chain was sealed by a reap** (wall #19: a reaped branch leaves the per-branch index). A
+    /// reaped branch's history is still in [`Self::attested_entries`], and its last entry's
+    /// attestation is the sealed head.
     pub fn attestation_of(&self, branch: BranchId) -> Option<Attestation> {
         self.attested.lock().unwrap().head_of(branch)
     }
@@ -5088,6 +5475,14 @@ impl AgentRuntime {
         self.attested.lock().unwrap().footprint()
     }
 
+    /// Lifecycle events the attested log refused to record (wall #19; see
+    /// [`crate::branch::attest::AppendRefused`]). A refused fork also fails its
+    /// `BEGIN AGENT SESSION`; a refused merge or reap does not fail its operation, because that
+    /// operation had already committed, so this count is where those refusals show.
+    pub fn attestation_refusals(&self) -> u64 {
+        self.attested.lock().unwrap().refused()
+    }
+
     /// Record a fork. The child's `prev` is the **parent's** head, which is what makes a
     /// verification walk of a child continue into the ancestry it forked from.
     ///
@@ -5105,7 +5500,7 @@ impl AgentRuntime {
         run_id: &str,
         model: (&str, &str),
         prompt_hash: &[u8; 32],
-    ) {
+    ) -> Result<(), FerroError> {
         let mut buf = Vec::with_capacity(96);
         for part in [agent_id.as_bytes(), run_id.as_bytes(), model.0.as_bytes(), model.1.as_bytes()]
         {
@@ -5113,7 +5508,8 @@ impl AgentRuntime {
             buf.extend_from_slice(part);
         }
         buf.extend_from_slice(prompt_hash);
-        self.attested.lock().unwrap().append_fork(child, parent, epoch, ContentId::of(&buf));
+        self.attested.lock().unwrap().append_fork(child, parent, epoch, ContentId::of(&buf))?;
+        Ok(())
     }
 
     /// Record a published merge on the branch it published INTO, committing to the row images it
@@ -5122,7 +5518,12 @@ impl AgentRuntime {
     /// O(delta): only the rows this merge published are folded in, each length-prefixed. A merge
     /// that published nothing still gets an entry — "this merge landed and wrote no rows" is a
     /// fact worth being unable to erase.
-    fn attest_merge(&self, into: BranchId, epoch: Epoch, images: &PublishedImages) {
+    fn attest_merge(
+        &self,
+        into: BranchId,
+        epoch: Epoch,
+        images: &PublishedImages,
+    ) -> Result<(), AppendRefused> {
         let mut buf = Vec::with_capacity(images.post.len() * 32);
         buf.extend_from_slice(&(images.post.len() as u64).to_be_bytes());
         for ((tbl, row), vals) in &images.post {
@@ -5135,21 +5536,113 @@ impl AgentRuntime {
             buf.extend_from_slice(&(enc.len() as u64).to_be_bytes());
             buf.extend_from_slice(&enc);
         }
-        self.attested.lock().unwrap().append(into, epoch, BranchOp::Merge, ContentId::of(&buf));
+        self.attested.lock().unwrap().append(into, epoch, BranchOp::Merge, ContentId::of(&buf))?;
+        Ok(())
     }
 
     /// Record a reap, sealing the branch's chain.
     ///
     /// The content is the branch's own head at this moment, so the terminal entry commits to the
-    /// entire history being closed: a later attempt to extend a reaped branch's chain has to
-    /// contend with an entry that already named the end.
-    fn attest_reap(&self, branch: BranchId, epoch: Epoch, published: bool) {
+    /// entire history being closed. A later attempt to extend a reaped branch's chain is refused
+    /// by the log (`AppendRefused::NoLiveHead`, wall #19); so is the reap of a branch the log
+    /// never saw forked, which has no chain to close.
+    fn attest_reap(
+        &self,
+        branch: BranchId,
+        epoch: Epoch,
+        published: bool,
+    ) -> Result<(), AppendRefused> {
         let mut h = self.attested.lock().unwrap();
+        Self::append_reap(&mut h, branch, epoch, published)
+    }
+
+    /// The `Reap` entry itself, on a log the caller has already locked, so that a caller can
+    /// check the head and append under ONE acquisition ([`Self::attest_landed_reaps`]).
+    fn append_reap(
+        h: &mut AttestedHistory,
+        branch: BranchId,
+        epoch: Epoch,
+        published: bool,
+    ) -> Result<(), AppendRefused> {
         let head = h.head_of(branch).unwrap_or_else(Attestation::genesis);
         let mut buf = Vec::with_capacity(33);
         buf.extend_from_slice(&head.0);
         buf.push(u8::from(published));
-        h.append(branch, epoch, BranchOp::Reap, ContentId::of(&buf));
+        h.append(branch, epoch, BranchOp::Reap, ContentId::of(&buf))?;
+        Ok(())
+    }
+
+    /// **D199: attest the reap of every branch in `candidates` whose reap has LANDED and whose
+    /// history this log still holds open.** The callers are the two forget paths
+    /// ([`Self::forget_branches`], [`Self::forget_reaped_branches`]), which reach every branch a
+    /// reaper took without the client, and `seal`, for a branch whose record it could not read as
+    /// its own live generation before the reap (D199 seal review F1/F2). Before this, such a
+    /// branch kept `[Fork]` as its whole history: the log called it live, and its head was never
+    /// dropped (wall #19).
+    ///
+    /// **Landed, not in flight (the lead's rule 1).** `get` refuses a `Reaping` branch as well as
+    /// a `Reaped` one, as `FerroError::Branch(String)` in both cases, so the forget paths'
+    /// `get(..).is_err()` cannot tell them apart. What can is the generation: `mark_reaped` bumps
+    /// it in the same step that sets `Reaped` (all three catalogs land `Reaped` through it), a
+    /// `Reaping` record keeps it, and recycling the slot only moves it further. So "landed" is
+    /// `get_raw(id).generation > branch.generation`, read before the log is locked.
+    ///
+    /// **An unreadable record is counted, not guessed** (the lead's review of `d95a1e7`). If
+    /// `get_raw` fails, nothing is written, because guessing "landed" could attest a reap still in
+    /// flight. If the log still holds the branch open, a refusal is counted
+    /// ([`Self::attestation_refusals`]), because reading the failure as "not landed" and moving on
+    /// would hide the gap. A later visit that can read the record attests it.
+    ///
+    /// **Exactly once, keyed by the log (rules 2 and 3).** A reap removes the branch's head
+    /// (wall #19), so the head is the idempotency key. It is checked and the `Reap` appended under
+    /// one lock, so two visitors cannot both append. A branch already sealed (by `seal`, or by an
+    /// earlier visit here) has no head and is skipped, not refused. So is a branch this log never
+    /// saw forked. Keying on "this call removed the workspace" instead, as the first version did,
+    /// missed a branch whose workspace an earlier sweep had dropped while its reap was still in
+    /// flight.
+    ///
+    /// **The epoch is the branch's fork epoch, the same value `seal` stamps** (the lead's review,
+    /// `ad60009`). The epoch is hashed into the entry, so one op carrying two meanings would be two
+    /// formats. It comes from the log's own index ([`AttestedHistory::opened_at`]: the epoch of
+    /// the branch's `Fork` entry, which `attest_fork` took from the catalog record), not from
+    /// `get_raw(id).fork_epoch`. By the time a sweep visits, the reaper may have released the slot
+    /// (`TwoTierReaper::reap` calls `release_id`) and a fork may have recycled it, so the record
+    /// `get_raw` returns can be another branch's. `published` is the caller's: the forget paths
+    /// pass `false` (a branch the lease took published nothing), and `seal` passes its own, which
+    /// is `true` for a MERGE.
+    ///
+    /// Called with neither `state` nor the catalog held (the leaf-lock rule on
+    /// [`AgentRuntime::attested`]). Every catalog read finishes before the log is locked.
+    fn attest_landed_reaps(&self, candidates: &[BranchId], published: bool) {
+        let mut landed: Vec<BranchId> = Vec::new();
+        let mut unreadable: Vec<BranchId> = Vec::new();
+        for &b in candidates {
+            match self.branches.get_raw(b.id) {
+                Ok(r) if r.generation > b.generation => landed.push(b),
+                // Still `Reaping`: left for a later visit.
+                Ok(_) => {}
+                Err(_) => unreadable.push(b),
+            }
+        }
+        if landed.is_empty() && unreadable.is_empty() {
+            return;
+        }
+        let mut h = self.attested.lock().unwrap();
+        for branch in unreadable {
+            if h.head_of(branch).is_some() {
+                h.count_refusal();
+            }
+        }
+        for branch in landed {
+            // `None` exactly when there is no live head: already sealed, or never forked here.
+            // Skipped, not refused. This is the exactly-once key.
+            let Some(fork_epoch) = h.opened_at(branch) else {
+                continue;
+            };
+            // Cannot be refused: the branch has a live head and is not trunk (trunk is never
+            // reaped). Counted rather than unwrapped if it ever is, as in `seal`.
+            let _ = Self::append_reap(&mut h, branch, fork_epoch, published);
+        }
     }
 
     // ---- D103: ancestry, and the merge it makes possible ------------------------------------
@@ -5283,16 +5776,17 @@ impl AgentRuntime {
     /// * The two sides forked from different shapes of a table they both touched. Composing across
     ///   that would compare images of different widths cell by cell and silently drop the extra
     ///   columns — no conflict, no report, `Clean`.
+    /// * Anything staging refuses — an escrow bound, a capability envelope, a row the target's
+    ///   page tree cannot hold — **on any table stages nothing on any table.** The composed rows of
+    ///   every table go to the target as ONE [`AgentRuntime::stage_all`] batch. Until D258 this
+    ///   was one `stage_all` per table, so a refusal on the second left the first staged on the
+    ///   target while the caller was handed an error.
     ///
     /// # What this does NOT do, rather than leaving it to be discovered
     ///
     /// * **No verification gate and no read-premise check.** Those are admission checks for
     ///   publishing to the shared tables and this publishes nothing; `target` still faces the full
     ///   gate when it merges to the parent, carrying the source's rows and guards with it.
-    /// * **Atomic per table, not across tables.** The composed rows are staged one `stage_all` call
-    ///   per table, so a per-table refusal (an escrow bound, a capability envelope) leaves earlier
-    ///   tables staged. Same shape, and the same reason, as the multi-table residue
-    ///   `publish_evaluation_as` documents.
     pub fn merge_into(
         &self,
         ctx: &mut ExecCtx,
@@ -5389,7 +5883,7 @@ impl AgentRuntime {
         // the parent-merge path.
         let mut merged_state = CellState::new();
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
-        // Composed rows to stage, grouped by table so each table is one atomic `stage_all`.
+        // Composed rows to stage, grouped by table; every table goes to the target in ONE batch.
         let mut staged: BTreeMap<u32, Vec<Staged>> = BTreeMap::new();
 
         for ((t, r), after) in src.rows.iter() {
@@ -5629,6 +6123,9 @@ impl AgentRuntime {
             });
         }
 
+        // Every table's name and key type is resolved before anything is staged, and then every
+        // table is staged as ONE batch: a refusal on any of them stages none of them (D258).
+        let mut batch: Vec<StagedTable> = Vec::with_capacity(staged.len());
         for (t, items) in staged {
             let name = src
                 .tables
@@ -5648,7 +6145,12 @@ impl AgentRuntime {
                 .first()
                 .map(|c| c.data_type.clone())
                 .ok_or_else(|| FerroError::Bind(format!("'{name}' has no columns")))?;
-            self.stage_all(target, TableId(t), &name, &pk_type, items)?;
+            batch.push(StagedTable { tbl: TableId(t), table: name, pk_type, items });
+        }
+        // No table, no call: the per-table loop this replaced made none either, and an empty batch
+        // would still append the target's frame.
+        if !batch.is_empty() {
+            self.stage_all(target, batch)?;
         }
 
         Ok(SiblingMergeReport {
@@ -5792,41 +6294,7 @@ impl AgentRuntime {
         // Every table the branch touched is considered, not only the ones it altered: a branch
         // that forked before a sibling's `ADD COLUMN` has rows one value short of the target, and
         // that is a schema question about a branch with no schema edits of its own.
-        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
-        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
-        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
-        for (_, name) in &snapshot.tables {
-            altered_tables.insert(name.clone());
-        }
-        for (name, _) in snapshot.schema_edits.iter() {
-            altered_tables.insert(name.clone());
-        }
-        let mut merged_shapes: BTreeMap<String, Schema> = BTreeMap::new();
-        for name in &altered_tables {
-            let entry = ctx
-                .catalog
-                .get_table(name)
-                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
-            let target_now = entry.schema.clone();
-            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
-            let ours: Vec<SchemaEdit> = snapshot
-                .schema_edits
-                .iter()
-                .filter(|(t, _)| t == name)
-                .map(|(_, e)| e.clone())
-                .collect();
-            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
-            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
-            merged_shapes.insert(name.clone(), merged.shape.clone());
-            schema_reports.push(SchemaMergeReport {
-                table: name.clone(),
-                outcome: merged.outcome,
-                to_apply: merged.to_apply,
-                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
-            });
-        }
-
-        // Current shared state for every table this branch touched.
+        //
         // **B11's schema merge, evaluated here and applied in `publish_evaluation`.**
         //
         // B6 split `merge` into a half that decides and a half that applies, so B11's schema
@@ -5837,6 +6305,11 @@ impl AgentRuntime {
         // arrive after the gate had already passed the merge.
         //
         // `merged_shapes` from B11's version is dropped: it was written and never read.
+        //
+        // Computed ONCE. Main's resolution of this merge (1ecc5c9) left B11's original block in place
+        // above its own copy, so the schema merge ran twice per table with the second result
+        // shadowing the first; I15's resolution of the same merge (622a17b) kept one. Same inputs,
+        // pure function, so dropping the copy changes no result.
         let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
         let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
         let mut altered_tables: BTreeSet<String> = BTreeSet::new();
@@ -5869,6 +6342,7 @@ impl AgentRuntime {
             });
         }
 
+        // Current shared state for every table this branch touched.
         let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
         let mut table_names: BTreeMap<u32, String> =
@@ -6507,7 +6981,30 @@ impl AgentRuntime {
         // repair at all. Closing them needs the heap rewrite logged, which is a larger change than
         // this row. What IS closed, below, is the change feed — it never carries half of a
         // multi-table merge.
-        let prov = Arc::clone(self.provenance());
+        //
+        // **D219 — this merge's provenance is made durable by one sync per durability point.** The
+        // rewrite below re-stamps the rows it moves and the publish loop stamps every version it
+        // writes, both through `prov`, which is the guard's stamper: applied to the index at once
+        // with every guard, and written later. Each table's rewrite flushes its own stamps right
+        // after `finish` installs it (`Catalog::apply_plan`), because the rewrite can reach the
+        // disk before the publish begins; the publish loop's ride `record_applied`'s row authorship,
+        // the merge's final durable write. `provenance.flush()` after it covers anything left, and
+        // the guard's `Drop` covers every early return. So a merge syncs the provenance file once,
+        // plus once per altered table whose rewrite moved an attributed row.
+        let provenance = ProvenanceFlush::new(Arc::clone(self.provenance()));
+        let prov = Arc::clone(provenance.stamper());
+        // **A merge that will stamp asks the store FIRST (PREREG A3, review 7 F5).** Every write
+        // this merge publishes is stamped or recorded by `record_applied` (whose `ProvId::NONE`
+        // clears an author, which is a write too), so a store already refusing writes would refuse
+        // this merge at its first publish stamp, after the schema below had been installed and
+        // logged. `plan_alters` asks only for a rewrite that will re-stamp an attributed row, so a
+        // merge whose altered tables carry none was not asked at all. Asked here, before any table
+        // is planned, the refusal leaves nothing behind (E82). A merge that publishes nothing is
+        // not asked: it writes no provenance (D219 F1's rule for ALTER). Advisory, as the trait
+        // says: a store that starts refusing after this line is refused at the write.
+        if !pending.is_empty() {
+            prov.check_writable()?;
+        }
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
         for (i, report) in schema_reports.iter().enumerate() {
             if report.to_apply.is_empty() {
@@ -6736,7 +7233,7 @@ impl AgentRuntime {
         for w in ready {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
-            let author = Some((Arc::clone(self.provenance()), snapshot.prov));
+            let author = Some((Arc::clone(&prov), snapshot.prov));
             if let Err(e) = w.apply_in(ctx, publish_txn, author) {
                 ctx.txn.abort(publish_txn)?;
                 return Err(e);
@@ -6760,6 +7257,13 @@ impl AgentRuntime {
             &images,
             reserved,
         );
+        // **D219 — durable before the merge is acknowledged.** A no-op, with no sync, whenever
+        // `record_applied` had a row to attribute: its write already carried every pending stamp.
+        // Folded into `authorship` rather than `?`-ed, for the reason just given (Amendment 12,
+        // F1): returning here would skip the attestation and the seal of a merge whose publish has
+        // committed. `and` runs the flush whatever `record_applied` returned, and reports the
+        // authorship error first when both fail.
+        let authorship = authorship.and(provenance.flush());
 
         // **D103 — the merge is attested AFTER the publish transaction committed**, and that
         // order is the whole point. An entry appended before the commit would attest a merge that
@@ -6770,7 +7274,15 @@ impl AgentRuntime {
         // O(delta), and the one place on the branch lifecycle where a content commitment is
         // affordable. See the field docs on `AgentRuntime::attested` for why fork and commit get
         // no such commitment.
-        self.attest_merge(into, self.branches.next_epoch(), &images);
+        //
+        // **Wall #19: a refusal here is counted, NOT propagated, and `seal` runs regardless.** The
+        // publish has committed, so an `Err` would report a merge that landed as one that failed,
+        // and a `?` would skip `seal` and leave a published branch live with its staged rows —
+        // one retry away from publishing them twice. The log refuses only a non-trunk target with
+        // no live attested head, i.e. one it never saw forked (a live catalog target cannot be
+        // reaped in the log, because `attest_reap` runs after the catalog reap). Such a merge is
+        // outside the log's scope: no entry is written, and `attestation_refusals` counts it.
+        let _ = self.attest_merge(into, self.branches.next_epoch(), &images);
         // Both results are reported (Amendment 13, B): a seal that also fails must not hide that
         // authorship is incomplete.
         match (authorship, self.seal(from, true)) {
@@ -6936,6 +7448,9 @@ impl AgentRuntime {
         // record is in memory. When a stamp sat inside this loop and failed, the publish had
         // already committed, so the rows were visible and the later versions unnamed: an exact read
         // of such a row named the version before it, and nothing refused that read.
+        //
+        // The rows this merge published, one entry per applied op, attributed in ONE batch at the
+        // end of this pass (D219).
         let mut stamps: Vec<(u32, u64)> = Vec::new();
         let mut next_seq = reserved.start;
         for r in rows {
@@ -7000,6 +7515,8 @@ impl AgentRuntime {
                 if seen.is_empty() {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
+                // Authorship of the published row, kept past `seal` AND past the process
+                // (exit criterion 9). Recorded at the end of this pass, all at once.
                 stamps.push((op.tbl.0, op.row.0));
             }
         }
@@ -7035,10 +7552,7 @@ impl AgentRuntime {
         // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
         // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
         // a merge that published nothing.
-        let capture = state
-            .captures
-            .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        let mut capture = state.captures.entry(txn, snapshot.prov, branch);
         for w in written {
             capture.on_write(w);
         }
@@ -7050,31 +7564,44 @@ impl AgentRuntime {
         // 9). This is the write that makes `who_wrote_row` durable. Last, so that a failure here
         // leaves authorship incomplete and nothing else.
         //
+        // **D219 — one append and one fsync for the whole merge's authorship.** This was one
+        // `stamp_row` per op inside the loop above, and a durable store syncs once per call, so a
+        // merge of δ ops held `state` — which every agent statement takes — across δ fsyncs. The
+        // records, their order and their bytes are unchanged; only the number of syncs they share
+        // went from δ to 1. This is still the write that makes `who_wrote_row` durable, and it
+        // still completes before this function returns, so before `merge` acknowledges anything.
+        // It is also the publish's ONE sync: every physical stamp the publish loop left pending
+        // (`ProvenanceFlush` in `publish_evaluation_as`) is written ahead of these records in the
+        // same append. An ALTER's rewrite flushed its own stamps before the publish began.
+        //
+        // It stays under `state` deliberately. The sync could be awaited after releasing `state`
+        // (stage under the lock, wait outside it, as `begin_session_as_staged` does for a fork),
+        // but every shape that runs SQL holds the catalog lock for the whole MERGE statement —
+        // `cli.rs` per statement, and pgwire's `writer_active` stands every shared reader down —
+        // so no STATEMENT could observe the shorter hold. The one caller that takes `state`
+        // outside the catalog lock is the lease thread's `forget_reaped_branches` reconciliation
+        // (D98 moved it out), which is background housekeeping no client waits on.
+        //
         // **Best-effort, and never stale (Amendment 13, D).** Stopping at the first failure left
-        // every later row naming its PREVIOUS author: a version this merge replaced. So a row whose
-        // stamp fails is cleared to "nobody on record", and the loop goes on. A row that can be
-        // neither stamped nor cleared is named in the error. A durable store that refuses both is
+        // every later row naming its PREVIOUS author: a version this merge replaced. A batch is
+        // refused WHOLE (`ProvenanceStore::stamp_rows`: no row is attributed when any is refused),
+        // so on a failure every row of it is cleared to "nobody on record" — as one batch too —
+        // rather than the failed rows alone, as the per-op loop this replaces did. Rows that can be
+        // neither stamped nor cleared are named in the error. A durable store that refuses both is
         // poisoned, and a poisoned store refuses to say who wrote any row (`durable.rs`).
-        let mut first_failure: Option<FerroError> = None;
-        let mut unstamped: Vec<(u32, u64)> = Vec::new();
-        let mut uncleared: Vec<(u32, u64)> = Vec::new();
-        for (tbl, row) in stamps {
-            if let Err(e) = self.prov_store.stamp_row(tbl, row, snapshot.prov) {
-                unstamped.push((tbl, row));
-                if self.prov_store.stamp_row(tbl, row, ProvId::NONE).is_err() {
-                    uncleared.push((tbl, row));
-                }
-                if first_failure.is_none() {
-                    first_failure = Some(e);
-                }
+        match self.prov_store.stamp_rows(&stamps, snapshot.prov) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let uncleared: &[(u32, u64)] =
+                    match self.prov_store.stamp_rows(&stamps, ProvId::NONE) {
+                        Ok(()) => &[],
+                        Err(_) => &stamps,
+                    };
+                Err(FerroError::Provenance(format!(
+                    "{e}; rows left unattributed (table, row): {stamps:?}; of those, rows whose \
+                     previous author could not be cleared: {uncleared:?}"
+                )))
             }
-        }
-        match first_failure {
-            None => Ok(()),
-            Some(e) => Err(FerroError::Provenance(format!(
-                "{e}; rows left unattributed (table, row): {unstamped:?}; of those, rows whose \
-                 previous author could not be cleared: {uncleared:?}"
-            ))),
         }
     }
 
@@ -7159,12 +7686,16 @@ impl AgentRuntime {
 
             // ---- phase 3: forget them, under the lock ---------------------------------------
             if !gone.is_empty() {
-                let mut state = self.state.lock().unwrap();
-                for bid in &gone {
-                    if forget_one_branch(&mut state, *bid) {
-                        forgotten += 1;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    for bid in &gone {
+                        if forget_one_branch(&mut state, *bid) {
+                            forgotten += 1;
+                        }
                     }
                 }
+                // D199: only once the state lock is released. See `attest_landed_reaps`.
+                self.attest_landed_reaps(&gone, false);
             }
 
             // A short chunk means the range ran out, which is the only end condition: `examined`
@@ -7222,12 +7753,17 @@ impl AgentRuntime {
             if gone.is_empty() {
                 continue;
             }
-            let mut state = self.state.lock().unwrap();
-            for bid in gone {
-                if forget_one_branch(&mut state, bid) {
-                    forgotten += 1;
+            {
+                let mut state = self.state.lock().unwrap();
+                for &bid in &gone {
+                    if forget_one_branch(&mut state, bid) {
+                        forgotten += 1;
+                    }
                 }
             }
+            // D199: every gone id, whether or not this call found its workspace, and only once
+            // the state lock is released. See `attest_landed_reaps`.
+            self.attest_landed_reaps(&gone, false);
         }
         forgotten
     }
@@ -7239,6 +7775,14 @@ impl AgentRuntime {
     /// with no client cooperation at all.
     pub fn abandon(&self, branch: BranchId) -> Result<(), FerroError> {
         self.seal(branch, false)
+    }
+
+    /// `seal`, for tests outside this module. A MERGE is the only production caller that seals with
+    /// `published = true`, and reaching it needs a SQL catalog; D199's seal-route tests
+    /// (`branch/lease_thread/tests.rs`) need that bit without one. Not compiled outside tests.
+    #[cfg(test)]
+    pub(crate) fn seal_for_test(&self, branch: BranchId, published: bool) -> Result<(), FerroError> {
+        self.seal(branch, published)
     }
 
     /// Retire a branch. `published` says whether its writes reached the shared tables, which is
@@ -7306,14 +7850,58 @@ impl AgentRuntime {
                 }
             }
         }
+        // **D199's seal route (ledger D199, 09:25Z): every exit attests a reap THIS call performed.**
+        //
+        // The reap can flip the record to `Reaped` durably and then fail: `TwoTierReaper::reap`
+        // flips before its fallible detach and drain, and a reaper-less arm that detaches after
+        // its flip (wall21's order) does the same. An attestation placed after `?` was skipped on
+        // exactly those exits, and the log then called a reaped branch live. It cannot be placed
+        // right after the flip instead, because with a reaper the flip is inside `Reaper::reap`.
+        // So the reap runs in `retire`, and the attestation follows it on every exit, `Ok` or `Err`.
+        //
+        // **Two paths, decided by the record read BEFORE the reap.**
+        // - It is this branch's live generation: this call can flip it, and after the reap a
+        //   bumped generation means the flip landed here, because `set_state` flips a generation
+        //   once. `attest_this_calls_reap` attests it. The epoch comes from this read, as it always
+        //   did (D103: the reap can recycle the slot).
+        // - Anything else (unreadable, or already landed): this call cannot tell, before the reap,
+        //   whether it will flip anything. After the reap it applies the forget paths' rule to this
+        //   one id, `attest_landed_reaps`: a landed reap is attested while the log still holds a
+        //   head, an unreadable record is counted, and the epoch is the log's own `opened_at`.
+        //   `seal` is the last holder of the branch's workspace, so it must not leave a landed reap
+        //   unattested (D199 seal review F1: a failed read here used to suppress the attestation
+        //   while the reaper-less arm flipped anyway; F2: a reap the lease flipped and then reported
+        //   `Refused` was never attested, and this seal removed the only handle that could).
+        // Either way the log's own key (a `Reap` removes the head, and a second one is refused)
+        // keeps it to one entry, and a retried seal finds no head and skips.
+        //
+        // **The premise "only the call that flipped attests" (F3).** It holds while seals are
+        // serialised with the lease scan's reap-and-forget, which run inside `with_lock` (the
+        // statement lock, `lease_thread.rs` `scan_once`). Without that lock the log still gets
+        // exactly one entry, but a seal can attest a flip the lease made, and the loser's attempt
+        // is refused and counted. The reconciliation's third phase already runs outside the lock,
+        // so a merged branch it attests first is recorded as `published = false`; that is a lease-
+        // route item, recorded in `lane_wall19_attested.md` §13, not fixed here.
+        let before = self
+            .branches
+            .get_raw(branch.id)
+            .ok()
+            .filter(|r| r.generation == branch.generation && r.state != BranchState::Reaped);
+        let retired = self.retire(branch);
+        match before {
+            Some(before) => self.attest_this_calls_reap(branch, before.fork_epoch, published),
+            None => self.attest_landed_reaps(&[branch], published),
+        }
+        retired
+    }
+
+    /// The reap half of [`Self::seal`]. It writes no attestation: `seal` attests after it on every
+    /// exit, including an `Err` that comes after the durable `Reaped` flip (D199's seal route).
+    fn retire(&self, branch: BranchId) -> Result<(), FerroError> {
         // With a reaper attached, retiring a branch means reclaiming it: the reaper does
         // everything below AND frees the extents this branch allocated, which nothing else will.
         // It is the same call the lease scan makes, so a branch that is merged and a branch that
         // was walked away from end in exactly the same state.
-        // **D103 — read the fork epoch BEFORE anything reaps.** The reap bumps the id slot's
-        // generation, so `get(branch)` afterwards is a hard error and the epoch would be
-        // unavailable exactly where the attestation needs it.
-        let fork_epoch = self.branches.get(branch).ok().map(|r| r.fork_epoch);
         if let Some(reaper) = &self.reaper {
             reaper.reap(branch)?;
             // `with_reaper` cannot check that the reaper was built over this runtime's catalog —
@@ -7331,21 +7919,6 @@ impl AgentRuntime {
                         rec.state
                     )));
                 }
-            }
-            // **This arm has to attest too, and it did not.** `seal` returns early when a reaper
-            // is attached, so an attestation placed only at the end of the fallback arm is
-            // silently absent on every runtime built with `with_reaper` — which is the production
-            // shape — and the gap reads exactly like "no branch was ever reaped": a missing entry
-            // is indistinguishable from a lifecycle event that never happened. Found by reading
-            // the control flow after the wiring was written; pinned by
-            // `integration_branch_attestation::a_reap_through_an_attached_reaper_is_attested_too`,
-            // which fails with `left: [Fork], right: [Fork, Reap]` when this call is removed.
-            //
-            // Two call sites rather than one because the alternative — restructuring the early
-            // return — changes the control flow of the reap path itself, which is not a thing to
-            // do as a side effect of adding an attestation.
-            if let Some(epoch) = fork_epoch {
-                self.attest_reap(branch, epoch, published);
             }
             return Ok(());
         }
@@ -7373,15 +7946,38 @@ impl AgentRuntime {
             }
         }
         self.branches.set_state(branch, record.state, BranchState::Reaped)?;
-        // **D103 — attested after the state change lands**, for the same reason the merge entry is
-        // appended after its commit: a record of a reap that did not happen is worse than none.
-        // The entry seals this branch's chain, and it carries whether the branch's writes were
-        // published, because "merged" and "abandoned" are different facts about a retired branch
-        // and the record must not conflate them.
-        //
-        // The reaper arm above carries the same call; see the note there for why there are two.
-        self.attest_reap(branch, record.fork_epoch, published);
         Ok(())
+    }
+
+    /// **D199's seal route:** attest the reap `seal`'s own call performed, whatever `retire`
+    /// returned. `fork_epoch` is the branch's, from the record read before the reap.
+    ///
+    /// - The record now shows a bumped generation: the flip landed in this call. Attested, with a
+    ///   refusal counted rather than returned (wall #19): the reap has happened, and an `Err`
+    ///   would report it as one that did not. The log refuses only a branch with no live head, one
+    ///   it never saw forked; writing its reap would root the entry at genesis, which
+    ///   `verify_chain` reports as `DanglingBranch`. The entry carries `published`, because
+    ///   "merged" and "abandoned" are different facts about a retired branch.
+    /// - The generation did not move: the reap failed before its flip, or the reaper is built over
+    ///   another catalog. Nothing to attest.
+    /// - The record cannot be read: counted if the branch still holds a head, never guessed (D199).
+    ///   **The count is final unless a later visitor comes** (D199 seal review F4). On this route
+    ///   the visitor is a retried seal, which takes `attest_landed_reaps` because it reads a bumped
+    ///   generation before its reap. `forget_branches` is not one (its only production caller is
+    ///   `scan_once`), and `forget_reaped_branches` walks workspaces, which this seal removed.
+    fn attest_this_calls_reap(&self, branch: BranchId, fork_epoch: Epoch, published: bool) {
+        match self.branches.get_raw(branch.id) {
+            Ok(after) if after.generation > branch.generation => {
+                let _ = self.attest_reap(branch, fork_epoch, published);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let mut h = self.attested.lock().unwrap();
+                if h.head_of(branch).is_some() {
+                    h.count_refusal();
+                }
+            }
+        }
     }
 
     // ---- REVERT ----------------------------------------------------------------------------
@@ -7397,23 +7993,42 @@ impl AgentRuntime {
         merge_id: &str,
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
-        let (targets, rec_branch, graph) = {
+        let (target, plan) = {
             let state = self.state.lock().unwrap();
             let rec = state
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
-        };
-        let target = *targets
-            .first()
-            .ok_or_else(|| {
+            let target = *rec.txns.first().ok_or_else(|| {
                 FerroError::Merge(format!(
                     "merge {} of branch {} recorded no transaction",
-                    merge_id, rec_branch
+                    merge_id, rec.branch
                 ))
             })?;
-        let plan = graph.plan_revert(target, mode);
+            // **Wall #18: walk out from the target; do not join everything ever retained.** This
+            // was `dependency_graph_of(&state.captures)` — every capture cloned into one
+            // `ProvenanceLog` and joined pairwise, Θ(N²) after N merged tasks, under this lock —
+            // for the one target's transitive dependents. The walk finds the same set; see
+            // `provenance::capture_set` for the argument and for what it still costs.
+            let (plan, cost) = state.captures.plan_revert(target, mode);
+            REVERT_GRAPH_CAPTURES.fetch_add(cost.captures, AtomicOrdering::Relaxed);
+            REVERT_GRAPH_CANDIDATES.fetch_add(cost.candidates, AtomicOrdering::Relaxed);
+            // The differential, debug builds only: the full-graph plan the walk replaced, and an
+            // audit that the read index is exactly what rebuilding it from the captures gives. Both
+            // are OBSERVING checks, and neither is the only guard: the REVERT tests assert the
+            // answers themselves, and a release build — where these compile out — must still fail
+            // them for every broken walk (lane_wall18_revert.md Amendment 1, mutants W1-W5).
+            debug_assert!(
+                state.captures.index_is_consistent(),
+                "the REVERT read index disagrees with a rebuild from the captures it indexes"
+            );
+            debug_assert_eq!(
+                plan,
+                state.captures.plan_revert_by_full_graph(target, mode),
+                "the REVERT walk disagrees with the full-graph plan for {target:?} under {mode:?}"
+            );
+            (target, plan)
+        };
         if plan.is_blocked() {
             return Ok(plan);
         }
@@ -7434,8 +8049,23 @@ impl AgentRuntime {
     fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
         let ops: Vec<AppliedOp> = {
             let state = self.state.lock().unwrap();
-            let mut v: Vec<AppliedOp> =
-                state.applied.iter().filter(|a| a.txn == txn).cloned().collect();
+            // **Wall #18: ask the index, do not rescan the log.** This was
+            // `state.applied.iter().filter(|a| a.txn == txn)`: every op any merge ever published,
+            // once per reverted transaction, under the lock every statement takes. The positions
+            // come back in log order, which is the order that filter produced, so the stable sort
+            // below hands back the same undo order it always did, ties included.
+            let mut examined = 0u64;
+            let mut v: Vec<AppliedOp> = state
+                .applied_of_txn(txn)
+                .iter()
+                .filter_map(|&i| {
+                    examined += 1;
+                    state.applied.get(i as usize)
+                })
+                .cloned()
+                .collect();
+            REVERT_APPLIED_EXAMINED.fetch_add(examined, AtomicOrdering::Relaxed);
+            REVERT_APPLIED_MATCHED.fetch_add(v.len() as u64, AtomicOrdering::Relaxed);
             v.sort_by(|a, b| b.seq.cmp(&a.seq));
             v
         };
@@ -7897,8 +8527,11 @@ fn blind_writes_of(
 /// could falsify it.
 ///
 /// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
-/// final element is not necessarily the largest. One pass per merge, the same order of cost
-/// `undo_txn` already pays per revert over the same vector.
+/// final element is not necessarily the largest. That makes it one pass over the whole vector per
+/// merge, so each merge pays for every op published before it. (This used to add "the same order
+/// of cost `undo_txn` already pays per revert over the same vector"; wall #18 indexed `undo_txn`'s
+/// lookup by txn, so that comparison no longer holds and this is the merge path's own whole-log
+/// walk.)
 fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
     applied.iter().map(|a| a.seq).max()
 }
@@ -8049,12 +8682,6 @@ struct PublishedImages {
     post: BTreeMap<(u32, u64), Vec<Value>>,
 }
 
-/// The dependency graph over everything every task retained — exact and predicate-derived alike.
-///
-/// **One derivation, and it lives in `ProvenanceLog::dependency_graph`.** That function is the only
-/// code in the tree that composes read-after-write edges over exact versions with the edges derived
-/// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
-/// does not keep a second copy of it, which is the reconciliation this lane exists to make.
 /// Drop the captures of a workspace that is going away WITHOUT having published anything -- and of
 /// any ancestor whose protection lapsed at the same moment.
 ///
@@ -8148,14 +8775,6 @@ fn capture_is_protected(state: &State, txn: TxnId) -> bool {
         "txn_refs disagrees with a scan of workspaces about txn {txn:?}"
     );
     state.published_txns.contains(&txn.0) || indexed
-}
-
-fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
-    let mut log = ProvenanceLog::new();
-    for c in captures.values() {
-        log.record(c.clone().finish());
-    }
-    log.dependency_graph()
 }
 
 /// The region a range or full scan looked at, retained so that a write landing inside it later is a
@@ -8779,6 +9398,37 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(e.contains("index entry too large: 2108 bytes"), "not the landing check's refusal: {e}");
+    }
+
+    /// **D258 (review 2, R2-1). A restore is skipped only when the tree holds the prior's exact
+    /// BYTES.** `Value`'s `==` is numeric, so each `false` pair below is one that `==` calls equal:
+    /// a write that landed a respelled value would then skip its restore and leave the page tree
+    /// holding a value the workspace does not. The `true` rows are the anti-vacuity: a comparison
+    /// that always answered "different" would restore every row and pass the `false` rows.
+    #[test]
+    fn same_image_compares_bytes_not_numeric_equality() {
+        let row = |v: Value| Some(vec![Value::Integer(1), v]);
+        for (now, prior, same) in [
+            (row(Value::Decimal("1.50".into())), row(Value::Decimal("1.5".into())), false),
+            (row(Value::Integer(1)), row(Value::Float(1.0)), false),
+            (row(Value::Varchar("x".into())), row(Value::Varchar("x".into())), true),
+            (row(Value::Decimal("1.50".into())), row(Value::Decimal("1.50".into())), true),
+            (None, None, true),
+            (row(Value::Null), None, false),
+            (None, row(Value::Null), false),
+        ] {
+            assert_eq!(
+                same_image(&now, &prior),
+                same,
+                "same_image({now:?}, {prior:?}) should be {same}"
+            );
+        }
+        assert_eq!(
+            row(Value::Decimal("1.50".into())),
+            row(Value::Decimal("1.5".into())),
+            "fixture: the premise is that `==` calls this pair equal; if it no longer does, the \
+             first row above stopped testing anything"
+        );
     }
 
     /// A workspace with nothing in it but the two fields `txn_refs` indexes.
@@ -10180,6 +10830,36 @@ mod tests {
             }
             self.inner.stamp_row(table, row, id)
         }
+        // Merge fixup (D219 batched `record_applied`'s stamps into one `stamp_rows`, and added the
+        // trait methods below). Each row of a batch counts as one call, so `fail_at` still names
+        // the same row it did when every row was its own `stamp_row`; and a batch holding the
+        // failing call is refused WHOLE, which is the trait's contract for `stamp_rows`.
+        fn stamp_rows(&self, rows: &[(u32, u64)], id: ProvId) -> Result<(), FerroError> {
+            let first = self
+                .calls
+                .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if (first..first + rows.len()).contains(&self.fail_at) {
+                return Err(FerroError::Internal("injected stamp failure".into()));
+            }
+            self.inner.stamp_rows(rows, id)
+        }
+        fn stamp_pending(
+            &self,
+            rid: crate::storage::heap_file_manager::RecordId,
+            id: ProvId,
+        ) -> Result<(), FerroError> {
+            self.inner.stamp_pending(rid, id)
+        }
+        fn flush(&self) -> Result<(), FerroError> {
+            self.inner.flush()
+        }
+        fn check_writable(&self) -> Result<(), FerroError> {
+            self.inner.check_writable()
+        }
+        fn sync_counts(&self) -> crate::provenance::SyncCounts {
+            self.inner.sync_counts()
+        }
         fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
             self.inner.row_author(table, row)
         }
@@ -10924,5 +11604,154 @@ mod tests {
         assert!(st.remove_workspace(&BranchId::new(1, 0)).is_some(), "fixture: b_1 not live");
         assert!(!st.retention.readers.contains_key(&h), "no pin reads h, yet it is still held");
         assert!(st.retention.by_reader.is_empty() && st.retention.pending.is_empty());
+    }
+
+    // ---- D219 PREREG A3 (review 7 F5): a MERGE that will stamp asks the store before its schema --
+    //
+    // Unit tests because `DurableProvenanceStore::fail_next_append`, the only way to poison a store
+    // without killing the process, exists only under `cfg(test)`. The agent statements go through
+    // the runtime's API rather than dispatch: `designated::tests` designates a runtime process-wide
+    // in this same binary, and dispatch refuses agent statements on any other while it does.
+
+    struct PoisonedMerge {
+        catalog: Catalog,
+        bp: Arc<BufferPoolManager>,
+        txn: Arc<crate::wal::txn::TxnManager>,
+        wal: Arc<crate::wal::log::WalManager>,
+        rt: Arc<AgentRuntime>,
+        branch: BranchId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn f5_parse(sql: &str) -> Stmt {
+        let tokens = crate::parser::scanner::Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .unwrap();
+        let mut p = crate::parser::parser::Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "{sql}: {:?}", p.errors);
+        stmts.remove(0)
+    }
+
+    /// `t (id, v)` with nothing on the target (so no row of it is attributed, and `plan_alters`
+    /// never probes), a completed session of run `r1` that staged `ADD COLUMN w` and, if `publish`,
+    /// an INSERT, and then the provenance store poisoned.
+    fn a_merge_on_a_poisoned_store(publish: bool) -> PoisonedMerge {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("f5.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file).unwrap(),
+        )));
+        let wal = Arc::new(crate::wal::log::WalManager::new(dir.path().join("f5.wal")).unwrap());
+        let txn = Arc::new(crate::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let durable = Arc::new(
+            crate::provenance::DurableProvenanceStore::open(dir.path().join("f5.provenance")).unwrap(),
+        );
+        let mut rt = AgentRuntime::new();
+        rt.prov_store = durable.clone() as Arc<dyn ProvenanceStore>;
+        let rt = Arc::new(rt);
+        let mut plain = crate::execution::session::Session::with_runtime(Arc::clone(&rt));
+        crate::execution::executor::run(
+            f5_parse("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);"),
+            &mut catalog,
+            bp.clone(),
+            txn.clone(),
+            &mut plain,
+        )
+        .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}"));
+        let session = rt
+            .begin_session_as(
+                RunIdentity {
+                    agent_id: "a",
+                    run_id: Some("r1"),
+                    model: Some(("claude-opus-5", "2026-05")),
+                    prompt: None,
+                },
+                BranchId::TRUNK,
+            )
+            .unwrap_or_else(|e| panic!("BEGIN failed: {e}"));
+        if publish {
+            rt.write(
+                &mut ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() },
+                session.branch,
+                f5_parse("INSERT INTO t VALUES (1, 10);"),
+            )
+            .unwrap_or_else(|e| panic!("INSERT in the session failed: {e}"));
+        }
+        let Stmt::AlterTable { table, action } = f5_parse("ALTER TABLE t ADD COLUMN w INTEGER;")
+        else {
+            panic!("the statement did not parse as an ALTER");
+        };
+        rt.stage_schema_edit(&catalog, session.branch, &table, &action)
+            .unwrap_or_else(|e| panic!("staging the ALTER failed: {e}"));
+        durable.fail_next_append.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            durable.stamp_row(1, 1, session.prov).is_err(),
+            "premise: the injected failure did not poison the store"
+        );
+        PoisonedMerge { catalog, bp, txn, wal, rt, branch: session.branch, _dir: dir }
+    }
+
+    impl PoisonedMerge {
+        fn merge(&mut self) -> Result<MergeReport, FerroError> {
+            let rt = Arc::clone(&self.rt);
+            rt.merge(
+                &mut ExecCtx { catalog: &mut self.catalog, bp: self.bp.clone(), txn: self.txn.clone() },
+                self.branch,
+            )
+        }
+
+        fn columns_of_t(&self) -> usize {
+            self.catalog.require_table("t").unwrap().schema.columns.len()
+        }
+    }
+
+    /// **P1 (PREREG A3): a MERGE that will stamp, on a store refusing writes, is refused before its
+    /// schema installs.** The altered table has no attributed row, so `plan_alters` does not probe;
+    /// without a probe of its own the merge installed and logged the ADD COLUMN and was refused only
+    /// at the first publish stamp: `Err` from a statement that changed the target's schema and told
+    /// the change feed so (E82).
+    #[test]
+    fn a_merge_that_will_stamp_on_a_poisoned_store_is_refused_before_its_schema_installs() {
+        let mut f = a_merge_on_a_poisoned_store(true);
+        let logged_before = f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        match f.merge() {
+            Ok(_) => panic!("a MERGE that publishes attributed rows succeeded on a store refusing writes"),
+            Err(e) => assert!(
+                format!("{e}").contains("refusing further writes"),
+                "refused, but not by the poisoned store: {e}"
+            ),
+        }
+        assert_eq!(
+            f.columns_of_t(),
+            2,
+            "the refused MERGE installed its ADD COLUMN before refusing: a schema change from a \
+             statement that returned Err"
+        );
+        assert_eq!(
+            f.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            logged_before,
+            "the refused MERGE wrote to the log: its DDL record reached the change feed"
+        );
+    }
+
+    /// **P2 (PREREG A3): a MERGE that publishes nothing is not refused by a store refusing
+    /// writes.** It writes no provenance, so there is nothing to refuse: the probe asks only when
+    /// the merge will stamp, as `plan_alters`' asks only when a rewrite will re-stamp (D219 F1).
+    #[test]
+    fn a_merge_that_publishes_nothing_on_a_poisoned_store_is_not_refused() {
+        let mut f = a_merge_on_a_poisoned_store(false);
+        if let Err(e) = f.merge() {
+            panic!("a schema-only MERGE was refused by a store it writes nothing to: {e}");
+        }
+        assert_eq!(f.columns_of_t(), 3, "the schema-only MERGE did not install its ADD COLUMN");
     }
 }

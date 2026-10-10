@@ -259,6 +259,18 @@ impl ReadSetBuilder {
         self.exact.is_empty() && self.predicates.is_empty()
     }
 
+    /// Every version retained exactly so far, sorted and de-duplicated — what `finish` will put in
+    /// its `ExactVersions` set.
+    pub fn exact_versions(&self) -> &[VersionRef] {
+        &self.exact
+    }
+
+    /// Whether `v` is retained exactly. A binary search, which is sound because `observe_version`
+    /// is the only writer of `exact` and keeps it sorted.
+    pub fn contains_version(&self, v: &VersionRef) -> bool {
+        self.exact.binary_search(v).is_ok()
+    }
+
     pub fn finish(self) -> Vec<ReadSet> {
         let mut out = Vec::with_capacity(self.predicates.len() + 1);
         if !self.exact.is_empty() {

@@ -1637,3 +1637,59 @@ fn the_position_index_survives_a_replay_intact() {
     assert_eq!(log.frame(b(3), TxnId(1)).unwrap().ops.len(), 1, "an ungrown frame gained ops");
     assert!(log.frame(b(1), TxnId(999)).is_none(), "the replayed index invented a key");
 }
+
+/// **D258. `check_append` answers exactly what `append` would, and writes nothing.**
+///
+/// Every verdict is taken twice: once by the check, with the file image, the fabric's operation
+/// count and the index compared before and after it, and once by the append it predicts. The five
+/// shapes are the five things this store decides — a value its format cannot hold, a new frame, a
+/// retry, a growth, a contradiction — in an order where each append changes what the next is
+/// classified against. A check that returned `Ok(())` without encoding fails the first row.
+///
+/// **Why `WriteThrough` and the operation count, not `SyncOnly` and the image alone** (D258 review
+/// 1, F4): under `SyncOnly` the durable image moves only on a sync, so a check that wrote without
+/// syncing passed the image comparison. `op_count` counts every storage operation the fabric saw —
+/// write, sync, read — so a check that touched the file at all now fails, and under `WriteThrough`
+/// the image comparison means what it says too.
+#[test]
+fn check_append_answers_what_append_would_and_writes_nothing() {
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let log = open_on(&fabric).unwrap();
+    let image = || fabric.durable_image().get(TEL).map(|v| v.len()).unwrap();
+
+    let mut too_long = TxnFrame::new(TxnId(9), b(1), CommitHash::ZERO, 0, 1);
+    too_long.push_op(Op::new(
+        TBL,
+        RowId(1),
+        Some(QTY),
+        OpKind::Assign(Value::Varchar("x".repeat(u16::MAX as usize + 1))),
+    ));
+    let fresh = grown(7, 1, 0, &[(1, 5)]);
+    let growth = grown(7, 1, 0, &[(1, 5), (2, 3)]);
+    let contradiction = grown(7, 1, 0, &[(1, 9), (2, 3)]);
+
+    let cases: [(&str, &TxnFrame, bool); 5] = [
+        ("a value past its length prefix", &too_long, false),
+        ("a fresh frame", &fresh, true),
+        ("a retry of it", &fresh, true),
+        ("a growth", &growth, true),
+        ("a contradiction", &contradiction, false),
+    ];
+    for (what, frame, accepted) in cases {
+        let before = (image(), log.len(), fabric.op_count());
+        let checked = log.check_append(frame);
+        assert_eq!(
+            (image(), log.len(), fabric.op_count()),
+            before,
+            "{what}: check_append changed the store, or touched its file"
+        );
+        let appended = log.append(frame);
+        assert_eq!(checked.is_ok(), accepted, "{what}: check_append said {checked:?}");
+        assert_eq!(appended.is_ok(), accepted, "{what}: append said {appended:?}");
+        if let (Err(c), Err(a)) = (&checked, &appended) {
+            assert_eq!(c.to_string(), a.to_string(), "{what}: the check and the append disagree");
+        }
+    }
+    assert_eq!(log.frame(b(1), TxnId(7)).unwrap().ops.len(), 2, "the growth did not land");
+    assert!(log.frame(b(1), TxnId(9)).is_none(), "the refused frame reached the index");
+}

@@ -344,6 +344,445 @@ fn a_reaped_branchs_workspace_is_forgotten_without_the_client_saying_anything() 
     );
 }
 
+/// ⛔ **D199, WRITTEN TO FAIL FIRST: a lease-expiry reap is attested, exactly once.**
+///
+/// `seal` attests a reap (MERGE, ABANDON), but a branch the lease reaper takes never reaches
+/// `seal`: `scan_once` reaps it and then only tells the runtime to forget its workspace. So the
+/// attested log still read `[Fork]` for a branch the catalog had retired. The log called a dead
+/// branch live, and under wall #19 its head was never dropped (`lane_wall19_attested.md` F1).
+///
+/// Hand-worked: the log is the session's `Fork`, then a `Reap` whose `prev` is that fork's
+/// attestation, so the branch's walk is 2 steps (trunk has no entries here). The reap's content
+/// commits to that head and to `published = false`, the abandon encoding, because a branch the
+/// lease took published nothing. Exactly once: a second scan and the reconciliation sweep find
+/// nothing more, and the log refuses nothing. A second attempt would show as a refusal rather
+/// than as an entry, because the log itself refuses a reaped branch, so the refusal count is
+/// what separates "the runtime attested once" from "the log caught the second one".
+#[test]
+fn a_lease_expiry_reap_is_attested_exactly_once() {
+    use crate::branch::attest::{BranchOp, ContentId};
+
+    let f = fixture();
+    let session = f.runtime.begin_session("pricing-agent", Some("r_1"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    write_pages(&f, branch, 3);
+    f.h.catalog.renew_lease(branch, EXPIRED).unwrap();
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: the session's fork is attested");
+    let fork_head = f.runtime.attestation_of(branch).expect("a live session has a head");
+    // From the catalog, before the reap: the epoch `seal` stamps on its Reap entries.
+    let fork_epoch = f.h.catalog.get(branch).unwrap().fork_epoch;
+
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
+    assert_eq!(counters.snapshot().reaped, 1, "the scan reaped nothing, so this proves nothing");
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    // The epoch assertion below can only discriminate if "now" has moved past the fork.
+    // `write_pages` advanced it.
+    assert_ne!(f.h.catalog.current_epoch(), fork_epoch, "precondition: the epoch never moved");
+
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "the lease reap left no attestation: the log still calls a retired branch live"
+    );
+    let reap = *f.runtime.attested_entries(branch).last().unwrap();
+    assert_eq!(reap.prev, fork_head, "the reap does not follow the branch's own fork");
+    assert_eq!(
+        reap.epoch, fork_epoch,
+        "a lease Reap must carry the branch's fork epoch, as seal's Reap entries do: the epoch is \
+         hashed into the entry, so one op with two epoch meanings is two formats"
+    );
+    let mut closed = fork_head.0.to_vec();
+    closed.push(0);
+    assert_eq!(
+        reap.content_cid,
+        ContentId::of(&closed),
+        "the reap does not commit to the head it closes and to published = false"
+    );
+    assert_eq!(f.runtime.verify_attested_branch(branch).unwrap(), 2, "Reap, Fork, then genesis");
+    assert_eq!(f.runtime.attestation_of(branch), None, "a lease-reaped branch still holds a head");
+
+    // Exactly once: another scan, the reconciliation sweep, and the same id reported to the
+    // forget path a second time (a reaper may name a branch twice) all find nothing to attest.
+    scan_once(&f.reaper, &f.runtime, &*TestGate::new(), &counters, &report);
+    assert_eq!(f.runtime.forget_reaped_branches(), 0, "a workspace outlived the scan's forget");
+    assert_eq!(f.runtime.forget_branches(&[branch]), 0, "a forgotten branch was forgotten again");
+    // And a later `seal` of the reaped branch (a client ABANDON arriving after the lease took it)
+    // must not append a second Reap. Its read before the reap sees a bumped generation, so it
+    // cannot be the call that flips, and it takes the landed-reap path, which finds no head (the
+    // lease's Reap removed it) and skips. The reaper-less arm's `get` then refuses the reaped id
+    // (D199 seal review F6: that refusal is not what stops the second Reap; M18 is the mutant that
+    // shows it).
+    assert!(f.runtime.abandon(branch).is_err(), "abandoning a reaped branch succeeded");
+    assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
+    assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// ⛔ **D199 rules 1 and 3, WRITTEN TO FAIL FIRST against `a5e9423`.** `get` refuses a `Reaping`
+/// branch as well as a `Reaped` one, so the reconciliation sweep forgets a branch whose reap is
+/// still in flight. `scan_once`'s error arm runs that sweep right after a reap that failed half
+/// way. Rule 1: the reap must not be attested before `Reaped` lands. Rule 3: once it lands it
+/// must still be attested, although the branch's workspace is already gone and no sweep will
+/// visit it again. `a5e9423` keyed the attestation on "this call removed the workspace", which
+/// breaks both.
+///
+/// Hand-worked: `[Fork]` after the sweep over the `Reaping` branch (one workspace forgotten);
+/// `[Fork, Reap]` once `Reaped` lands and the branch is reported to the forget path by id.
+#[test]
+fn a_reap_is_attested_once_it_lands_even_if_its_workspace_was_forgotten_first() {
+    use crate::branch::attest::BranchOp;
+
+    let f = fixture();
+    let session = f.runtime.begin_session("half-reaped", Some("r_3"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.h.catalog.set_state(branch, BranchState::Live, BranchState::Reaping).unwrap();
+    assert_eq!(f.runtime.forget_reaped_branches(), 1, "the sweep did not forget a Reaping branch");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested before Reaped landed");
+
+    f.h.catalog.set_state(branch, BranchState::Reaping, BranchState::Reaped).unwrap();
+    assert_eq!(f.runtime.forget_branches(&[branch]), 0, "its workspace was already gone");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a landed reap was missed because its workspace had been forgotten first"
+    );
+    assert_eq!(f.runtime.attestation_refusals(), 0, "an attestation was refused");
+}
+
+/// ⛔ **D199, the lead's review of `d95a1e7`, WRITTEN TO FAIL FIRST: an unreadable record is
+/// counted, not guessed.** Whether a reap has landed is read from the branch's catalog record
+/// (`get_raw`). When that read fails, the forget path must not guess in either direction. It
+/// writes no entry, because guessing "landed" could attest a reap still in flight. It counts a
+/// refusal, because treating it silently as "not landed" hides the gap, which is what
+/// `3ddb1a4` did. A later visit that can read the record attests the reap, once.
+///
+/// Hand-worked: with the read failing, `[Fork]` and 1 refusal, and the workspace forgotten
+/// (1). Once it succeeds, `[Fork, Reap]` and still 1 refusal, with nothing left to forget (0).
+#[test]
+fn an_unreadable_record_is_counted_not_guessed() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap();
+    let branch = rt.begin_session("unreadable", Some("r_4"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.reaper.reap(branch).unwrap();
+    refusing.arm_raw(branch.id);
+    assert_eq!(rt.forget_branches(&[branch]), 1, "the workspace was not forgotten");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested without reading its record");
+    assert_eq!(rt.attestation_refusals(), 1, "the unreadable record was not counted");
+
+    refusing.disarm_raw();
+    assert_eq!(rt.forget_branches(&[branch]), 0, "the workspace was forgotten twice");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a readable, landed reap was not attested"
+    );
+    assert_eq!(rt.attestation_refusals(), 1, "a successful attestation was counted as a refusal");
+}
+
+/// ⛔ **D199, the other door, WRITTEN TO FAIL FIRST.** A branch a reaper took with no forget call
+/// at all (`reap_expired` can reap several and then return `Err`, dropping the ids it had) is
+/// found by `forget_reaped_branches`, which drops its workspace. It must attest the reap exactly
+/// as the scan's forget does. `scan_once` never reaches this path on success, so the test above
+/// cannot see a mutant that removes the attestation only here.
+///
+/// Hand-worked: `[Fork]` before the sweep, `[Fork, Reap]` after, one workspace forgotten, and
+/// nothing more on a second sweep.
+#[test]
+fn a_reap_the_reconciliation_finds_is_attested_exactly_once() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let session = f.runtime.begin_session("sweep-agent", Some("r_2"), BranchId::TRUNK).unwrap();
+    let branch = session.branch;
+    write_pages(&f, branch, 2);
+    let ops = || f.runtime.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    f.reaper.reap(branch).unwrap();
+    assert_eq!(state_of(&f, branch), BranchState::Reaped);
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: nothing has told the runtime yet");
+
+    assert_eq!(f.runtime.forget_reaped_branches(), 1, "the sweep did not find the workspace");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "the reconciliation forgot a reaped branch and left no attestation"
+    );
+    assert_eq!(f.runtime.forget_reaped_branches(), 0, "the sweep found the workspace twice");
+    assert_eq!(f.runtime.attested_len(), 2, "the reap was attested more than once");
+    assert_eq!(f.runtime.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// ⛔ **D199's seal route (ledger D199, 09:25Z), WRITTEN TO FAIL FIRST against `a0bf5d3`.** `seal`
+/// with a reaper runs `reaper.reap(branch)?`, and `TwoTierReaper::reap` durably flips the record to
+/// `Reaped` BEFORE its fallible detach and drain. An `Err` from either returned through `seal`'s `?`
+/// ahead of the attestation, so the log kept calling a reaped branch live. Here the detach is armed
+/// to fail on trunk, the parent: the reap flips, then refuses, and the abandon returns `Err`. The
+/// reap must be attested anyway, once. A retried abandon and a forget visit find nothing more to
+/// attest, and nothing is counted as refused.
+///
+/// Hand-worked: `[Fork]` before; `abandon` is `Err` with the record `Reaped`; `[Fork, Reap]` after;
+/// a second `abandon` is `Err` and changes nothing; 0 refusals throughout.
+#[test]
+fn a_seal_whose_reap_fails_after_the_flip_is_still_attested() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::clone(&f.h.store),
+    ));
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+    .with_reaper(reaper);
+    let branch = rt.begin_session("seal-fails", Some("r_5"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+    assert_eq!(ops(), vec![BranchOp::Fork], "control: the session's fork is attested");
+
+    refusing.arm_detach(BranchId::TRUNK.id);
+    let err = match rt.abandon(branch) {
+        Ok(()) => panic!("premise failed: the seal succeeded, so its reap never failed after the flip"),
+        Err(e) => e,
+    };
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed before the failure (`{err}`)");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a seal that failed after the durable Reaped flip left no attestation: the log calls a reaped \
+         branch live"
+    );
+    assert_eq!(rt.attestation_refusals(), 0, "the seal's attestation was counted as refused");
+
+    // Exactly once: a retried abandon and a forget visit attest nothing more.
+    refusing.disarm_detach();
+    assert!(rt.abandon(branch).is_err(), "abandoning a reaped branch succeeded");
+    assert_eq!(rt.forget_branches(&[branch]), 0, "the sealed branch still had a workspace");
+    assert_eq!(ops(), vec![BranchOp::Fork, BranchOp::Reap], "the reap was attested more than once");
+    assert_eq!(rt.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// **D199's seal route, the third case: a record `seal` cannot read after its reap is counted, not
+/// guessed.** Whether this call's reap landed is read back from the catalog. If that read fails,
+/// `seal` must not attest, because guessing "landed" could attest a reap that never happened. It
+/// must count a refusal instead, since the branch still holds a head, rather than treat the read
+/// silently as "not landed". This is the rule D199 set for the forget paths
+/// (`an_unreadable_record_is_counted_not_guessed`), applied to `seal`. `a0bf5d3`'s seal attested
+/// after an `Ok` reap without reading anything.
+///
+/// The double lets every read of the record succeed until it reads `Reaped`, and fails every read
+/// after that, however many the reap itself makes.
+///
+/// Hand-worked: `[Fork]` and 1 refusal after the abandon, whether the abandon itself returned `Ok`
+/// or `Err`.
+#[test]
+fn a_seal_that_cannot_read_its_record_after_the_flip_counts_it_not_guesses() {
+    use crate::branch::attest::BranchOp;
+    use crate::branch::Reaper;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::clone(&f.h.store),
+    ));
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+    .with_reaper(reaper);
+    let branch = rt.begin_session("seal-unreadable", Some("r_6"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    refusing.arm_raw_once_reaped(branch.id);
+    let _ = rt.abandon(branch);
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested without reading the record back");
+    assert_eq!(rt.attestation_refusals(), 1, "the unreadable record was not counted");
+}
+
+/// A runtime over the refusing double with storage and NO reaper, so `seal` takes the reaper-less
+/// arm, which reaps through `get` and never calls `get_raw`: the double's read arms then reach only
+/// the reads `seal` makes around the reap.
+fn runtime_without_reaper(f: &Fixture, refusing: &Arc<RefusesLiveChildren>) -> AgentRuntime {
+    AgentRuntime::with_storage(
+        Arc::clone(refusing) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&f.h.store) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+}
+
+/// ⛔ **D199 seal review F1, WRITTEN TO FAIL FIRST against `2673674`: a failed read BEFORE the reap
+/// no longer suppresses the attestation.** `seal` read the record before its reap to decide whether
+/// this call could flip it, and took a failed read as "it cannot": a guess. The reaper-less arm then
+/// reaped through `get` regardless, so the flip landed and nothing was written or counted, and
+/// nothing visits a sealed branch again. Here the first `get_raw` of the branch fails and later ones
+/// succeed, so the seal must fall back to the landed-reap rule and attest the reap, once.
+///
+/// Hand-worked: `abandon` is `Ok`, the record reads `Reaped`, the log `[Fork, Reap]`, 0 refusals.
+#[test]
+fn a_seal_whose_read_before_the_reap_fails_still_attests_the_reap_it_made() {
+    use crate::branch::attest::BranchOp;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = runtime_without_reaper(&f, &refusing);
+    let branch = rt.begin_session("first-read-fails", Some("r_7"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    refusing.arm_raw_once(branch.id);
+    rt.abandon(branch).expect("premise: the reaper-less arm reaps through `get`, which is not armed");
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a seal whose read before the reap failed left no attestation for a reap that landed"
+    );
+    assert_eq!(rt.attestation_refusals(), 0, "a readable, landed reap was counted as refused");
+}
+
+/// ⛔ **D199 seal review F1 and F4, WRITTEN TO FAIL FIRST against `2673674`: a seal that cannot read
+/// its record at all counts the reap, and a retried ABANDON attests it.** With every read failing,
+/// whether the reap landed is unknown, so the landed-reap rule writes nothing and counts a refusal.
+/// On the seal route nothing used to visit again (the workspace is gone), so the count was final
+/// (F4); a retried ABANDON now takes the same rule, and once it can read the record it attests the
+/// reap, once.
+///
+/// Hand-worked: after the first abandon (`Ok`), `[Fork]` and 1 refusal; after the retry (`Err`, the
+/// branch is reaped), `[Fork, Reap]` and still 1 refusal.
+#[test]
+fn an_unreadable_seal_counts_the_reap_and_a_retried_abandon_attests_it() {
+    use crate::branch::attest::BranchOp;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = runtime_without_reaper(&f, &refusing);
+    let branch = rt.begin_session("never-readable", Some("r_8"), BranchId::TRUNK).unwrap().branch;
+    let ops = || rt.attested_entries(branch).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    refusing.arm_raw(branch.id);
+    rt.abandon(branch).expect("premise: the reaper-less arm reaps through `get`, which is not armed");
+    assert_eq!(state_of(&f, branch), BranchState::Reaped, "premise: the flip landed");
+    assert_eq!(ops(), vec![BranchOp::Fork], "a reap was attested without reading its record");
+    assert_eq!(rt.attestation_refusals(), 1, "the unreadable record was not counted");
+
+    refusing.disarm_raw();
+    assert!(rt.abandon(branch).is_err(), "premise: abandoning a reaped branch fails");
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a retried abandon that could read the record did not attest the landed reap"
+    );
+    assert_eq!(rt.attestation_refusals(), 1, "a successful attestation was counted as a refusal");
+}
+
+/// ⛔ **D199 seal review F2, WRITTEN TO FAIL FIRST against `2673674`: a lease reap that flips and
+/// then reports `Refused` is attested when the client seals.** `TwoTierReaper::reap` flips C to
+/// `Reaped`, then its `detach_from_parent` cascade reaches C's reaped parent P and asks
+/// `has_live_children(P)`, which the double refuses (D124's shape). `reap_if_still_expired` turns
+/// that into `Refused`, so `scan_once` neither forgets C nor attests it: C is `Reaped`, its workspace
+/// is present, and the log still holds its head. The client's ABANDON then removed the workspace,
+/// which was the reconciliation's only handle, and attested nothing, because its read before the
+/// reap saw a generation it could not flip. It must attest the landed reap, once.
+///
+/// Hand-worked: after the scan, 1 refused branch, C `Reaped`, `[Fork]`; after `abandon(C)` (`Err`),
+/// `[Fork, Reap]` with 0 refusals; a retried abandon changes nothing.
+#[test]
+fn a_lease_reap_refused_after_its_flip_is_attested_when_the_client_seals() {
+    use crate::branch::attest::BranchOp;
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = runtime_without_reaper(&f, &refusing);
+    let p = rt.begin_session("parent", Some("r_9"), BranchId::TRUNK).unwrap().branch;
+    let c = rt.begin_session("child", Some("r_10"), p).unwrap().branch;
+    rt.abandon(p).expect("premise: the reaper-less arm reaps a parent with a live child");
+    assert_eq!(state_of(&f, p), BranchState::Reaped, "premise: P is reaped while C is live");
+    f.h.catalog.renew_lease(c, EXPIRED).unwrap();
+    refusing.arm(p.id);
+    let reaper =
+        TwoTierReaper::new(Arc::clone(&refusing) as Arc<dyn BranchCatalog>, Arc::clone(&f.h.store));
+    let ops = || rt.attested_entries(c).iter().map(|e| e.op).collect::<Vec<_>>();
+
+    let counters = Counters::default();
+    scan_once(&reaper, &rt, &*TestGate::new(), &counters, &report);
+    assert_eq!(counters.snapshot().refused_branches, 1, "premise: the lease reported C as refused");
+    assert_eq!(state_of(&f, c), BranchState::Reaped, "premise: the reap flipped C before it refused");
+    assert_eq!(ops(), vec![BranchOp::Fork], "premise: the refused lease reap attested nothing");
+
+    let _ = rt.abandon(c);
+    assert_eq!(
+        ops(),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "a reap the lease flipped and reported refused was never attested, and the client's seal \
+         removed the last handle that could have"
+    );
+    assert_eq!(rt.attestation_refusals(), 0, "the landed reap's attestation was counted as refused");
+
+    let _ = rt.abandon(c);
+    assert_eq!(ops(), vec![BranchOp::Fork, BranchOp::Reap], "the reap was attested more than once");
+    assert_eq!(rt.attestation_refusals(), 0, "a second attestation was attempted");
+}
+
+/// ⛔ **D199 seal review F1/F2, the `published` bit, WRITTEN TO FAIL FIRST against `2673674`: a
+/// MERGE's seal that takes the landed-reap path records `published = true`.** The landed-reap rule
+/// wrote `false` unconditionally: right for the forget paths (a branch the lease took published
+/// nothing), wrong for a merge's seal, which now reaches it. Reached through `seal_for_test`,
+/// because a MERGE needs a SQL catalog this module does not build. The first read of the record
+/// fails, so the seal takes the landed path.
+///
+/// Hand-worked: `[Fork, Reap]`; the Reap's content is `ContentId::of(fork head ‖ 1)` and its epoch
+/// the fork epoch, which "now" has moved past.
+#[test]
+fn a_merged_seal_that_takes_the_landed_path_records_published() {
+    use crate::branch::attest::{BranchOp, ContentId};
+
+    let f = fixture();
+    let refusing = RefusesLiveChildren::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let rt = runtime_without_reaper(&f, &refusing);
+    let branch = rt.begin_session("merged-landed", Some("r_11"), BranchId::TRUNK).unwrap().branch;
+    let fork_head = rt.attestation_of(branch).expect("a live session has a head");
+    let fork_epoch = f.h.catalog.get(branch).unwrap().fork_epoch;
+    let _ = f.h.catalog.next_epoch();
+    assert_ne!(f.h.catalog.current_epoch(), fork_epoch, "precondition: the epoch never moved");
+
+    refusing.arm_raw_once(branch.id);
+    rt.seal_for_test(branch, true).expect("premise: the reaper-less arm reaps through `get`, which is not armed");
+    let ops: Vec<_> = rt.attested_entries(branch).iter().map(|e| e.op).collect();
+    assert_eq!(ops, vec![BranchOp::Fork, BranchOp::Reap], "the merged seal's landed reap was not attested");
+    let reap = *rt.attested_entries(branch).last().unwrap();
+    let mut closed = fork_head.0.to_vec();
+    closed.push(1);
+    assert_eq!(
+        reap.content_cid,
+        ContentId::of(&closed),
+        "a merged branch's Reap does not commit to the head it closes and to published = true"
+    );
+    assert_eq!(reap.epoch, fork_epoch, "the Reap does not carry the branch's fork epoch");
+}
+
 // -------------------------------------------------------------------------------------------
 // Stoppable cleanly.
 // -------------------------------------------------------------------------------------------
@@ -766,18 +1205,58 @@ const CORRUPT_MARKER: &str = "CHILD entry (parent 7, fork epoch 11) names branch
 /// than corrupting a catalog is the point: the arm under test catches an `Err` from that call, so
 /// what matters is the error, not how a catalog came to produce it. Reproducing the real
 /// corruption would test `TableBranchCatalog`'s key layout instead.
+///
+/// **Also armable, separately, to refuse `get_raw` for one id (D199):** the read the runtime's
+/// forget path uses to tell a landed reap from one in flight. The two arms are independent and
+/// both start disarmed, so a test arming one sees the other delegate.
 struct RefusesLiveChildren {
     inner: Arc<dyn BranchCatalog>,
     /// `u64::MAX` means nothing is armed; no real id reaches it, ids are minted from 0 up.
     armed: AtomicU64,
+    /// The same convention, for `get_raw`.
+    raw_armed: AtomicU64,
+    /// The same convention, for `detach_child`, keyed by the PARENT id (D199's seal route): the
+    /// reaper's first step after its durable `Reaped` flip.
+    detach_armed: AtomicU64,
+    /// The same convention, for `get_raw` of one id, but only once that record reads `Reaped`:
+    /// every read before the flip succeeds, every read after it fails, however many there are.
+    raw_armed_once_reaped: AtomicU64,
+    /// The same convention, for the NEXT `get_raw` of one id only (D199 seal review F1): that read
+    /// fails and the arm clears itself, so every later read succeeds.
+    raw_armed_once: AtomicU64,
 }
 
 impl RefusesLiveChildren {
     fn new(inner: Arc<dyn BranchCatalog>) -> Arc<RefusesLiveChildren> {
-        Arc::new(RefusesLiveChildren { inner, armed: AtomicU64::new(u64::MAX) })
+        Arc::new(RefusesLiveChildren {
+            inner,
+            armed: AtomicU64::new(u64::MAX),
+            raw_armed: AtomicU64::new(u64::MAX),
+            detach_armed: AtomicU64::new(u64::MAX),
+            raw_armed_once_reaped: AtomicU64::new(u64::MAX),
+            raw_armed_once: AtomicU64::new(u64::MAX),
+        })
     }
     fn arm(&self, parent_id: u64) {
         self.armed.store(parent_id, Ordering::SeqCst);
+    }
+    fn arm_raw(&self, id: u64) {
+        self.raw_armed.store(id, Ordering::SeqCst);
+    }
+    fn disarm_raw(&self) {
+        self.raw_armed.store(u64::MAX, Ordering::SeqCst);
+    }
+    fn arm_detach(&self, parent_id: u64) {
+        self.detach_armed.store(parent_id, Ordering::SeqCst);
+    }
+    fn disarm_detach(&self) {
+        self.detach_armed.store(u64::MAX, Ordering::SeqCst);
+    }
+    fn arm_raw_once_reaped(&self, id: u64) {
+        self.raw_armed_once_reaped.store(id, Ordering::SeqCst);
+    }
+    fn arm_raw_once(&self, id: u64) {
+        self.raw_armed_once.store(id, Ordering::SeqCst);
     }
 }
 
@@ -805,7 +1284,26 @@ impl BranchCatalog for RefusesLiveChildren {
         self.inner.get(b)
     }
     fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
-        self.inner.get_raw(id)
+        if self.raw_armed_once.compare_exchange(id, u64::MAX, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "record {id} could not be read, this once (armed by the test)"
+            ))
+            .into());
+        }
+        if id == self.raw_armed.load(Ordering::SeqCst) {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "record {id} could not be read (armed by the test)"
+            ))
+            .into());
+        }
+        let rec = self.inner.get_raw(id)?;
+        if id == self.raw_armed_once_reaped.load(Ordering::SeqCst) && rec.state == BranchState::Reaped {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "record {id} could not be read once reaped (armed by the test)"
+            ))
+            .into());
+        }
+        Ok(rec)
     }
     fn reparent(
         &self,
@@ -874,6 +1372,12 @@ impl BranchCatalog for RefusesLiveChildren {
         self.inner.attach_child(p, e, c)
     }
     fn detach_child(&self, p: u64, e: crate::branch::types::Epoch) -> Result<bool, FerroError> {
+        if p == self.detach_armed.load(Ordering::SeqCst) {
+            return Err(crate::branch::types::BranchError::Corrupt(format!(
+                "detach from parent {p} refused (armed by the test)"
+            ))
+            .into());
+        }
         self.inner.detach_child(p, e)
     }
     fn add_arena(&self, b: BranchId, a: crate::branch::types::ArenaId) -> Result<(), FerroError> {

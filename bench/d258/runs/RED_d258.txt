@@ -1,0 +1,95 @@
+# 2026-09-24T21:48:22Z tree=/Users/idide/wt/ferrodb-d258-red.noindex HEAD=081f98eabcdfce58a022c3b55a2b77c7c71b1a1e
+# cmd: lockrun d258 env CARGO_TARGET_DIR=/Users/idide/wt/ferrodb-lane-target.noindex timeout 1800 cargo test --no-fail-fast --test d258_stage_atomic
+2026-09-24T21:48:22Z d258 acquiring (5s poll), pid 51991
+2026-09-24T22:06:32Z d258 ACQUIRED: 51991 d258 2026-09-24T22:06:32Z
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-d258-red.noindex)
+warning: unused import: `RowId`
+  --> tests/d258_stage_atomic.rs:56:32
+   |
+56 | use ferrodb::tel::ids::{ColId, RowId};
+   |                                ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "d258_stage_atomic") generated 1 warning (run `cargo fix --test "d258_stage_atomic" -p ferrodb` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.52s
+     Running tests/d258_stage_atomic.rs (/Users/idide/wt/ferrodb-lane-target.noindex/debug/deps/d258_stage_atomic-288d6c220e7fde21)
+
+running 8 tests
+test a_refused_statement_leaves_no_trace_and_its_retry_applies_once ... FAILED
+test a_refused_statement_spends_neither_escrow_nor_row_write_budget ... FAILED
+test a_log_limit_refusal_does_not_wedge_the_branch ... FAILED
+test a_row_at_the_entry_cap_still_stages_mirrors_and_merges ... ok
+test an_oversized_row_is_refused_and_merge_publishes_nothing ... FAILED
+test a_failed_log_write_leaves_no_trace_and_restores_the_page_tree ... FAILED
+test a_sibling_merge_that_refuses_on_its_second_table_stages_nothing ... FAILED
+test a_page_tree_failure_mid_statement_leaves_no_trace ... FAILED
+
+failures:
+
+---- a_refused_statement_leaves_no_trace_and_its_retry_applies_once stdout ----
+
+thread 'a_refused_statement_leaves_no_trace_and_its_retry_applies_once' (357602049) panicked at tests/d258_stage_atomic.rs:459:9:
+assertion `left == right` failed: refusal 1 (`cow page store error: entry of 1039 bytes exceeds the 1015-byte limit for a 4KB page`) left the statement staged on the branch
+  left: [[Integer(15), Varchar("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy")]]
+ right: [[Integer(20), Varchar("n")]]
+
+---- a_refused_statement_spends_neither_escrow_nor_row_write_budget stdout ----
+
+thread 'a_refused_statement_spends_neither_escrow_nor_row_write_budget' (357602050) panicked at tests/d258_stage_atomic.rs:516:5:
+assertion `left == right` failed: the statement was refused with `cow page store error: entry of 1039 bytes exceeds the 1015-byte limit for a 4KB page` and still spent the escrow claim
+  left: Some(0)
+ right: Some(5)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_log_limit_refusal_does_not_wedge_the_branch stdout ----
+
+thread 'a_log_limit_refusal_does_not_wedge_the_branch' (357602047) panicked at tests/d258_stage_atomic.rs:562:9:
+the branch is wedged: after `merge error: a string value in this frame is 65536 bytes, over the 65535 a length prefix can hold; refusing to write a record that could not be read back`, an ordinary INSERT was refused with `merge error: a string value in this frame is 65536 bytes, over the 65535 a length prefix can hold; refusing to write a record that could not be read back`
+
+---- an_oversized_row_is_refused_and_merge_publishes_nothing stdout ----
+
+thread 'an_oversized_row_is_refused_and_merge_publishes_nothing' (357602053) panicked at tests/d258_stage_atomic.rs:403:5:
+assertion `left == right` failed: the INSERT was refused with `cow page store error: entry of 1016 bytes exceeds the 1015-byte limit for a 4KB page`, and MERGE published its row anyway
+  left: [1, 2]
+ right: [1]
+
+---- a_failed_log_write_leaves_no_trace_and_restores_the_page_tree stdout ----
+
+thread 'a_failed_log_write_leaves_no_trace_and_restores_the_page_tree' (357602046) panicked at tests/d258_stage_atomic.rs:656:5:
+assertion `left == right` failed: the log write failed with `wal error: d258: injected effect-log write failure` and the statement is still staged
+  left: [(1, 15), (2, 15)]
+ right: [(1, 20), (2, 20)]
+
+---- a_sibling_merge_that_refuses_on_its_second_table_stages_nothing stdout ----
+
+thread 'a_sibling_merge_that_refuses_on_its_second_table_stages_nothing' (357602052) panicked at tests/d258_stage_atomic.rs:729:5:
+assertion `left == right` failed: the merge was refused on d258_a with `constraint error: write of 5 exceeds this branch's remaining escrow of 0 on (TableId(552905270), RowId(1), ColId(1)) (claimed 0, already spent 0); claim more before writing` and still staged d258_b on the target
+  left: [(1, 1)]
+ right: [(1, 20)]
+
+---- a_page_tree_failure_mid_statement_leaves_no_trace stdout ----
+
+thread 'a_page_tree_failure_mid_statement_leaves_no_trace' (357602048) panicked at tests/d258_stage_atomic.rs:604:9:
+assertion `left == right` failed: call 1 of 2 failed with `io error: d258: injected failure of cow_page call 1` and the statement is still staged
+  left: [(1, 15), (2, 15)]
+ right: [(1, 20), (2, 20)]
+
+
+failures:
+    a_failed_log_write_leaves_no_trace_and_restores_the_page_tree
+    a_log_limit_refusal_does_not_wedge_the_branch
+    a_page_tree_failure_mid_statement_leaves_no_trace
+    a_refused_statement_leaves_no_trace_and_its_retry_applies_once
+    a_refused_statement_spends_neither_escrow_nor_row_write_budget
+    a_sibling_merge_that_refuses_on_its_second_table_stages_nothing
+    an_oversized_row_is_refused_and_merge_publishes_nothing
+
+test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+error: test failed, to rerun pass `--test d258_stage_atomic`
+error: 1 target failed:
+    `--test d258_stage_atomic`
+2026-09-24T22:06:48Z d258 rc=101
+2026-09-24T22:06:48Z d258 released (owner matched)
+# rc=101 end=2026-09-24T22:06:48Z HEAD_after=081f98eabcdfce58a022c3b55a2b77c7c71b1a1e

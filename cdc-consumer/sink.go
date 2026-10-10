@@ -526,6 +526,13 @@ func (s *Sink) applySchemaChange(e *Event) error {
 // dropped rather than mis-assigned — but this source has no DROP COLUMN, so the name sets are equal
 // in practice and a difference would be a bug worth failing on rather than absorbing.
 func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
+	// The attribution columns are carried across below, so they must exist on the table being
+	// rebuilt. A destination an older sink made can reach this path without passing through
+	// `ensureTable` (its first event in this run being the retype itself), so upgrade it here first:
+	// idempotent, the same call `ensureTable` makes.
+	if err := s.ensureWriterColumns(table); err != nil {
+		return err
+	}
 	existing, err := s.tableColumns(table)
 	if err != nil {
 		return err
@@ -544,6 +551,13 @@ func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
 		carried = append(carried, quoteIdent(n))
 	}
 	carried = append(carried, `"_commit_lsn"`, `"_lsn"`, `"_deleted"`)
+	// I15: the attribution columns travel with the row. `tableDDL` declares them on the new table,
+	// but a column declared and not copied comes back at its DEFAULT, so a retype rebuild would
+	// silently reset the writer of every row it moves (`_prov_id` 0, `_agent`..`_prompt_sha256`
+	// NULL) and un-retract every retracted one (`_retracted` 0).
+	for _, w := range writerColumns {
+		carried = append(carried, quoteIdent(w.name))
+	}
 	tmp := table + "_cdc_rebuild"
 
 	tx, err := s.db.Begin()
